@@ -50,7 +50,8 @@ impl LaterMdApp {
 
         // ② 次外层:侧边栏(可折叠)。show_collapsible 原地持有 `&mut visible`,
         // 因此先把 sidebar 解构成 `visible` 与其余字段,闭包只捕获后者。
-        // 大纲数据与光标位置只读借用 `preview`/`cursor`(与 `visible` 不相交)。
+        // 大纲数据、文件树与当前文档路径只读借用 `preview`/`file_tree`/
+        // `document`(与 `visible` 不相交);树的交互全部经由消息归约。
         let SidebarState {
             visible,
             active_tab,
@@ -63,6 +64,8 @@ impl LaterMdApp {
                 crate::ui::sidebar::ui(
                     ui,
                     active_tab,
+                    &self.state.file_tree,
+                    self.state.document.path.as_deref(),
                     &self.state.preview.outline,
                     self.state.cursor.byte,
                     &mut self.outbox,

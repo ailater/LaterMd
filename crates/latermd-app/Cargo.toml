@@ -22,6 +22,8 @@ latermd-md = { path = "../latermd-md" }
 latermd-export = { path = "../latermd-export" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
+# 文件树目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)
+ignore = "0.4.33"
 
 [features]
 # 逃生后端:默认产物只带 wgpu(AGENTS.md §5)。开启本 feature 的构建才能响应

@@ -172,7 +172,9 @@ impl fmt::Display for SaveError {
 /// Linux/其余 Unix `$XDG_CONFIG_HOME/latermd`(未设置或为空串时
 /// `$HOME/.config/latermd`,按 XDG 规范);macOS
 /// `$HOME/Library/Application Support/latermd`;Windows `%APPDATA%\latermd`。
-fn config_dir() -> Option<PathBuf> {
+///
+/// 文件树的最近目录持久化(`crate::filetree`)落在同一目录,故 crate 内共享。
+pub(crate) fn config_dir() -> Option<PathBuf> {
     config_dir_from(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),

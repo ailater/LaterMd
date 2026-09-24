@@ -8,6 +8,7 @@
 mod command;
 mod export;
 mod file;
+mod filetree;
 mod fonts;
 mod state;
 mod theme;
@@ -39,7 +40,9 @@ fn main() -> eframe::Result<()> {
             // 首帧前装好主题,避免开场按默认深色闪一帧;此后每次切换由
             // `App::logic` 的投影维持
             theme.apply(&cc.egui_ctx);
-            Ok(Box::new(LaterMdApp::new(theme)))
+            // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
+            let file_tree = filetree::FileTreeSettings::load();
+            Ok(Box::new(LaterMdApp::new(theme, file_tree)))
         }),
     )
 }
@@ -55,11 +58,12 @@ struct LaterMdApp {
 }
 
 impl LaterMdApp {
-    /// 以启动时装载的主题建应用(重启保持)。`Default` 恒为深色且不走磁盘,
-    /// 仅供测试。
-    fn new(theme: theme::ThemeSettings) -> Self {
+    /// 以启动时装载的主题与文件树设置建应用(重启保持)。`Default` 恒为
+    /// 深色且不走磁盘,仅供测试。
+    fn new(theme: theme::ThemeSettings, file_tree: filetree::FileTreeSettings) -> Self {
         let mut app = Self::default();
         app.state.theme = theme;
+        app.state.file_tree = file_tree.into();
         app
     }
 }

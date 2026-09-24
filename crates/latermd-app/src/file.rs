@@ -60,6 +60,14 @@ fn markdown_dialog(start_dir: &Path) -> rfd::FileDialog {
         .set_directory(start_dir)
 }
 
+/// 目录选择对话框:文件树根目录用(`ui::sidebar` 发消息,归约里弹出)。
+/// 取消返回 `None`。起始目录必须存在,由调用方保证。
+pub fn pick_folder_dialog(start_dir: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_directory(start_dir)
+        .pick_folder()
+}
+
 /// 文件操作失败:带动作与路径,提示行可直接展示。
 #[derive(Debug)]
 pub struct FileError {
