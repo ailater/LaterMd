@@ -224,7 +224,6 @@ impl InlineCodeStyle {
       ui.label("Expand bg:");
       ui.add(DragValue::new(&mut self.expand_bg).range(0.0..=10.0).speed(0.1));
       ui.end_row();
-
     });
   }
 }
