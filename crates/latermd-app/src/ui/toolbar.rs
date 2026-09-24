@@ -1,8 +1,8 @@
-//! 文件工具栏(编辑面板顶部):四个命令按钮 + 设置菜单(主题切换入口)+
-//! 当前文件名/未保存标记 + 上次文件操作的失败提示。点击只发消息,执行在
-//! `App::logic`。
+//! 文件工具栏(编辑面板顶部):命令按钮(label/快捷键统一取自
+//! `crate::command`)+ 设置菜单(主题定向选择)+ 当前文件名/未保存标记 +
+//! 上次文件操作的失败提示。点击只发消息,执行在 `App::logic`。
 
-use crate::file::FileCmd;
+use crate::command::Command;
 use crate::state::{DocumentState, Message};
 use crate::theme::ThemeMode;
 use eframe::egui;
@@ -16,19 +16,12 @@ pub fn ui(
 ) {
     // wrapped:面板被拖窄时按钮换行而不是溢出裁切
     panel.horizontal_wrapped(|ui| {
-        for cmd in FileCmd::ALL {
-            let mut button = egui::Button::new(cmd.label());
-            if let Some(shortcut) = cmd.shortcut() {
-                button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
-            }
+        for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
+            let button = egui::Button::new(cmd.label())
+                .shortcut_text(ui.ctx().format_shortcut(&cmd.shortcut()));
             if ui.add(button).clicked() {
-                outbox.push(Message::FileCommand(cmd));
+                outbox.push(cmd.message());
             }
-        }
-        let export_button = egui::Button::new("导出 HTML")
-            .shortcut_text(ui.ctx().format_shortcut(&crate::export::shortcut()));
-        if ui.add(export_button).clicked() {
-            outbox.push(Message::ExportHtml);
         }
         // 设置菜单:egui 菜单内点击任意控件自动收起,无需手工关闭
         ui.menu_button("设置", |ui| {

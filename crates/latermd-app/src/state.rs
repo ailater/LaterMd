@@ -43,8 +43,9 @@ impl SidebarTab {
     }
 }
 
-/// 侧边栏状态。`visible` 直接喂给 `Panel::show_collapsible` 的 `&mut bool`,
-/// 折叠/展开由面板把手原地翻转,不走消息。
+/// 侧边栏状态。`visible` 直接喂给 `Panel::show_collapsible` 的 `&mut bool`:
+/// 面板把手在 `ui` 里原地翻转;命令层(菜单/快捷键)的切换走
+/// [`Message::SidebarToggled`] 在 `logic` 归约。
 pub struct SidebarState {
     /// 是否展开。
     pub visible: bool,
@@ -215,6 +216,11 @@ pub enum Message {
     ExportHtml,
     /// 切换明暗主题(设置菜单产出);归约里改状态并即时落盘。
     ThemeChanged(ThemeMode),
+    /// 明暗主题互换(命令层「切换主题」的快捷键/菜单入口;定向选择走
+    /// [`Message::ThemeChanged`])。
+    ToggleTheme,
+    /// 切换侧边栏展开/折叠(命令层入口;面板把手翻转不走消息)。
+    SidebarToggled,
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
 }
@@ -228,6 +234,8 @@ impl State {
             Message::NoticeDismissed => self.document.notice = None,
             Message::ExportHtml => self.run_export_html(),
             Message::ThemeChanged(mode) => self.change_theme(mode),
+            Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
+            Message::SidebarToggled => self.sidebar.visible = !self.sidebar.visible,
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
         }
     }
@@ -391,6 +399,27 @@ mod tests {
             notice: None,
         };
         assert_eq!(document.display_name(), "未命名*");
+    }
+
+    /// 命令层开关消息:主题互换(翻转 + 落盘)与侧边栏翻转,都走完整归约。
+    #[test]
+    fn toggle_messages_flip_theme_and_sidebar() {
+        let dir = temp_path("toggle-dir");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        let visible_before = state.sidebar.visible;
+
+        state.apply(Message::ToggleTheme);
+        assert_eq!(state.theme.mode, ThemeMode::Light, "默认深色 → 浅色");
+        assert!(dir.join("settings.json").exists(), "互换同样持久化");
+        state.apply(Message::ToggleTheme);
+        assert_eq!(state.theme.mode, ThemeMode::Dark, "再切回深色");
+
+        state.apply(Message::SidebarToggled);
+        assert_eq!(state.sidebar.visible, !visible_before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 打开:内容进缓冲、dirty 复位、路径认领、预览快照同帧联动。

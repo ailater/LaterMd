@@ -4,12 +4,13 @@
 //! (roadmap P0 验收「`.md` 文件保持原样(无格式化篡改)」)。对话框用 rfd
 //! 同步版,在 `App::logic` 的归约里弹出——原生模态对话框本来就会阻塞
 //! 事件循环,弹框期间本应用没有需要继续绘制的状态。
+//!
+//! 命令的 label 与快捷键统一收在 [`crate::command`] —— 单一事实源,不再
+//! 分散;本模块只承载文件域的执行细节(对话框、读写、错误)。
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use eframe::egui::{self, Modifiers};
 
 /// 对话框过滤器接受的 Markdown 扩展名(同步给 rfd,不带点)。
 pub const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
@@ -28,55 +29,6 @@ pub enum FileCmd {
     Save,
     /// 另存为(总是弹框)。
     SaveAs,
-}
-
-impl FileCmd {
-    /// 工具栏按钮顺序。
-    pub const ALL: [FileCmd; 4] = [Self::New, Self::Open, Self::Save, Self::SaveAs];
-
-    /// 工具栏显示名。
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::New => "新建",
-            Self::Open => "打开",
-            Self::Save => "保存",
-            Self::SaveAs => "另存为",
-        }
-    }
-
-    /// 本模块绑定的快捷键:Ctrl/Cmd+S 与 Ctrl/Cmd+Shift+S。
-    /// 完整快捷键表由后续模块统一接入,这里只认领保存两条。
-    pub fn shortcut(self) -> Option<egui::KeyboardShortcut> {
-        match self {
-            Self::Save => Some(egui::KeyboardShortcut::new(
-                Modifiers::COMMAND,
-                egui::Key::S,
-            )),
-            Self::SaveAs => Some(egui::KeyboardShortcut::new(
-                Modifiers::COMMAND | Modifiers::SHIFT,
-                egui::Key::S,
-            )),
-            Self::New | Self::Open => None,
-        }
-    }
-}
-
-/// 从本帧输入消费文件快捷键,返回被触发的命令(已从输入流移除,不会重复触发)。
-///
-/// 消费顺序固定先 SaveAs 后 Save:`InputState::consume_shortcut` 按
-/// `matches_logically` 匹配(多余 Shift 被忽略),先问 Save 的话
-/// Ctrl+Shift+S 会先命中它。
-pub fn poll_shortcuts(ctx: &egui::Context) -> Vec<FileCmd> {
-    /// 消费顺序,见函数文档。
-    const SHORTCUT_ORDER: [FileCmd; 2] = [FileCmd::SaveAs, FileCmd::Save];
-    SHORTCUT_ORDER
-        .iter()
-        .filter_map(|cmd| {
-            let shortcut = cmd.shortcut()?;
-            ctx.input_mut(|input| input.consume_shortcut(&shortcut))
-                .then_some(*cmd)
-        })
-        .collect()
 }
 
 /// 起始目录:当前文档所在目录;未落盘或路径无父目录时退回进程工作目录。
@@ -163,21 +115,10 @@ pub fn write_as(op: &'static str, path: &Path, text: &str) -> Result<(), FileErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{Event, Key, RawInput};
 
     /// 进程内唯一且不冲突的临时路径;测试自删。
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("latermd-file-{}-{name}", std::process::id()))
-    }
-
-    fn key_event(modifiers: Modifiers) -> Event {
-        Event::Key {
-            key: Key::S,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }
     }
 
     /// 写出→读回逐字节一致:UTF-8、CRLF、LF 混排与尾随空行都原样保留。
@@ -209,56 +150,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("不存在.md"), "{error}");
-    }
-
-    /// Ctrl+Shift+S 只触发 SaveAs 一条;`matches_logically` 忽略多余 Shift,
-    /// 若先消费 Save 会双触发(顺序约束见 [`poll_shortcuts`] 文档)。
-    #[test]
-    fn shift_save_fires_only_save_as() {
-        let ctx = egui::Context::default();
-        let output = ctx.run_ui(
-            RawInput {
-                events: vec![key_event(Modifiers::COMMAND | Modifiers::SHIFT)],
-                ..Default::default()
-            },
-            |ui| {
-                assert_eq!(poll_shortcuts(ui.ctx()), vec![FileCmd::SaveAs]);
-            },
-        );
-        output.drop_without_applying_deltas();
-    }
-
-    #[test]
-    fn plain_save_fires_only_save() {
-        let ctx = egui::Context::default();
-        let output = ctx.run_ui(
-            RawInput {
-                events: vec![key_event(Modifiers::COMMAND)],
-                ..Default::default()
-            },
-            |ui| {
-                assert_eq!(poll_shortcuts(ui.ctx()), vec![FileCmd::Save]);
-            },
-        );
-        output.drop_without_applying_deltas();
-    }
-
-    /// 无修饰的 S 不是保存快捷键;同帧重复消费也不会二次返回。
-    #[test]
-    fn bare_s_does_not_fire() {
-        let ctx = egui::Context::default();
-        let output = ctx.run_ui(
-            RawInput {
-                events: vec![key_event(Modifiers::NONE)],
-                ..Default::default()
-            },
-            |ui| {
-                let ctx = ui.ctx().clone();
-                assert!(poll_shortcuts(&ctx).is_empty());
-                // 同一帧再问一次:已消费的按键不回流
-                assert!(poll_shortcuts(&ctx).is_empty());
-            },
-        );
-        output.drop_without_applying_deltas();
     }
 }

@@ -50,6 +50,14 @@ impl ThemeMode {
             Self::Dark => "深色",
         }
     }
+
+    /// 反向模式:「切换主题」命令用;设置菜单的定向选择直接给目标模式。
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
 }
 
 /// 主题设置:模式 + 正文样式覆盖。缺省字段(含整个 `overrides`)回落默认,
