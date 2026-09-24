@@ -44,6 +44,7 @@ impl eframe::App for LaterMdApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // ① 最外层:侧边栏(可折叠)。show_collapsible 原地持有 `&mut visible`,
         // 因此先把 sidebar 解构成 `visible` 与其余字段,闭包只捕获后者。
+        // 大纲数据与光标位置只读借用 `preview`/`cursor`(与 `visible` 不相交)。
         let SidebarState {
             visible,
             active_tab,
@@ -53,12 +54,19 @@ impl eframe::App for LaterMdApp {
             .default_size(240.0)
             .size_range(160.0..=400.0)
             .show_collapsible(ui, visible, |ui| {
-                crate::ui::sidebar::ui(ui, active_tab, &mut self.outbox);
+                crate::ui::sidebar::ui(
+                    ui,
+                    active_tab,
+                    &self.state.preview.outline,
+                    self.state.cursor.byte,
+                    &mut self.outbox,
+                );
             });
 
         // ② 次外层:编辑器(顶部文件工具栏 + 源码)。TextEdit 是立即模式控件,
-        // 必须原地持有 `&mut` 缓冲,因此 editor 与 preview 快照的借用下放到本
-        // 面板闭包内(归约/绘制二分对这对"控件附属状态"的例外见 state.rs)。
+        // 必须原地持有 `&mut` 缓冲,因此 editor、preview 快照与大纲光标的
+        // 借用下放到本面板闭包内(归约/绘制二分对这对"控件附属状态"的
+        // 例外见 state.rs)。
         let state = &mut self.state;
         let outbox = &mut self.outbox;
         egui::Panel::left("editor")
@@ -66,7 +74,7 @@ impl eframe::App for LaterMdApp {
             .default_size(500.0)
             .show(ui, |ui| {
                 crate::ui::toolbar::ui(ui, &state.document, outbox);
-                crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview);
+                crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
         // ③ 必须最后:预览

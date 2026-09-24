@@ -4,8 +4,9 @@
 //! IME 组合、内建 undo/redo 最终都落成 `insert_text` / `delete_char_range`
 //! 调用,rope 因此天然吃到增量编辑,不存在"整段字符串重写"路径。
 //! undo/redo 用 `TextEdit` 内建 undoer(快照存于其 widget state)。
+//! 大纲跳转也在这里应用:覆写 TextEdit 持久光标并交还焦点。
 
-use crate::state::PreviewState;
+use crate::state::{OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
 
@@ -43,12 +44,13 @@ impl egui::TextBuffer for EditorText<'_> {
     }
 }
 
-/// 绘制编辑面板,并在控件返回后维护预览快照。返回 TextEdit 的响应
-/// (焦点/交互归因用,测试也用它拿 widget id)。
+/// 绘制编辑面板,并在控件返回后维护预览快照与大纲光标协调。返回 TextEdit
+/// 的响应(焦点/交互归因用,测试也用它拿 widget id)。
 pub fn ui(
     panel: &mut egui::Ui,
     editor: &mut EditorBuffer,
     preview: &mut PreviewState,
+    cursor: &mut OutlineCursor,
 ) -> egui::Response {
     panel.horizontal(|ui| {
         ui.weak("源码");
@@ -74,11 +76,33 @@ pub fn ui(
         .lock_focus(true)
         .show(panel);
 
-    // 快照只在修订号前进时重建;这是"避免每帧重解析"的第一层,
-    // vendored 层的 text hash 缓存是第二层。
+    // 快照只在修订号前进时重建(文本 + 大纲同源);这是"避免每帧重解析"
+    // 的第一层,vendored 层的 text hash 缓存是第二层。
     if preview.synced_rev != editor.revision() {
-        preview.text = editor.text().to_owned();
-        preview.synced_rev = editor.revision();
+        preview.rebuild(editor);
+    }
+
+    // 光标位置回填(大纲「当前小节」高亮用):主光标的字符偏移按当前缓冲
+    // 换成字节。读持久化的 cursor 而非 output.cursor_range —— 后者在失焦
+    // 帧为 None,而持久化值保留上次位置。
+    cursor.byte = output
+        .state
+        .cursor
+        .char_range()
+        .map(|range| editor.char_to_byte(range.primary.index.0));
+
+    // 大纲跳转:覆写 TextEdit 持久光标到目标标题,并把焦点还给编辑器。
+    // 存储在下一帧生效。编辑器面板目前没有 ScrollArea,廉价版不滚屏。
+    if let Some(char_idx) = cursor.jump_to.take() {
+        let id = output.response.response.id;
+        let mut state = output.state;
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(char_idx),
+            )));
+        state.store(panel.ctx(), id);
+        panel.ctx().memory_mut(|mem| mem.request_focus(id));
     }
     output.response.response
 }
@@ -86,6 +110,7 @@ pub fn ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::widgets::text_edit::TextEditState;
     use egui::{Event, Key, Modifiers, RawInput};
 
     /// 跑一帧编辑面板,返回 TextEdit 的 widget id。`now` 逐帧递增:
@@ -96,6 +121,7 @@ mod tests {
         now: f64,
         editor: &mut EditorBuffer,
         preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
     ) -> egui::Id {
         let id = std::cell::Cell::new(egui::Id::NULL);
         let output = ctx.run_ui(
@@ -105,7 +131,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                id.set(super::ui(ui, editor, preview).id);
+                id.set(super::ui(ui, editor, preview, cursor).id);
             },
         );
         // egui 0.36 的 TexturesDelta drop 检查:测试里不消费绘制增量,
@@ -121,31 +147,42 @@ mod tests {
     }
 
     /// 中文文本事件(与 IME 组合落定时同一 `insert_text` 路径)必须逐字
-    /// 进入 rope,并在同一帧刷新预览快照。
+    /// 进入 rope,并在同一帧刷新预览快照与大纲。
     #[test]
     fn typing_flows_into_rope_and_refreshes_snapshot() {
         let ctx = test_ctx();
-        let mut editor = EditorBuffer::new("");
-        let mut preview = PreviewState {
-            text: String::new(),
-            synced_rev: editor.revision(),
-        };
+        let mut editor = EditorBuffer::new("# 首标题");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
 
-        let id = frame(&ctx, Vec::new(), 0.0, &mut editor, &mut preview);
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         ctx.memory_mut(|m| m.request_focus(id)); // 等价于用户点击编辑区
         frame(
             &ctx,
-            vec![Event::Text("你好,".into()), Event::Text("world".into())],
+            vec![
+                Event::Text("\n\n## 次标题".into()),
+                Event::Text("more".into()),
+            ],
             0.1,
             &mut editor,
             &mut preview,
+            &mut cursor,
         );
 
-        assert_eq!(editor.text(), "你好,world");
+        assert_eq!(editor.text(), "# 首标题\n\n## 次标题more");
         assert!(editor.is_dirty());
         assert!(editor.revision() >= 2, "每个事件独立推进修订号");
-        assert_eq!(preview.text, "你好,world", "快照与缓冲一致");
+        assert_eq!(preview.text, editor.text(), "快照与缓冲一致");
         assert_eq!(preview.synced_rev, editor.revision());
+        let levels: Vec<u8> = preview.outline.iter().map(|item| item.level).collect();
+        assert_eq!(levels, vec![1, 2], "大纲随编辑同帧重算");
     }
 
     /// 空闲帧(无输入)不推进修订号、不重建快照。
@@ -153,18 +190,44 @@ mod tests {
     fn idle_frames_do_not_touch_snapshot() {
         let ctx = test_ctx();
         let mut editor = EditorBuffer::new("x");
-        let mut preview = PreviewState {
-            text: editor.text().to_owned(),
-            synced_rev: editor.revision(),
-        };
-        let id = frame(&ctx, Vec::new(), 0.0, &mut editor, &mut preview);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         let rev = editor.revision();
         ctx.memory_mut(|m| m.request_focus(id));
-        frame(&ctx, Vec::new(), 0.1, &mut editor, &mut preview);
-        frame(&ctx, Vec::new(), 0.2, &mut editor, &mut preview);
+        frame(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
 
         let text_ptr = preview.text.as_ptr();
-        frame(&ctx, Vec::new(), 0.3, &mut editor, &mut preview);
+        frame(
+            &ctx,
+            Vec::new(),
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         assert_eq!(editor.revision(), rev);
         assert_eq!(preview.synced_rev, rev);
         assert_eq!(preview.text.as_ptr(), text_ptr, "空闲帧未重建快照字符串");
@@ -175,12 +238,17 @@ mod tests {
     fn builtin_undo_redo() {
         let ctx = test_ctx();
         let mut editor = EditorBuffer::new("");
-        let mut preview = PreviewState {
-            text: String::new(),
-            synced_rev: 0,
-        };
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
 
-        let id = frame(&ctx, Vec::new(), 0.0, &mut editor, &mut preview);
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         ctx.memory_mut(|m| m.request_focus(id));
         frame(
             &ctx,
@@ -188,16 +256,25 @@ mod tests {
             0.1,
             &mut editor,
             &mut preview,
+            &mut cursor,
         );
         // egui undoer 按输入稳定时长(stable_time,默认 1s)切分撤销组:
         // 空转一帧让「一」成为已提交的撤销点,再输入「二」。
-        frame(&ctx, Vec::new(), 1.5, &mut editor, &mut preview);
+        frame(
+            &ctx,
+            Vec::new(),
+            1.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         frame(
             &ctx,
             vec![Event::Text("二".into())],
             1.6,
             &mut editor,
             &mut preview,
+            &mut cursor,
         );
         assert_eq!(editor.text(), "一二");
 
@@ -208,7 +285,14 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::COMMAND,
         };
-        frame(&ctx, vec![undo], 1.7, &mut editor, &mut preview);
+        frame(
+            &ctx,
+            vec![undo],
+            1.7,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         assert_eq!(editor.text(), "一", "undo 一步");
         assert_eq!(preview.text, "一");
 
@@ -219,8 +303,68 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
         };
-        frame(&ctx, vec![redo], 1.8, &mut editor, &mut preview);
+        frame(
+            &ctx,
+            vec![redo],
+            1.8,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
         assert_eq!(editor.text(), "一二", "redo 恢复");
         assert_eq!(preview.text, "一二");
+    }
+
+    /// 大纲跳转:消费 jump_to 后,TextEdit 持久光标被覆写到目标字符偏移,
+    /// 焦点回到编辑器;下一帧输入从新位置继续。
+    #[test]
+    fn outline_jump_sets_persisted_cursor_and_focus() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("# 甲\n\n正文\n\n## 乙\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(cursor.byte, None, "尚无任何光标交互");
+
+        // 归约产出的跳转目标:二级标题行首(字符偏移)
+        let heading_byte = editor.text().find("##").unwrap();
+        let target = editor.byte_to_char(heading_byte);
+        cursor.jump_to = Some(target);
+        frame(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        let state = TextEditState::load(&ctx, id).expect("已持久化 widget state");
+        let range = state.cursor.char_range().expect("光标已覆写");
+        assert_eq!(range.primary.index.0, target);
+        assert_eq!(range.secondary.index.0, target, "无选区,两端一致");
+        assert!(ctx.memory(|m| m.has_focus(id)), "焦点已还给编辑器");
+        assert!(cursor.jump_to.is_none(), "跳转请求已消费");
+        assert_eq!(cursor.byte, None, "回填发生在覆写之前,跳转当帧仍是旧值(空)");
+
+        // 下一帧:输入从跳转处继续(打到 '#' 前),编辑器仍持焦点
+        frame(
+            &ctx,
+            vec![Event::Text("!".into())],
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(editor.text().contains("\n\n!## 乙"), "从新光标处插入");
+        assert_eq!(cursor.byte, Some(heading_byte + 1), "光标随输入前进");
     }
 }

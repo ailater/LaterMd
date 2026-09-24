@@ -10,6 +10,8 @@ eframe = "0.36.2"
 # 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内)
 egui_markdown = { path = "../../vendor/egui_markdown" }
 latermd-editor = { path = "../latermd-editor" }
+# 大纲条目(OutlineItem)与标题提取的快路径
+latermd-md = { path = "../latermd-md" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
 

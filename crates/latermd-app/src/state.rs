@@ -1,16 +1,19 @@
 //! 应用状态与消息骨架(docs/adr-005 §5)。
 //!
 //! 归约铁律:状态变更只发生在 `App::logic` 调用的 [`State::apply`];
-//! `App::ui` 只读状态、只产出 [`Message`]。本文件目前落了侧边栏与文件操作
-//! 两组条目,`file_tree` / `search` / `outline` 等字段随对应模块接入时
+//! `App::ui` 只读状态、只产出 [`Message`]。本文件目前落了侧边栏、文件
+//! 操作与大纲三组条目,`file_tree` / `search` 等字段随对应模块接入时
 //! 增量加入,完整规划见 docs/adr-005 §5.1。
 //!
-//! 例外:编辑器缓冲与预览快照由 `ui::editor` 原地维护 —— `TextEdit` 是
-//! 立即模式控件,必须拿到 `&mut` 缓冲才能绘制(AGENTS.md §8「UI 与状态机
-//! 天然耦合」),快照又是它的派生缓存,归约进下一帧反而让预览滞后一帧。
+//! 例外:编辑器缓冲、预览快照(含大纲)与 [`OutlineCursor`] 由 `ui::editor`
+//! 原地维护 —— `TextEdit` 是立即模式控件,必须拿到 `&mut` 缓冲才能绘制
+//! (AGENTS.md §8「UI 与状态机天然耦合」),快照与光标又是它的派生缓存,
+//! 归约进下一帧反而让预览滞后一帧。
 
 use crate::file::{self, FileCmd};
 use latermd_editor::EditorBuffer;
+use latermd_md::OutlineItem;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// 侧边栏功能页签。
@@ -47,15 +50,46 @@ pub struct SidebarState {
     pub active_tab: SidebarTab,
 }
 
-/// 预览快照:喂给渲染层的全文字符串 + 已同步到的编辑器修订号。
+/// 文档派生视图快照:预览文本 + 大纲,与编辑器修订号绑定。
 ///
-/// 只在编辑器修订号前进时重建(vendored 层内部还会按 text hash 二次
-/// 缓存),空闲帧既不拷贝字符串也不重解析。
+/// 只在编辑器修订号前进(或整篇换入)时重建,与预览同步是同一时机;
+/// vendored 层内部还会按 text hash 二次缓存,空闲帧零开销。
 pub struct PreviewState {
     /// 当前喂给 [`egui_markdown::MarkdownLabel`] 的全文。
     pub text: String,
     /// 快照对应的 [`EditorBuffer::revision`]。
     pub synced_rev: u64,
+    /// 文档大纲,与 `text` 同一次重建产出,`span` 直接索引该文本。
+    pub outline: Vec<OutlineItem>,
+}
+
+impl PreviewState {
+    /// 以编辑器当前内容建立快照(文本 + 大纲)。
+    pub fn new(editor: &EditorBuffer) -> Self {
+        Self {
+            text: editor.text().to_owned(),
+            synced_rev: editor.revision(),
+            outline: latermd_md::outline(editor.text()),
+        }
+    }
+
+    /// 修订号前进后重建快照;空闲帧不得调用(会白白重解析全文)。
+    pub fn rebuild(&mut self, editor: &EditorBuffer) {
+        *self = Self::new(editor);
+    }
+}
+
+/// 大纲面板与编辑器之间的光标协调,只存偏移、不含 egui 类型。
+///
+/// `ui` 产出 [`Message::OutlineItemClicked`]、`logic` 归约成 `jump_to`,
+/// `ui::editor` 消费时改写 TextEdit 持久光标并交还焦点;此后每帧把实际
+/// 光标位置回填到 `byte`,供大纲「当前小节」高亮。
+#[derive(Default)]
+pub struct OutlineCursor {
+    /// 待应用的跳转目标(字符偏移,与 `CCursor.index` 同语义),消费即清空。
+    pub jump_to: Option<usize>,
+    /// 编辑器当前光标字节位置(上一帧值);`None` = 尚无光标信息。
+    pub byte: Option<usize>,
 }
 
 /// 应用根状态。
@@ -64,8 +98,10 @@ pub struct State {
     pub sidebar: SidebarState,
     /// 编辑器缓冲(唯一正文真源)。
     pub editor: EditorBuffer,
-    /// 预览快照。
+    /// 预览快照(含大纲)。
     pub preview: PreviewState,
+    /// 大纲↔编辑器光标协调。
+    pub cursor: OutlineCursor,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
 }
@@ -140,10 +176,8 @@ impl Default for State {
                 visible: true,
                 active_tab: SidebarTab::Files,
             },
-            preview: PreviewState {
-                text: editor.text().to_owned(),
-                synced_rev: editor.revision(),
-            },
+            preview: PreviewState::new(&editor),
+            cursor: OutlineCursor::default(),
             editor,
             document: DocumentState {
                 path: None,
@@ -156,9 +190,10 @@ impl Default for State {
 
 /// UI 事件消息:`ui` 产出、`logic` 消费(docs/adr-005 §5.1/§5.2)。
 ///
-/// 后续变体(`SearchQueryChanged` / `OutlineItemClicked` …)随搜索、大纲模块
-/// 接入加入;后台任务的结果回传也走同一入口。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 后续变体(`SearchQueryChanged` …)随搜索模块接入加入;后台任务的结果
+/// 回传也走同一入口。
+// 不再整体 Copy:`OutlineItemClicked` 携带 `Range<usize>`(Clone 但非 Copy)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// 切换侧边栏页签。
     SidebarTabChanged(SidebarTab),
@@ -166,6 +201,8 @@ pub enum Message {
     FileCommand(FileCmd),
     /// 关闭提示行。
     NoticeDismissed,
+    /// 点击大纲条目,载荷为标题的源码字节区间。
+    OutlineItemClicked(Range<usize>),
 }
 
 impl State {
@@ -175,7 +212,24 @@ impl State {
             Message::SidebarTabChanged(tab) => self.sidebar.active_tab = tab,
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.document.notice = None,
+            Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
         }
+    }
+
+    /// 把编辑器光标跳到标题行首(大纲点击的归约)。
+    ///
+    /// span 平铺不变量使标题 span 可能吸收前一块尾部的换行(实测 `## X` 的
+    /// span 起于其前的空行),跳过换行让光标落在标题行首。区间来自点击时
+    /// 的快照,若其间又有编辑,`byte_to_char` 的钳制保证最多落到文档末尾。
+    fn jump_cursor_to_heading(&mut self, span: Range<usize>) {
+        let mut byte = span.start;
+        for b in &self.editor.text().as_bytes()[byte..] {
+            match b {
+                b'\n' | b'\r' => byte += 1,
+                _ => break,
+            }
+        }
+        self.cursor.jump_to = Some(self.editor.byte_to_char(byte));
     }
 
     /// 帧末刷新派生状态。`App::logic` 每帧调用一次。
@@ -251,8 +305,7 @@ impl State {
         self.document.path = path;
         self.document.notice = None;
         // 预览快照就地重建,不等下一帧编辑面板的修订号检查
-        self.preview.text = self.editor.text().to_owned();
-        self.preview.synced_rev = self.editor.revision();
+        self.preview.rebuild(&self.editor);
     }
 
     /// 写盘成功后复位 dirty 并认领新路径;失败只落提示行。
@@ -318,7 +371,41 @@ mod tests {
         assert!(!state.document.dirty);
         assert_eq!(state.preview.text, state.editor.text(), "预览快照已联动");
         assert_eq!(state.preview.synced_rev, state.editor.revision());
+        assert_eq!(state.preview.outline.len(), 1);
+        assert_eq!(state.preview.outline[0].text, "磁盘标题");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 初始文档的大纲:示例文档的两个标题,span 索引快照文本。
+    #[test]
+    fn default_state_outline_matches_sample() {
+        let state = State::default();
+        let outline = &state.preview.outline;
+        let levels: Vec<u8> = outline.iter().map(|item| item.level).collect();
+        assert_eq!(levels, vec![1, 2]);
+        assert_eq!(outline[0].text, "LaterMD");
+        assert_eq!(outline[1].text, "常用元素");
+        assert!(state.preview.text[outline[1].span.clone()].contains("## 常用元素"));
+    }
+
+    /// 大纲点击归约:跳过 span 吸收的前置换行落到标题行首,并按当前缓冲
+    /// 把字节偏移换成字符偏移(示例文档在目标前有 CJK,两者必然不同)。
+    #[test]
+    fn outline_click_converts_to_char_offset_on_heading_line() {
+        let mut state = State::default();
+        let span = state.preview.outline[1].span.clone();
+        state.apply(Message::OutlineItemClicked(span));
+
+        let heading_byte = state.editor.text().find("## 常用元素").unwrap();
+        let jump = state.cursor.jump_to.expect("已设置跳转目标");
+        assert_eq!(jump, state.editor.byte_to_char(heading_byte));
+        assert!(jump < heading_byte, "目标前有 CJK,字符偏移必须小于字节偏移");
+        let bytes = state.editor.text().as_bytes();
+        assert_ne!(
+            bytes[state.editor.char_to_byte(jump)],
+            b'\n',
+            "落在标题行首"
+        );
     }
 
     /// 保存:字节原样落盘、dirty 复位;写入失败保留 dirty 并给出带路径的提示。

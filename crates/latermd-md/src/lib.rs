@@ -59,6 +59,27 @@ impl MarkdownDoc {
     }
 }
 
+/// 提取标题大纲(借用型快路径)。
+///
+/// 与 [`MarkdownDoc::outline`] 产出一致,但不做借转拥有的整篇 token 拷贝,
+/// 只为命中的标题分配字符串。编辑器每次修订号前进都要重算大纲,应走这一
+/// 条;已持有 [`MarkdownDoc`] 的离线场景用方法形态即可。
+pub fn outline(text: &str) -> Vec<OutlineItem> {
+    let md = egui_markdown::parser::parse(text);
+    md.tokens
+        .iter()
+        .zip(&md.spans)
+        .filter_map(|(token, span)| match token {
+            Token::Text { text, style } => style.heading.map(|level| OutlineItem {
+                level,
+                text: text.to_string(),
+                span: span.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// 解析 Markdown 文本,产出拥有型文档模型(统一入口)。
 ///
 /// 代价是两次拷贝:源文本进 `String`,借用型 `CowStr::Borrowed` 转堆上的
@@ -204,6 +225,14 @@ mod tests {
         let doc = parse(src);
         assert!(!doc.tokens.is_empty());
         assert!(doc.outline().is_empty());
+        assert!(outline(src).is_empty());
+    }
+
+    /// 借用型快路径与拥有型方法形态产出一致,两处实现不得漂移。
+    #[test]
+    fn borrowed_outline_matches_doc_outline() {
+        let src = "# 甲\n\n## 乙 *强调*\n\n正文 ### 非标题\n";
+        assert_eq!(outline(src), parse(src).outline());
     }
 
     #[test]

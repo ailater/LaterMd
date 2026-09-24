@@ -2162,6 +2162,7 @@ dependencies = [
  "eframe",
  "egui_markdown",
  "latermd-editor",
+ "latermd-md",
  "rfd",
 ]
 
