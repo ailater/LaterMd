@@ -1,0 +1,32 @@
+[
+  {
+    "label": "Check",
+    "command": "cargo check --all-features",
+    "use_new_terminal": false
+  },
+  {
+    "label": "Clippy",
+    "command": "cargo clippy --all-features -- -D warnings",
+    "use_new_terminal": false
+  },
+  {
+    "label": "Test",
+    "command": "cargo test --all-features",
+    "use_new_terminal": false
+  },
+  {
+    "label": "Run Simple",
+    "command": "cargo run --example simple",
+    "use_new_terminal": true
+  },
+  {
+    "label": "Run Advanced",
+    "command": "cargo run --example advanced",
+    "use_new_terminal": true
+  },
+  {
+    "label": "Check WASM",
+    "command": "cargo check --target wasm32-unknown-unknown --no-default-features",
+    "use_new_terminal": false
+  }
+]

@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Check",
+      "type": "shell",
+      "command": "cargo check --all-features",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Clippy",
+      "type": "shell",
+      "command": "cargo clippy --all-features -- -D warnings",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Test",
+      "type": "shell",
+      "command": "cargo test --all-features",
+      "group": "test",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Run Simple",
+      "type": "shell",
+      "command": "cargo run --example simple",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Run Advanced",
+      "type": "shell",
+      "command": "cargo run --example advanced",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Check WASM",
+      "type": "shell",
+      "command": "cargo check --target wasm32-unknown-unknown --no-default-features",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    }
+  ]
+}
