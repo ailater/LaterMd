@@ -126,6 +126,7 @@ vendored `egui_markdown` 存在于 `vendor/egui_markdown/`，以下结论均已�
 - 不做 `packages/markdown-editor` 这类过早抽象 —— 第一个可用版本之前不存在第二个消费者。
 - Windows 用 `Ctrl`，macOS 用 `Cmd`；换行符 Win = CRLF，其余 LF。三平台都要确保中文字体可用。
 - **IME 是头号风险。** Windows 微软拼音 + macOS 简体拼音的候选框跟随、不吞字、不抢焦点，必须在 M0 阶段实测掉，不要想当然。
+- **提交即推送。** 单人项目，`main` 是唯一长期分支，不设 PR 流程：本地 commit 完成后直接 `git push origin main`，不留未推送堆积。push 会触发 CI gate（六项门禁 + 三平台构建），红了就地修，不回滚、不 force push。
 
 ---
 
