@@ -7,6 +7,9 @@ description = "LaterMD desktop application (the only GUI crate)"
 
 [dependencies]
 eframe = "0.36.2"
+# 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内)
+egui_markdown = { path = "../../vendor/egui_markdown" }
+latermd-editor = { path = "../latermd-editor" }
 
 [features]
 # 逃生后端:默认产物只带 wgpu(AGENTS.md §5)。开启本 feature 的构建才能响应

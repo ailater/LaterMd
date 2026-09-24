@@ -31,23 +31,20 @@ impl eframe::App for LaterMdApp {
                 crate::ui::sidebar::ui(ui, active_tab, &mut self.outbox);
             });
 
-        // ② 次外层:编辑器
+        // ② 次外层:编辑器。TextEdit 是立即模式控件,必须原地持有
+        // `&mut` 缓冲,因此 editor 与 preview 快照的借用下放到本面板
+        // 闭包内(归约/绘制二分对这对"控件附属状态"的例外见 state.rs)。
+        let state = &mut self.state;
         egui::Panel::left("editor")
             .resizable(true)
             .default_size(500.0)
-            .show(ui, editor_ui);
+            .show(ui, |ui| {
+                crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview);
+            });
 
         // ③ 必须最后:预览
-        egui::CentralPanel::default().show(ui, preview_ui);
+        egui::CentralPanel::default().show(ui, |ui| {
+            crate::ui::preview::ui(ui, &self.state.preview);
+        });
     }
-}
-
-/// 编辑器面板占位,双栏源码编辑的接入点(roadmap P0「编辑器」)。
-fn editor_ui(ui: &mut egui::Ui) {
-    ui.weak("编辑器占位(待接入:P0 编辑器模块)");
-}
-
-/// 预览面板占位,vendored 渲染层的接入点。
-fn preview_ui(ui: &mut egui::Ui) {
-    ui.weak("预览占位(待接入:vendored 渲染层)");
 }
