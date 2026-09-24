@@ -4,6 +4,7 @@ members = [
   "vendor/egui_markdown",
   "vendor/egui_markdown/egui_markdown_style",
   "crates/latermd-app",
+  "crates/latermd-md",
 ]
 
 [workspace.package]

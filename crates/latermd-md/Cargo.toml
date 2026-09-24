@@ -1,0 +1,13 @@
+[package]
+name = "latermd-md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Owned markdown document model and outline extraction (data layer, no UI deps)"
+
+[dependencies]
+# 数据层铁律:本 crate 禁止直接依赖 egui/eframe,只消费 vendored 层的
+# parser/types 数据模块;关掉默认 feature,不连带拉 syntect。
+egui_markdown = { path = "../../vendor/egui_markdown", default-features = false }
+# Token 的字符串字段是 pulldown_cmark::CowStr,借转拥有需构造 CowStr::Boxed。
+pulldown-cmark = "0.13.4"

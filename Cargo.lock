@@ -2161,6 +2161,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "latermd-md"
+version = "0.1.0"
+dependencies = [
+ "egui_markdown",
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
