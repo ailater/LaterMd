@@ -2161,10 +2161,13 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_markdown",
+ "egui_markdown_style",
  "latermd-editor",
  "latermd-export",
  "latermd-md",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

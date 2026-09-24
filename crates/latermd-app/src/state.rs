@@ -12,6 +12,7 @@
 
 use crate::export;
 use crate::file::{self, FileCmd};
+use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
 use std::ops::Range;
@@ -105,6 +106,12 @@ pub struct State {
     pub cursor: OutlineCursor,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
+    /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
+    /// 投影到 context,切换即时生效。
+    pub theme: ThemeSettings,
+    /// 主题落盘目录;`None` = 平台默认。仅为测试注入临时目录而存在,
+    /// 生产恒为 `None`。
+    pub(crate) settings_dir: Option<PathBuf>,
 }
 
 /// 文档落盘身份 + 未保存镜像。
@@ -185,6 +192,8 @@ impl Default for State {
                 dirty: false,
                 notice: None,
             },
+            theme: ThemeSettings::default(),
+            settings_dir: None,
         }
     }
 }
@@ -204,6 +213,8 @@ pub enum Message {
     NoticeDismissed,
     /// 导出当前文档为 HTML(弹保存对话框,不触碰文档落盘身份)。
     ExportHtml,
+    /// 切换明暗主题(设置菜单产出);归约里改状态并即时落盘。
+    ThemeChanged(ThemeMode),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
 }
@@ -216,7 +227,18 @@ impl State {
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.document.notice = None,
             Message::ExportHtml => self.run_export_html(),
+            Message::ThemeChanged(mode) => self.change_theme(mode),
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
+        }
+    }
+
+    /// 切换主题(设置菜单的归约):改状态并即时落盘(重启保持);投影到
+    /// context 由每帧的 `theme.apply` 完成。落盘失败只落提示行,切换本身
+    /// 照常生效 —— 持久化失败不该牺牲本次会话的可用性。
+    fn change_theme(&mut self, mode: ThemeMode) {
+        self.theme.mode = mode;
+        if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
+            self.document.notice = Some(error.to_string());
         }
     }
 
@@ -466,6 +488,43 @@ mod tests {
         assert!(!state.document.dirty, "编辑动作本身不动镜像");
         state.end_of_logic();
         assert!(state.document.dirty);
+    }
+
+    /// 主题切换归约:状态翻转 + settings.json 落盘(注入临时目录,不碰
+    /// 真实平台配置);成功路径无提示。
+    #[test]
+    fn theme_change_updates_state_and_persists() {
+        let dir = temp_path("theme-dir");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+
+        state.apply(Message::ThemeChanged(ThemeMode::Light));
+        assert_eq!(state.theme.mode, ThemeMode::Light);
+        assert!(state.document.notice.is_none());
+        // "light" 必须在盘上,重启 load 才能还原
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(json.contains("\"light\""), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘失败(目录路径被同名文件占据):切换照常生效,失败带路径进提示行。
+    #[test]
+    fn theme_save_failure_lands_in_notice_but_mode_still_changes() {
+        let blocker = temp_path("theme-blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut state = State {
+            settings_dir: Some(blocker.clone()),
+            ..State::default()
+        };
+
+        state.apply(Message::ThemeChanged(ThemeMode::Light));
+        assert_eq!(state.theme.mode, ThemeMode::Light, "持久化失败不影响切换");
+        let notice = state.document.notice.as_deref().unwrap();
+        assert!(notice.contains("主题保存失败"), "{notice}");
+        assert!(notice.contains("theme-blocker"), "{notice}");
+        let _ = std::fs::remove_file(&blocker);
     }
 
     /// 导出:写出的是完整 HTML 文档(标题取自缓冲当前内容),且不触碰文档

@@ -9,6 +9,12 @@ description = "LaterMD desktop application (the only GUI crate)"
 eframe = "0.36.2"
 # 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内)
 egui_markdown = { path = "../../vendor/egui_markdown" }
+# 主题:开启 vendor 子 crate 自带的 serde feature(MarkdownStyle 派生,ThemeSettings 持久化)
+egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
+# 主题设置(ThemeSettings/ThemeMode)的序列化 derive
+serde = { version = "1", features = ["derive"] }
+# 主题设置落盘为 JSON;本就在依赖图中(criterion 的传递依赖),此处转直接依赖
+serde_json = "1"
 latermd-editor = { path = "../latermd-editor" }
 # 大纲条目(OutlineItem)与标题提取的快路径
 latermd-md = { path = "../latermd-md" }

@@ -20,6 +20,10 @@ impl LaterMdApp {
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
+        // 主题投影到 context:egui 主题(外壳)+ MarkdownStyle(正文,含代码
+        // 高亮自动随 dark/light)。带 staleness 检查,空闲帧近零开销;首帧前
+        // main 已装载一次,这里覆盖此后每次切换。
+        state.theme.apply(ctx);
         // 文件快捷键(Ctrl/Cmd+S、Ctrl/Cmd+Shift+S)。eframe 在 begin_pass 之后
         // 调 logic,本帧按键事件此刻可见;消费即从输入流移除,不会传给控件。
         for cmd in crate::file::poll_shortcuts(ctx) {
@@ -77,7 +81,7 @@ impl eframe::App for LaterMdApp {
             .resizable(true)
             .default_size(500.0)
             .show(ui, |ui| {
-                crate::ui::toolbar::ui(ui, &state.document, outbox);
+                crate::ui::toolbar::ui(ui, &state.document, state.theme.mode, outbox);
                 crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
@@ -163,5 +167,28 @@ mod tests {
         let expected = format!("LaterMD — {}", path.file_name().unwrap().to_string_lossy());
         assert_eq!(titles.last().map(String::as_str), Some(expected.as_str()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 主题切换消息走完整归约链:同帧内 egui 主题已翻转(设置菜单点击的下一
+    /// 帧面板即按新模式绘制),且 settings.json 落盘(注入临时目录)。
+    #[test]
+    fn theme_message_flips_context_and_persists() {
+        let dir = std::env::temp_dir().join(format!("latermd-layout-{}-theme", std::process::id()));
+        let mut app = LaterMdApp::default();
+        app.state.settings_dir = Some(dir.clone());
+
+        let ctx = egui::Context::default();
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            app.outbox
+                .push(state::Message::ThemeChanged(crate::theme::ThemeMode::Light));
+            app.reduce(ui.ctx());
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(ctx.theme(), egui::Theme::Light, "切换同帧生效");
+        assert!(!ctx.global_style().visuals.dark_mode);
+        assert!(dir.join("settings.json").exists(), "重启保持的数据已落盘");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
