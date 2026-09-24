@@ -1,8 +1,16 @@
 # egui_markdown vendor + 升级操作清单
 
-状态: 待执行
+状态: **已执行(2026-09-24,六项门禁全绿)**
 估时: **3-5 个工作日**（不含 `#membrane` feature 部分）
 实测环境: rustc 1.98.0, `/tmp/em_head` = `membrane-io/egui_markdown` HEAD
+
+> **执行结果纪要(2026-09-24)**:15 个真实错误全部按本文修法解决;`membrane` feature 已整
+> 体删除(23 处 cfg,含 style crate 的 5 个字段、tests/indent.rs、tests/width.rs 一个测试);
+> `Token::source_span` 以平行数组落地(`Markdown { s, tokens, spans }`)。**两处本文未预见的
+> 问题**:① `ByteIndex` 需在 `mod syntect_code` 内单独 import(顶层 use 不进子模块);②
+> egui 0.36 新增 `TexturesDelta` drop 检查,10 个测试因无渲染环境下 drop 未消费的
+> font atlas delta 而 panic,修法是接住 `run_ui` 的 `FullOutput` 并在 drop 前
+> `output.textures_delta.clear()`。全部差异见 vendor/egui_markdown/README.md。
 
 ---
 
@@ -305,3 +313,37 @@ cargo doc --no-deps --all-features
 5. 最后才是 `cargo fmt` + `clippy`
 
 > **第 4 步不能跳过。** 现有的 `tests/*.rs` 就是为此存在的。
+
+---
+
+## 9. 提交拆分与上游回馈（规范）
+
+> 规范正文在 [AGENTS.md](../AGENTS.md) §6 第 9 条与 [vendor/README.md](../vendor/README.md)（变更登记处，subtree 前缀之外）。本节只记操作。
+
+### 9.1 三类拆分
+
+vendor 改动 commit 按主题拆：①上游可合（升级 / API 迁移 / 通用能力）②私有删改（membrane）③仓库接驳（workspace / toolchain）。同一文件混多类（如 `layout.rs` 同时含 `ByteIndex` 迁移与 membrane cfg 删除）时按 hunk 拆：
+
+```bash
+git add -p vendor/egui_markdown/src/layout.rs   # 逐 hunk 归入不同 commit
+```
+
+同一 hunk 混两类时归 ①；提交后在 vendor/README.md 登记表补 hash。
+
+### 9.2 发往 fork 的提取命令
+
+```bash
+# 主仓导出 ① 类累计改动（基点 = subtree merge commit，或上一个 ① 类 commit）
+git diff 0fe1510 -- vendor/egui_markdown > /tmp/upgrade.patch
+
+# 在 fork clone 里应用（去掉 vendor/egui_markdown 两级前缀）
+git apply -p2 /tmp/upgrade.patch
+```
+
+随后手工补齐 membrane 分支的 0.36 迁移（`LeadingSpace` 悬挂缩进、`TextFormat::bg_stroke`/`bg_corner_radius` 在 0.36 无直接等价，需实现或向作者说明取舍），过上游 `./check.sh`，更新 CHANGELOG，再发 PR。
+
+### 9.3 上游地址与 CONTRIBUTING 硬要求
+
+- **canonical：`membrane-io/egui_markdown`**。`iamseeley/egui_markdown` 301 跳转到此（仓库已转移到组织）；上游 Cargo.toml 的 `repository` 字段是转移前旧地址，勿据此判断。截至 2026-09-24 上游 main 仍在 egui 0.34。
+- 一个 PR 单一变更；新 parser/layout 行为必须带测试；`CHANGELOG.md` 加 `[Unreleased]`；`./check.sh` 全绿。
+- 风格：行内注释以句号结尾、无 banner、`use` 排序、`format!` 内不写 `.to_string()`、doc 注释在 `#[allow]` 之前。

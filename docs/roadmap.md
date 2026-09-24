@@ -12,13 +12,15 @@
 ## 当前位置
 
 ```
-[ ] Vendor 适配   ← 起点
-[ ] M0 技术验证
+[x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
+[ ] M0 技术验证   ← 当前
 [ ] P0 骨架
 [ ] P1 差异化
 [ ] P2 版本层
 [ ] P3 深水区
 ```
+
+> Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 
 ---
 

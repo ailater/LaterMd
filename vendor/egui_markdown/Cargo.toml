@@ -1,6 +1,8 @@
-[workspace]
-members = [".", "egui_markdown_style"]
-resolver = "2"
+# vendored from membrane-io/egui_markdown@4f3075f (2026-09)
+# 变更记录见 ../README.md (vendor/README.md，subtree 前缀之外):
+# - 删除 [workspace] 段(由 LaterMD 根 workspace 接管)
+# - egui 0.34 -> 0.36.2
+# - 删除 membrane feature
 
 [package]
 name = "egui_markdown"
@@ -17,17 +19,17 @@ keywords = ["egui", "markdown", "gui", "commonmark"]
 include = ["**/*.rs", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]
 
 [dependencies]
-egui = { version = "0.34", default-features = false }
-epaint = { version = "0.34", default-features = false }
-egui_extras = { version = "0.34", default-features = false }
+egui = { version = "0.36.2", default-features = false }
+epaint = { version = "0.36.2", default-features = false }
+egui_extras = { version = "0.36.2", default-features = false }
 egui_markdown_style = { path = "./egui_markdown_style", version = "0.1.0" }
-pulldown-cmark = "0.13.0"
+pulldown-cmark = "0.13.4"
 syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-eframe = { version = "0.34", default-features = true, features = ["default_fonts", "glow"] }
-egui_extras = { version = "0.34", features = ["syntect"] }
+eframe = { version = "0.36.2", default-features = true, features = ["default_fonts", "glow"] }
+egui_extras = { version = "0.36.2", features = ["syntect"] }
 env_logger = "0.11"
 
 [features]
@@ -35,7 +37,6 @@ default = ["syntax_highlighting"]
 syntax_highlighting = ["egui_extras/syntect", "dep:syntect"]
 images = ["egui_extras/image", "egui_extras/http"]
 svg = ["egui_extras/svg"]
-membrane = ["egui_markdown_style/membrane"]
 
 [[example]]
 name = "simple"

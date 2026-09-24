@@ -19,7 +19,7 @@
 | 层面 | 方案 | 版本 | 备注 |
 |---|---|---|---|
 | GUI | **egui + eframe** | **0.36.2** | 五个子 crate 同步发版，无版本错配 |
-| 渲染层 | **vendored egui_markdown**（membrane-io） | HEAD + 升级到 0.36.2 | `vendor/` 目录，非 crates.io 依赖 |
+| 渲染层 | **vendored egui_markdown**（membrane-io） | HEAD + 升级到 0.36.2 | `vendor/` 目录，非 crates.io 依赖；变更登记见 [vendor/README.md](vendor/README.md) |
 | Markdown 解析 | **pulldown-cmark** | 0.13.4 | 唯一解析器 |
 | 序列化回 MD | `pulldown-cmark-to-cmark` | 22.0.1 | Live Preview 与 AI 回写刚需 |
 | 语法高亮 | `syntect` | 5.3.0 | vendored 层已集成 |
@@ -91,7 +91,8 @@ vendored `egui_markdown` 存在于 `vendor/egui_markdown/`，以下结论均已�
 5. **`heal()` 是字符串预处理函数**，给残缺 Markdown 补闭合标记，让 LLM 流式输出的每一帧语法合法。**P1 AI 功能的必需品，不是可选优化。**
 6. **`LinkHandler` 是五级扩展点**（block widget / inline widget / layout_link / link_style / click）。`ai://` 链接、AI 指令块、内联批注都从这里长出来。
 7. **AI 流式预览的 widget id 必须稳定**，绝对不能包含 `content.len()`，否则每 token 都清空缓存、增量高亮失效。
-8. **`membrane` feature 不启用。** 它带来 9 个额外编译错误（`LeadingSpace`、`TextFormat::bg_stroke` 等），是上游自家产品定制，对我们无价值。建议 vendor 时直接删除该 feature 及其 cfg 代码（约 5 处），并在 `vendor/README.md` 记录删除理由。
+8. **`membrane` feature 不启用。** 它带来 9 个额外编译错误（`LeadingSpace`、`TextFormat::bg_stroke` 等），是上游自家产品定制，对我们无价值。vendor 时直接删除该 feature 及其 cfg 代码（约 5 处），删除理由已记录在 [vendor/README.md](vendor/README.md)。
+9. **vendor 改动按主题拆 commit，三类不得混。** ①上游可合（版本升级、API 迁移、token span 透传等通用能力，设计时即按上游 CONTRIBUTING 标准）；②私有删改（`membrane` feature 及其测试）；③仓库接驳（删上游 `[workspace]` 段与嵌套 `rust-toolchain.toml`、挂根 workspace）。同一文件混多类时按 hunk 拆（`git add -p`）。①类保持独立可 cherry-pick，用于将来 fork 上游提 PR（上游 main 截至 2026-09 仍在 egui 0.34，升级 PR 有真实价值）。全部改动登记进 [vendor/README.md](vendor/README.md) 的变更表；该文件在 subtree 前缀之外，**LaterMD 的说明一律不写进 `vendor/egui_markdown/` 内部**，否则会污染 subtree pull 与发往 fork 的补丁。
 
 升级 0.34 → 0.36.2 的完整操作清单见 [docs/vendor-upgrade-checklist.md](docs/vendor-upgrade-checklist.md)。
 质量门禁照抄上游 `check.sh` 六项到 CI：`cargo fmt --check`、三轮 `clippy -D warnings`、`cargo test --all-features`、`cargo doc --no-deps --all-features`。

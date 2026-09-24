@@ -1,4 +1,21 @@
-# egui_markdown
+# egui_markdown(vendored copy)
+
+> **本目录是 vendored 副本**,来源 `membrane-io/egui_markdown` @ `4f3075f`(main,2026-09),
+> 经 `git subtree add --squash` 引入。以下内容为上游原始 README,未改动。
+> 合并上游 patch(`git subtree pull --prefix=vendor/egui_markdown https://github.com/membrane-io/egui_markdown.git main --squash`)时,按下表处理冲突:
+
+| # | 与上游的差异 | 理由 |
+|---|---|---|
+| 1 | 删除 `[workspace]` 段(Cargo.toml) | 由 LaterMD 根 workspace 接管,保证单依赖图(同一 egui 版本) |
+| 2 | egui 0.34 → 0.36.2(Cargo.toml × 2) | 修 epaint 0.35 强类型重构(PR #8245)的 15 个编译错误,修法见 [docs/vendor-upgrade-checklist.md](../../docs/vendor-upgrade-checklist.md)。实测补充:`ByteIndex` 需在 `mod syntect_code` 内单独 import;另有 checklist 未预见的 `TexturesDelta` drop 检查导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()` |
+| 3 | **删除 `membrane` feature**(约 23 处 cfg) | 上游自家产品定制,在 published egui 0.36 中无对应 API(上游 README 自述"does not compile against published egui"),对我们无价值。连带删除 `egui_markdown_style` 的 5 个 membrane 字段、`tests/indent.rs`(整文件 membrane-only)与 `tests/width.rs` 的一个 membrane 测试 |
+| 4 | 删除本目录 `rust-toolchain.toml` | 根目录已钉 1.98.0,子目录文件会遮蔽根配置 |
+| 5 | **新增 `Markdown::spans` 平行数组**(parser.rs / types.rs) | 顶层 token 的源码 byte range,连续无洞(`spans.len() == tokens.len()`)。大纲导航与 Live Preview 的 prerequisite,LaterMD 定制 |
+| 6 | pulldown-cmark 钉 0.13.4 | 上游写 `0.13.0`,锁定补丁版本 |
+
+`bash check.sh` 六项门禁在本目录运行时作用于整个 LaterMD workspace。
+
+---
 
 [![crates.io](https://img.shields.io/crates/v/egui_markdown.svg)](https://crates.io/crates/egui_markdown)
 [![docs.rs](https://docs.rs/egui_markdown/badge.svg)](https://docs.rs/egui_markdown)

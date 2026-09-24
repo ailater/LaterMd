@@ -3,6 +3,7 @@
 use egui::{
   text::LayoutJob, Align, Color32, CursorIcon, FontFamily, FontId, OpenUrl, Response, Sense, Stroke, TextFormat, Ui,
 };
+use epaint::text::ByteRangeExt as _;
 
 use crate::link::LinkHandler;
 use crate::style::{InlineCodeStyle, MarkdownStyle};
@@ -46,7 +47,7 @@ pub struct LayoutResult {
 pub fn section_for_char(job: &LayoutJob, char_index: u32) -> Option<u32> {
   let mut offset = 0u32;
   for (section_idx, section) in job.sections.iter().enumerate() {
-    let section_text = &job.text[section.byte_range.clone()];
+    let section_text = section.byte_range.slice(&job.text);
     let char_count = section_text.chars().count() as u32;
     if char_index < offset + char_count {
       return Some(section_idx as u32);
@@ -61,19 +62,7 @@ pub fn section_for_char(job: &LayoutJob, char_index: u32) -> Option<u32> {
 pub fn apply_inline_code_bg(format: &mut TextFormat, dark_mode: bool, inline_style: &InlineCodeStyle) {
   format.color = inline_style.color(dark_mode);
   format.background = inline_style.background(dark_mode);
-  #[cfg(feature = "membrane")]
-  {
-    format.expand_bg = epaint::Vec2::new(inline_style.expand_bg, inline_style.expand_bg_y);
-    format.bg_corner_radius = inline_style.bg_corner_radius;
-    format.bg_stroke = inline_style.stroke(dark_mode);
-  }
-  #[cfg(not(feature = "membrane"))]
-  {
-    #[allow(clippy::useless_conversion)]
-    {
-      format.expand_bg = inline_style.expand_bg.into();
-    }
-  }
+  format.expand_bg = inline_style.expand_bg;
 }
 
 #[inline]
@@ -236,18 +225,6 @@ fn apply_bold(format: &mut TextFormat, ui: &Ui, has_bold: bool) {
   }
 }
 
-/// Width of each line's leading whitespace, in points, using the code font.
-#[cfg(feature = "membrane")]
-fn code_line_indents(ui: &Ui, text: &str, code_font_size: f32) -> Vec<f32> {
-  let font_id = FontId::monospace(code_font_size);
-  ui.ctx().fonts_mut(|f| {
-    text
-      .split('\n')
-      .map(|line| line.chars().take_while(|c| c.is_whitespace()).map(|c| f.glyph_width(&font_id, c)).sum())
-      .collect()
-  })
-}
-
 /// Whether a token stream contains anything that [`build_layout`] would report as a segment
 /// break, which means whether it must use the segmented render path.
 ///
@@ -375,35 +352,8 @@ pub fn build_layout(
 
           let start_char = job.text.chars().count();
 
-          #[cfg(feature = "membrane")]
-          {
-            // Each source line is its own paragraph, so a soft wrap inside a long line would
-            // restart at column 0. Indent every line's wrapped rows by its own leading whitespace.
-            let line_indents = code_line_indents(ui, &padded_text, code_font_size);
-            let mut line_index = 0usize;
-            let mut at_line_start = true;
-            for section in highlighted_job.sections {
-              let section_text = &highlighted_job.text[section.byte_range.clone()];
-              for part in section_text.split_inclusive('\n') {
-                if at_line_start {
-                  let indent = line_indents.get(line_index).copied().unwrap_or(0.0);
-                  if indent > 0.0 {
-                    job.push_with_leading_space("", epaint::text::LeadingSpace::Indent(indent), section.format.clone());
-                    section_to_token.push(token_index);
-                  }
-                }
-                at_line_start = part.ends_with('\n');
-                if at_line_start {
-                  line_index += 1;
-                }
-                job.append(part, 0.0, section.format.clone());
-                section_to_token.push(token_index);
-              }
-            }
-          }
-          #[cfg(not(feature = "membrane"))]
           for section in highlighted_job.sections {
-            let section_text = &highlighted_job.text[section.byte_range.clone()];
+            let section_text = section.byte_range.slice(&highlighted_job.text);
             job.append(section_text, 0.0, section.format);
             section_to_token.push(token_index);
           }
@@ -437,25 +387,9 @@ pub fn build_layout(
         // The nudge and the gap are made up after the marker, so moving a marker never moves text.
         let trailing = nesting + slot_width + list.gap - leading - marker_width;
 
-        #[cfg(feature = "membrane")]
-        {
-          let text_start = leading + marker_width + trailing.max(0.0);
-          let mut format = base_format.clone();
-          format.line_height = MARKDOWN_LINE_HEIGHT_POINTS.map(|h| h * 4.0);
-          if leading > 0.0 {
-            job.push_with_leading_space("", epaint::text::LeadingSpace::FirstRow(leading), format.clone());
-            section_to_token.push(token_index);
-          }
-          // Wrapped rows resume where the item's text starts.
-          job.push_with_leading_space("", epaint::text::LeadingSpace::Indent(text_start), format);
-          section_to_token.push(token_index);
-        }
-        #[cfg(not(feature = "membrane"))]
-        {
-          // Upstream egui only supports first-row leading space; wrapped rows return to column 0.
-          job.append("", leading, base_format.clone());
-          section_to_token.push(token_index);
-        }
+        // Upstream egui only supports first-row leading space; wrapped rows return to column 0.
+        job.append("", leading, base_format.clone());
+        section_to_token.push(token_index);
 
         job.append(marker.as_ref(), 0.0, marker_format);
         section_to_token.push(token_index);
@@ -567,7 +501,7 @@ mod syntect_code {
   use std::sync::{Arc, LazyLock};
 
   use egui::{text::LayoutJob, Color32, FontId, Ui};
-  use epaint::text::Galley;
+  use epaint::text::{ByteIndex, Galley};
   use syntect::easy::HighlightLines;
   use syntect::highlighting::{HighlightState, Highlighter, Style};
   use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
@@ -633,10 +567,9 @@ mod syntect_code {
       let byte_start = byte_offset;
       let byte_end = byte_offset + range.len();
       let fg = syn_style.foreground;
-      #[allow(clippy::useless_conversion)]
       job.sections.push(LayoutSection {
-        leading_space: 0.0_f32.into(),
-        byte_range: byte_start..byte_end,
+        leading_space: 0.0,
+        byte_range: ByteIndex(byte_start)..ByteIndex(byte_end),
         format: TF {
           font_id: FontId::monospace(code_font_size),
           color: Color32::from_rgb(fg.r, fg.g, fg.b),
@@ -652,10 +585,9 @@ mod syntect_code {
 
     let byte_start = job.text.len();
     job.text.push_str(padded_line);
-    #[allow(clippy::useless_conversion)]
     job.sections.push(LayoutSection {
-      leading_space: 0.0_f32.into(),
-      byte_range: byte_start..job.text.len(),
+      leading_space: 0.0,
+      byte_range: ByteIndex(byte_start)..ByteIndex(job.text.len()),
       format: TF { font_id: FontId::monospace(code_font_size), ..Default::default() },
     });
   }
@@ -931,7 +863,7 @@ mod syntect_code {
     fn frozen_len_advances_on_complete_lines() {
       let ctx = Context::default();
       let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(700.0, 400.0));
-      let _ = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+      let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
         let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
         let c1 = scrolling_code_galley(&mut child, "fn main() {\n    let x", "rust", 12.0, 1, None, None);
         assert_eq!(c1.frozen_len, "fn main() {\n".len());
@@ -942,13 +874,14 @@ mod syntect_code {
         assert_eq!(c2.frozen_len, "fn main() {\n    let x = 1;\n".len());
         assert_eq!(c2.source.as_ref(), "fn main() {\n    let x = 1;\n    let y");
       });
+      output.textures_delta.clear();
     }
 
     #[test]
     fn append_reuses_frozen_prefix_bytes() {
       let ctx = Context::default();
       let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(700.0, 400.0));
-      let _ = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+      let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
         let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
         let a = growing_body(20);
         let c1 = scrolling_code_galley(&mut child, &a, "rust", 12.0, 1, None, None);
@@ -962,6 +895,7 @@ mod syntect_code {
         assert_eq!(c2.frozen_len, b.len());
         assert_eq!(c2.source.as_ref(), b);
       });
+      output.textures_delta.clear();
     }
   }
 }

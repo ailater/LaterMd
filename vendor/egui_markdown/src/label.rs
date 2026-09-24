@@ -9,7 +9,7 @@ use egui::{
 };
 use epaint::{
   pos2,
-  text::{Galley, Glyph, Row},
+  text::{ByteRangeExt as _, Galley, Glyph, Row},
 };
 
 #[cfg(not(feature = "syntax_highlighting"))]
@@ -578,7 +578,8 @@ impl<'a> MarkdownLabel<'a> {
         let tokens = Arc::clone(&cached.tokens);
 
         let Some(layout) = cached.layout.clone() else {
-          let md = Markdown { s: text, tokens: (*tokens).clone() };
+          // 渲染路径不消费 spans,缓存重建时留空;应用层需要 span 时直接调 `parser::parse`。
+          let md = Markdown { s: text, tokens: (*tokens).clone(), spans: Vec::new() };
           self.render_segmented(ui, &md, &font, color, style, text_hash);
           return;
         };
@@ -1115,13 +1116,10 @@ impl<'a> MarkdownLabel<'a> {
         // Find the char range for this section.
         let mut sec_start_char = 0u32;
         for s in &galley.job.sections[..sec_idx] {
-          sec_start_char += galley.job.text[s.byte_range.clone()].chars().count() as u32;
+          sec_start_char += s.byte_range.slice(&galley.job.text).chars().count() as u32;
         }
-        let sec_char_count = galley.job.sections[sec_idx]
-          .byte_range
-          .clone()
-          .len()
-          .min(galley.job.text[galley.job.sections[sec_idx].byte_range.clone()].chars().count());
+        let section_text = galley.job.sections[sec_idx].byte_range.slice(&galley.job.text);
+        let sec_char_count = section_text.chars().count();
         let sec_end_char = sec_start_char + sec_char_count as u32;
         if sec_end_char <= sec_start_char {
           continue;
@@ -1360,7 +1358,7 @@ pub fn cursor_from_pos(galley: &Galley, pos: Pos2) -> Option<u32> {
         return Some(index + column as u32);
       }
     }
-    index += row.char_count_including_newline() as u32;
+    index += row.char_count_including_newline().0 as u32;
   }
   None
 }
@@ -1369,10 +1367,10 @@ pub fn cursor_from_pos(galley: &Galley, pos: Pos2) -> Option<u32> {
 pub fn glyph_at_index(galley: &Galley, index: u32) -> Option<(&Glyph, u32)> {
   let mut offset = 0;
   for (row_index, row) in galley.rows.iter().enumerate() {
-    if index < offset + row.char_count_including_newline() as u32 {
+    if index < offset + row.char_count_including_newline().0 as u32 {
       return row.glyphs.get((index - offset) as usize).map(|glyph| (glyph, row_index as u32));
     }
-    offset += row.char_count_including_newline() as u32;
+    offset += row.char_count_including_newline().0 as u32;
   }
   None
 }

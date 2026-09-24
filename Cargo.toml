@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "vendor/egui_markdown",
+  "vendor/egui_markdown/egui_markdown_style",
+  "crates/latermd-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ailater/LaterMd"
+
+[profile.release]
+# 默认即可;后续按 M0 帧率数据再调 opt-level/lto

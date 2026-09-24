@@ -1,6 +1,7 @@
 //! Parsed markdown token types and data structures.
 
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use pulldown_cmark::CowStr;
 
@@ -173,6 +174,19 @@ pub struct Markdown<'s> {
   pub s: &'s str,
   /// Parsed token stream.
   pub tokens: Vec<Token<'s>>,
+  /// Source byte range of each token, parallel to `tokens`.
+  ///
+  /// Spans are contiguous: each starts where the previous one ended, so every byte
+  /// of the source maps to exactly one token. This is what block-level consumers
+  /// (outline navigation, live preview) need; the render path does not use it.
+  pub spans: Vec<Range<usize>>,
+}
+
+impl Markdown<'_> {
+  /// Source byte range of the token at `token_index`, parallel to [`Markdown::tokens`].
+  pub fn span(&self, token_index: usize) -> Range<usize> {
+    self.spans[token_index].clone()
+  }
 }
 
 impl<'s> Token<'s> {

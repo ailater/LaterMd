@@ -1,8 +1,9 @@
 //! CommonMark markdown parser with streaming-friendly healing.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeWithOffset};
 
 use crate::types::{Alignment, Markdown, TableData, Token, TokenStyle};
 
@@ -343,18 +344,40 @@ fn count_table_columns(row: &str) -> usize {
   row.split('|').filter(|s| !s.trim().is_empty()).count()
 }
 
+/// Push a token and record its source span, keeping spans contiguous.
+///
+/// Each span runs from where the previous token's span ended to the end of the
+/// event that produced this token, so the spans tile the source with no gaps.
+fn push_token<'s>(
+  tokens: &mut Vec<Token<'s>>,
+  spans: &mut Vec<Range<usize>>,
+  span_last_end: &mut usize,
+  token: Token<'s>,
+  event_range: &Range<usize>,
+) {
+  let end = event_range.end.max(*span_last_end);
+  spans.push(*span_last_end..end);
+  *span_last_end = end;
+  tokens.push(token);
+}
+
 /// Parse a markdown string into a [`Markdown`] token stream.
+///
+/// The returned [`Markdown::spans`] are parallel to the tokens and contiguous,
+/// mapping every byte of `s` to exactly one token index.
 ///
 /// Supports CommonMark with extensions: tables, strikethrough, footnotes, and task lists.
 pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
   let mut tokens = Vec::new();
+  let mut spans: Vec<Range<usize>> = Vec::new();
+  let mut span_last_end = 0usize;
   let mut options = Options::empty();
   options.insert(Options::ENABLE_STRIKETHROUGH);
   options.insert(Options::ENABLE_TABLES);
   options.insert(Options::ENABLE_FOOTNOTES);
   options.insert(Options::ENABLE_TASKLISTS);
 
-  let parser = TextMergeStream::new(Parser::new_ext(s, options));
+  let parser = TextMergeWithOffset::new(Parser::new_ext(s, options).into_offset_iter());
 
   let mut current_style = TokenStyle::default();
   let mut in_link = false;
@@ -382,28 +405,35 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
   // Footnote definition state.
   let mut in_footnote_def = false;
 
-  let ensure_double_newline = |tokens: &mut Vec<Token>| {
+  // Synthesized newlines have no source event, so they get an empty span. The
+  // stronger invariant is `spans.len() == tokens.len()`, which block-level
+  // consumers rely on when mapping a byte offset to a token index.
+  let ensure_double_newline = |tokens: &mut Vec<Token>, spans: &mut Vec<Range<usize>>, last_end: &mut usize| {
     if tokens.is_empty() {
       return;
     }
     if !matches!(tokens.last(), Some(Token::Newline)) {
       tokens.push(Token::Newline);
+      spans.push(*last_end..*last_end);
       tokens.push(Token::Newline);
+      spans.push(*last_end..*last_end);
     } else if tokens.len() > 1 && !matches!(tokens.get(tokens.len() - 2), Some(Token::Newline)) {
       tokens.push(Token::Newline);
+      spans.push(*last_end..*last_end);
     }
   };
 
-  let ensure_newline = |tokens: &mut Vec<Token>| {
+  let ensure_newline = |tokens: &mut Vec<Token>, spans: &mut Vec<Range<usize>>, last_end: &mut usize| {
     if tokens.is_empty() || !matches!(tokens.last(), Some(Token::Newline)) {
       tokens.push(Token::Newline);
+      spans.push(*last_end..*last_end);
     }
   };
 
   let is_last_token_list_marker =
     |tokens: &[Token]| -> bool { matches!(tokens.last(), Some(Token::ListMarker { .. })) };
 
-  for event in parser {
+  for (event, range) in parser {
     // When collecting table cells, route text into the cell buffer.
     if in_table {
       match &event {
@@ -439,12 +469,18 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
         }
         Event::End(TagEnd::Table) => {
           in_table = false;
-          ensure_double_newline(&mut tokens);
-          tokens.push(Token::Table(TableData {
-            alignments: std::mem::take(&mut table_alignments),
-            headers: std::mem::take(&mut table_headers),
-            rows: std::mem::take(&mut table_rows),
-          }));
+          ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
+          push_token(
+            &mut tokens,
+            &mut spans,
+            &mut span_last_end,
+            Token::Table(TableData {
+              alignments: std::mem::take(&mut table_alignments),
+              headers: std::mem::take(&mut table_headers),
+              rows: std::mem::take(&mut table_rows),
+            }),
+            &range,
+          );
           continue;
         }
         Event::Text(text) => {
@@ -523,18 +559,42 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
         } else if in_link {
           link_text = Some(text);
         } else if in_code_block {
-          tokens.push(Token::CodeBlock { text: trim_end_newlines(text), language: current_code_language.clone() });
+          push_token(
+            &mut tokens,
+            &mut spans,
+            &mut span_last_end,
+            Token::CodeBlock { text: trim_end_newlines(text), language: current_code_language.clone() },
+            &range,
+          );
         } else {
-          tokens.push(Token::Text { text, style: current_style.clone() });
+          push_token(
+            &mut tokens,
+            &mut spans,
+            &mut span_last_end,
+            Token::Text { text, style: current_style.clone() },
+            &range,
+          );
         }
       }
 
       Event::Html(html) => {
-        tokens.push(Token::Text { text: html, style: current_style.clone() });
+        push_token(
+          &mut tokens,
+          &mut spans,
+          &mut span_last_end,
+          Token::Text { text: html, style: current_style.clone() },
+          &range,
+        );
       }
 
       Event::InlineHtml(html) => {
-        tokens.push(Token::Text { text: html, style: current_style.clone() });
+        push_token(
+          &mut tokens,
+          &mut spans,
+          &mut span_last_end,
+          Token::Text { text: html, style: current_style.clone() },
+          &range,
+        );
       }
 
       Event::Code(text) => {
@@ -542,29 +602,41 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           link_text = Some(text);
         } else {
           let code_style = TokenStyle { inline_code: true, ..Default::default() };
-          tokens.push(Token::Text { text, style: code_style });
+          push_token(&mut tokens, &mut spans, &mut span_last_end, Token::Text { text, style: code_style }, &range);
         }
       }
 
       Event::SoftBreak => {
-        tokens.push(Token::Text { text: CowStr::Borrowed(" "), style: current_style.clone() });
+        push_token(
+          &mut tokens,
+          &mut spans,
+          &mut span_last_end,
+          Token::Text { text: CowStr::Borrowed(" "), style: current_style.clone() },
+          &range,
+        );
       }
       Event::HardBreak => {
-        tokens.push(Token::Newline);
+        push_token(&mut tokens, &mut spans, &mut span_last_end, Token::Newline, &range);
       }
 
       Event::Rule => {
-        ensure_double_newline(&mut tokens);
-        tokens.push(Token::HorizontalRule);
+        ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
+        push_token(&mut tokens, &mut spans, &mut span_last_end, Token::HorizontalRule, &range);
       }
 
       Event::TaskListMarker(checked) => {
         let indent_level = list_stack.len();
-        tokens.push(Token::TaskListMarker { checked, indent_level });
+        push_token(
+          &mut tokens,
+          &mut spans,
+          &mut span_last_end,
+          Token::TaskListMarker { checked, indent_level },
+          &range,
+        );
       }
 
       Event::FootnoteReference(label) => {
-        tokens.push(Token::FootnoteRef { label });
+        push_token(&mut tokens, &mut spans, &mut span_last_end, Token::FootnoteRef { label }, &range);
       }
 
       Event::Start(tag) => match tag {
@@ -576,9 +648,9 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           if matches!(last, Some(Token::ListMarker { .. })) || matches!(last, Some(Token::TaskListMarker { .. })) {
             // Don't add newlines right after a list/task marker.
           } else if after_header_in_list {
-            ensure_newline(&mut tokens);
+            ensure_newline(&mut tokens, &mut spans, &mut span_last_end);
           } else if !in_list_item && !in_footnote_def {
-            ensure_double_newline(&mut tokens);
+            ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
           }
         }
         Tag::CodeBlock(code_block_kind) => {
@@ -588,9 +660,9 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           let last = tokens.last();
           if matches!(last, Some(Token::ListMarker { .. })) {
           } else if after_header_in_list {
-            ensure_newline(&mut tokens);
+            ensure_newline(&mut tokens, &mut spans, &mut span_last_end);
           } else if !in_list_item {
-            ensure_double_newline(&mut tokens);
+            ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
           }
 
           current_code_language = match code_block_kind {
@@ -612,15 +684,15 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
 
           if !is_last_token_list_marker(&tokens) {
             if list_stack.len() == 1 {
-              ensure_double_newline(&mut tokens);
+              ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
             } else {
-              ensure_newline(&mut tokens);
+              ensure_newline(&mut tokens, &mut spans, &mut span_last_end);
             }
           }
         }
         Tag::Item => {
           if !tokens.is_empty() {
-            ensure_newline(&mut tokens);
+            ensure_newline(&mut tokens, &mut spans, &mut span_last_end);
           }
           in_list_item = true;
           let indent_level = list_stack.len();
@@ -635,12 +707,12 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           } else {
             CowStr::Borrowed("  • ")
           };
-          tokens.push(Token::ListMarker { marker, indent_level });
+          push_token(&mut tokens, &mut spans, &mut span_last_end, Token::ListMarker { marker, indent_level }, &range);
         }
         Tag::Heading { level, .. } => {
           let after_list_marker = is_last_token_list_marker(&tokens);
           if !after_list_marker && !in_list_item {
-            ensure_double_newline(&mut tokens);
+            ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
           }
           current_style.heading = Some(level as u8);
         }
@@ -664,7 +736,7 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           image_title = if title.is_empty() { None } else { Some(title) };
         }
         Tag::BlockQuote(_) => {
-          tokens.push(Token::BlockquoteStart);
+          push_token(&mut tokens, &mut spans, &mut span_last_end, Token::BlockquoteStart, &range);
         }
         Tag::Table(alignments) => {
           in_table = true;
@@ -682,8 +754,8 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
         }
         Tag::FootnoteDefinition(label) => {
           in_footnote_def = true;
-          ensure_double_newline(&mut tokens);
-          tokens.push(Token::FootnoteDef { label });
+          ensure_double_newline(&mut tokens, &mut spans, &mut span_last_end);
+          push_token(&mut tokens, &mut spans, &mut span_last_end, Token::FootnoteDef { label }, &range);
         }
         _ => {}
       },
@@ -716,18 +788,30 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           in_link = false;
           let text = link_text.take().unwrap_or_else(|| CowStr::Boxed("".into()));
           if let Some(url) = link_href.take() {
-            tokens.push(Token::Link { text, href: url, title: link_title.take() });
+            push_token(
+              &mut tokens,
+              &mut spans,
+              &mut span_last_end,
+              Token::Link { text, href: url, title: link_title.take() },
+              &range,
+            );
           }
         }
         TagEnd::Image => {
           in_image = false;
           let alt = image_alt.take().unwrap_or_else(|| CowStr::Boxed("".into()));
           if let Some(url) = image_url.take() {
-            tokens.push(Token::Image { alt, url, title: image_title.take() });
+            push_token(
+              &mut tokens,
+              &mut spans,
+              &mut span_last_end,
+              Token::Image { alt, url, title: image_title.take() },
+              &range,
+            );
           }
         }
         TagEnd::BlockQuote(_) => {
-          tokens.push(Token::BlockquoteEnd);
+          push_token(&mut tokens, &mut spans, &mut span_last_end, Token::BlockquoteEnd, &range);
         }
         TagEnd::FootnoteDefinition => {
           in_footnote_def = false;
@@ -739,7 +823,7 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
     }
   }
 
-  Markdown { s, tokens }
+  Markdown { s, tokens, spans }
 }
 
 #[cfg(test)]
@@ -750,6 +834,42 @@ mod tests {
   fn empty() {
     let md = parse("");
     assert!(md.tokens.is_empty());
+  }
+
+  #[test]
+  fn spans_are_parallel_and_contiguous() {
+    let docs = [
+      "# Heading\n\nParagraph with **bold** and `code`.\n\n- item one\n- item two\n",
+      "| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n",
+      "> quote\n\n[^1]: footnote\n\nA ref[^1].\n\n---\n",
+      "line1\nline2\n\n### h3 tail",
+    ];
+    for doc in docs {
+      let md = parse(doc);
+      assert_eq!(md.tokens.len(), md.spans.len(), "parallel arrays diverge for: {doc:?}");
+      let mut prev_end = 0;
+      for (i, span) in md.spans.iter().enumerate() {
+        assert_eq!(span.start, prev_end, "span {i} not contiguous in: {doc:?}");
+        assert!(span.end >= span.start, "span {i} inverted in: {doc:?}");
+        assert!(span.end <= doc.len(), "span {i} beyond source in: {doc:?}");
+        prev_end = span.end;
+      }
+    }
+  }
+
+  #[test]
+  fn heading_span_covers_source_line() {
+    let src = "intro\n\n# Title here\n\nbody";
+    let md = parse(src);
+    let (idx, _) = md
+      .tokens
+      .iter()
+      .enumerate()
+      .find(|(_, t)| matches!(t, Token::Text { style, .. } if style.heading == Some(1)))
+      .expect("heading token");
+    let span = md.span(idx);
+    assert!(span.start <= src.find("# Title").unwrap(), "span starts after the marker: {span:?}");
+    assert!(span.end >= src.find("here").unwrap() + 4, "span ends before the text: {span:?}");
   }
 
   #[test]
