@@ -10,6 +10,7 @@
 //! (AGENTS.md §8「UI 与状态机天然耦合」),快照与光标又是它的派生缓存,
 //! 归约进下一帧反而让预览滞后一帧。
 
+use crate::export;
 use crate::file::{self, FileCmd};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
@@ -201,6 +202,8 @@ pub enum Message {
     FileCommand(FileCmd),
     /// 关闭提示行。
     NoticeDismissed,
+    /// 导出当前文档为 HTML(弹保存对话框,不触碰文档落盘身份)。
+    ExportHtml,
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
 }
@@ -212,6 +215,7 @@ impl State {
             Message::SidebarTabChanged(tab) => self.sidebar.active_tab = tab,
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.document.notice = None,
+            Message::ExportHtml => self.run_export_html(),
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
         }
     }
@@ -316,6 +320,25 @@ impl State {
                 self.document.path = Some(path);
                 self.document.notice = None;
             }
+            Err(error) => self.document.notice = Some(error.to_string()),
+        }
+    }
+
+    /// 导出 HTML(消息归约):弹保存对话框,把当前缓冲渲染成完整 HTML 落盘。
+    /// 导出物是派生物:文档路径与 dirty 均不动。
+    fn run_export_html(&mut self) {
+        let start = file::start_dir(self.document.path.as_deref());
+        let default = export::default_name(self.document.path.as_deref());
+        if let Some(path) = export::save_dialog(&start, &default) {
+            self.export_html_to(&path);
+        }
+    }
+
+    /// 渲染并写出;失败只落提示行。绕开对话框直测落盘路径,单独成函数供测试。
+    fn export_html_to(&mut self, path: &Path) {
+        let html = latermd_export::export_html(self.editor.text());
+        match file::write_as("导出", path, &html) {
+            Ok(()) => self.document.notice = None,
             Err(error) => self.document.notice = Some(error.to_string()),
         }
     }
@@ -443,5 +466,30 @@ mod tests {
         assert!(!state.document.dirty, "编辑动作本身不动镜像");
         state.end_of_logic();
         assert!(state.document.dirty);
+    }
+
+    /// 导出:写出的是完整 HTML 文档(标题取自缓冲当前内容),且不触碰文档
+    /// 身份 —— 路径不被认领、dirty 不被清、失败提示带路径。
+    #[test]
+    fn export_writes_html_without_touching_document_identity() {
+        let path = temp_path("export.html");
+        let mut state = State::default();
+        state.editor.insert_chars(0, "# 导出标题\n");
+        assert!(state.editor.is_dirty());
+
+        state.export_html_to(&path);
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>"), "{html}");
+        assert!(html.contains("<h1>导出标题</h1>"), "{html}");
+        assert!(html.contains("max-width: 46em"), "{html}");
+        // 派生物:dirty 保留、路径不认领
+        assert!(state.editor.is_dirty());
+        assert_eq!(state.document.path, None);
+        let _ = std::fs::remove_file(&path);
+
+        state.export_html_to(&PathBuf::from("/latermd/no/such/dir.html"));
+        let notice = state.document.notice.as_deref().unwrap();
+        assert!(notice.contains("导出失败"), "{notice}");
+        assert!(notice.contains("dir.html"), "{notice}");
     }
 }

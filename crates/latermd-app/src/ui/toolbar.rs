@@ -18,6 +18,11 @@ pub fn ui(panel: &mut egui::Ui, document: &DocumentState, outbox: &mut Vec<Messa
                 outbox.push(Message::FileCommand(cmd));
             }
         }
+        let export_button = egui::Button::new("导出 HTML")
+            .shortcut_text(ui.ctx().format_shortcut(&crate::export::shortcut()));
+        if ui.add(export_button).clicked() {
+            outbox.push(Message::ExportHtml);
+        }
         ui.separator();
         ui.weak(document.display_name());
     });

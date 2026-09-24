@@ -149,9 +149,15 @@ pub fn read(path: &Path) -> Result<String, FileError> {
     })
 }
 
-/// UTF-8 写全文,字节原样落盘:不做换行符转换,不补尾换行。
+/// UTF-8 写全文,字节原样落盘:不做换行符转换,不补尾换行。失败提示的
+/// 动作名固定为「保存」;导出等其它写路径用 [`write_as`] 指定动作名。
 pub fn write(path: &Path, text: &str) -> Result<(), FileError> {
-    std::fs::write(path, text.as_bytes()).map_err(|source| err("保存", path, source))
+    write_as("保存", path, text)
+}
+
+/// [`fn@write`] 的动作名可指定版本,失败提示形如「导出失败 路径: 原因」。
+pub fn write_as(op: &'static str, path: &Path, text: &str) -> Result<(), FileError> {
+    std::fs::write(path, text.as_bytes()).map_err(|source| err(op, path, source))
 }
 
 #[cfg(test)]

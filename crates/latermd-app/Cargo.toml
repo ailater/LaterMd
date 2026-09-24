@@ -12,6 +12,8 @@ egui_markdown = { path = "../../vendor/egui_markdown" }
 latermd-editor = { path = "../latermd-editor" }
 # 大纲条目(OutlineItem)与标题提取的快路径
 latermd-md = { path = "../latermd-md" }
+# HTML 导出(ADR-004 清单内,P0 验收项)
+latermd-export = { path = "../latermd-export" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
 

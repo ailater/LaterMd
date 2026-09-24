@@ -25,6 +25,10 @@ impl LaterMdApp {
         for cmd in crate::file::poll_shortcuts(ctx) {
             state.apply(state::Message::FileCommand(cmd));
         }
+        // 导出快捷键(Ctrl/Cmd+E),与文件快捷键同一消费时机。
+        if crate::export::poll_shortcut(ctx) {
+            state.apply(state::Message::ExportHtml);
+        }
         state.end_of_logic();
 
         // 窗口标题只在变化时下发,避免每帧一次原生 set_title
