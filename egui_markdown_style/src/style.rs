@@ -1,0 +1,574 @@
+//! Customizable visual styling for all markdown elements.
+
+use std::hash::{Hash, Hasher};
+
+use egui::{self, Color32, DragValue, Grid, Ui};
+// Only `InlineCodeStyle::stroke` uses this, and the membrane feature gates that method.
+#[cfg(feature = "membrane")]
+use egui::Stroke;
+
+/// Visual styling for markdown rendering.
+///
+/// All fields have sensible defaults matching the previously hardcoded values.
+/// Dark/light theme adaptation is automatic via `InlineCodeStyle`'s per-theme color
+/// fields and egui's `Visuals::dark_mode`.
+///
+/// Install a context-wide default with [`crate::set_style`]; widgets read it via
+/// [`crate::global_style`] when no per-widget override is set.
+///
+/// # Example
+///
+/// ```
+/// use egui_markdown_style::MarkdownStyle;
+///
+/// let mut style = MarkdownStyle::default();
+/// style.heading.scales[0] = 2.0; // Bigger H1
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MarkdownStyle {
+  /// Styling for inline code spans.
+  pub inline_code: InlineCodeStyle,
+  /// Styling for fenced code blocks.
+  pub code_block: CodeBlockStyle,
+  /// Styling for heading levels 1–6.
+  pub heading: HeadingStyle,
+  /// Styling for horizontal rules.
+  pub horizontal_rule: HorizontalRuleStyle,
+  /// Styling for blockquotes.
+  pub blockquote: BlockquoteStyle,
+  /// Styling for list markers (bullets and numbers).
+  pub list: ListStyle,
+  /// Styling for tables.
+  #[cfg_attr(feature = "serde", serde(default))]
+  pub table: TableStyle,
+  /// Vertical spacing between block elements in pixels.
+  pub block_spacing: f32,
+  /// Font size for code blocks. Default: `10.0`.
+  pub code_font_size: f32,
+  /// Language used for syntax highlighting when no language is specified.
+  pub default_code_language: String,
+}
+
+impl Default for MarkdownStyle {
+  fn default() -> Self {
+    Self {
+      inline_code: InlineCodeStyle::default(),
+      code_block: CodeBlockStyle::default(),
+      heading: HeadingStyle::default(),
+      horizontal_rule: HorizontalRuleStyle::default(),
+      blockquote: BlockquoteStyle::default(),
+      list: ListStyle::default(),
+      table: TableStyle::default(),
+      block_spacing: 8.0,
+      code_font_size: 10.0,
+      default_code_language: String::new(),
+    }
+  }
+}
+
+impl Hash for MarkdownStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.inline_code.hash(state);
+    self.code_block.hash(state);
+    self.heading.hash(state);
+    self.horizontal_rule.hash(state);
+    self.blockquote.hash(state);
+    self.list.hash(state);
+    self.table.hash(state);
+    self.block_spacing.to_bits().hash(state);
+    self.code_font_size.to_bits().hash(state);
+    self.default_code_language.hash(state);
+  }
+}
+
+impl MarkdownStyle {
+  /// Show an interactive editor for all style fields, plus a dark/light switch.
+  pub fn ui(&mut self, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+      let dark_mode = ui.visuals().dark_mode;
+      if ui.selectable_label(dark_mode, "Dark").clicked() {
+        ui.ctx().set_visuals(egui::Visuals::dark());
+      }
+      if ui.selectable_label(!dark_mode, "Light").clicked() {
+        ui.ctx().set_visuals(egui::Visuals::light());
+      }
+      ui.separator();
+      if ui.button("Reset").clicked() {
+        *self = Self::default();
+      }
+    });
+
+    ui.separator();
+    self.render_style(ui);
+  }
+
+  /// Edit the markdown style fields.
+  pub fn render_style(&mut self, ui: &mut Ui) {
+    ui.label("Block spacing:");
+    ui.add(DragValue::new(&mut self.block_spacing).range(0.0..=40.0).speed(0.5));
+
+    ui.separator();
+
+    egui::CollapsingHeader::new("Inline Code").default_open(true).show(ui, |ui| {
+      self.inline_code.ui(ui);
+    });
+
+    egui::CollapsingHeader::new("Code Blocks").default_open(true).show(ui, |ui| {
+      self.code_block.ui(ui);
+      ui.separator();
+      ui.horizontal(|ui| {
+        ui.label("Font size:");
+        ui.add(DragValue::new(&mut self.code_font_size).range(6.0..=30.0).speed(0.5));
+      });
+      ui.horizontal(|ui| {
+        ui.label("Default language:");
+        ui.add(egui::TextEdit::singleline(&mut self.default_code_language).desired_width(80.0));
+      });
+    });
+
+    egui::CollapsingHeader::new("Headings").default_open(true).show(ui, |ui| {
+      self.heading.ui(ui);
+    });
+
+    egui::CollapsingHeader::new("Horizontal Rules").default_open(false).show(ui, |ui| {
+      self.horizontal_rule.ui(ui);
+    });
+
+    egui::CollapsingHeader::new("Blockquotes").default_open(false).show(ui, |ui| {
+      self.blockquote.ui(ui);
+    });
+
+    egui::CollapsingHeader::new("Lists").default_open(false).show(ui, |ui| {
+      self.list.ui(ui);
+    });
+
+    egui::CollapsingHeader::new("Tables").default_open(false).show(ui, |ui| {
+      self.table.ui(ui);
+    });
+  }
+}
+
+/// Styling for inline code spans (backtick-delimited).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct InlineCodeStyle {
+  /// Text color in dark mode.
+  pub color_dark: Color32,
+  /// Text color in light mode.
+  pub color_light: Color32,
+  /// Background color in dark mode.
+  pub background_dark: Color32,
+  /// Background color in light mode.
+  pub background_light: Color32,
+  /// How much to expand the background rectangle horizontally beyond the text bounds (in pixels).
+  pub expand_bg: f32,
+  /// How much to expand the background rectangle vertically (requires `membrane` feature).
+  /// When this is not set, or when the `membrane` feature is off, both axes use `expand_bg`.
+  #[cfg(feature = "membrane")]
+  pub expand_bg_y: f32,
+  /// Corner radius for inline code backgrounds (requires `membrane` feature).
+  #[cfg(feature = "membrane")]
+  pub bg_corner_radius: u8,
+  /// Border color in dark mode (requires `membrane` feature).
+  #[cfg(feature = "membrane")]
+  pub stroke_dark: Color32,
+  /// Border color in light mode (requires `membrane` feature).
+  #[cfg(feature = "membrane")]
+  pub stroke_light: Color32,
+  /// Border width in points. A code block uses `CodeBlockStyle::stroke_width`, and an inline span
+  /// is the same surface, so both take one value (requires `membrane` feature).
+  #[cfg(feature = "membrane")]
+  pub stroke_width: f32,
+}
+
+impl Default for InlineCodeStyle {
+  fn default() -> Self {
+    Self {
+      color_dark: Color32::from_rgb(255, 152, 0),
+      color_light: Color32::from_rgb(204, 102, 0),
+      background_dark: Color32::from_gray(50),
+      background_light: Color32::from_gray(225),
+      expand_bg: 3.0,
+      // A border needs room, so the background clears the glyphs by two points and not by one.
+      #[cfg(feature = "membrane")]
+      expand_bg_y: 2.0,
+      #[cfg(feature = "membrane")]
+      bg_corner_radius: 3,
+      #[cfg(feature = "membrane")]
+      stroke_dark: Color32::from_gray(60),
+      #[cfg(feature = "membrane")]
+      stroke_light: Color32::from_gray(190),
+      #[cfg(feature = "membrane")]
+      stroke_width: 1.0,
+    }
+  }
+}
+
+impl Hash for InlineCodeStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.color_dark.hash(state);
+    self.color_light.hash(state);
+    self.background_dark.hash(state);
+    self.background_light.hash(state);
+    self.expand_bg.to_bits().hash(state);
+    #[cfg(feature = "membrane")]
+    {
+      self.expand_bg_y.to_bits().hash(state);
+      self.bg_corner_radius.hash(state);
+      self.stroke_dark.hash(state);
+      self.stroke_light.hash(state);
+      self.stroke_width.to_bits().hash(state);
+    }
+  }
+}
+
+impl InlineCodeStyle {
+  /// Resolve color for the current theme.
+  pub fn color(&self, dark_mode: bool) -> Color32 {
+    if dark_mode {
+      self.color_dark
+    } else {
+      self.color_light
+    }
+  }
+
+  /// Resolve background for the current theme.
+  pub fn background(&self, dark_mode: bool) -> Color32 {
+    if dark_mode {
+      self.background_dark
+    } else {
+      self.background_light
+    }
+  }
+
+  /// Resolve the border for the current theme.
+  #[cfg(feature = "membrane")]
+  pub fn stroke(&self, dark_mode: bool) -> Stroke {
+    let color = if dark_mode { self.stroke_dark } else { self.stroke_light };
+    Stroke::new(self.stroke_width, color)
+  }
+
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("inline_code_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Color (dark):");
+      ui.color_edit_button_srgba(&mut self.color_dark);
+      ui.end_row();
+
+      ui.label("Color (light):");
+      ui.color_edit_button_srgba(&mut self.color_light);
+      ui.end_row();
+
+      ui.label("Background (dark):");
+      ui.color_edit_button_srgba(&mut self.background_dark);
+      ui.end_row();
+
+      ui.label("Background (light):");
+      ui.color_edit_button_srgba(&mut self.background_light);
+      ui.end_row();
+
+      ui.label("Expand bg:");
+      ui.add(DragValue::new(&mut self.expand_bg).range(0.0..=10.0).speed(0.1));
+      ui.end_row();
+
+      #[cfg(feature = "membrane")]
+      {
+        ui.label("Expand bg Y:");
+        ui.add(DragValue::new(&mut self.expand_bg_y).range(0.0..=10.0).speed(0.1));
+        ui.end_row();
+
+        ui.label("Bg corner radius:");
+        ui.add(DragValue::new(&mut self.bg_corner_radius).range(0..=16));
+        ui.end_row();
+
+        // `stroke_dark`, `stroke_light` and `stroke_width` get no row. `Theme::refresh_derived`
+        // writes all three from the dim stroke and from `CodeBlockStyle::stroke_width`, so it
+        // would overwrite an edit made here.
+      }
+    });
+  }
+}
+
+/// Styling for fenced code blocks.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CodeBlockStyle {
+  /// Padding `[left, top, right, bottom]`.
+  pub padding: [f32; 4],
+  /// Corner radius for the code block border.
+  pub corner_radius: f32,
+  /// Stroke width for the code block border.
+  pub stroke_width: f32,
+}
+
+impl Default for CodeBlockStyle {
+  fn default() -> Self {
+    Self { padding: [4.0, 6.0, 12.0, 6.0], corner_radius: 3.0, stroke_width: 1.0 }
+  }
+}
+
+impl Hash for CodeBlockStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    for v in &self.padding {
+      v.to_bits().hash(state);
+    }
+    self.corner_radius.to_bits().hash(state);
+    self.stroke_width.to_bits().hash(state);
+  }
+}
+
+impl CodeBlockStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("code_block_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Padding left:");
+      ui.add(DragValue::new(&mut self.padding[0]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Padding top:");
+      ui.add(DragValue::new(&mut self.padding[1]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Padding right:");
+      ui.add(DragValue::new(&mut self.padding[2]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Padding bottom:");
+      ui.add(DragValue::new(&mut self.padding[3]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Corner radius:");
+      ui.add(DragValue::new(&mut self.corner_radius).range(0.0..=20.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Stroke width:");
+      ui.add(DragValue::new(&mut self.stroke_width).range(0.0..=5.0).speed(0.1));
+      ui.end_row();
+    });
+  }
+}
+
+/// Styling for heading levels 1–6.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HeadingStyle {
+  /// Font size multipliers for H1–H6.
+  pub scales: [f32; 6],
+}
+
+impl Default for HeadingStyle {
+  fn default() -> Self {
+    Self { scales: [1.6, 1.35, 1.2, 1.1, 1.05, 1.0] }
+  }
+}
+
+impl Hash for HeadingStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    for v in &self.scales {
+      v.to_bits().hash(state);
+    }
+  }
+}
+
+impl HeadingStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("heading_style").num_columns(2).striped(true).show(ui, |ui| {
+      for (i, scale) in self.scales.iter_mut().enumerate() {
+        ui.label(format!("H{}:", i + 1));
+        ui.add(DragValue::new(scale).range(0.5..=4.0).speed(0.01));
+        ui.end_row();
+      }
+    });
+  }
+}
+
+/// Styling for horizontal rules (`---`).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HorizontalRuleStyle {
+  /// Stroke width for horizontal rule lines.
+  pub stroke_width: f32,
+  /// Vertical space reserved for the rule row (points).
+  pub height: f32,
+}
+
+impl Default for HorizontalRuleStyle {
+  fn default() -> Self {
+    Self { stroke_width: 1.0, height: 8.0 }
+  }
+}
+
+impl Hash for HorizontalRuleStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.stroke_width.to_bits().hash(state);
+    self.height.to_bits().hash(state);
+  }
+}
+
+impl HorizontalRuleStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("hr_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Stroke width:");
+      ui.add(DragValue::new(&mut self.stroke_width).range(0.0..=5.0).speed(0.1));
+      ui.end_row();
+      ui.label("Height:");
+      ui.add(DragValue::new(&mut self.height).range(1.0..=40.0).speed(0.5));
+      ui.end_row();
+    });
+  }
+}
+
+/// Styling for blockquotes.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BlockquoteStyle {
+  /// Horizontal indent per nesting depth in pixels.
+  pub indent_per_depth: f32,
+  /// Width of the vertical bar drawn at the left edge of a blockquote.
+  pub stroke_width: f32,
+}
+
+impl Default for BlockquoteStyle {
+  fn default() -> Self {
+    Self { indent_per_depth: 12.0, stroke_width: 1.0 }
+  }
+}
+
+impl Hash for BlockquoteStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.indent_per_depth.to_bits().hash(state);
+    self.stroke_width.to_bits().hash(state);
+  }
+}
+
+impl BlockquoteStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("blockquote_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Indent per depth:");
+      ui.add(DragValue::new(&mut self.indent_per_depth).range(0.0..=40.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Stroke width:");
+      ui.add(DragValue::new(&mut self.stroke_width).range(0.0..=5.0).speed(0.1));
+      ui.end_row();
+    });
+  }
+}
+
+/// Styling for list markers.
+///
+/// Markers are right-aligned in a slot whose width is measured from the body font, so every item
+/// of a nesting level starts its text at the same x. These fields adjust that arrangement: `gap`
+/// moves the text away from the marker column (wrapped rows follow it), while the two `nudge`
+/// fields move a marker left of the column without moving any text.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ListStyle {
+  /// Space between the marker column and the item text, in points.
+  pub gap: f32,
+  /// How far left of the marker column to draw a bullet, in points.
+  pub bullet_nudge: f32,
+  /// How far left of the marker column to draw a number, in points.
+  pub number_nudge: f32,
+  /// Font size multiplier for the bullet glyph. The row height is unaffected.
+  pub bullet_scale: f32,
+}
+
+impl Default for ListStyle {
+  fn default() -> Self {
+    Self { gap: 0.0, bullet_nudge: 0.0, number_nudge: 0.0, bullet_scale: 1.0 }
+  }
+}
+
+impl Hash for ListStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.gap.to_bits().hash(state);
+    self.bullet_nudge.to_bits().hash(state);
+    self.number_nudge.to_bits().hash(state);
+    self.bullet_scale.to_bits().hash(state);
+  }
+}
+
+fn default_cell_padding() -> [f32; 4] {
+  [10.0, 6.0, 10.0, 6.0]
+}
+
+/// Styling for markdown tables.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TableStyle {
+  /// Width of separator lines between cells. `0.0` draws none.
+  pub stroke_width: f32,
+  /// Corner radius of the outer table stroke. Only visible when [`Self::stroke_width`] is non-zero.
+  pub corner_radius: f32,
+  /// Inner cell padding `[left, top, right, bottom]`.
+  #[cfg_attr(feature = "serde", serde(default = "default_cell_padding"))]
+  pub cell_padding: [f32; 4],
+}
+
+impl Default for TableStyle {
+  fn default() -> Self {
+    Self { stroke_width: 0.0, corner_radius: 0.0, cell_padding: default_cell_padding() }
+  }
+}
+
+impl Hash for TableStyle {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.stroke_width.to_bits().hash(state);
+    self.corner_radius.to_bits().hash(state);
+    for v in &self.cell_padding {
+      v.to_bits().hash(state);
+    }
+  }
+}
+
+impl TableStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("table_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Stroke width:");
+      ui.add(DragValue::new(&mut self.stroke_width).range(0.0..=5.0).speed(0.1));
+      ui.end_row();
+
+      ui.label("Corner radius:");
+      ui.add(DragValue::new(&mut self.corner_radius).range(0.0..=20.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Cell padding left:");
+      ui.add(DragValue::new(&mut self.cell_padding[0]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Cell padding top:");
+      ui.add(DragValue::new(&mut self.cell_padding[1]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Cell padding right:");
+      ui.add(DragValue::new(&mut self.cell_padding[2]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Cell padding bottom:");
+      ui.add(DragValue::new(&mut self.cell_padding[3]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+    });
+  }
+}
+
+impl ListStyle {
+  fn ui(&mut self, ui: &mut Ui) {
+    Grid::new("list_style").num_columns(2).striped(true).show(ui, |ui| {
+      ui.label("Marker gap:");
+      ui.add(DragValue::new(&mut self.gap).range(0.0..=40.0).speed(0.25));
+      ui.end_row();
+
+      ui.label("Bullet nudge:");
+      ui.add(DragValue::new(&mut self.bullet_nudge).range(0.0..=40.0).speed(0.25));
+      ui.end_row();
+
+      ui.label("Number nudge:");
+      ui.add(DragValue::new(&mut self.number_nudge).range(0.0..=40.0).speed(0.25));
+      ui.end_row();
+
+      ui.label("Bullet scale:");
+      ui.add(DragValue::new(&mut self.bullet_scale).range(0.5..=4.0).speed(0.05));
+      ui.end_row();
+    });
+  }
+}
