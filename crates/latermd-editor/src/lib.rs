@@ -115,6 +115,13 @@ impl EditorBuffer {
         self.touch();
     }
 
+    /// 载入一整篇外部内容(打开文件 / 新建空文档),并复位未保存标志:
+    /// 内容来自磁盘而非用户修改,不构成 dirty。
+    pub fn load(&mut self, text: &str) {
+        self.replace_all(text);
+        self.clear_dirty();
+    }
+
     /// 全文快照(喂给预览/导出)。
     pub fn snapshot(&self) -> String {
         self.mirror.clone()
@@ -213,6 +220,28 @@ mod tests {
         buf.remove_chars(0..buf.len_chars());
         buf.insert_chars(0, "# 新标题\n\n新正文");
         assert_eq!(buf.text(), "# 新标题\n\n新正文");
+        assert_invariants(&buf);
+    }
+
+    #[test]
+    fn load_resets_dirty_but_keeps_revision_monotonic() {
+        let mut buf = EditorBuffer::new("old");
+        buf.insert_chars(3, "!");
+        assert!(buf.is_dirty());
+        let rev = buf.revision();
+
+        buf.load("# 新文档");
+        assert_eq!(buf.text(), "# 新文档");
+        assert!(!buf.is_dirty(), "磁盘内容不是用户修改");
+        assert!(
+            buf.revision() >= rev,
+            "修订号只前进不回退(快照缓存依赖此约定)"
+        );
+
+        // 载入与当前内容相同的文本:replace_all 短路,dirty 仍须复位。
+        buf.insert_chars(0, "x");
+        buf.load("x# 新文档");
+        assert!(!buf.is_dirty());
         assert_invariants(&buf);
     }
 

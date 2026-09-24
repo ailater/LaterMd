@@ -5,6 +5,7 @@
 //! App trait 采用 egui 0.36 的 `logic` / `ui` 二分,三栏布局见 `ui::layout`
 //! (docs/adr-005)。
 
+mod file;
 mod fonts;
 mod state;
 mod ui;
@@ -42,4 +43,6 @@ fn main() -> eframe::Result<()> {
 struct LaterMdApp {
     state: state::State,
     outbox: Vec<state::Message>,
+    /// 最近一次下发给原生窗口的标题缓存;仅用于跳过重复的 set_title。
+    window_title: String,
 }
