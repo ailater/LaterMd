@@ -1,0 +1,11 @@
+[package]
+name = "latermd-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone document exporters (HTML via pulldown-cmark, no UI deps)"
+
+[dependencies]
+# 单一解析器铁律(AGENTS.md §3):HTML 导出与预览共用 pulldown-cmark,
+# 版本与 workspace 其余 crate 一致。
+pulldown-cmark = "0.13.4"
