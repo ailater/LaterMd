@@ -48,3 +48,4 @@
 | 2026-09-24 | vendor-upgrade-checklist：0.34→0.36.2 升级实测（24 个错误），并发现其中 9 个是上游 HEAD 自身 bug（在其自称支持的 egui 0.34.3 上也编译失败） |
 | 2026-09-24 | ADR-005 + roadmap：三栏布局。修正 `SidePanel` / `App::update` 两个已消失的 API；大纲从 P3 前移到 P0（廉价版 3 天）；`Token::source_span` 提前到 vendor 阶段一次性完成 |
 | 2026-09-24 | **文档体系一致性修订**：① ADR-004 重构为纯技术栈 ADR（原「最终汇总」中的功能范围/排期是过期快照，与 roadmap 冲突，已移交）；② 确立 roadmap.md 为排期唯一事实来源，ADR-001 §5 加修订注；③ P3「全文检索」与 P1 侧边栏搜索重复，删除；④ roadmap 阶段 0 验收补齐第六项 clippy；⑤ 新增 crate 增量创建表、风险登记册、阶段出口条件、M0 产出物约定（m0-report.md）；⑥ 修复 checklist 笔误 |
+| 2026-09-24 | **分发策略修订**：确认无 Apple Developer 账号与签名证书。分发改为 GitHub Release + Homebrew tap `crazykun/homebrew-ailater`（cask 复刻 lscreen 模式：universal2 dmg + postflight 去 quarantine + livecheck）。签名公证相关结论在 ADR-004 / roadmap / AGENTS.md 中同步作废改写 |

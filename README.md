@@ -16,6 +16,20 @@
 
 驱动黑名单逃生口:`LATERMD_RENDERER=glow` 环境变量可切换渲染后端(仅诊断用)。
 
+## 安装(发布后)
+
+本项目**不做代码签名与公证**(个人开源软件,省 $99/年与证书成本),分发渠道:
+
+```bash
+# macOS(推荐):Homebrew tap,postflight 自动移除 quarantine,无 Gatekeeper 拦截
+brew install --cask crazykun/ailater/latermd
+```
+
+- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 直下 `.exe`。首次运行 SmartScreen 会警告,点「更多信息 → 仍要运行」即可。
+- **Linux**:`.AppImage` / `.deb` / `.rpm` 从 Releases 直下,或使用 Linuxbrew。
+
+> 未发布前此节为渠道预告,当前无可安装产物。
+
 ## 技术栈
 
 纯 Rust。核心选型(完整清单与版本见 [docs/adr-004](docs/adr-004-technical-stack.md)):

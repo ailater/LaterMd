@@ -71,14 +71,19 @@
 | 输入法 | IME | IME | IME |
 | 文件监听 | ReadDirectoryChangesW | FSEvents | inotify |
 | Git 凭据 | Credential Manager | Keychain | libsecret / gnome-keyring |
-| 打包 | `.msi` / `.exe` | `.app` / `.dmg` + 签名公证 | `.AppImage` / `.deb` / `.rpm` |
+| 打包 | `.msi` / `.exe` | `.app`（universal2 dmg） | `.AppImage` / `.deb` / `.rpm` |
 
-### 存在性阻塞（不是可选项）
+### 分发策略（2026-09-24 修订：无签名证书路线）
 
-- **macOS**：必须 codesign + notarytool，否则 Gatekeeper 报「已损坏」。需要 Apple Developer 账号。
-- **Windows**：未签名 exe 触发 SmartScreen，建议购买代码签名证书。
-- **证书采购周期是排期风险**：账号审批与证书采购在 M0 期间并行启动（见 roadmap 风险登记册 #3）。
-- **Linux**：AppImage 兼容性最好；deb/rpm 适合发行版仓库。
+**不购买 Apple Developer 账号与代码签名证书。** 主渠道 GitHub Release，macOS 经自有 Homebrew tap [`crazykun/homebrew-ailater`](https://github.com/crazykun/homebrew-ailater) 分发：
+
+- **cask 复刻 tap 内 `lscreen` 的成熟模式**：universal2 单 dmg（双架构 lipo 合一）、`postflight` 执行 `xattr -dr com.apple.quarantine` 消除 Gatekeeper「已损坏」拦截、`livecheck :github_latest` 自动发现新版本。
+- tap 已有每小时 auto-bump 流水线（`.github/workflows/auto-bump.yml`），接入 LaterMD 只需新增一项。
+- cargo-dist 只负责构建三平台 Release 产物与 CI；tap 更新走自有流水线，不走 cargo-dist 的 homebrew installer（它生成 formula 装 `bin/`，不适合 GUI app 的 cask 形态）。
+- Linux 的 AppImage / deb / rpm 照常产出，供非 brew 用户直下。
+- Windows 直下 `.exe` 触发 SmartScreen，README 写明「更多信息 → 仍要运行」，不视为缺陷。
+
+> 先前的「macOS 必须 codesign + notarytool、建议购买 Windows 代码签名证书」结论**作废**——那是签名路线的前提，成本（$99/年 + 证书费 + 公证调试）对本项目无必要，brew 路线已由 lscreen 验证。
 
 CI 矩阵结构见 [roadmap.md](roadmap.md) 持续项一节（落地以 `cargo dist init` 生成物为准）。
 
@@ -159,3 +164,4 @@ LaterMD/
 |---|---|
 | 2026-09-24 | 初版：技术栈汇总（当时还承担「最终汇总」职责，含功能范围与排期） |
 | 2026-09-24 | **重构**：原 §六功能范围、§七演进路线是过期快照（P0 6-8 周、无文件树/大纲/搜索），与 ADR-005 修订后的 roadmap 冲突。按「单一事实来源」原则，范围与排期全部移交 roadmap.md，本文收敛为纯技术栈 ADR。同步删除与 ADR-001/002/003 重复的铁律、heal/LinkHandler、架构约束三节 |
+| 2026-09-24 | **分发策略修订**：确认无 Apple Developer 账号与签名证书，分发改为 GitHub Release + Homebrew tap `crazykun/homebrew-ailater`（cask 复刻 lscreen 模式）。原「存在性阻塞」小节的公证/证书结论作废，排期中证书申请动作移除 |

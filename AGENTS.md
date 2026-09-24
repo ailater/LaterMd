@@ -73,7 +73,8 @@ channel = "1.98.0"
 - 渲染后端：**wgpu**（eframe 默认）。**不要启用 `glow`** —— macOS 上 OpenGL 已被 Apple 废弃。
   仅保留 `LATERMD_RENDERER=glow` 环境变量作为驱动黑名单的逃生口，并在 Settings 面板显示当前后端。
 - Linux 开发机（Deepin + rolling kernel）：若 Wayland 下 `egui_wgpu` 起不来，**直接切 X11 会话**，不要在此耗时。
-- 打包存在性阻塞：macOS 必须 codesign + notarytool；Windows 建议代码签名证书（否则 SmartScreen）。
+- **分发策略（2026-09-24 定）：无签名证书路线。** 主渠道 GitHub Release；macOS 经 Homebrew tap [`crazykun/homebrew-ailater`](https://github.com/crazykun/homebrew-ailater) 以 **cask** 分发，**复刻 `lscreen` 模式**：universal2 单 dmg（双架构 lipo 合一）+ `postflight` 执行 `xattr -dr com.apple.quarantine` 消除 Gatekeeper 拦截 + `livecheck :github_latest` 自动发现新版本。**不做 codesign 公证，不买证书。**
+- Windows 无证书直下会触发 SmartScreen，README 写明「更多信息 → 仍要运行」，不视为缺陷。
 - CI 矩阵三平台，追加 `aarch64-pc-windows-msvc` 发布目标。
 
 ---
@@ -132,4 +133,4 @@ vendored `egui_markdown` 存在于 `vendor/egui_markdown/`，以下结论均已�
 - 决策全文：[docs/README.md](docs/README.md) 是 ADR 索引，先看决策总表。
 - 五份 ADR 均有「实测推翻先前判断」的记录。**读 ADR 时优先看修订对照表**，不要在已推翻的旧结论上继续推理。
 - 排期与验收的**唯一事实来源是 [docs/roadmap.md](docs/roadmap.md)**。ADR 与本文件里出现的历史周期数字不回写，以 roadmap 为准。
-- 风险清单（IME、签名证书、上游停更、工期）集中在 roadmap.md 的「风险登记册」。
+- 风险清单（IME、无签名信任门槛、上游停更、cask 停更、工期）集中在 roadmap.md 的「风险登记册」。

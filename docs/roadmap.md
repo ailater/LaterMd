@@ -93,9 +93,9 @@ cargo doc --no-deps --all-features
 | 快捷键 | `Ctrl` / `Cmd` 自动适配 | 0.5 周 |
 | **文件树**（基础版） | `ignore` + 懒加载 + `.gitignore` + 点击打开 + 当前文件高亮 | 1.5 周 |
 | **大纲**（廉价版） | AST 提取标题 + 点击跳编辑器光标。**不跳预览** | 0.5 周 |
-| 打包 | 三平台产物 + macOS 签名公证 + Windows 代码签名 | 1 周 |
+| 打包 | 三平台产物发 GitHub Release；macOS universal2 dmg 经 [crazykun/homebrew-ailater](https://github.com/crazykun/homebrew-ailater) cask 分发（复刻 lscreen 模式） | 1 周 |
 
-> **存在性依赖，提前办**：Apple Developer 账号（审批需数天）与 Windows 代码签名证书（OV/EV 采购周期更长）必须在 **M0 期间并行申请**，不要等到打包周才发现卡在证书上。
+> **分发依赖（非阻塞）**：无签名证书路线已定（AGENTS.md §5）。macOS cask 复刻 `lscreen` 写法（universal2 单 dmg + postflight 去 quarantine + livecheck）；接入 tap 的 auto-bump 流水线只需在其 `FORMULAS` 表 / `Casks/` 加一项，随时可办，无审批等待。
 
 ### crate 增量创建表（防止「开工即 8 个空 crate」）
 
@@ -212,11 +212,11 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 |---|---|---|---|---|---|
 | 1 | **IME 缺陷**（吞字 / 候选框不跟随 / 抢焦点） | 高 | M0 第 1 条验证 | M0 实测不过 | 停止或换 iced 备选（ADR-001 §2.5），不硬修 egui |
 | 2 | **单人 9 个月工期** | 高 | 每阶段出口评审；P0 完成即有自用价值 | 连续两阶段超期 50% | 砍 P2/P3 范围，P1 收敛为「流式写作」单功能 |
-| 3 | **签名证书阻塞打包** | 中 | M0 期间并行申请 Apple Developer + Windows 代码签名证书 | 打包周无证书 | 先发未签名内测版，正式版延后，不算 P0 失败 |
+| 3 | **无签名的信任门槛**（Gatekeeper「已损坏」/ SmartScreen 警告） | 低 | brew cask `postflight` 去 quarantine；README 写明 Windows「仍要运行」指引 | 非 brew 用户首次打开受阻 | 已是 lscreen 验证过的成熟路径，不新增投入 |
 | 4 | **上游 egui_markdown 停更** | 中 | 已 vendor（subtree），不受上游发布节奏约束 | 上游 6 个月无提交 | fork 并公开维护；升级决策权完全在我们 |
 | 5 | **CharIndex 强类型重构引入 off-by-one** | 中 | vendor 升级后 `cargo test` 必跑（checklist §8 第 4 步） | tests/cache、indent、truncate 回归 | 以测试为准逐个修，不带病合并 |
 | 6 | **egui 上游 churn**（季度级破坏性发版） | 中 | 钉 0.36.2；升级是显式 ADR 决策，不追新 | 安全公告 / 必需 bugfix | 单独开升级 ADR，走 vendor-upgrade-checklist 流程 |
-| 7 | **macOS notarytool / Gatekeeper 拒绝** | 中 | ADR-004 §八存在性阻塞已列 | 公证失败 | 按 cargo-dist 官方模板核对 hardened-runtime entitlements |
+| 7 | **cask 停更**（lscreen 曾因 dmg 资产命名变化导致 cask 停在旧版） | 中 | `livecheck :github_latest` + tap 的 auto-bump 流水线；Release 资产命名在 cargo-dist 配置中钉死，不随版本改格式 | 用户 brew 拿不到新版本 | 命名变化时同步改 cask URL 模板（一次 5 分钟） |
 
 ---
 
