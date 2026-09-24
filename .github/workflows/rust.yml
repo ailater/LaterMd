@@ -1,9 +1,9 @@
 name: Rust
 
+# 只在 main 上跑:feature 分支每次 push 都跑一遍三平台构建是纯浪费,
+# 门禁验证交给合入后的 main(分支保护会挡住不合规的合入)。
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
     branches: [ "main" ]
 
 env:

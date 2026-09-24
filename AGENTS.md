@@ -127,9 +127,10 @@ vendored `egui_markdown` 存在于 `vendor/egui_markdown/`，以下结论均已�
 - Windows 用 `Ctrl`，macOS 用 `Cmd`；换行符 Win = CRLF，其余 LF。三平台都要确保中文字体可用。
 - **IME 是头号风险。** Windows 微软拼音 + macOS 简体拼音的候选框跟随、不吞字、不抢焦点，必须在 M0 阶段实测掉，不要想当然。
 - **分支与推送（多人协作）。** `main` 是受保护的集成分支，**禁止直接 push 到 main、禁止 force push**。日常在 `feature/<短横线主题>` 上工作（修缺陷用 `fix/<主题>`，基础设施用 `chore/<主题>`）；commit 完成后 `git push -u origin <branch>` 推同名远端分支，不留本地堆积，再 `gh pr create` 开 PR 合入 `main`。
-- **PR 合入门槛**：CI gate（六项门禁 + 三平台构建）全绿；vendor 改动必须在 PR 描述里标明类别（①上游可合 / ②私有删改 / ③仓库接驳，见 §6），便于将来 cherry-pick 与解 subtree 冲突。
-- **与 main 同步用 rebase，不用 merge**：开工前 `git pull --rebase origin main`，PR 落后于 main 时同样 rebase 后 force push **自己的分支**（不是 main）。
-- 仓库设置侧应为 `main` 开启分支保护（要求 PR + CI 通过），把上述约定固化下来，别只靠自觉。
+- **CI 只在 `main` 上跑**（`.github/workflows/rust.yml` 只保留 `push: branches: [main]`）。因此**合入 PR 前必须在本地跑完六项门禁**：`cargo fmt --all --check`、三轮 `cargo clippy --workspace --all-targets`（default / `--no-default-features` / `--all-features`，均 `-D warnings`）、`cargo test --workspace --all-features`、`cargo doc --no-deps --all-features`；vendor 改动加跑 `vendor/egui_markdown/check.sh`。合入后 main 上的 CI 是兜底，不是第一道防线。
+- **PR 描述要求**：vendor 改动必须标明类别（①上游可合 / ②私有删改 / ③仓库接驳，见 §6），便于将来 cherry-pick 与解 subtree 冲突；非 vendor 改动注明「非 vendor」即可。
+- **与 main 同步用 rebase，不用 merge**：开工前 `git pull --rebase origin main`，PR 落后于 main 时同样 rebase 后 force push **自己的分支**（不是 main）。工作区有他人未提交改动、rebase 无法启动时，允许用 `git merge origin/main` 例外。
+- 仓库设置侧应为 `main` 开启分支保护（要求 PR），把「禁止直推 main」固化下来，别只靠自觉。
 
 ---
 

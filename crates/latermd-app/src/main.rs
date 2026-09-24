@@ -1,10 +1,13 @@
-//! LaterMD 应用入口 —— M0 技术验证载体。
+//! LaterMD 应用入口。
 //!
 //! 渲染后端选择见 docs/adr-002 §3.4:默认 wgpu;`LATERMD_RENDERER=glow` 仅在
 //! 启用 `glow` feature 的构建中生效(驱动黑名单逃生口,不进主产物)。
-//! App trait 采用 egui 0.36 的 `logic` / `ui` 二分(见 docs/adr-005 §2.3)。
+//! App trait 采用 egui 0.36 的 `logic` / `ui` 二分,三栏布局见 `ui::layout`
+//! (docs/adr-005)。
 
 mod fonts;
+mod state;
+mod ui;
 
 use eframe::egui;
 
@@ -16,71 +19,27 @@ fn main() -> eframe::Result<()> {
     };
     let opts = eframe::NativeOptions {
         renderer,
+        // 三栏的最小可用宽度:侧边栏下限 160 + 编辑器 500 + 预览余量(docs/adr-005)
+        viewport: egui::ViewportBuilder::default().with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
         "LaterMD",
         opts,
         Box::new(|cc| {
-            let font_source = fonts::install(&cc.egui_ctx);
-            Ok(Box::new(LaterMdApp::new(font_source)))
+            if fonts::install(&cc.egui_ctx).is_none() {
+                // M0 验证 UI 已退役,字体失配只在终端告警,不静默吞掉
+                eprintln!("LaterMD: 未找到候选 CJK 字体,中文将显示为方块");
+            }
+            Ok(Box::new(LaterMdApp::default()))
         }),
     )
 }
 
-/// 应用根状态。P0 阶段将承载 `State`/`Message` 归约(docs/adr-005 §5)。
+/// 应用根:状态 + 待归约消息队列。归约在 [`eframe::App::logic`],绘制在
+/// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
+#[derive(Default)]
 struct LaterMdApp {
-    frame_count: u64,
-    font_source: Option<String>,
-}
-
-impl LaterMdApp {
-    fn new(font_source: Option<String>) -> Self {
-        Self {
-            frame_count: 0,
-            font_source,
-        }
-    }
-}
-
-impl eframe::App for LaterMdApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 只做状态归约,严格禁止在此绘制任何 UI(docs/adr-005 §2.3)。
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.frame_count += 1;
-        let backend = if frame.wgpu_render_state().is_some() {
-            "wgpu"
-        } else {
-            "glow"
-        };
-        ui.heading("LaterMD · M0 技术验证");
-        ui.label(format!(
-            "骨架运行中 · 第 {} 帧 · 渲染后端: {backend}",
-            self.frame_count
-        ));
-        if let Some(render_state) = frame.wgpu_render_state() {
-            // M0 验证 3「报告合理 adapter」的在屏证据:选中项 + loader 枚举全集
-            ui.label(format!(
-                "wgpu adapter: {:?}",
-                render_state.adapter.get_info()
-            ));
-            ui.label(format!(
-                "available: {:?}",
-                render_state
-                    .available_adapters
-                    .iter()
-                    .map(|a| a.get_info())
-                    .collect::<Vec<_>>()
-            ));
-        }
-        match &self.font_source {
-            Some(source) => ui.label(format!("中文字体来源: {source}")),
-            None => ui.label("⚠ 未找到候选 CJK 字体,中文将显示为方块"),
-        };
-        // SC 与 JP 字形有别的样本字(骨/直/關),用于确认加载的是 SC 字型而非 JP
-        ui.label("中文渲染(比例):雾凇沆砀,天与云与山与水,上下一白 —— 骨直關开办");
-        ui.monospace("中文渲染(等宽): fn 骨直關() { 雾凇沆砀 } // abc123");
-    }
+    state: state::State,
+    outbox: Vec<state::Message>,
 }
