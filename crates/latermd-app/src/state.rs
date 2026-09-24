@@ -269,10 +269,11 @@ impl State {
     /// 把编辑器光标跳到标题行首(大纲点击的归约)。
     ///
     /// span 平铺不变量使标题 span 可能吸收前一块尾部的换行(实测 `## X` 的
-    /// span 起于其前的空行),跳过换行让光标落在标题行首。区间来自点击时
-    /// 的快照,若其间又有编辑,`byte_to_char` 的钳制保证最多落到文档末尾。
+    /// span 起于其前的空行),跳过换行让光标落在标题行首。区间来自点击帧
+    /// 的快照,同帧编辑器面板仍可能改动文本,归约时缓冲或已变短:切片前
+    /// 按当前长度钳制,`byte_to_char` 把落在字符中间的偏移归到起点。
     fn jump_cursor_to_heading(&mut self, span: Range<usize>) {
-        let mut byte = span.start;
+        let mut byte = span.start.min(self.editor.text().len());
         for b in &self.editor.text().as_bytes()[byte..] {
             match b {
                 b'\n' | b'\r' => byte += 1,
@@ -544,6 +545,26 @@ mod tests {
             bytes[state.editor.char_to_byte(jump)],
             b'\n',
             "落在标题行首"
+        );
+    }
+
+    /// 大纲点击归约的过期 span:消息产自上一帧快照,同帧编辑可能已把缓冲
+    /// 删短,越界 start 不得 panic,钳制后跳到当前文档末尾。
+    #[test]
+    fn outline_click_with_stale_span_clamps_to_text_end() {
+        let mut state = State::default();
+        let stale = state.preview.outline[1].span.clone();
+        state.editor.replace_all("短");
+        assert!(
+            stale.start > state.editor.text().len(),
+            "前置:span 确已越界"
+        );
+
+        state.apply(Message::OutlineItemClicked(stale));
+        assert_eq!(
+            state.cursor.jump_to,
+            Some(state.editor.len_chars()),
+            "钳制到末尾(byte_to_char 再把字节偏移换成字符偏移)"
         );
     }
 
