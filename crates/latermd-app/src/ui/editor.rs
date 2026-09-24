@@ -12,6 +12,13 @@ use std::ops::Range;
 
 use eframe::egui;
 
+/// 编辑器 widget 的固定 id:显式指定(而非 `id_salt` 随面板 id 链派生),
+/// 光标/undo 状态跨帧、跨面板结构调整都保持;焦点管理与集成测试也靠它
+/// 稳定引用。
+pub(crate) fn editor_id() -> egui::Id {
+    egui::Id::new("source-editor")
+}
+
 /// 把 [`EditorBuffer`] 适配成 egui `TextBuffer` 的 newtype。
 ///
 /// 孤儿规则:`egui::TextBuffer` 与 `EditorBuffer` 都不归本 crate,
@@ -69,7 +76,7 @@ pub fn ui(
     let mut buffer = EditorText(editor);
     let output = egui::TextEdit::multiline(&mut buffer)
         // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
-        .id_salt("source-editor")
+        .id(editor_id())
         .font(egui::TextStyle::Monospace)
         .desired_width(f32::INFINITY)
         .desired_rows(rows)

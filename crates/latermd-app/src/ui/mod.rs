@@ -2,6 +2,7 @@
 
 pub mod editor;
 pub mod layout;
+pub mod menubar;
 pub mod preview;
 pub mod sidebar;
 pub mod toolbar;

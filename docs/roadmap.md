@@ -13,13 +13,31 @@
 
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
-[ ] M0 技术验证   ← 当前
-[ ] P0 骨架
+[~] M0 技术验证   自动化可测项已有结论「继续」;出口放行卡两条真机项(IME、Win/mac wgpu),挂账随 P0 载体补测,见 m0-report.md
+[~] P0 骨架       ← 当前(2026-09-25,模块批量落地中;剩打包分发与 M0 真机项)
 [ ] P1 差异化
 [ ] P2 版本层
 [ ] P2.5 界面打磨（皮肤系统批次 B，见「专题：界面美化与皮肤系统」）
 [ ] P3 深水区
 ```
+
+**本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
+
+| 模块 | commit |
+|---|---|
+| M0 可自动化验证（[m0-report.md](m0-report.md)：中文字体注入 + bench 数据 + 六项验证状态） | `75871fa` |
+| latermd-md 解析与大纲数据层 | `18ca4c0` |
+| 三栏布局骨架（侧边栏/编辑器/预览 + State/Message 归约） | `33fa18f` |
+| 源码编辑与实时预览 | `a3f760f` |
+| 文件新建/打开/保存/另存为 | `6710669` |
+| 大纲面板与光标跳转 | `8c00cdd` |
+| HTML 导出（latermd-export） | `35f0bf0` |
+| 主题切换与持久化（settings.json） | `bf32495` |
+| 统一快捷键与菜单栏 | `b0bbc2c` |
+| 文件树基础版（懒加载 + .gitignore + 当前文件高亮） | `37c9e0c` |
+| 修复：大纲跳转 span 过期越界钳制 + 保存/导出原子落盘 | `efedd6b` |
+
+> P0 范围表对照：Markdown 与代码高亮已由 vendor 提供，上表已覆盖其余功能条目；**剩余 = 打包分发**（三平台 Release + macOS cask）**与 M0 两条真机项**。
 
 > Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 

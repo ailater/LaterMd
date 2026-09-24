@@ -12,6 +12,8 @@
 
 use crate::export;
 use crate::file::{self, FileCmd};
+use crate::filetree::{FileTreeSettings, FileTreeState};
+use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
 use std::ops::Range;
@@ -42,8 +44,9 @@ impl SidebarTab {
     }
 }
 
-/// 侧边栏状态。`visible` 直接喂给 `Panel::show_collapsible` 的 `&mut bool`,
-/// 折叠/展开由面板把手原地翻转,不走消息。
+/// 侧边栏状态。`visible` 直接喂给 `Panel::show_collapsible` 的 `&mut bool`:
+/// 面板把手在 `ui` 里原地翻转;命令层(菜单/快捷键)的切换走
+/// [`Message::SidebarToggled`] 在 `logic` 归约。
 pub struct SidebarState {
     /// 是否展开。
     pub visible: bool,
@@ -103,8 +106,16 @@ pub struct State {
     pub preview: PreviewState,
     /// 大纲↔编辑器光标协调。
     pub cursor: OutlineCursor,
+    /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
+    pub file_tree: FileTreeState,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
+    /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
+    /// 投影到 context,切换即时生效。
+    pub theme: ThemeSettings,
+    /// 主题落盘目录;`None` = 平台默认。仅为测试注入临时目录而存在,
+    /// 生产恒为 `None`。
+    pub(crate) settings_dir: Option<PathBuf>,
 }
 
 /// 文档落盘身份 + 未保存镜像。
@@ -179,12 +190,15 @@ impl Default for State {
             },
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
+            file_tree: FileTreeState::default(),
             editor,
             document: DocumentState {
                 path: None,
                 dirty: false,
                 notice: None,
             },
+            theme: ThemeSettings::default(),
+            settings_dir: None,
         }
     }
 }
@@ -204,6 +218,21 @@ pub enum Message {
     NoticeDismissed,
     /// 导出当前文档为 HTML(弹保存对话框,不触碰文档落盘身份)。
     ExportHtml,
+    /// 切换明暗主题(设置菜单产出);归约里改状态并即时落盘。
+    ThemeChanged(ThemeMode),
+    /// 明暗主题互换(命令层「切换主题」的快捷键/菜单入口;定向选择走
+    /// [`Message::ThemeChanged`])。
+    ToggleTheme,
+    /// 切换侧边栏展开/折叠(命令层入口;面板把手翻转不走消息)。
+    SidebarToggled,
+    /// 请求为文件树选择新根目录(归约里弹目录对话框)。
+    FileTreeRootPick,
+    /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
+    FileTreeRootSelected(PathBuf),
+    /// 点击文件树目录行,载荷为目录路径。
+    FileTreeToggled(PathBuf),
+    /// 点击文件树文件行,载荷为文件路径。
+    FileSelected(PathBuf),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
 }
@@ -216,17 +245,35 @@ impl State {
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.document.notice = None,
             Message::ExportHtml => self.run_export_html(),
+            Message::ThemeChanged(mode) => self.change_theme(mode),
+            Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
+            Message::SidebarToggled => self.sidebar.visible = !self.sidebar.visible,
+            Message::FileTreeRootPick => self.pick_file_tree_root(),
+            Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
+            Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
+            Message::FileSelected(path) => self.open_from_file_tree(&path),
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
+        }
+    }
+
+    /// 切换主题(设置菜单的归约):改状态并即时落盘(重启保持);投影到
+    /// context 由每帧的 `theme.apply` 完成。落盘失败只落提示行,切换本身
+    /// 照常生效 —— 持久化失败不该牺牲本次会话的可用性。
+    fn change_theme(&mut self, mode: ThemeMode) {
+        self.theme.mode = mode;
+        if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
+            self.document.notice = Some(error.to_string());
         }
     }
 
     /// 把编辑器光标跳到标题行首(大纲点击的归约)。
     ///
     /// span 平铺不变量使标题 span 可能吸收前一块尾部的换行(实测 `## X` 的
-    /// span 起于其前的空行),跳过换行让光标落在标题行首。区间来自点击时
-    /// 的快照,若其间又有编辑,`byte_to_char` 的钳制保证最多落到文档末尾。
+    /// span 起于其前的空行),跳过换行让光标落在标题行首。区间来自点击帧
+    /// 的快照,同帧编辑器面板仍可能改动文本,归约时缓冲或已变短:切片前
+    /// 按当前长度钳制,`byte_to_char` 把落在字符中间的偏移归到起点。
     fn jump_cursor_to_heading(&mut self, span: Range<usize>) {
-        let mut byte = span.start;
+        let mut byte = span.start.min(self.editor.text().len());
         for b in &self.editor.text().as_bytes()[byte..] {
             match b {
                 b'\n' | b'\r' => byte += 1,
@@ -239,6 +286,8 @@ impl State {
     /// 帧末刷新派生状态。`App::logic` 每帧调用一次。
     pub fn end_of_logic(&mut self) {
         self.document.dirty = self.editor.is_dirty();
+        // 文件树懒加载落点:根 + 展开中目录的子项缓存补齐(键缺席才 IO)。
+        self.file_tree.ensure_loaded();
     }
 
     fn run_file_cmd(&mut self, cmd: FileCmd) {
@@ -296,10 +345,57 @@ impl State {
     }
 
     /// 读盘并换入缓冲。读取失败只落提示行,不动当前文档。
+    ///
+    /// 同时展开该文件在树内的祖先目录:无论从文件树、菜单还是快捷键打开,
+    /// 当前文件的高亮行都应当在 Files 页里可见。
     fn open_from(&mut self, path: &Path) {
         match file::read(path) {
-            Ok(text) => self.load_document(Some(path.to_path_buf()), &text),
+            Ok(text) => {
+                self.load_document(Some(path.to_path_buf()), &text);
+                self.file_tree.expand_ancestors_of(path);
+            }
             Err(error) => self.document.notice = Some(error.to_string()),
+        }
+    }
+
+    /// 文件树点击文件:与「打开」命令同一语义(dirty 拦截 + 换入缓冲)。
+    fn open_from_file_tree(&mut self, path: &Path) {
+        if self.unsaved_guard() {
+            return;
+        }
+        self.open_from(path);
+    }
+
+    /// 弹目录对话框选文件树根目录(Files 页「选择…」按钮的归约)。起始目录
+    /// 取最近根或当前文档所在目录,均已校验存在(rfd 对不存在目录的行为未定义)。
+    fn pick_file_tree_root(&mut self) {
+        let start = self
+            .file_tree
+            .recents
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.document
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| file::start_dir(None));
+        if let Some(dir) = file::pick_folder_dialog(&start) {
+            self.change_file_tree_root(dir);
+        }
+    }
+
+    /// 换根并持久化(对话框与最近列表两个入口共用);落盘失败只落提示行,
+    /// 本次会话的文件树照常可用。
+    fn change_file_tree_root(&mut self, dir: PathBuf) {
+        self.file_tree.set_root(dir);
+        if let Err(error) =
+            FileTreeSettings::from(&self.file_tree).save_to(self.settings_dir.as_deref())
+        {
+            self.document.notice = Some(error.to_string());
         }
     }
 
@@ -371,6 +467,27 @@ mod tests {
         assert_eq!(document.display_name(), "未命名*");
     }
 
+    /// 命令层开关消息:主题互换(翻转 + 落盘)与侧边栏翻转,都走完整归约。
+    #[test]
+    fn toggle_messages_flip_theme_and_sidebar() {
+        let dir = temp_path("toggle-dir");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        let visible_before = state.sidebar.visible;
+
+        state.apply(Message::ToggleTheme);
+        assert_eq!(state.theme.mode, ThemeMode::Light, "默认深色 → 浅色");
+        assert!(dir.join("settings.json").exists(), "互换同样持久化");
+        state.apply(Message::ToggleTheme);
+        assert_eq!(state.theme.mode, ThemeMode::Dark, "再切回深色");
+
+        state.apply(Message::SidebarToggled);
+        assert_eq!(state.sidebar.visible, !visible_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 打开:内容进缓冲、dirty 复位、路径认领、预览快照同帧联动。
     #[test]
     fn open_loads_buffer_and_syncs_preview() {
@@ -431,6 +548,26 @@ mod tests {
         );
     }
 
+    /// 大纲点击归约的过期 span:消息产自上一帧快照,同帧编辑可能已把缓冲
+    /// 删短,越界 start 不得 panic,钳制后跳到当前文档末尾。
+    #[test]
+    fn outline_click_with_stale_span_clamps_to_text_end() {
+        let mut state = State::default();
+        let stale = state.preview.outline[1].span.clone();
+        state.editor.replace_all("短");
+        assert!(
+            stale.start > state.editor.text().len(),
+            "前置:span 确已越界"
+        );
+
+        state.apply(Message::OutlineItemClicked(stale));
+        assert_eq!(
+            state.cursor.jump_to,
+            Some(state.editor.len_chars()),
+            "钳制到末尾(byte_to_char 再把字节偏移换成字符偏移)"
+        );
+    }
+
     /// 保存:字节原样落盘、dirty 复位;写入失败保留 dirty 并给出带路径的提示。
     #[test]
     fn save_writes_bytes_and_resets_dirty() {
@@ -466,6 +603,109 @@ mod tests {
         assert!(!state.document.dirty, "编辑动作本身不动镜像");
         state.end_of_logic();
         assert!(state.document.dirty);
+    }
+
+    /// 主题切换归约:状态翻转 + settings.json 落盘(注入临时目录,不碰
+    /// 真实平台配置);成功路径无提示。
+    #[test]
+    fn theme_change_updates_state_and_persists() {
+        let dir = temp_path("theme-dir");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+
+        state.apply(Message::ThemeChanged(ThemeMode::Light));
+        assert_eq!(state.theme.mode, ThemeMode::Light);
+        assert!(state.document.notice.is_none());
+        // "light" 必须在盘上,重启 load 才能还原
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(json.contains("\"light\""), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘失败(目录路径被同名文件占据):切换照常生效,失败带路径进提示行。
+    #[test]
+    fn theme_save_failure_lands_in_notice_but_mode_still_changes() {
+        let blocker = temp_path("theme-blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut state = State {
+            settings_dir: Some(blocker.clone()),
+            ..State::default()
+        };
+
+        state.apply(Message::ThemeChanged(ThemeMode::Light));
+        assert_eq!(state.theme.mode, ThemeMode::Light, "持久化失败不影响切换");
+        let notice = state.document.notice.as_deref().unwrap();
+        assert!(notice.contains("主题保存失败"), "{notice}");
+        assert!(notice.contains("theme-blocker"), "{notice}");
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// 文件树消息链:换根(持久化 + 最近列表)、展开翻转、懒加载在帧末补
+    /// 齐子项、点击文件换入缓冲并展开祖先;dirty 时点击文件被拦。
+    #[test]
+    fn file_tree_messages_drive_root_toggle_and_open() {
+        let dir = temp_path("filetree-root");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/note.md"), "# 树内标题\n").unwrap();
+        std::fs::write(dir.join("top.md"), "# 顶层\n").unwrap();
+
+        let settings_dir = temp_path("filetree-settings");
+        let mut state = State {
+            settings_dir: Some(settings_dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        assert_eq!(state.file_tree.root.as_deref(), Some(dir.as_path()));
+        assert_eq!(state.file_tree.recents, vec![dir.clone()]);
+        assert!(
+            settings_dir.join("file_tree.json").exists(),
+            "最近目录持久化"
+        );
+
+        // 懒加载:换根不列举,帧末归约才列根级子项
+        assert!(state.file_tree.children.is_empty());
+        state.end_of_logic();
+        let root_children = state.file_tree.children.get(&dir).unwrap();
+        assert_eq!(
+            root_children
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs", "top.md"]
+        );
+
+        // 展开翻转:toggle 后帧末补齐该目录子项
+        state.apply(Message::FileTreeToggled(dir.join("docs")));
+        state.end_of_logic();
+        assert!(state
+            .file_tree
+            .children
+            .contains_key(dir.join("docs").as_path()));
+
+        // 点击文件:换入缓冲、树内祖先展开(为高亮行可见)
+        let note = dir.join("docs/note.md");
+        state.apply(Message::FileSelected(note.clone()));
+        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
+        assert_eq!(state.editor.text(), "# 树内标题\n");
+        assert_eq!(
+            state.file_tree.expanded.get(dir.join("docs").as_path()),
+            Some(&true),
+            "打开的文件的父目录已展开"
+        );
+
+        // dirty 保护:未保存时点击树上另一文件不动当前文档
+        state.editor.insert_chars(0, "草稿");
+        state.apply(Message::FileSelected(dir.join("top.md")));
+        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
+        assert!(state.document.notice.is_some());
+        assert!(state.editor.text().starts_with("草稿"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&settings_dir);
     }
 
     /// 导出:写出的是完整 HTML 文档(标题取自缓冲当前内容),且不触碰文档
