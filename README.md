@@ -2,7 +2,8 @@
 
 **跨平台、版本化、可对话、可演化的 Markdown 知识工作台** —— Markdown 是内容层,AI 是智能层,Git 是时间层。
 
-> **当前状态:规划阶段(P0 之前)。** 全部技术决策见 [docs/](docs/README.md),演进路线与验收标准见 [docs/roadmap.md](docs/roadmap.md)。尚无可运行代码。
+> **当前状态:Vendor 适配已完成,M0 技术验证进行中,P0 骨架在建。** 全部技术决策见 [docs/](docs/README.md),演进路线与验收标准见 [docs/roadmap.md](docs/roadmap.md),M0 实测数据见 [docs/m0-report.md](docs/m0-report.md)。
+> 仓库已可编译运行(骨架窗口),但**尚无对外发布的安装包** —— 想跑就本地编译,见「构建与运行」。
 
 ## 平台支持
 
@@ -53,15 +54,60 @@ brew install --cask crazykun/ailater/latermd
 
 > 判断标准:如果一项功能不能让「写下一篇技术文档」变得更快,它就不在 P0–P2。
 
-## 开发
+## 构建与运行
 
-要求 rustc **1.98.0**(根目录 `rust-toolchain.toml` 已钉死,egui 0.36.2 要求 rustc ≥ 1.95)。
+> 没有发布产物,跑起来必须本地编译。产物**不能跨平台拷贝** —— Linux 编出来的是 ELF,Windows 上跑不了。
+
+### 前提
+
+| 项 | 要求 |
+|---|---|
+| Rust | **1.98.0**(根目录 `rust-toolchain.toml` 已钉死,rustup 自动切换;egui 0.36.2 要求 ≥ 1.95) |
+| Linux 额外依赖 | `sudo apt-get install -y libxkbcommon-dev`(winit 编译需要) |
+| 图形环境 | Linux 需 X11 / Wayland 会话;无显示器时窗口起不来 |
+
+### 命令
 
 ```bash
-cargo build --release
+cargo run --release -p latermd-app     # 编译并直接运行
+cargo build --release                  # 只编译
+./target/release/latermd-app           # 跑已编译好的产物
 ```
 
-规范(所有贡献者与 Agent 必读):[AGENTS.md](AGENTS.md)。
+产物位置:`target/release/latermd-app`(Linux 约 31 MB)。另有 `target/debug/latermd-app`(约 393 MB,带调试信息、启动慢)。
+
+### Windows / macOS
+
+同样在各自平台上执行 `cargo run --release -p latermd-app`,仓库无平台特定逻辑。Windows 需 MSVC 生成工具(rustup 默认会装),首次编译 10 分钟级。
+
+**已知限制**:字体候选表目前只列了 Linux 的 Noto Sans CJK / 文泉驿,**Windows 上中文会显示为方块**,界面会给出「⚠ 未找到候选 CJK 字体」的警告。P0 打包前补 `msyh.ttc` 候选(PingFang 同理)。
+
+### 渲染后端
+
+默认 wgpu。`LATERMD_RENDERER=glow` 是驱动黑名单的逃生口,**只在启用 glow feature 的构建里生效**:
+
+```bash
+cargo run --release -p latermd-app --features glow
+```
+
+### 合入 PR 前:本地跑完六项门禁
+
+CI 只在 `main` 上跑(`push: branches: [main]`),所以 PR 合入前必须本地验证:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo doc --no-deps --all-features
+```
+
+改动落在 `vendor/egui_markdown/` 时,再跑一遍上游门禁 `vendor/egui_markdown/check.sh`。
+
+## 开发
+
+分支与推送规则、vendor 改动三类拆分、三条铁律等,见 [AGENTS.md](AGENTS.md)(所有贡献者与 Agent 必读)。
 
 ## License
 
