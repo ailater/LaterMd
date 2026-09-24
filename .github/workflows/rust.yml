@@ -9,14 +9,81 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# 依据 AGENTS.md §4(工具链钉 1.98.0)/§5(三平台矩阵) 与 docs/roadmap.md「持续项:跨平台 CI」。
+# 门禁六项照抄上游 vendor/egui_markdown/check.sh,在 workspace 根执行。
+# 发布产物(cargo dist)尚未接入:等 `cargo dist init` 生成官方 workflow 后并入本文件,
+# 届时追加 aarch64-pc-windows-msvc 发布目标。
+
 jobs:
-  build:
-
+  gate:
+    name: Gate (fmt / clippy / test / doc)
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+
+    # 不能用 @stable —— 默认 toolchain 编不了 egui 0.36.2(AGENTS.md §4)
+    - uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        components: rustfmt, clippy
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Linux build deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxkbcommon-dev
+
+    - name: cargo fmt --check
+      run: cargo fmt --all --check
+
+    - name: clippy (default)
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    - name: clippy (no-default-features)
+      run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+    - name: clippy (all-features)
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+    - name: cargo test
+      run: cargo test --workspace --all-features
+
+    - name: cargo doc
+      run: cargo doc --no-deps --all-features
+
+    # glow 是驱动黑名单逃生口,不进主产物;只验证可编译(AGENTS.md §5)
+    - name: clippy (glow feature)
+      run: cargo clippy -p latermd-app --all-targets --features glow -- -D warnings
+
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        targets: ${{ matrix.target }}
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
+
+    - name: Install Linux build deps
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxkbcommon-dev
+
+    - name: cargo build --release
+      run: cargo build --release --target ${{ matrix.target }}
