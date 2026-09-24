@@ -13,7 +13,7 @@
 | [adr-005-layout-and-sidebar.md](adr-005-layout-and-sidebar.md) | 三栏布局、侧边栏、字体与并发模型 | 已接受 |
 | [roadmap.md](roadmap.md) | 阶段划分、验收标准、crate 增量时机、风险登记册、当前位置 | 已接受（**排期唯一事实来源**） |
 | [vendor-upgrade-checklist.md](vendor-upgrade-checklist.md) | egui_markdown vendor 与升级操作清单 | **已执行**(2026-09-24 六项全绿) |
-| [m0-report.md](m0-report.md) | M0 技术验证结论（IME / 帧率 / 三 target 实测数据） | 计划产出 |
+| [m0-report.md](m0-report.md) | M0 技术验证结论（IME / 帧率 / 三 target 实测数据） | 已产出（Linux 项完成；IME 与 Win·mac wgpu 待真机） |
 
 ## 决策总表（一句话版）
 
@@ -50,3 +50,4 @@
 | 2026-09-24 | **文档体系一致性修订**：① ADR-004 重构为纯技术栈 ADR（原「最终汇总」中的功能范围/排期是过期快照，与 roadmap 冲突，已移交）；② 确立 roadmap.md 为排期唯一事实来源，ADR-001 §5 加修订注；③ P3「全文检索」与 P1 侧边栏搜索重复，删除；④ roadmap 阶段 0 验收补齐第六项 clippy；⑤ 新增 crate 增量创建表、风险登记册、阶段出口条件、M0 产出物约定（m0-report.md）；⑥ 修复 checklist 笔误 |
 | 2026-09-24 | **分发策略修订**：确认无 Apple Developer 账号与签名证书。分发改为 GitHub Release + Homebrew tap `crazykun/homebrew-ailater`（cask 复刻 lscreen 模式：universal2 dmg + postflight 去 quarantine + livecheck）。签名公证相关结论在 ADR-004 / roadmap / AGENTS.md 中同步作废改写 |
 | 2026-09-24 | **阶段 0（Vendor 适配）完成**：subtree 引入 egui_markdown@4f3075f，egui 0.34→0.36.2（15 错误 + 未预见的 TexturesDelta drop 检查 10 测试），删除 membrane feature（23 处），`Markdown::spans` 平行数组落地（大纲/Live Preview prerequisite）。check.sh 六项全绿、100 测试通过、latermd-app 空窗口在 Linux/X11 实跑通过 |
+| 2026-09-24 | **M0 中间态**：`docs/m0-report.md` 产出（Linux 侧三项通过 —— wgpu/Vulkan 软件 adapter 起动、流式追加 ~9 ms、中文渲染无方块且字体方案定案为 cfg 原生候选表）；bench 全量重跑数据回填。CI 重写为 gate（六项门禁 + glow 编译）+ 三平台 build 矩阵，工具链钉 1.98.0。剩余真机项（IME、Win11 DX12 / macOS Metal）未测，M0 结论未最终放行 |

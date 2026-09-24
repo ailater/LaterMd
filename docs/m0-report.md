@@ -37,17 +37,19 @@
 
 | 基准 | 时间(区间中值) | 相对 60fps 帧预算(16.67ms) |
 |---|---|---|
-| `parse_100_sections`(解析) | 92.9 µs | 0.6% |
-| `hash_text_100_sections`(全文哈希,缓存失效探测) | 1.23 µs | 0.007% |
-| `hash_token_slice_100_sections`(token 哈希) | 17.9 µs | 0.1% |
-| `arc_clone_tokens`(token Arc 克隆) | 12 ns | 可忽略 |
-| `render_steady_state`(同输入稳态整帧) | 60.1 µs | 0.4% |
-| `render_resizing`(每帧改宽度,强制重排) | 389.8 µs | 2.3% |
+| `parse_100_sections`(解析) | 94.3 µs | 0.6% |
+| `hash_text_100_sections`(全文哈希,缓存失效探测) | 1.25 µs | 0.008% |
+| `hash_token_slice_100_sections`(token 哈希) | 18.8 µs | 0.1% |
+| `arc_clone_tokens`(token Arc 克隆) | 12.5 ns | 可忽略 |
+| `render_steady_state`(同输入稳态整帧) | 60.5 µs | 0.4% |
+| `render_resizing`(每帧改宽度,强制重排) | 387.5 µs | 2.3% |
+| `render_scroll_code_steady_state`(200 行滚动代码块) | 6.79 µs | 0.04% |
 
 - 基准文档为 100 个块级 section(标题/代码/列表/表格/引用循环,7,298 字节 / 500 行,`benches/markdown.rs` 的 `generate_document`)。
 - **量级解读**:稳态渲染路径(视口剔除 + 缓存命中)与强制重排距帧预算均有两个数量级余量;缓存失效探测(两个哈希)在 µs 级,说明"输入没变就不重排"的守门成本可以忽略。
 - **未测**:验收标准是"10 万字 md 滚动到中部 ≥ 55fps"的**交互帧率**,需要真实滚动 + 视口剔除在窗口里的表现,当前 bench 是 headless 固定 700×900 视口、~7KB 文档。线性外推解析约 1.3ms/10万字(仅为量级估计,非实测),但滚动 fps 结论以 P0 编辑器骨架实测为准。
-- criterion 自身对 `hash_text_100_sections` 标了 +3.2% 微小回弹、对 `hash_token_slice` / `arc_clone` 标了改善,均在同机两次运行噪声带内,不采取行动。
+- criterion 自身对部分基准标了 ±5% 级别的回弹/改善,均在同机多次运行的噪声带内,不采取行动。
+- **本表为 2026-09-24 全量重跑**(含 `render_scroll_code_steady_state`),不是摘录。两次运行的解析/渲染中值差异在 2% 内,数据可用。
 
 ## 主验证 3:wgpu 三 target —— Linux 通过(软件 adapter),Win/mac 待真机
 
@@ -67,7 +69,8 @@
 cargo bench -p egui_markdown --bench markdown -- render_scroll_code_streaming_append
 ```
 
-- **结果**:`time: [9.00 ms 9.34 ms 9.67 ms]`(100 采样)。
+- **结果**:`time: [9.00 ms 9.34 ms 9.67 ms]`(100 采样);同日全量重跑得 `[8.33 ms 8.77 ms 9.21 ms]`,两次同量级,取 ~9 ms 为结论值。
+- **成本构成提醒**:该 bench 每次迭代都 `format!` 重建整篇文档字符串(O(n) 拷贝)后再渲染,因此 9 ms **不是纯渲染成本**。它证明的是「追加一行的端到端成本在毫秒量级」,不能证明渲染是 O(line)。P1 若要把流式成本压到更低,需先自建 bench 剥离字符串拼接,再决定是否必须做增量渲染。
 - **基准语义**(`vendor/egui_markdown/benches/markdown.rs:168`):向一个 100 行起步、持续增长的 rust 代码 fence **追加一行**后整帧渲染 `MarkdownLabel`(700×900 视口,暖缓存,`scroll_code_blocks(true)`);一次 criterion 运行内文档长到 ~2200 行,即该中值覆盖了 100–2200 行区间的追加成本。
 - **量级解读**:单帧 ~9.3ms < 16.7ms 预算(占 56%),mock LLM 100ms/chunk 的节奏下每 chunk 有约 6 帧余量;roadmap 想要的 500/2000/10000 行**帧率矩阵**需产品骨架窗口实测,该 bench 的行数上限与节奏(每 iter 一行)即当前能拿到的最接近数据。
 
@@ -96,4 +99,18 @@ cargo bench -p egui_markdown --bench markdown -- render_scroll_code_streaming_ap
 | 流式基准补跑 | `cargo bench -p egui_markdown --bench markdown -- render_scroll_code_streaming_append` | 9.34 ms 中值 |
 | TTC face 枚举 | `fc-query /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | face 2=Sans SC,7=Mono SC |
 
-其余 bench 数字引自编排提供的 `cargo bench -p egui_markdown` 摘录(题设材料,非本会话重跑)。
+上表 bench 数字均为本机 `cargo bench -p egui_markdown --bench markdown` 全量重跑结果(2026-09-24),非摘录。
+
+## 附:门禁六项在 workspace 根的复跑(2026-09-24)
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ 全绿(本次修掉 vendor `style.rs` 删 membrane 字段遗留的空行) |
+| `cargo clippy --workspace --all-targets` | ✅ |
+| `cargo clippy --workspace --all-targets --no-default-features` | ✅ |
+| `cargo clippy --workspace --all-targets --all-features` | ✅ |
+| `cargo test --workspace --all-features` | ✅ |
+| `cargo doc --no-deps --all-features` | ✅ |
+| `cargo clippy -p latermd-app --all-targets --features glow` | ✅(仅验证可编译,glow 不进主产物) |
+
+> 这七项已固化为 CI 的 gate job(`.github/workflows/rust.yml`),每次 push / PR 自动执行。
