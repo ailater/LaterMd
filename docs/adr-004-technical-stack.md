@@ -1,0 +1,161 @@
+# ADR-004: 技术栈与依赖版本清单
+
+日期: 2026-09-24
+状态: 已接受（2026-09-24 重构，见文末修订记录）
+关联: [[adr-001-gui-and-architecture]]、[[adr-002-platform-renderer-wysiwyg]]、[[adr-003-renderer-and-ecosystem-audit]]
+
+> 本 ADR 只记录**技术栈选型、依赖版本与打包方案**。
+> 功能范围与排期不在本文 —— 唯一事实来源是 [roadmap.md](roadmap.md)。
+
+---
+
+## 1. 项目定位
+
+**跨平台、版本化、可对话、可演化的 Markdown 知识工作台。**
+
+- **Markdown** = 内容层（pulldown-cmark，单一解析器）
+- **AI** = 智能层（token/AST 层操作，见 ADR-003 §3/§6）
+- **Git** = 时间层（只读集成，P2）
+- **纯 Rust GUI** = 跨平台与性能保障（egui + eframe）
+
+三条贯穿全局的约束（单一解析器 / 业务逻辑不依赖 UI 框架 / AST 是 AI 基础）见 [README.md](README.md)，此处不重复。
+
+---
+
+## 2. 技术栈总览（已按实测修正）
+
+| 层面 | 方案 | 版本 | 说明 |
+| :-- | :-- | :-- | :-- |
+| **GUI** | **egui + eframe** | 0.36.2 (2026-09-08) | 五个子 crate 同步发版，无版本错配 |
+| **渲染层** | **vendored egui_markdown (membrane-io)** | HEAD + 升级到 0.36.2 | 4001 行，`forbid(unsafe_code)`，MIT OR Apache-2.0，带集成测试与 criterion bench |
+| **Markdown 解析** | **pulldown-cmark** | 0.13.4 | 从 comrak 改过来，理由见 ADR-003 §4 |
+| **序列化回 MD** | `pulldown-cmark-to-cmark` | 22.0.1 | Live Preview 与 AI 回写的刚需 |
+| **语法高亮** | `syntect` | 5.3.0 | vendored egui_markdown 已集成 |
+| **文本缓冲** | `ropey` | 1.6.1 | 编辑器缓冲 |
+| **Git** | `git2` | 0.21.0 | vendored-libgit2 + vendored-openssl 简化构建 |
+| **文件对话框** | `rfd` | 0.17.2 | Win32 / Cocoa / GTK+XDG Portal |
+| **文件监听** | `notify` | 8.2.0 | inotify / FSEvents / ReadDirectoryChangesW |
+| **异步运行时** | `tokio` | 1.53.1 | — |
+| **CLI** | `clap` | 4.6.7 | — |
+| **目录遍历** | `ignore` | 0.4.33 | 文件树与搜索共用（ADR-005 §4） |
+| **LLM 接入** | OpenAI / Anthropic / Ollama | — | HTTP + SSE 流式，异步 |
+| **打包编排** | **`axodotdev/cargo-dist`** | **v0.33.0** | ❌ 修正：不是已归档的 `astral-sh/cargo-dist` |
+| **打包（备选）** | `crabnebula-dev/cargo-packager` | 0.11.8 | ❌ 修正：不是 `tauri-apps/`（404） |
+| **macOS 打包** | `cargo-bundle` | 0.12.0 | 2026-09-20 仍活跃 |
+| **Linux AppImage** | `cargo-appimage` | 2.4.0 | — |
+| **Linux deb** | `cargo-deb` | 3.8.0 | — |
+| **Linux rpm** | `cargo-generate-rpm` | 0.21.0 | — |
+
+### 已否决
+
+| 方案 | 否决理由 |
+|---|---|
+| **Tauri** | 用户已选纯 Rust。补充：Linux 需 WebKitGTK 4.1，Ubuntu 24.04 / Debian 13 已移除 4.0 包 |
+| **GPUI** | crates.io 版本 0.2.2 停更近一年；实际需 git 依赖 Zed 仓库跟随季度级破坏性重构 |
+| **tektite** | 146 下载 / 0 star / 单人业余维护。**仅保留作为设计参考** |
+| **True WYSIWYG** | 列入 non-goals，理由见 ADR-002 §4.7 |
+
+---
+
+## 3. 跨平台专项
+
+（扩充自 ADR-002 §5，增加打包维度）
+
+| 类别 | Windows 11 | macOS 14 | Linux |
+|---|---|---|---|
+| 窗口后端 | Win32 | Cocoa | X11 / Wayland |
+| 渲染后端 | DX12 / Vulkan | Metal | Vulkan |
+| 快捷键 | `Ctrl` | `Cmd` | `Ctrl` |
+| 换行符 | CRLF | LF | LF |
+| 字体 | 需加载中文字体 | 系统字体较好 | 需确保中文字体可用 |
+| 输入法 | IME | IME | IME |
+| 文件监听 | ReadDirectoryChangesW | FSEvents | inotify |
+| Git 凭据 | Credential Manager | Keychain | libsecret / gnome-keyring |
+| 打包 | `.msi` / `.exe` | `.app` / `.dmg` + 签名公证 | `.AppImage` / `.deb` / `.rpm` |
+
+### 存在性阻塞（不是可选项）
+
+- **macOS**：必须 codesign + notarytool，否则 Gatekeeper 报「已损坏」。需要 Apple Developer 账号。
+- **Windows**：未签名 exe 触发 SmartScreen，建议购买代码签名证书。
+- **证书采购周期是排期风险**：账号审批与证书采购在 M0 期间并行启动（见 roadmap 风险登记册 #3）。
+- **Linux**：AppImage 兼容性最好；deb/rpm 适合发行版仓库。
+
+CI 矩阵结构见 [roadmap.md](roadmap.md) 持续项一节（落地以 `cargo dist init` 生成物为准）。
+
+---
+
+## 4. 工具链：必须钉 1.98.0
+
+**实测失败**：
+
+```
+error: rustc 1.94.0 is not supported by the following packages:
+  egui@0.36.2 requires rustc 1.95
+  ecolor@0.36.2 requires rustc 1.95
+  emath@0.36.2 requires rustc 1.95
+  epaint@0.36.2 requires rustc 1.95
+```
+
+本机默认 toolchain 为 1.94.0。**必须加 `rust-toolchain.toml`**：
+
+```toml
+[toolchain]
+channel = "1.98.0"
+```
+
+本机已装该版本，实测可编译通过。
+
+> 注意：上游 egui_markdown 的 `rust-toolchain.toml` 写的是 `channel = "stable"`，vendor 后需改为钉死版本。
+
+---
+
+## 5. 项目结构（终态）
+
+```
+LaterMD/
+├── Cargo.toml
+├── rust-toolchain.toml              # channel = "1.98.0"
+├── vendor/
+│   └── egui_markdown/               # vendored + 升到 egui 0.36.2
+│       ├── src/
+│       ├── egui_markdown_style/     # 子 crate：MarkdownStyle + serde
+│       ├── tests/                   # cache / indent / truncate / width
+│       ├── check.sh                 # 照抄到 CI
+│       └── LICENSE-MIT, LICENSE-APACHE
+├── crates/
+│   ├── latermd-core/                # 应用状态机、DTO（出现第二消费者时创建）
+│   ├── latermd-md/                  # pulldown-cmark 封装 + token span
+│   ├── latermd-render/              # token → 绘制指令（不 import egui）
+│   ├── latermd-editor/              # ropey + caret/选区 + IME
+│   ├── latermd-git/                 # git2 封装（P2）
+│   ├── latermd-ai/                  # provider trait、流式（P1）
+│   ├── latermd-export/              # HTML（P0）/ PDF / DOCX
+│   └── latermd-app/                 # eframe binary，唯一 GUI crate
+├── docs/
+└── .github/workflows/
+```
+
+**此结构是终态，不是开工指令。** 各 crate 的增量创建时机见 [roadmap.md](roadmap.md)「crate 增量创建表」—— 空骨架是过早抽象。
+
+**说明**：此结构相对于初版方案的 `apps/desktop` + `core` + `ui` + `packages/` 做了简化。理由：
+
+- egui 是立即模式，UI 代码天然与状态机耦合，强行拆 `ui` 层会产生大量跨 crate 的 `&mut Ui` 传递
+- `packages/markdown-editor` 是过早抽象 —— 第一个可用版本之前不存在第二个消费者
+
+保留的核心原则不变：**业务逻辑不依赖 UI 框架**。
+
+---
+
+## 6. 历史决策摘录（保留结论，细节见出处）
+
+- **PoC 阶段已被 Vendor 适配取代。** 原 PoC 的三个验证项中，「升级改动量」已由实测回答（24 个错误、3-5 工作日，无阻塞风险），故可直接进 M0。
+- **打包工具勘误**：cargo-dist 官方仓库是 `axodotdev/cargo-dist`；`astral-sh/cargo-dist` 已归档；`tauri-apps/cargo-packager` 404，实为 `crabnebula-dev/cargo-packager`。
+
+---
+
+## 修订记录
+
+| 日期 | 变更 |
+|---|---|
+| 2026-09-24 | 初版：技术栈汇总（当时还承担「最终汇总」职责，含功能范围与排期） |
+| 2026-09-24 | **重构**：原 §六功能范围、§七演进路线是过期快照（P0 6-8 周、无文件树/大纲/搜索），与 ADR-005 修订后的 roadmap 冲突。按「单一事实来源」原则，范围与排期全部移交 roadmap.md，本文收敛为纯技术栈 ADR。同步删除与 ADR-001/002/003 重复的铁律、heal/LinkHandler、架构约束三节 |
