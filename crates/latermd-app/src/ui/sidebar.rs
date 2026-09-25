@@ -1,41 +1,60 @@
 //! 侧边栏:页签栏 + 当前页签内容。文件树(P0 基础版:懒加载 + 截断 +
-//! 点击打开 + 当前文件高亮)与大纲(P0 廉价版:点击跳编辑器光标)接真数据,
-//! 搜索仍占位。
+//! 点击打开 + 当前文件高亮)、全文搜索(P1:去抖 + 流式结果 + 点击跳行)
+//! 与大纲(P0 廉价版:点击跳编辑器光标)均接真数据。
 //!
 //! 文件树渲染自管展开状态(`FileTreeState::expanded`)+ `ui.indent` 缩进,
 //! 不用 `CollapsingHeader`(ADR-005 §4.1);行点击只发消息,子项列举在
 //! `logic` 归约的 `FileTreeState::ensure_loaded`(懒加载落点)。
+//!
+//! 搜索面板的去抖是两段接力:`ui` 把输入变化原地写入 `SearchState` 并发
+//! `SearchQueryChanged`,`logic` 归约顺延去抖计时;计时到点由本层发
+//! `SearchRequested`、`logic` 再发起后台搜索——到点判断必须在每帧都跑的
+//! `ui` 侧,egui 空闲时不来帧,`logic` 单靠自己等不到到点那一刻。
 
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
+use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
 use crate::state::{Message, SidebarTab};
 use latermd_md::OutlineItem;
 
 use eframe::egui;
 use std::path::Path;
+use std::time::Instant;
 
 /// 大纲层级每深一级的缩进宽度(px)。
 const OUTLINE_INDENT: f32 = 14.0;
 
+/// 搜索结果行摘要的最大字符数(命中行可能是长段落,截断保列表可读)。
+const SNIPPET_MAX_CHARS: usize = 120;
+
+/// 大纲页的只读数据:标题快照 + 编辑器当前光标(两者分属 `State` 的
+/// `preview` 与 `cursor` 字段,侧边栏只读;打包纯粹为收敛 `ui` 的参数)。
+pub struct OutlineView<'a> {
+    pub items: &'a [OutlineItem],
+    pub cursor_byte: Option<usize>,
+}
+
 /// 绘制侧边栏内容。
 ///
-/// `active_tab` 与 `outbox` 是从 `App` 上解构出的不相交借用,使本函数可以与
-/// `show_collapsible` 原地持有的 `&mut visible` 并存(见 `layout.rs`)。
-/// `file_tree` 与 `current_file` 只读:树交互全部经由消息归约。
+/// `active_tab`、`search` 与 `outbox` 是从 `App` 上解构出的不相交借用,使本
+/// 函数可以与 `show_collapsible` 原地持有的 `&mut visible` 并存(见
+/// `layout.rs`)。`file_tree`、`outline` 与 `current_file` 只读:交互全部
+/// 经由消息归约;`search` 的输入文本/开关由本层原地改写(TextEdit/checkbox
+/// 控件的 `&mut` 要求,同编辑器缓冲的例外),取消与发起都在归约。
 pub fn ui(
     panel: &mut egui::Ui,
     active_tab: &mut SidebarTab,
     file_tree: &FileTreeState,
     current_file: Option<&Path>,
-    outline: &[OutlineItem],
-    cursor_byte: Option<usize>,
+    outline: OutlineView<'_>,
+    search: &mut SearchState,
     outbox: &mut Vec<Message>,
 ) {
     tab_bar(panel, active_tab, outbox);
     panel.add_space(4.0);
     match *active_tab {
         SidebarTab::Files => files_panel(panel, file_tree, current_file, outbox),
-        SidebarTab::Search => placeholder(panel, "搜索占位(P1)"),
-        SidebarTab::Outline => outline_panel(panel, outline, cursor_byte, outbox),
+        SidebarTab::Search => search_panel(panel, search, file_tree.root.as_deref(), outbox),
+        SidebarTab::Outline => outline_panel(panel, outline, outbox),
     }
 }
 
@@ -55,22 +74,18 @@ fn tab_bar(panel: &mut egui::Ui, active_tab: &mut SidebarTab, outbox: &mut Vec<M
 
 /// 大纲列表。数据来自 [`crate::state::PreviewState`] 的快照,文档变化时随
 /// 预览同一时机重算,空闲帧零开销。
-fn outline_panel(
-    panel: &mut egui::Ui,
-    outline: &[OutlineItem],
-    cursor_byte: Option<usize>,
-    outbox: &mut Vec<Message>,
-) {
+fn outline_panel(panel: &mut egui::Ui, outline: OutlineView<'_>, outbox: &mut Vec<Message>) {
+    let OutlineView { items, cursor_byte } = outline;
     egui::ScrollArea::vertical()
         .id_salt("outline-scroll")
         // 不收缩宽度,让长标题换行而不是把面板撑宽
         .auto_shrink([false, false])
         .show(panel, |ui| {
-            if outline.is_empty() {
+            if items.is_empty() {
                 ui.weak("无标题:文档里还没有 Markdown 标题");
             }
-            let active = active_index(outline, cursor_byte);
-            for (index, item) in outline.iter().enumerate() {
+            let active = active_index(items, cursor_byte);
+            for (index, item) in items.iter().enumerate() {
                 outline_row(ui, item, active == Some(index), outbox);
             }
         });
@@ -104,8 +119,100 @@ fn outline_row(
     response
 }
 
-fn placeholder(panel: &mut egui::Ui, text: &str) {
-    panel.weak(text);
+/// Search 页:输入行(正则 + 大小写开关)+ 状态行 + 结果列表。
+///
+/// 无根目录时只显示引导(搜索范围复用文件树的根,不另设第二份)。
+fn search_panel(
+    panel: &mut egui::Ui,
+    search: &mut SearchState,
+    root: Option<&Path>,
+    outbox: &mut Vec<Message>,
+) {
+    let Some(root) = root else {
+        panel.weak("搜索需要一个根目录:先在「文件」页选择");
+        return;
+    };
+
+    panel.horizontal(|ui| {
+        let edited = egui::TextEdit::singleline(&mut search.query)
+            .id_salt("search-input")
+            .hint_text("正则表达式…")
+            .desired_width(f32::INFINITY)
+            .show(ui)
+            .response
+            .changed();
+        let toggled = ui.checkbox(&mut search.case_insensitive, "Aa").changed();
+        if edited || toggled {
+            outbox.push(Message::SearchQueryChanged);
+        }
+    });
+    // 去抖到点:本层发 SearchRequested,发起在下一帧归约(模块注释)。
+    if search.debounce_due.is_some_and(|due| due <= Instant::now()) && !search.query.is_empty() {
+        outbox.push(Message::SearchRequested);
+    }
+    match &search.status {
+        SearchStatus::Running => {
+            panel.weak(format!("搜索中…(已 {} 条)", search.hits.len()));
+        }
+        SearchStatus::Finished if search.hits.is_empty() => {
+            panel.weak("无命中");
+        }
+        SearchStatus::Invalid(msg) => {
+            panel.weak(format!("⚠ {msg}"));
+        }
+        SearchStatus::Idle | SearchStatus::Finished => {}
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt("search-results-scroll")
+        .auto_shrink([false, false])
+        .show(panel, |ui| {
+            if search.hits.is_empty() && matches!(search.status, SearchStatus::Idle) {
+                ui.weak("输入搜索词,回车不必按——300ms 停顿后自动搜索");
+            }
+            for hit in &search.hits {
+                search_row(ui, hit, root, outbox);
+            }
+            if search.truncated {
+                ui.weak(format!(
+                    "已达 {} 条上限,后续命中未显示(输入更精确的模式收窄)",
+                    MAX_HITS
+                ));
+            }
+        });
+}
+
+/// 单条结果:第一行「相对根的路径:行号」,第二行命中行摘要;整块一个
+/// SelectableLabel,点击发消息(打开 + 跳行在 `logic` 归约)。
+/// 返回行响应,独立成函数便于点击测试定位。
+fn search_row(
+    ui: &mut egui::Ui,
+    hit: &SearchResult,
+    root: &Path,
+    outbox: &mut Vec<Message>,
+) -> egui::Response {
+    let relative = hit.path.strip_prefix(root).unwrap_or(hit.path.as_path());
+    let text = format!(
+        "{}:{}\n{}",
+        relative.display(),
+        hit.line_no,
+        snippet(&hit.line_text)
+    );
+    let response = ui.selectable_label(false, text);
+    if response.clicked() {
+        outbox.push(Message::SearchResultClicked(hit.path.clone(), hit.line_no));
+    }
+    response
+}
+
+/// 命中行摘要:按字符截断(不切断多字节序列),超长加省略号。
+fn snippet(line: &str) -> String {
+    if line.chars().count() <= SNIPPET_MAX_CHARS {
+        line.to_owned()
+    } else {
+        let cut: String = line.chars().take(SNIPPET_MAX_CHARS).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Files 页:顶部根目录选择行 + 懒加载目录树。
@@ -389,5 +496,105 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(outbox, vec![Message::OutlineItemClicked(10..19)]);
+    }
+
+    /// 点击搜索结果行:发出携带(路径, 行号)的消息;仅渲染不产生消息。
+    #[test]
+    fn clicking_search_row_sends_message() {
+        let ctx = egui::Context::default();
+        let root = PathBuf::from("/vault");
+        let hit = SearchResult {
+            path: root.join("docs/note.md"),
+            line_no: 7,
+            line_text: "命中这一行".to_owned(),
+        };
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        // 第一帧只渲染,拿行位置
+        ctx.run_ui(RawInput::default(), |ui| {
+            rect.set(search_row(ui, &hit, &root, &mut outbox).rect);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty());
+
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                search_row(ui, &hit, &root, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::SearchResultClicked(root.join("docs/note.md"), 7)]
+        );
+    }
+
+    /// 去抖接力(search_panel 层):计时到点 + 非空输入 → SearchRequested;
+    /// 未到点不发;无根目录时提前返回,到点也不发。
+    #[test]
+    fn search_panel_sends_requested_only_when_due_and_rooted() {
+        let ctx = egui::Context::default();
+        let render = |search: &mut SearchState, root: Option<&Path>, outbox: &mut Vec<Message>| {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                search_panel(ui, search, root, outbox);
+            });
+            output.drop_without_applying_deltas();
+        };
+
+        // 未到点:不发
+        let mut search = SearchState {
+            query: "latermd".into(),
+            debounce_due: Some(Instant::now() + std::time::Duration::from_secs(60)),
+            ..SearchState::default()
+        };
+        let mut outbox = Vec::new();
+        render(&mut search, Some(Path::new("/vault")), &mut outbox);
+        assert!(outbox.is_empty(), "计时未到点,不发起");
+
+        // 到点 + 有根:发
+        search.debounce_due = Some(Instant::now() - std::time::Duration::from_secs(1));
+        render(&mut search, Some(Path::new("/vault")), &mut outbox);
+        assert_eq!(outbox, vec![Message::SearchRequested]);
+
+        // 到点 + 无根:面板短路(显示引导),不发起
+        let mut unrooted = SearchState {
+            query: "latermd".into(),
+            debounce_due: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..SearchState::default()
+        };
+        let mut outbox = Vec::new();
+        render(&mut unrooted, None, &mut outbox);
+        assert!(outbox.is_empty(), "无根目录不发 SearchRequested");
+
+        // 空输入:即使到点也不发(归约里同样短路,这里先挡一道)
+        let mut empty = SearchState {
+            debounce_due: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..SearchState::default()
+        };
+        let mut outbox = Vec::new();
+        render(&mut empty, Some(Path::new("/vault")), &mut outbox);
+        assert!(outbox.is_empty());
+    }
+
+    /// 摘要截断按字符不切断多字节序列,短行原样返回。
+    #[test]
+    fn snippet_truncates_by_chars() {
+        assert_eq!(snippet("短行"), "短行");
+        let long = "界".repeat(SNIPPET_MAX_CHARS + 10);
+        let cut = snippet(&long);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), SNIPPET_MAX_CHARS + 1);
     }
 }

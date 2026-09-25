@@ -13,11 +13,16 @@
 use crate::export;
 use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
+use crate::search::SearchState;
 use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// 搜索输入去抖间隔(roadmap 阶段 3 的既定值)。
+const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// 侧边栏功能页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +113,8 @@ pub struct State {
     pub cursor: OutlineCursor,
     /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
     pub file_tree: FileTreeState,
+    /// 全文搜索(Search 页签):输入去抖、后台服务与结果缓存。
+    pub search: SearchState,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
     /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
@@ -191,6 +198,7 @@ impl Default for State {
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
             file_tree: FileTreeState::default(),
+            search: SearchState::default(),
             editor,
             document: DocumentState {
                 path: None,
@@ -233,6 +241,14 @@ pub enum Message {
     FileTreeToggled(PathBuf),
     /// 点击文件树文件行,载荷为文件路径。
     FileSelected(PathBuf),
+    /// 搜索输入变化(文本/大小写开关由 `ui` 原地写入 `SearchState`,消息
+    /// 本身无载荷):归约里取消旧搜索并顺延去抖。
+    SearchQueryChanged,
+    /// 去抖到点,按当前输入与根目录发起搜索。
+    SearchRequested,
+    /// 点击搜索结果,载荷为(文件路径, 1 起行号):归约里打开该文件并把
+    /// 光标跳到行首。
+    SearchResultClicked(PathBuf, usize),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
 }
@@ -252,6 +268,11 @@ impl State {
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
             Message::FileSelected(path) => self.open_from_file_tree(&path),
+            Message::SearchQueryChanged => self.search.input_changed(DEBOUNCE),
+            Message::SearchRequested => self.start_search(),
+            Message::SearchResultClicked(path, line_no) => {
+                self.open_search_hit(&path, line_no);
+            }
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
         }
     }
@@ -288,6 +309,8 @@ impl State {
         self.document.dirty = self.editor.is_dirty();
         // 文件树懒加载落点:根 + 展开中目录的子项缓存补齐(键缺席才 IO)。
         self.file_tree.ensure_loaded();
+        // 搜索结果收流:非阻塞收空 channel(重绘驱动见 `ui::layout::reduce`)。
+        self.search.poll_hits();
     }
 
     fn run_file_cmd(&mut self, cmd: FileCmd) {
@@ -366,6 +389,39 @@ impl State {
         self.open_from(path);
     }
 
+    /// 去抖到点发起搜索(`Message::SearchRequested` 的归约)。无根目录
+    /// 不发起(该情形下 `ui` 层就不该发消息,这里防御性短路)。
+    fn start_search(&mut self) {
+        if let Some(root) = self.file_tree.root.clone() {
+            self.search.start(&root);
+        } else {
+            self.search.reset();
+        }
+    }
+
+    /// 点击搜索结果(`Message::SearchResultClicked` 的归约):文件与当前
+    /// 不同则先打开(读盘失败只落提示行,不跳转),再把光标跳到命中行
+    /// 行首——经 [`OutlineCursor::jump_to`] 由 `ui::editor` 覆写持久光标
+    /// 并交还焦点。
+    ///
+    /// 行号来自点击时刻的搜索快照,打开后文件可能比搜索时短(外部修改、
+    /// 或命中的本就是尚未落盘的另一版本):1 起行号先转 0 起,再由
+    /// [`EditorBuffer::line_to_byte`] 按当前缓冲钳制到文末,绝不 panic
+    /// (大纲跳转 span 过期的同款教训)。
+    fn open_search_hit(&mut self, path: &Path, line_no: usize) {
+        if self.document.path.as_deref() != Some(path) {
+            if self.unsaved_guard() {
+                return;
+            }
+            self.open_from(path);
+            if self.document.path.as_deref() != Some(path) {
+                return; // 读盘失败:notice 已带原因,不跳
+            }
+        }
+        let byte = self.editor.line_to_byte(line_no.saturating_sub(1));
+        self.cursor.jump_to = Some(self.editor.byte_to_char(byte));
+    }
+
     /// 弹目录对话框选文件树根目录(Files 页「选择…」按钮的归约)。起始目录
     /// 取最近根或当前文档所在目录,均已校验存在(rfd 对不存在目录的行为未定义)。
     fn pick_file_tree_root(&mut self) {
@@ -389,9 +445,11 @@ impl State {
     }
 
     /// 换根并持久化(对话框与最近列表两个入口共用);落盘失败只落提示行,
-    /// 本次会话的文件树照常可用。
+    /// 本次会话的文件树照常可用。搜索一并复位:旧根的结果在新根下相对
+    /// 路径失真,留着只会误导。
     fn change_file_tree_root(&mut self, dir: PathBuf) {
         self.file_tree.set_root(dir);
+        self.search.reset();
         if let Err(error) =
             FileTreeSettings::from(&self.file_tree).save_to(self.settings_dir.as_deref())
         {
@@ -731,5 +789,179 @@ mod tests {
         let notice = state.document.notice.as_deref().unwrap();
         assert!(notice.contains("导出失败"), "{notice}");
         assert!(notice.contains("dir.html"), "{notice}");
+    }
+
+    /// 搜索点击归约:换文件 + 跳到命中行行首。行号 1 起 → rope 行 0 起,
+    /// 目标是第 2 行(含 CJK)行首的字符偏移。
+    #[test]
+    fn search_click_opens_file_and_jumps_to_hit_line() {
+        let dir = temp_path("search-click");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "# 甲\n你好 world\n第三行\n").unwrap();
+
+        let mut state = State::default();
+        state.apply(Message::SearchResultClicked(note.clone(), 2));
+
+        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
+        assert_eq!(state.editor.text(), "# 甲\n你好 world\n第三行\n");
+        let line2_byte = state.editor.line_to_byte(1);
+        assert_eq!(line2_byte, 6, "前置:首行「# 甲\\n」共 6 字节");
+        assert_eq!(
+            state.cursor.jump_to,
+            Some(state.editor.byte_to_char(line2_byte)),
+            "光标(字符偏移)落在第二行行首"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已打开文件上的点击:不重开、只更新跳转目标(路径相同即跳过 IO)。
+    #[test]
+    fn search_click_on_current_file_only_jumps() {
+        let dir = temp_path("search-same");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "一\n二\n三\n").unwrap();
+
+        let mut state = State::default();
+        state.apply(Message::SearchResultClicked(note.clone(), 1));
+        assert_eq!(state.cursor.jump_to, Some(0));
+        state.apply(Message::SearchResultClicked(note.clone(), 3));
+        assert_eq!(
+            state.cursor.jump_to,
+            Some(state.editor.byte_to_char(state.editor.line_to_byte(2))),
+            "同行内再次点击,光标前进到第三行"
+        );
+        assert!(state.document.notice.is_none(), "未发生 IO 失败");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 过期行号(搜索后文件变短/被外部修改):钳制到文末,不 panic。
+    #[test]
+    fn search_click_with_stale_line_clamps_to_end() {
+        let dir = temp_path("search-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "只有一行\n").unwrap();
+
+        let mut state = State::default();
+        state.apply(Message::SearchResultClicked(note.clone(), 999));
+        assert_eq!(
+            state.cursor.jump_to,
+            Some(state.editor.len_chars()),
+            "行号远超行数,钳制到文末"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 点击指向已消失的文件:读盘失败落提示行,不换文档、不设跳转。
+    #[test]
+    fn search_click_on_missing_file_notifies_without_jump() {
+        let mut state = State::default();
+        let before = state.editor.text().to_owned();
+        state.apply(Message::SearchResultClicked(
+            PathBuf::from("/latermd/no/such/hit.md"),
+            1,
+        ));
+        assert!(state.document.notice.is_some(), "读盘失败有提示");
+        assert_eq!(state.document.path, None, "文档身份未变");
+        assert_eq!(state.editor.text(), before, "缓冲未被触碰");
+        assert_eq!(state.cursor.jump_to, None, "不设跳转");
+    }
+
+    /// dirty 保护与文件树同款:未保存时点击搜索结果被拦,不跳转。
+    #[test]
+    fn search_click_blocked_while_dirty() {
+        let dir = temp_path("search-dirty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "目标\n").unwrap();
+
+        let mut state = State::default();
+        state.editor.insert_chars(0, "草稿");
+        assert!(state.editor.is_dirty());
+
+        state.apply(Message::SearchResultClicked(note.clone(), 1));
+        assert_eq!(state.document.path, None, "未换文档");
+        assert_eq!(state.cursor.jump_to, None, "未设跳转");
+        assert!(state.document.notice.is_some(), "拦截有提示");
+        assert!(state.editor.text().starts_with("草稿"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 去抖两段归约:输入变化清结果并顺延计时;到点发起(有根)Running,
+    /// 帧末收流落回 Idle 且命中在缓存;无根时到点是复位而非发起。
+    #[test]
+    fn search_messages_drive_debounce_and_start() {
+        let dir = temp_path("search-flow");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "latermd 独占一行\n没有\n").unwrap();
+
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.search.query = "latermd".into();
+        // 预置旧搜索残留:归约必须清掉
+        state.search.hits.push(crate::search::SearchResult {
+            path: dir.join("stale.md"),
+            line_no: 1,
+            line_text: "旧根的残留".into(),
+        });
+
+        state.apply(Message::SearchQueryChanged);
+        assert!(state.search.debounce_due.is_some(), "去抖计时已顺延");
+        assert!(state.search.hits.is_empty(), "旧结果被清");
+
+        state.apply(Message::SearchRequested);
+        assert!(state.search.is_running(), "有根 + 合法模式 → Running");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.search.is_running() && std::time::Instant::now() < deadline {
+            state.end_of_logic();
+            if state.search.is_running() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            state.search.status,
+            crate::search::SearchStatus::Finished,
+            "自然结束"
+        );
+        assert_eq!(state.search.hits.len(), 1);
+        assert_eq!(state.search.hits[0].line_no, 1);
+
+        // 无根:到点发起是防御性复位,不进后台
+        let mut rootless = State::default();
+        rootless.search.query = "latermd".into();
+        rootless.apply(Message::SearchQueryChanged);
+        rootless.apply(Message::SearchRequested);
+        assert!(!rootless.search.is_running());
+        assert_eq!(rootless.search.debounce_due, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换根复位搜索:结果与去抖计时一并丢弃,绝不重发(新根由用户重新输入)。
+    #[test]
+    fn changing_tree_root_resets_search() {
+        let dir = temp_path("search-reset-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_dir = temp_path("search-reset-settings");
+        let mut state = State {
+            settings_dir: Some(settings_dir.clone()),
+            ..State::default()
+        };
+        state.search.query = "latermd".into();
+        state.search.debounce_due = Some(std::time::Instant::now());
+        state.search.hits.push(crate::search::SearchResult {
+            path: dir.join("old.md"),
+            line_no: 1,
+            line_text: "旧根结果".into(),
+        });
+
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        assert_eq!(state.search.debounce_due, None, "去抖计时被清");
+        assert!(state.search.hits.is_empty(), "旧根结果被清");
+        assert!(!state.search.is_running());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&settings_dir);
     }
 }
