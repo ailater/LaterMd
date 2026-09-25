@@ -26,10 +26,24 @@
 brew install --cask crazykun/ailater/latermd
 ```
 
-- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 直下 `.exe`。首次运行 SmartScreen 会警告,点「更多信息 → 仍要运行」即可。
-- **Linux**:`.AppImage` / `.deb` / `.rpm` 从 Releases 直下,或使用 Linuxbrew。
+- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 下 `latermd-x86_64-pc-windows-msvc.zip`(ARM64 机器取 `aarch64-pc-windows-msvc`),解压即用。无签名,SmartScreen 会警告,点「更多信息 → 仍要运行」。
+- **Linux**:下 `latermd-x86_64-unknown-linux-gnu.tar.xz`,解包后 `./latermd`,或自行丢进 `~/.local/bin`。
+- **macOS**:universal2 单 dmg(`latermd-v{版本}-universal2-apple-darwin.dmg`),双架构 lipo 合一,Intel / Apple Silicon 通用。推荐走 brew(postflight 自动去 quarantine);**从 Releases 直下 dmg** 的用户,拖入 `/Applications/` 后首次打开会被 Gatekeeper 拦(本项目无签名公证,提示「无法验证开发者」或「已损坏,无法打开」),执行一次下面的命令即可正常启动(brew 安装的用户不需要):
 
-> 未发布前此节为渠道预告,当前无可安装产物。
+  ```bash
+  sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app
+  ```
+
+> **当前还没发过版。** 发布链路(cargo-dist 五目标 + macOS dmg + cask)已就位,首次 Release 需先合入打包 PR 并打 tag:`git tag v0.1.0 && git push origin v0.1.0`。在那之前请按上一节本地编译运行。
+
+### 发布一次版本的步骤
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0   # 触发 release.yml:五目标构建 + 建 Release
+                                            # Release 发布后自动触发 macos-dmg.yml 合成 dmg
+```
+
+产物命名固定为 `latermd-{target-triple}.tar.xz|.zip`(**不含版本号**,cask 热链依赖此格式)与 `latermd-v{版本}-universal2-apple-darwin.dmg`。
 
 ## 技术栈
 
@@ -71,10 +85,10 @@ brew install --cask crazykun/ailater/latermd
 ```bash
 cargo run --release -p latermd-app     # 编译并直接运行
 cargo build --release                  # 只编译
-./target/release/latermd-app           # 跑已编译好的产物
+./target/release/latermd               # 跑已编译好的产物
 ```
 
-产物位置:`target/release/latermd-app`(Linux 约 31 MB)。另有 `target/debug/latermd-app`(约 393 MB,带调试信息、启动慢)。
+产物位置:`target/release/latermd`(Linux 约 31 MB;crate 名 `latermd-app` 不变,bin 名 `latermd`,与发布资产同名)。另有 `target/debug/latermd`(约 393 MB,带调试信息、启动慢)。
 
 ### Windows / macOS
 

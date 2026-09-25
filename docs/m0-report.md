@@ -1,7 +1,7 @@
 # M0 技术验证报告
 
 日期: 2026-09-24
-状态: 自动化部分完成,真机项待实测
+状态: 自动化完成;Linux 真机项已测(IME 首测结论见验证 1),Win/mac 真机项待实测
 关联: [roadmap.md](roadmap.md) 阶段 1、[adr-002](adr-002-platform-renderer-wysiwyg.md)、[adr-004](adr-004-technical-stack.md)
 
 > 执行环境: Deepin 25(内核 6.18.48-amd64-desktop-rolling)/ X11 会话(DISPLAY=:0)/ rustc 1.98.0 / eframe 0.36.2 + wgpu 30.0.1。
@@ -13,23 +13,28 @@
 
 | # | 验证项 | 状态 | 一句话结论 |
 |---|---|---|---|
-| 1 | IME 中文输入 | **待实测** | 三平台均未测;M0 冒烟载体还没有文本输入框,候选框跟随/不吞字无法自动化 |
+| 1 | IME 中文输入 | **Linux 已实测:可用,候选框不跟随** | Deepin X11 + fcitx5:中文组词上屏正常,但候选框不落在光标下方;上报链路核对完整,故障点待定位(见验证 1) |
 | 2 | 长文档性能 | **bench 证据支持,交互 fps 待测** | 解析 ~93 µs/7.3KB、稳态渲染 ~60 µs/帧,距 16.7ms 帧预算两个数量级;10 万字滚动 fps 需骨架期实测 |
 | 3 | wgpu 三 target | **Linux ✅(软件 adapter),Win/mac 待真机** | Linux Vulkan 起动并正确渲染,但 adapter 为 llvmpipe;Win11 DX12 / macOS Metal 待真机 |
 | 4 | 流式性能边界 | **Linux ✅** | 追加一行 + 整帧渲染 ~9.3 ms < 16.7ms,100ms/chunk 节奏有约 6 帧余量 |
 | 5 | 中文渲染 | **Linux ✅** | 无方块;字体方案定案:cfg 原生候选路径表,不引入 fontdb / font-kit |
 | 6 | tokio ↔ egui 通道 | **未开始(P1 前补)** | workspace 尚未引入 tokio(符合增量依赖原则),不为验证提前引入 |
 
-**结论:继续。** 自动化可见的全部证据无红旗,不构成换 iced 或停止的信号;但 M0 出口放行仍卡在两条真机项(IME、Win/mac wgpu),维持原计划。
+**结论:继续。** 自动化可见的全部证据无红旗,不构成换 iced 或停止的信号;但 M0 出口放行仍卡在两条真机项(Win/mac IME、Win/mac wgpu;Linux IME 已首测,见验证 1),维持原计划。
 
 ---
 
-## 主验证 1:IME 中文输入 —— 待实测
+## 主验证 1:IME 中文输入 —— Linux 已实测(可用,候选框不跟随),Win/mac 待真机
 
 - **验收标准**:候选框跟随 caret、不吞字、不抢焦点(Win11 微软拼音 + macOS 14 简体拼音)。
-- **现状**:M0 冒烟载体(`crates/latermd-app/src/main.rs`)只有只读标签,没有 `TextEdit`,IME 行为无从触发;且候选框跟随属于人工交互观察项,无法在无人值守环境自动化。
-- **已完成的相关事实**:X11 下 eframe 窗口稳定运行(见验证 3 证据),无与输入法服务相关的启动报错。
-- **下一步**:P0 编辑器骨架落地 `TextEdit` 后,先在本机测 fcitx/ibus,再上 Win11 / macOS 真机;三平台均记录候选框跟随、连续输入不吞字、窗口切换不抢焦点三项观察结果。
+- **Linux 真机首测(2026-09-25,Deepin 25 / X11 会话 / fcitx5,会话内挂搜狗输入法模块 `com.sogou.ime.ng.fcitx5.deepin`,`XMODIFIERS=@im=fcitx`;载体 = P0 编辑器 `TextEdit`)**:
+  - **✅ 中文输入可用**:经输入法组词、上屏均正常,输入功能本身成立。
+  - **❌ 候选框不跟随光标**:候选框未出现在光标下方,不随 caret 移动。吞字 / 抢焦点两项本轮未逐项观察,不记结论,随修复复测一并补记。
+  - **上报链路核对(2026-09-25,本机 cargo registry 源码)**:光标位置上报链在当前依赖栈中**完整存在** —— egui 0.36.2 `TextEdit` 产出 `Output::ime`(`IMEOutput`,含 caret rect;`widgets/text_edit/builder.rs:952`)→ egui-winit 0.36.2 调 `Window::set_ime_cursor_area`(`src/lib.rs:1177`)→ winit 0.30.13 X11 侧实现了 XIM spot 上报(`x11/ime/mod.rs:188` `send_xim_spot`)。即**不是整条链路缺失**,故障点在链中某一环或输入法侧。
+  - **怀疑方向(待验证,非结论)**:① fcitx5 / 搜狗模块在 XIM 路径下对候选框定位的处理 —— 经典 XIM root/over-the-spot 风格下候选框固定于屏角/窗角,不跟随 spot;② rect 数值或上报时机问题(如仅在组合进行中才更新);③ **对照实验(成本最低,先做)**:同机 Wayland 会话跑一次,winit 走 `zwp_text_input_v3`,与 X11/XIM 是两条完全不同的定位路径,可一步区分「窗口系统路径问题」与「应用上报问题」。
+  - **定性**:缺陷隔离在「候选框跟随」,不是「输入不可用」;Linux 不在 M0 放行线内(验收标准只定义 Win11/macOS 真机),**不触发风险登记册 #1 的换 iced 应对**。归属定位后再定:app/配置层可修则修;若为上游(egui/winit/fcitx5-XIM)限制,按既定原则记为已知问题,不硬修 egui。
+- **历史(2026-09-24)**:M0 冒烟载体(`crates/latermd-app/src/main.rs`)只有只读标签,无 `TextEdit`,IME 无从触发;X11 下 eframe 窗口稳定运行(见验证 3 证据),无输入法服务相关启动报错。
+- **下一步**:① 先做上面③的 Wayland 对照实验,定位故障环节后回填本文档(连同吞字/抢焦点观察);② Win11 / macOS 真机实测,记录候选框跟随、连续输入不吞字、窗口切换不抢焦点三项。
 
 ## 主验证 2:长文档性能 —— bench 证据支持,交互 fps 待测
 
