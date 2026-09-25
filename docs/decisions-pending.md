@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #22 界面打磨批次的四个口径:图标自绘、撞键拒绝、未实现项禁用、MCP 只出规划(2026-09-25)
+
+- **岔路**:用户指令「图标、快捷键设置、AI 配置页、MCP 规划」留了四处自由度。①egui 无图标集,用 emoji/Unicode 字符(✎ 🗋)还是自绘?②改键撞到别的命令的键位时,抢占还是拒绝?③AI 配置页的「接口方式」里 Anthropic/Ollama adapter 还没写,下拉里给不给选?④MCP 做到什么深度?
+- **自动选择**:①**全部自绘**(`ui/icons.rs`,`Painter` 线段/圆/矩形,归一化坐标)—— emoji 在三平台缺字风险真实(AGENTS §5 已把字体列风险项),自绘零字体/纹理依赖且随主题取色;②**拒绝并指名占用者**("Ctrl+K 已被「打开」占用,未修改")—— 静默抢占会让用户莫名丢另一个命令的键位;裸字母/数字一律拒绑(会被编辑器当输入吞掉);③**显式禁用并写明"未实现"**—— 伪装可选会让用户配完发现没生效,与 decisions-pending #12 同口径;④**只出规划文档**([mcp-plan.md](mcp-plan.md))与设置页禁用态开关,不写半截 server —— MCP 是新增范围(AGENTS §7 深水区之外),该有单独立项,设置页伪造"运行中"不可接受。
+- **如何改**:要换字体图标方案,`ui/icons.rs` 的 `Icon::draw` 是唯一绘制点;要改抢占语义,`State::assign_shortcut` 的 conflict 分支改 `set` 即可;要实现 Anthropic/Ollama,在 `latermd-ai` 加 adapter 并放开 `settings.rs` 里 `implemented()` 的两个禁用点;MCP 开工按 mcp-plan.md 的阶段表走。
+
 ## #21 设置面板 AI key 接线的三岔路：浮窗形态、状态分组、key 闸门位置（2026-09-25）
 
 - **岔路**：任务写「Settings 面板新增 AI Provider 区」，但仓库没有独立 Settings 面板实体——设置只有工具栏的「设置」`menu_button`（`ui/toolbar.rs`），且仓库自己的注释证明「egui 菜单内点击任意控件自动收起」，把密码框 TextEdit 直接嵌进菜单有「点进输入框菜单即收起」的交互风险；任务又写「State 增加 `ai_key_configured: bool`」，字面平铺与仓库的状态分组风格（`SidebarState`/`SearchState`/`AiState`）相悖；key 闸门（provider 启动链路）若放流式共用入口 `start_ai_stream_with_prompt`，`AiStart` 的外层归约会先补空行、`AiSummaryRequested` 会先移除旧摘要节——被拦的命令留下副作用。
