@@ -4,6 +4,8 @@
 //! 只负责把 diff 变成 provider 可消费的 prompt:超长 diff 按字节预算截断
 //! 并在 prompt 里注明,输出要求是一行 conventional 中文 subject。
 
+use crate::truncate_bytes;
+
 /// diff 的字节预算(约 16KB):请求体上限由调用方兜底,不指望模型端截断。
 const DIFF_BUDGET_BYTES: usize = 16 * 1024;
 
@@ -17,14 +19,7 @@ const INSTRUCTIONS: &str = "你是提交信息助手。请根据下方的 git di
 /// 按字节预算截断 diff,不拆 UTF-8 字符(边界回退到字符起点)。
 /// 返回 (截断后的文本, 是否发生了截断)。
 pub fn truncate_diff(diff: &str) -> (String, bool) {
-    let mut budget = DIFF_BUDGET_BYTES;
-    if diff.len() <= budget {
-        return (diff.to_owned(), false);
-    }
-    while !diff.is_char_boundary(budget) {
-        budget -= 1;
-    }
-    (diff[..budget].to_owned(), true)
+    truncate_bytes(diff, DIFF_BUDGET_BYTES)
 }
 
 /// 把 git diff 拼成完整 prompt:输出要求 + (截断说明)+ diff 原文。

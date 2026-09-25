@@ -37,6 +37,10 @@ pub enum Command {
     /// 合成 conventional 中文 subject 并弹建议对话框。流式进行中触发
     /// 同样被忽略(与 AiMockStream 共用防重入)。
     AiCommitMessage,
+    /// AI:生成摘要(P1):文档全文喂 provider,3-5 条要点以引用块形式
+    /// 流式追加到文档末尾;文档已含「AI 摘要」节则先移除再插入。流式
+    /// 进行中触发同样被忽略(共用防重入)。
+    AiSummary,
 }
 
 impl Command {
@@ -55,6 +59,7 @@ impl Command {
             Self::ToggleSidebar => "切换侧边栏",
             Self::AiMockStream => "AI: Mock 流式续写",
             Self::AiCommitMessage => "AI: 生成 commit message",
+            Self::AiSummary => "AI: 生成摘要",
         }
     }
 
@@ -81,7 +86,7 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
             // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
-            Self::AiMockStream | Self::AiCommitMessage => return None,
+            Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => return None,
         };
         Some(shortcut)
     }
@@ -98,6 +103,7 @@ impl Command {
             Self::ToggleSidebar => Message::SidebarToggled,
             Self::AiMockStream => Message::AiStart,
             Self::AiCommitMessage => Message::AiCommitRequested,
+            Self::AiSummary => Message::AiSummaryRequested,
         }
     }
 }
@@ -251,6 +257,7 @@ mod tests {
             Command::AiCommitMessage.message(),
             Message::AiCommitRequested
         );
+        assert_eq!(Command::AiSummary.message(), Message::AiSummaryRequested);
     }
 
     /// AI 命令不绑快捷键(ask 约束:避免与现有键位冲突),其余命令全部有绑定。
@@ -269,5 +276,6 @@ mod tests {
         }
         assert_eq!(Command::AiMockStream.shortcut(), None);
         assert_eq!(Command::AiCommitMessage.shortcut(), None);
+        assert_eq!(Command::AiSummary.shortcut(), None);
     }
 }

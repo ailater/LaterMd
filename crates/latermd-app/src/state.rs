@@ -39,6 +39,11 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// trait 契约),先按 2k 字符封顶。
 const AI_PROMPT_TAIL_CHARS: usize = 2000;
 
+/// 摘要节的标题文本:插入固定用二级标题,与
+/// [`latermd_md::heading_section_span`] 的定位键(层级 + 文本精确匹配)
+/// 保持一致 —— 重复生成时凭它移除旧节,避免摘要堆积。
+const AI_SUMMARY_HEADING: &str = "AI 摘要";
+
 /// 侧边栏功能页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarTab {
@@ -293,6 +298,10 @@ pub enum Message {
     /// 用 working tree diff,喂 provider 合成单行 subject。流式进行中在
     /// 归约里被忽略(防重入,与 [`Message::AiStart`] 同一道闸)。
     AiCommitRequested,
+    /// 请求生成摘要(命令层入口):文档全文喂 provider,移除旧「AI 摘要」
+    /// 节后在文档末尾以引用块形式流式追加新要点。流式进行中在归约里被
+    /// 忽略(防重入,同一道闸)。
+    AiSummaryRequested,
     /// commit message 建议就绪,载荷为单行 subject;置入 state 供浮窗展示。
     AiCommitSuggestion { subject: String },
     /// 关闭 commit message 建议浮窗。
@@ -334,6 +343,7 @@ impl State {
                 Err(reason) => self.document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
+            Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
         }
@@ -380,6 +390,36 @@ impl State {
         // 并取首行;演示期用 Mock 的关键词同步合成。
         let subject = self.ai.provider.mock_commit_subject(&prompt);
         self.apply(Message::AiCommitSuggestion { subject });
+    }
+
+    /// 生成摘要(`Message::AiSummaryRequested` 的归约):移除旧摘要节 →
+    /// 全文拼 prompt → 复用流式通道发块,「## AI 摘要」标题与空行在发起
+    /// 时落到文档末尾,要点 chunk(`> - …` 引用块行)经 [`Message::AiChunk`]
+    /// 追加长在标题下。移除旧节走 AST 定位 + rope 删除,且只发生在归约里
+    /// (铁律三);流式进行中忽略(防重入,与其它 AI 命令同一道闸)。
+    fn request_summary(&mut self) {
+        if self.ai.is_streaming() {
+            return;
+        }
+        let text = self.editor.text().to_owned();
+        if text.trim().is_empty() {
+            self.document.notice = Some("文档为空,没有可摘要的内容".to_owned());
+            return;
+        }
+        // 先移除旧节再取全文:摘要不总结自己;定位用移除前的快照,span 与
+        // 此刻缓冲一致(同帧无人改它)
+        if let Some(span) = latermd_md::heading_section_span(&text, 2, AI_SUMMARY_HEADING) {
+            let range = self.editor.byte_to_char(span.start)..self.editor.byte_to_char(span.end);
+            self.editor.remove_chars(range);
+        }
+        let prompt = latermd_ai::summary_prompt(self.editor.text());
+        // 共用流式入口(二次防重入 + 补空行 + 发起);标题在发起后、首个
+        // chunk 到达前的同一归约里插入,流式块自然接在标题与空行之后
+        self.start_ai_stream_with_prompt(&prompt);
+        self.editor.insert_chars(
+            self.editor.len_chars(),
+            &format!("## {AI_SUMMARY_HEADING}\n\n"),
+        );
     }
 
     /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。流式进行中
@@ -1443,5 +1483,144 @@ mod tests {
         state.apply(Message::AiCommitRequested);
         assert!(state.ai_commit_suggestion.is_some(), "收尾后同一请求生效");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把在途流收干净(收流到结束块并逐条归约),供摘要链路测试复用;
+    /// 超时退出循环后断言流式标志已清。
+    fn drain_ai_stream(state: &mut State) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut done = false;
+            for message in state.poll_ai() {
+                if matches!(message, Message::AiDone | Message::AiFailed(_)) {
+                    done = true;
+                }
+                state.apply(message);
+            }
+            if done || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!state.ai.is_streaming(), "流已收尾");
+    }
+
+    /// 摘要全链路(文档已含旧摘要节):发起时旧节先被移除,新「## AI 摘要」
+    /// 标题落在文档末尾,流式块以引用块行长在标题下;收尾后全文恰好一个
+    /// 「AI 摘要」标题,旧要点不残留,正文原样保留。
+    #[test]
+    fn ai_summary_replaces_old_section_and_streams_new_points() {
+        let mut state = State::default();
+        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state
+            .editor
+            .load("# 设计\n\n正文段落。\n\n## AI 摘要\n\n> - 旧要点甲\n> - 旧要点乙\n");
+
+        state.apply(Message::AiSummaryRequested);
+        assert!(state.ai.is_streaming(), "发起后流式标志置位");
+        assert_eq!(
+            state.editor.text(),
+            "# 设计\n\n正文段落。\n\n## AI 摘要\n\n",
+            "发起时旧节已移除,新标题与空行就位"
+        );
+
+        drain_ai_stream(&mut state);
+        assert_eq!(
+            state.editor.text(),
+            "# 设计\n\n正文段落。\n\n## AI 摘要\n\n> - 设计\n> - 正文段落。\n",
+            "要点引用块长在标题下,旧要点不残留"
+        );
+        let summary_headings = latermd_md::outline(state.editor.text())
+            .into_iter()
+            .filter(|item| item.text == AI_SUMMARY_HEADING)
+            .count();
+        assert_eq!(summary_headings, 1, "摘要标题恰好一个,不堆积");
+        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+
+        // 再来一次:新节替换上一轮的节,仍然恰好一个
+        state.apply(Message::AiSummaryRequested);
+        drain_ai_stream(&mut state);
+        let summary_headings = latermd_md::outline(state.editor.text())
+            .into_iter()
+            .filter(|item| item.text == AI_SUMMARY_HEADING)
+            .count();
+        assert_eq!(summary_headings, 1, "重复生成不堆积");
+        assert_eq!(
+            state.editor.text().matches("## AI 摘要").count(),
+            1,
+            "标题文本也只出现一次"
+        );
+    }
+
+    /// 文档没有旧摘要节:正文原样保留,新节直接追加到末尾(空行分隔)。
+    #[test]
+    fn ai_summary_appends_when_document_has_no_section() {
+        let mut state = State::default();
+        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.editor.load("# 标题甲\n\n段落甲。\n");
+
+        state.apply(Message::AiSummaryRequested);
+        assert!(state.ai.is_streaming());
+        assert_eq!(
+            state.editor.text(),
+            "# 标题甲\n\n段落甲。\n\n## AI 摘要\n\n",
+            "无旧节可移除,标题直接接在补齐的空行后"
+        );
+
+        drain_ai_stream(&mut state);
+        assert_eq!(
+            state.editor.text(),
+            "# 标题甲\n\n段落甲。\n\n## AI 摘要\n\n> - 标题甲\n> - 段落甲。\n"
+        );
+        assert!(
+            state.editor.text().starts_with("# 标题甲\n\n段落甲。"),
+            "正文原样"
+        );
+    }
+
+    /// 空文档:提示行拦下,不发起流、不落标题。
+    #[test]
+    fn ai_summary_on_empty_document_notices_without_stream() {
+        let mut state = State::default();
+        state.editor.load("");
+        state.apply(Message::AiSummaryRequested);
+        assert!(!state.ai.is_streaming(), "空文档不发起流");
+        assert_eq!(state.editor.text(), "", "文档未被触碰");
+        assert_eq!(
+            state.document.notice.as_deref(),
+            Some("文档为空,没有可摘要的内容")
+        );
+    }
+
+    /// 防重入(双向):续写流在途时摘要请求被静默忽略 —— 连移除旧节/插
+    /// 标题都不发生;摘要流在途时续写命令同样被忽略(同一道闸)。
+    #[test]
+    fn ai_summary_and_stream_reentry_guard_each_other() {
+        let mut state = State::default();
+        state.ai.provider =
+            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.editor.load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
+
+        // 续写流在途 → 摘要请求忽略:文档一字未动(旧节还在)
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming(), "前置:续写流在途");
+        let before = state.editor.text().to_owned();
+        state.apply(Message::AiSummaryRequested);
+        assert_eq!(state.editor.text(), before, "流式中摘要请求不碰文档");
+        assert!(state.document.notice.is_none(), "忽略是静默的");
+        assert!(state.ai.is_streaming(), "原流继续在途");
+        state.ai.finish();
+
+        // 摘要流在途 → 续写命令忽略
+        state.apply(Message::AiSummaryRequested);
+        assert!(state.ai.is_streaming(), "摘要流已发起(旧节此刻已移除)");
+        assert!(
+            !state.editor.text().contains("旧要点"),
+            "前置:旧节确实移除了"
+        );
+        let before = state.editor.text().to_owned();
+        state.apply(Message::AiStart);
+        assert_eq!(state.editor.text(), before, "流式中续写命令不碰文档");
+        state.ai.finish();
     }
 }

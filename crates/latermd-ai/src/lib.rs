@@ -13,10 +13,12 @@
 mod commit;
 mod mock;
 mod openai;
+mod summary;
 
 pub use commit::{commit_message_prompt, truncate_diff};
 pub use mock::MockProvider;
 pub use openai::{parse_openai_sse, AiError, OpenAiProvider, API_KEY_ENV};
+pub use summary::{summary_prompt, truncate_document};
 
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
@@ -47,4 +49,17 @@ pub fn read_api_key() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+}
+
+/// 按字节预算截断,不拆 UTF-8 字符(边界回退到字符起点)。返回 (截断后的
+/// 文本, 是否发生了截断)。commit 的 diff 与摘要的文档全文截断共用。
+pub(crate) fn truncate_bytes(text: &str, budget: usize) -> (String, bool) {
+    if text.len() <= budget {
+        return (text.to_owned(), false);
+    }
+    let mut budget = budget;
+    while !text.is_char_boundary(budget) {
+        budget -= 1;
+    }
+    (text[..budget].to_owned(), true)
 }

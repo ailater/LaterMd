@@ -80,6 +80,26 @@ pub fn outline(text: &str) -> Vec<OutlineItem> {
         .collect()
 }
 
+/// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
+/// 它的标题前(无则到文末)。更深层级的标题(`###`)是该节的子内容,一并
+/// 属于节;标题文本按 `trim` 后全等匹配,层级精确匹配。
+///
+/// 起点与终点都取大纲条目的 `span.start`:平铺 span 会吸收前一块尾部的
+/// 换行(含标题前的空行),因此移除该区间会连同节的前导空行一起带走,
+/// 删后正文仍以合法换行结尾、下一个标题前也仍留有自己的空行。
+pub fn heading_section_span(text: &str, level: u8, heading: &str) -> Option<Range<usize>> {
+    let outline = outline(text);
+    let index = outline
+        .iter()
+        .position(|item| item.level == level && item.text.trim() == heading)?;
+    let start = outline[index].span.start;
+    let end = outline[index + 1..]
+        .iter()
+        .find(|item| item.level <= level)
+        .map_or_else(|| text.len(), |next| next.span.start);
+    Some(start..end)
+}
+
 /// 解析 Markdown 文本,产出拥有型文档模型(统一入口)。
 ///
 /// 代价是两次拷贝:源文本进 `String`,借用型 `CowStr::Borrowed` 转堆上的
@@ -233,6 +253,51 @@ mod tests {
     fn borrowed_outline_matches_doc_outline() {
         let src = "# 甲\n\n## 乙 *强调*\n\n正文 ### 非标题\n";
         assert_eq!(outline(src), parse(src).outline());
+    }
+
+    /// 节定位(AI 摘要旧节清理的依据,边界行为经探针实测):起点吸收标题
+    /// 前的空行,终点到下一同级/更浅标题前 —— 删除区间后,正文与下一个
+    /// 标题之间仍留有换行,标题保持合法。
+    #[test]
+    fn heading_section_span_bounds_middle_section() {
+        let src = "# 甲\n\n正文甲。\n\n## AI 摘要\n\n> - 要点\n\n## 乙\n\n正文乙。\n";
+        let span = heading_section_span(src, 2, "AI 摘要").expect("定位到摘要节");
+        assert_eq!(&src[span.clone()], "\n\n## AI 摘要\n\n> - 要点\n");
+        let remainder = format!("{}{}", &src[..span.start], &src[span.end..]);
+        assert_eq!(remainder, "# 甲\n\n正文甲。\n## 乙\n\n正文乙。\n");
+        // 删除后的文本里旧节彻底消失,其余标题原样
+        assert!(!remainder.contains("AI 摘要"));
+        assert_eq!(outline(&remainder).len(), 2);
+    }
+
+    /// 更深层级的标题(`###`)是节的子内容,一并属于节;节在文末时区间
+    /// 到文末,起点同样吸收前导空行。
+    #[test]
+    fn heading_section_span_swallows_subheadings_and_tail() {
+        // ### 子节归入 ## AI 摘要节
+        let src = "# 甲\n\n## AI 摘要\n\n### 子节\n\n内容\n\n## 乙\n\n正文乙\n";
+        let span = heading_section_span(src, 2, "AI 摘要").expect("定位到摘要节");
+        assert_eq!(&src[span.clone()], "\n\n## AI 摘要\n\n### 子节\n\n内容");
+
+        // 文末节:删完只剩前文,正文结尾不带多余换行
+        let src = "正文\n\n## AI 摘要\n\n> - 只有一条要点";
+        let span = heading_section_span(src, 2, "AI 摘要").expect("定位到摘要节");
+        assert_eq!(&src[span.clone()], "\n\n## AI 摘要\n\n> - 只有一条要点");
+        assert_eq!(&src[..span.start], "正文");
+    }
+
+    /// 没有目标标题、标题文本不精确匹配或层级不符时返回 `None`
+    /// (调用方据此跳过移除,直接追加新节)。
+    #[test]
+    fn heading_section_span_absent_or_mismatched_is_none() {
+        assert_eq!(heading_section_span("# 甲\n\n正文\n", 2, "AI 摘要"), None);
+        // 文本变体不算同一节:保守匹配,避免误删用户手写内容
+        let src = "# 甲\n\n## AI 摘要(旧)\n\n> - 要点\n";
+        assert_eq!(heading_section_span(src, 2, "AI 摘要"), None);
+        // 层级不同不算:用户改写成 # / ### 后的旧节不在此口径内
+        let src = "# AI 摘要\n\n> - 要点\n";
+        assert_eq!(heading_section_span(src, 2, "AI 摘要"), None);
+        assert!(heading_section_span(src, 1, "AI 摘要").is_some());
     }
 
     #[test]

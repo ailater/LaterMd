@@ -4,6 +4,13 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #15 AI 摘要的插入形态、引用块前缀来源与 Mock 请求识别（2026-09-25）
+
+- **岔路**：任务把展示形态留成二选一——「以引用块形式插入文档末尾」或「展示给用户可选插入」。另外 prompt 输出要求固定为「每条一行中文，以 '- ' 开头」，而最终插入形态是引用块（`> - …` 行），`> ` 前缀由谁加上、Mock provider 在共用 `stream_complete` 通道里如何区分摘要请求与续写请求，都需要定口径。
+- **自动选择**：**直接插入文档末尾**（`crates/latermd-app/src/state.rs::request_summary`）。理由：摘要流式落文档与续写同语义，天然复用 `AiChunk` 追加通道与防重入；浮窗形态走不了流式追加（commit 选浮窗是因为 subject 是「建议」，摘要是要写进文档的内容）。`> ` 前缀由 **Mock 替身直接产出最终文档形态**（`crates/latermd-ai/src/mock.rs::mock_summary` 输出 `> - …` 行序列），prompt 指令保持任务原口径不改；真实 key 接入时在适配层把模型输出的 `- ` 行包成 `> - `（与 commit 的真实 provider TODO 同批，见 `request_commit_message` 的 TODO 注释）。Mock 请求识别用**摘要指令头前缀嗅探**（`stream_complete` 里 `starts_with(SUMMARY_INSTRUCTIONS)`，与现有「按 prompt 关键词选脚本」同构；真实 provider 无此问题，模型自己读指令）。
+- **已知并接受的边界**：①摘要节定位按「二级标题 + 文本精确等于 `AI 摘要`」（`latermd_md::heading_section_span`），用户改层级/改名后的旧节不清理（保守匹配，防误删手写内容）；②流失败时旧节已删、新标题已插、要点可能半截——与续写流「失败留半截正文」同语义，演示期 Mock 不产生失败块；③摘要节被用户挪到文档中间且其后还有内容时，删节后正文与下一节间保留一个换行（合法 Markdown，源码视觉紧凑）。
+- **如何改**：要改浮窗形态，在 `State` 加 `ai_summary_suggestion: Option<String>` 并把 `request_summary` 改成收流进缓冲区外的暂存（AiChunk 归约需按流类型分流）；要匹配用户变体的旧节，放宽 `heading_section_span` 的层级参数或做模糊文本匹配；要让真实 provider 输出自动加 `> `，在接入 `OpenAiProvider` 时于 app 侧对摘要流的 chunk 做行级包装（需在 `AiState` 加当前流类型标志）。
+
 ## #14 AI commit message 的仓库定位与浮窗/复制口径（2026-09-25）
 
 - **岔路**：菜单「AI: 生成 commit message」要读「当前仓库」的未提交改动，但 LaterMD 没有「当前仓库」的概念——文档可以不在任何 git 仓库里，文件树根也可以是任意目录，还可以向上搜 `.git` 找仓库根。另外 ask 把展示（状态栏 vs 对话框）与复制（按钮 vs 自动写剪贴板）留成二选一。
