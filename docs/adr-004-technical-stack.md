@@ -45,6 +45,7 @@
 | **URL 编解码** | `percent-encoding` | 2.3.2 | P1 `ai://` 链接协议：prompt 查询参数的严格 %XX 解码（坏序列自行校验，`+` 不当空格）；decisions-pending #11 |
 | **LLM·HTTP 客户端** | `ureq` | 3.4.2（default-features 关闭，仅 rustls） | P1 `latermd-ai`：阻塞 HTTP 读 SSE 流；零 async 依赖。选型取舍见修订记录 2026-09-25 |
 | **LLM 接入** | OpenAI / Anthropic / Ollama | — | HTTP + SSE 流式；经 `latermd-ai` 以 std 线程 + mpsc 阻塞流实现，不经 tokio |
+| **凭据存取** | `keyring` | 4.2.0 | 三平台系统凭据统一封装（Windows Credential Manager / macOS Keychain / Linux Secret Service 的 zbus 实现，不链 libsecret C 库）；P2 `latermd-creds` 引入；4.x 维护线选择见 decisions-pending #20 |
 | **打包编排** | **`axodotdev/cargo-dist`** | **v0.33.0** | ❌ 修正：不是已归档的 `astral-sh/cargo-dist` |
 | **打包（备选）** | `crabnebula-dev/cargo-packager` | 0.11.8 | ❌ 修正：不是 `tauri-apps/`（404） |
 | **macOS 打包** | `cargo-bundle` | 0.12.0 | 2026-09-20 仍活跃 |
@@ -175,3 +176,4 @@ LaterMD/
 | 2026-09-25 | **依赖表补登**：P1 搜索核心（`crates/latermd-app/src/search.rs`）新增 grep-searcher 0.1.17 与 regex 1.13.1，遵循 decisions-pending #4 口径；不引入 `grep-regex` 的取舍见 decisions-pending #7 |
 | 2026-09-25 | **依赖表补登**：P1 新建 `crates/latermd-ai`（crate 增量创建表「P1 开工」行授权），新增 `ureq` 3.4.2。选型取舍：reqwest 的 blocking 客户端内部仍自建 tokio runtime，与本轮「流式 = std 线程 + mpsc、不引入 tokio」的既定口径冲突，故选零 async 依赖的 ureq；default-features 关闭去掉 gzip（SSE 不需要），只留 rustls。同轮订正「LLM 接入」行的「异步」表述——实际为阻塞流。serde_json 复用清单既有条目，不另列 |
 | 2026-09-25 | **依赖表补登**：P1 `ai://` 链接协议（`crates/latermd-app/src/ai_link.rs`）新增 `percent-encoding` 2.3.2，遵循 decisions-pending #4 口径；零传递依赖、Cargo.lock 原有条目提升为直接依赖。协议语义定稿见 decisions-pending #11 |
+| 2026-09-25 | **依赖表补登**：P2 凭据管理新建 `crates/latermd-creds`（roadmap 阶段 4「凭据管理」条目），新增 `keyring` 4.2.0（默认 feature `v1`）。选型：3.6.3 随原维护者移交已停更且无默认 features；4.2.0（open-source-cooperative 接管，2026-08 仍更新）默认 feature 即按平台选三平台 native store，Linux 走 zbus 纯 Rust 实现免 libsecret C 库，Cargo.lock 既有 zbus 条目复用；keyring-core `Error` 的 `Display` 不携带凭据字节，契合「凭据值不进错误信息」红线。岔路与签名口径登记见 decisions-pending #20 |

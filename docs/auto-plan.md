@@ -30,6 +30,7 @@
 | 5 | p1-ai-tools | AI commit message + AI 摘要大纲（基于 #3 的 provider，mock 可用） | ✅完成 | feat(app): AI 生成 commit message——diff 采集、prompt 模板、Mock 合成与建议浮窗;feat(app): AI 生成摘要——全文喂 provider、引用块流式插入文档末尾、旧摘要节自动清理 |
 | 6 | p2-git | latermd-git 只读集成：状态、历史、diff、blame、回滚 + 文件树 M/A/U/? 标记 | ✅完成 | feat(git): 新建 latermd-git——git2 只读封装(status/log/diff/blame)与确认式单文件回滚;feat(app): Git 面板与文件树状态角标——latermd-git 接入 UI(平铺改动列表/只读 diff/确认式回滚/历史折叠区) |
 | 7 | p2-creds | 凭据管理三平台封装（Credential Manager / Keychain / libsecret） | ⏳待开始 | — |
+| 11 | multi-tabs | 多标签页：同时打开多个文档（用户 2026-09-25 追加；**插队到 #8 之前执行**——编辑器状态大重构，必须先于 Live Preview 落地，否则 #9 的块级 caret 路由建立在单文档假设上要返工） | ⏳待开始 | — |
 | 8 | p2b-theme | 皮肤批次 B：三态切换（亮/暗/跟随系统）+ 自定义皮肤文件（RON 导出至 themes/）+ 视觉打磨 | ⏳待开始 | — |
 | 9 | p3-live-preview | Live Preview：块级 caret 路由 + 聚焦块裸源码；**共用同一 rope buffer 与 undo 栈**（roadmap 铁律） | ⏳待开始 | — |
 | 10 | p3-nav | 大纲预览跳转（复用 section_to_token 映射）+ `[[wikilink]]` 双向链接（LinkHandler） | ⏳待开始 | — |
@@ -54,6 +55,10 @@
 **#6 p2-git**：新建 `crates/latermd-git`（git2，只读）：状态列表、log 历史、diff（HEAD vs workdir，按文件）、blame（当前文件行级）、回滚（checkout 单文件，唯一写操作，需确认模态）。侧边栏文件树加 M/A/U/? 角标。
 
 **#7 p2-creds**：凭据存取 trait + 三平台实现（Windows Credential Manager via `keyring` crate 或 winapi、macOS Keychain、Linux libsecret；选 `keyring` 统一封装最省——ADR 登记）。供 #3 的 API key 存取用。
+
+**#11 multi-tabs**（用户 2026-09-25 追加，插队于 #8 前）：
+- tabs-core：`TabState { id: u64, doc: DocumentState, scroll: … }`、`Vec<TabState> + active_tab`；`Message::TabOpen/TabClose/TabActivate/TabCloseActive`；关闭脏标签确认模态；Ctrl+Tab 切换、Ctrl+W 关闭；编辑器 buffer/预览/大纲/搜索跳转/选中行按 active_tab 隔离。
+- tabs-ui：顶部标签条（`egui::TabBar` 或自绘；与顶部菜单栏并存），标签拖拽排序延后（notes 记录）。
 
 **#8 p2b-theme**：Theme 加三态（亮/暗/跟随系统，`dark-light` crate，Linux 失灵回退手动）；Theme serde 导出 RON 至用户配置目录 `themes/`，启动扫描可加载；视觉打磨（间距/圆角 token 统一、滚动条、hover 态、编辑器行距）。
 

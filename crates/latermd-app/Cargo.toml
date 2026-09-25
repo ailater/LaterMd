@@ -28,6 +28,9 @@ latermd-md = { path = "../latermd-md" }
 # AI 流式 provider(MockProvider 联调,P1「AI 流式写作」);workspace 内部
 # crate 依赖,不属 ADR-004 外部依赖清单
 latermd-ai = { path = "../latermd-ai" }
+# AI API key 的系统凭据存取(P2「凭据管理」):设置浮窗保存/清除 + AI 命令
+# key 闸门的优先后端;同 workspace 内部 crate,不属 ADR-004 外部依赖清单
+latermd-creds = { path = "../latermd-creds" }
 # HTML 导出(ADR-004 清单内,P0 验收项)
 latermd-export = { path = "../latermd-export" }
 # Git 只读集成(P2 版本层):状态角标、Git 面板与确认式单文件回滚

@@ -5,6 +5,7 @@ members = [
   "vendor/egui_markdown/egui_markdown_style",
   "crates/latermd-ai",
   "crates/latermd-app",
+  "crates/latermd-creds",
   "crates/latermd-editor",
   "crates/latermd-export",
   "crates/latermd-git",

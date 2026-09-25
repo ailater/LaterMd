@@ -47,6 +47,37 @@ impl Command {
     /// 文件组:菜单「文件」子菜单与工具栏按钮共用的顺序。
     pub const FILE: [Command; 4] = [Self::New, Self::Open, Self::Save, Self::SaveAs];
 
+    /// 全部命令(快捷键设置页与绑定表遍历的顺序,见 `crate::keymap`)。
+    pub const ALL: [Command; 10] = [
+        Self::New,
+        Self::Open,
+        Self::Save,
+        Self::SaveAs,
+        Self::ExportHtml,
+        Self::ToggleTheme,
+        Self::ToggleSidebar,
+        Self::AiMockStream,
+        Self::AiCommitMessage,
+        Self::AiSummary,
+    ];
+
+    /// 稳定 id:快捷键表 `keymap.json` 的键。命令的显示名会随文案调整,
+    /// id 不随,存档才不会因改 label 而失效。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Open => "open",
+            Self::Save => "save",
+            Self::SaveAs => "save_as",
+            Self::ExportHtml => "export_html",
+            Self::ToggleTheme => "toggle_theme",
+            Self::ToggleSidebar => "toggle_sidebar",
+            Self::AiMockStream => "ai_mock_stream",
+            Self::AiCommitMessage => "ai_commit_message",
+            Self::AiSummary => "ai_summary",
+        }
+    }
+
     /// 菜单与按钮的显示名。
     pub fn label(self) -> &'static str {
         match self {
@@ -63,14 +94,16 @@ impl Command {
         }
     }
 
-    /// 绑定的快捷键;`None` = 不绑定(菜单里只显示名字)。
+    /// **出厂默认**的快捷键;`None` = 不绑定(菜单里只显示名字)。
     ///
-    /// 全部文件/视图命令都有绑定,菜单栏负责展示以保证可发现性;AI 命令
-    /// 一律 `None`:联调入口不抢键位,等 provider 选型定案再定。
+    /// 实际生效的键位在 [`crate::keymap::Keymap`](用户可改,`keymap.json`);
+    /// 这里只是默认值来源。全部文件/视图命令都有默认绑定,菜单栏负责展示
+    /// 以保证可发现性;AI 命令一律 `None`:联调入口不抢键位,等 provider
+    /// 选型定案再定。
     ///
     /// ToggleSidebar 取 Ctrl/Cmd+\\ 而非更常见的 Ctrl+B:Markdown 工作台的
     /// Ctrl+B 要留给将来的加粗(与主流 Markdown 编辑器一致)。
-    pub fn shortcut(self) -> Option<egui::KeyboardShortcut> {
+    pub fn default_shortcut(self) -> Option<egui::KeyboardShortcut> {
         let shortcut = match self {
             Self::New => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N),
             Self::Open => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O),
@@ -91,6 +124,21 @@ impl Command {
         Some(shortcut)
     }
 
+    /// 图标(工具栏按钮用;`ui::icons` 自绘,不依赖字体)。
+    pub fn icon(self) -> crate::ui::icons::Icon {
+        use crate::ui::icons::Icon;
+        match self {
+            Self::New => Icon::New,
+            Self::Open => Icon::Open,
+            Self::Save => Icon::Save,
+            Self::SaveAs => Icon::SaveAs,
+            Self::ExportHtml => Icon::Export,
+            Self::ToggleTheme => Icon::Theme,
+            Self::ToggleSidebar => Icon::Sidebar,
+            Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
+        }
+    }
+
     /// 归约入口:命令翻成状态消息,执行在 `State::apply`。
     pub fn message(self) -> Message {
         match self {
@@ -108,39 +156,45 @@ impl Command {
     }
 }
 
-/// 快捷键消费顺序:SaveAs 必须先于 Save —— `consume_shortcut` 底层的
-/// `matches_logically` 忽略多余 Shift,先问 Save 的话 Ctrl/Cmd+Shift+S
-/// 会被它抢先吃掉(egui 文档要求 most specific first)。其余命令键位
-/// 互不相撞,顺序无关。无快捷键的命令(如 AiMockStream)不进本表。
-const POLL_ORDER: [Command; 7] = [
-    Command::SaveAs,
-    Command::Save,
-    Command::New,
-    Command::Open,
-    Command::ExportHtml,
-    Command::ToggleTheme,
-    Command::ToggleSidebar,
-];
-
 /// 从本帧输入消费全部命令快捷键,返回被触发的命令。
+///
+/// 键位取自 `keymap`(用户可改)而非出厂默认;**消费顺序按修饰键个数降序**
+/// —— 通用化了原先「SaveAs 必须先于 Save」的特例:`consume_shortcut` 底层的
+/// `matches_logically` 忽略多余 Shift,先问 Ctrl/Cmd+S 的话 Ctrl/Cmd+Shift+S
+/// 会被它抢先吃掉(egui 文档要求 most specific first)。
 ///
 /// 只在 `App::logic` 调用:logic 先于 `App::ui` 运行,本帧按键事件此刻
 /// 可见;消费即从输入流移除,TextEdit 即使聚焦也收不到。普通字符输入
 /// (无 COMMAND 修饰)不匹配任何绑定,原样放行给控件。
-pub fn poll_shortcuts(ctx: &egui::Context) -> Vec<Command> {
-    POLL_ORDER
+pub fn poll_shortcuts(ctx: &egui::Context, keymap: &crate::keymap::Keymap) -> Vec<Command> {
+    let mut bound: Vec<(Command, crate::keymap::Shortcut)> = Command::ALL
         .iter()
-        .filter_map(|cmd| {
-            let shortcut = cmd.shortcut()?;
-            ctx.input_mut(|input| input.consume_shortcut(&shortcut))
-                .then_some(*cmd)
+        .filter_map(|cmd| keymap.get(*cmd).map(|shortcut| (*cmd, shortcut)))
+        .collect();
+    // 修饰键多的先匹配(most specific first);同位数保持 ALL 的顺序,
+    // 排序用稳定排序
+    bound.sort_by_key(|(_, shortcut)| std::cmp::Reverse(modifier_count(shortcut.modifiers)));
+    bound
+        .into_iter()
+        .filter_map(|(cmd, shortcut)| {
+            ctx.input_mut(|input| input.consume_shortcut(&shortcut.keyboard()))
+                .then_some(cmd)
         })
         .collect()
+}
+
+/// 修饰键个数(决定消费优先级)。
+fn modifier_count(modifiers: egui::Modifiers) -> u32 {
+    u32::from(modifiers.command)
+        + u32::from(modifiers.shift)
+        + u32::from(modifiers.alt)
+        + u32::from(modifiers.mac_cmd)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Keymap;
     use egui::{Event, Key, RawInput};
 
     fn key_event(key: Key, modifiers: Modifiers) -> Event {
@@ -164,7 +218,10 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                assert_eq!(poll_shortcuts(ui.ctx()), vec![Command::SaveAs]);
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::SaveAs]
+                );
             },
         );
         output.drop_without_applying_deltas();
@@ -179,7 +236,10 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                assert_eq!(poll_shortcuts(ui.ctx()), vec![Command::Save]);
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::Save]
+                );
             },
         );
         output.drop_without_applying_deltas();
@@ -208,8 +268,11 @@ mod tests {
                 },
                 |ui| {
                     let ctx = ui.ctx().clone();
-                    assert_eq!(poll_shortcuts(&ctx), vec![cmd]);
-                    assert!(poll_shortcuts(&ctx).is_empty(), "同一帧重复消费");
+                    assert_eq!(poll_shortcuts(&ctx, &Keymap::builtin()), vec![cmd]);
+                    assert!(
+                        poll_shortcuts(&ctx, &Keymap::builtin()).is_empty(),
+                        "同一帧重复消费"
+                    );
                 },
             );
             output.drop_without_applying_deltas();
@@ -233,7 +296,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                assert!(poll_shortcuts(ui.ctx()).is_empty());
+                assert!(poll_shortcuts(ui.ctx(), &Keymap::builtin()).is_empty());
             },
         );
         output.drop_without_applying_deltas();
@@ -272,10 +335,65 @@ mod tests {
             Command::ToggleTheme,
             Command::ToggleSidebar,
         ] {
-            assert!(cmd.shortcut().is_some(), "{cmd:?} 应有快捷键");
+            assert!(cmd.default_shortcut().is_some(), "{cmd:?} 应有默认快捷键");
         }
-        assert_eq!(Command::AiMockStream.shortcut(), None);
-        assert_eq!(Command::AiCommitMessage.shortcut(), None);
-        assert_eq!(Command::AiSummary.shortcut(), None);
+        assert_eq!(Command::AiMockStream.default_shortcut(), None);
+        assert_eq!(Command::AiCommitMessage.default_shortcut(), None);
+        assert_eq!(Command::AiSummary.default_shortcut(), None);
+    }
+
+    /// 改绑生效:把「保存」改到 Ctrl+K 后,原 Ctrl+S 不再触发任何命令,
+    /// 新键位触发保存 —— 键位来自 keymap 而不是硬编码。
+    #[test]
+    fn rebound_shortcut_replaces_default() {
+        let mut keymap = Keymap::builtin();
+        keymap.set(
+            Command::Save,
+            Some(crate::keymap::Shortcut {
+                modifiers: Modifiers::COMMAND,
+                key: Key::K,
+            }),
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::S, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert!(poll_shortcuts(ui.ctx(), &keymap).is_empty(), "旧键位已解绑");
+            },
+        );
+        output.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::K, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(poll_shortcuts(ui.ctx(), &keymap), vec![Command::Save]);
+            },
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    /// 未绑定的命令不消费任何键(清除绑定 = 只能从菜单触发)。
+    #[test]
+    fn unbound_command_consumes_nothing() {
+        let mut keymap = Keymap::builtin();
+        keymap.set(Command::Save, None);
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::S, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert!(poll_shortcuts(ui.ctx(), &keymap).is_empty());
+            },
+        );
+        output.drop_without_applying_deltas();
     }
 }

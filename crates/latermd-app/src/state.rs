@@ -20,11 +20,16 @@
 //! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
 
 use crate::ai::AiState;
+use crate::ai_config::AiConfig;
+use crate::ai_key::AiKeyState;
+use crate::command::Command;
 use crate::export;
 use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
 use crate::git_panel::GitPanelState;
+use crate::keymap::{Keymap, Shortcut};
 use crate::search::SearchState;
+use crate::settings::SettingsState;
 use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
@@ -44,6 +49,9 @@ const AI_PROMPT_TAIL_CHARS: usize = 2000;
 /// [`latermd_md::heading_section_span`] 的定位键(层级 + 文本精确匹配)
 /// 保持一致 —— 重复生成时凭它移除旧节,避免摘要堆积。
 const AI_SUMMARY_HEADING: &str = "AI 摘要";
+
+/// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
+const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
 
 /// 侧边栏功能页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +77,17 @@ impl SidebarTab {
             Self::Search => "搜索",
             Self::Outline => "大纲",
             Self::Git => "Git",
+        }
+    }
+
+    /// 页签图标(`ui::icons` 自绘)。
+    pub fn icon(self) -> crate::ui::icons::Icon {
+        use crate::ui::icons::Icon;
+        match self {
+            Self::Files => Icon::Files,
+            Self::Search => Icon::Search,
+            Self::Outline => Icon::Outline,
+            Self::Git => Icon::Git,
         }
     }
 }
@@ -144,6 +163,13 @@ pub struct State {
     pub search: SearchState,
     /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
     pub ai: AiState,
+    /// AI Provider 凭据设置区(P2「凭据管理」):草稿、三态与凭据操作集,
+    /// 读写全部经 latermd-creds 在归约发生。
+    pub ai_key: AiKeyState,
+    /// 快捷键绑定表(用户可改,`keymap.json`;命令层从它读实际键位)。
+    pub keymap: Keymap,
+    /// 设置对话框(外观 / 快捷键 / AI / MCP 四页)。
+    pub settings: SettingsState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -234,6 +260,9 @@ impl Default for State {
             git: GitPanelState::default(),
             search: SearchState::default(),
             ai: AiState::default(),
+            ai_key: AiKeyState::default(),
+            keymap: Keymap::builtin(),
+            settings: SettingsState::default(),
             ai_commit_suggestion: None,
             editor,
             document: DocumentState {
@@ -252,7 +281,8 @@ impl Default for State {
 /// 后续变体(`SearchQueryChanged` …)随搜索模块接入加入;后台任务的结果
 /// 回传也走同一入口。
 // 不再整体 Copy:`OutlineItemClicked` 携带 `Range<usize>`(Clone 但非 Copy)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+// 不再 Eq:`AiConfigSaved` 携带 AiConfig(含 f32 采样参数,无 Eq)。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// 切换侧边栏页签。
     SidebarTabChanged(SidebarTab),
@@ -314,6 +344,30 @@ pub enum Message {
     AiCommitSuggestion { subject: String },
     /// 关闭 commit message 建议浮窗。
     AiCommitDismissed,
+    /// 保存 AI API key 草稿到系统凭据(设置浮窗「保存」):归约里经
+    /// latermd-creds 写入,成功置已配置并清空草稿(UI 不回显值);空白
+    /// 拒绝;后端失败落提示行并转 [`Message::AiKeyBackendUnavailable`]。
+    AiKeySaved,
+    /// 从系统凭据删除 AI API key(设置浮窗「清除」):幂等,成功置
+    /// 未配置;后端失败同 [`Message::AiKeySaved`] 的降级。
+    AiKeyCleared,
+    /// 凭据后端不可用:置不可用状态,设置浮窗状态行提示回退环境变量。
+    /// 归约内部的结果消息(保存/清除失败时再归约),UI 不直接产出。
+    AiKeyBackendUnavailable,
+    /// 保存 AI 配置(设置页 AI 区「保存」):归一化 → 落 `ai.json` → 即时
+    /// 重装配 provider(无需重启)。失败只落提示行,不改内存配置。
+    AiConfigSaved(AiConfig),
+    /// 给某命令绑定新键位(快捷键页捕获到按键后由归约侧产出)。撞键时
+    /// **拒绝**并落提示 —— 不静默抢占另一个命令的键位。
+    KeymapAssign { cmd: Command, shortcut: Shortcut },
+    /// 清除某命令的键位(此后只能从菜单 / 工具栏触发)。
+    KeymapCleared(Command),
+    /// 某命令的键位恢复出厂。
+    KeymapReset(Command),
+    /// 全部键位恢复出厂。
+    KeymapResetAll,
+    /// 打开设置对话框并切到指定分页(工具栏齿轮 / 菜单「设置…」入口)。
+    SettingsOpened(crate::settings::SettingsTab),
     /// 点击 Git 页改动列表里的文件,载荷为相对仓库根的路径:归约里选中
     /// 并读它的 diff(列表外的过期路径被忽略)。
     GitFileSelected(String),
@@ -365,13 +419,47 @@ impl State {
                 self.document.notice = Some(error);
             }
             Message::AiLinkClicked { prompt } => match prompt {
-                Ok(prompt) => self.start_ai_stream_with_prompt(&prompt),
+                Ok(prompt) => {
+                    // key 闸门与防重入同判:流式中静默忽略,无 key 才落提示
+                    if !self.ai.is_streaming() && self.ai_key_gate() {
+                        self.start_ai_stream_with_prompt(&prompt);
+                    }
+                }
                 Err(reason) => self.document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
+            Message::AiKeySaved => {
+                if let Err(err) = self.ai_key.save() {
+                    self.ai_key_failure(err);
+                }
+            }
+            Message::AiKeyCleared => {
+                if let Err(err) = self.ai_key.clear() {
+                    self.ai_key_failure(err);
+                }
+            }
+            Message::AiKeyBackendUnavailable => self.ai_key.backend_ok = false,
+            Message::AiConfigSaved(config) => self.apply_ai_config(config),
+            Message::KeymapAssign { cmd, shortcut } => self.assign_shortcut(cmd, shortcut),
+            Message::KeymapCleared(cmd) => {
+                self.keymap.set(cmd, None);
+                self.persist_keymap();
+            }
+            Message::KeymapReset(cmd) => {
+                self.keymap.reset(cmd);
+                self.persist_keymap();
+            }
+            Message::KeymapResetAll => {
+                self.keymap.reset_all();
+                self.persist_keymap();
+            }
+            Message::SettingsOpened(tab) => {
+                self.settings.open = true;
+                self.settings.tab = tab;
+            }
             Message::GitFileSelected(path) => self.git.select(&path),
             Message::GitCheckoutRequested(path) => self.git.request_checkout(path),
             Message::GitCheckoutConfirmed => {
@@ -424,6 +512,31 @@ impl State {
         }
     }
 
+    /// `Message::AiKeySaved` / `AiKeyCleared` 的失败归约:消毒后的错误文案
+    /// 进提示行(文案由 latermd-creds 保证不含凭据值);后端类失败再归约
+    /// [`Message::AiKeyBackendUnavailable`] 置不可用状态(状态行提示回退
+    /// 环境变量)。空白拒绝等非后端错误只落提示行,不动可用性。
+    fn ai_key_failure(&mut self, err: latermd_creds::CredentialError) {
+        self.document.notice = Some(err.to_string());
+        if matches!(err, latermd_creds::CredentialError::Backend { .. }) {
+            self.apply(Message::AiKeyBackendUnavailable);
+        }
+    }
+
+    /// AI 命令发起前的 key 闸门:provider 需要 key 且 latermd-creds →
+    /// `LATERMD_AI_API_KEY`(latermd-creds 定死的顺序)都解析不到时,落
+    /// 状态栏提示并返回 `false`。调用点必须在各命令归约的**最前面**、任何
+    /// 副作用(补空行/移除旧摘要节/采 diff)之前,被拦下的命令不留痕迹。
+    /// 当前 Mock provider 无 key 也能跑(闸门直通);选了 OpenAI 兼容端点后
+    /// 闸门自动生效(decisions-pending #21 的四入口归约不变)。
+    fn ai_key_gate(&mut self) -> bool {
+        if !self.ai.requires_key() || self.ai_key.creds.ai_api_key().is_some() {
+            return true;
+        }
+        self.document.notice = Some(AI_KEY_MISSING_NOTICE.to_owned());
+        false
+    }
+
     /// 生成 commit message(`Message::AiCommitRequested` 的归约):定位仓库
     /// 目录 → 采 diff → 拼 prompt → 取建议。结果经
     /// [`Message::AiCommitSuggestion`] 再归约一次落 state,与其它 AI 结果
@@ -433,7 +546,7 @@ impl State {
     /// 里跑也返回全仓改动);两者皆无 → 提示行。演示期同步完成(Mock 的
     /// 关键词合成,流式通道是续写文本不适用);流式进行中忽略(防重入)。
     fn request_commit_message(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         let Some(dir) = self
@@ -461,19 +574,22 @@ impl State {
             }
         };
         let prompt = latermd_ai::commit_message_prompt(&diff);
-        // TODO(真实 key,decisions-pending #3):换 OpenAiProvider 低温度补全
-        // 并取首行;演示期用 Mock 的关键词同步合成。
-        let subject = self.ai.provider.mock_commit_subject(&prompt);
-        self.apply(Message::AiCommitSuggestion { subject });
+        // 同步生成:Mock 走关键词合成,真实端点走一次非流式请求取首行
+        // (commit 建议是「一行结果」,流式对它没有意义)
+        match self.ai.runtime.commit_subject(&prompt) {
+            Ok(subject) => self.apply(Message::AiCommitSuggestion { subject }),
+            Err(error) => self.document.notice = Some(error),
+        }
     }
 
     /// 生成摘要(`Message::AiSummaryRequested` 的归约):移除旧摘要节 →
     /// 全文拼 prompt → 复用流式通道发块,「## AI 摘要」标题与空行在发起
     /// 时落到文档末尾,要点 chunk(`> - …` 引用块行)经 [`Message::AiChunk`]
     /// 追加长在标题下。移除旧节走 AST 定位 + rope 删除,且只发生在归约里
-    /// (铁律三);流式进行中忽略(防重入,与其它 AI 命令同一道闸)。
+    /// (铁律三);key 闸门在最前,被拦时连旧节都不动;流式进行中忽略
+    /// (防重入,与其它 AI 命令同一道闸)。
     fn request_summary(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         let text = self.editor.text().to_owned();
@@ -497,11 +613,12 @@ impl State {
         );
     }
 
-    /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。流式进行中
-    /// 忽略(防重入);成功发起前把文档收成「以空行结尾」,让续写从新段落
-    /// 开始 —— 直接拼在末行会与 AI 首行粘连成一行。
+    /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。key 闸门与防
+    /// 重入在最前(被拦的命令不补空行、不留任何痕迹);成功发起前把文档
+    /// 收成「以空行结尾」,让续写从新段落开始 —— 直接拼在末行会与 AI 首行
+    /// 粘连成一行。
     fn start_ai_stream(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         self.ensure_trailing_blank_line();
@@ -518,7 +635,8 @@ impl State {
 
     /// 流式启动的共用入口,两个来源:菜单命令(带文档尾部的 prompt)与
     /// ai:// 链接点击(链接里的提示词,原样透传)。防重入在此把关,流式
-    /// 进行中连「补空行」都不发生。
+    /// 进行中连「补空行」都不发生;key 闸门在两处入口的归约最前面
+    /// (见 [`Self::ai_key_gate`]),走到这里必然已过闸。
     fn start_ai_stream_with_prompt(&mut self, prompt: &str) {
         if self.ai.is_streaming() {
             return;
@@ -554,6 +672,71 @@ impl State {
     /// 由调用方(`ui::layout::reduce`)并入本帧的归约队列。
     pub fn poll_ai(&mut self) -> Vec<Message> {
         self.ai.poll()
+    }
+
+    /// 启动装载:`ai.json`(AI provider 参数)与 `keymap.json`(键位),并据
+    /// 此装配 provider 运行时。与主题/文件树设置同处调用(见 `main`)。
+    /// 无配置目录(极简环境)时保持内存默认,不报错。
+    pub fn load_preferences(&mut self) {
+        let Some(dir) = self.config_dir() else {
+            return;
+        };
+        let config = AiConfig::load_from(&dir);
+        let key = self.ai_key.creds.ai_api_key();
+        self.ai.set_provider(config, key.as_deref());
+        self.keymap = Keymap::load_from(&dir);
+    }
+
+    /// 配置目录:测试注入的 `settings_dir` 优先,否则平台默认目录。
+    fn config_dir(&self) -> Option<PathBuf> {
+        self.settings_dir.clone().or_else(crate::theme::config_dir)
+    }
+
+    /// 快捷键落盘;失败只落提示行(改键已在内存生效,不回滚 —— 落盘失败
+    /// 不该让用户白按一次)。
+    fn persist_keymap(&mut self) {
+        let Some(dir) = self.config_dir() else {
+            return;
+        };
+        if let Err(error) = self.keymap.save_to(&dir) {
+            self.document.notice = Some(format!("快捷键保存失败:{error}"));
+        }
+    }
+
+    /// 绑定新键位:不可绑定(裸字母)与撞键都**拒绝**并给可行动的提示,
+    /// 不静默抢占另一个命令的键位。
+    fn assign_shortcut(&mut self, cmd: Command, shortcut: Shortcut) {
+        if !shortcut.bindable() {
+            self.document.notice = Some(
+                "请带上 Ctrl/Cmd、Shift 或 Alt 等修饰键 —— 裸字母会被编辑器当输入吞掉".to_owned(),
+            );
+            return;
+        }
+        if let Some(holder) = self.keymap.conflict(cmd, shortcut) {
+            self.document.notice = Some(format!(
+                "{} 已被「{}」占用,未修改",
+                shortcut.platform_text(),
+                holder.label()
+            ));
+            return;
+        }
+        self.keymap.set(cmd, Some(shortcut));
+        self.persist_keymap();
+    }
+
+    /// 保存 AI 配置(设置页「保存」):归一化 → 落 `ai.json` → 即时重装配
+    /// provider 运行时(无需重启)。落盘失败则**不**改内存配置 —— 否则
+    /// 界面显示已生效、重启却回到旧值。
+    fn apply_ai_config(&mut self, mut config: AiConfig) {
+        config.normalize();
+        if let Some(dir) = self.config_dir() {
+            if let Err(error) = config.save_to(&dir) {
+                self.document.notice = Some(format!("AI 配置保存失败:{error}"));
+                return;
+            }
+        }
+        let key = self.ai_key.creds.ai_api_key();
+        self.ai.set_provider(config, key.as_deref());
     }
 
     /// 切换主题(设置菜单的归约):改状态并即时落盘(重启保持);投影到
@@ -1260,7 +1443,9 @@ mod tests {
     fn ai_messages_stream_append_and_reentry_guard() {
         let mut state = State::default();
         // 快速 provider:测试不等 3-5 秒的联调节奏
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
         let base = state.editor.text().to_owned();
 
         state.apply(Message::AiStart);
@@ -1312,8 +1497,9 @@ mod tests {
         let path = temp_path("ai-switch.md");
         let mut state = State::default();
         // 慢 provider:保证测试在流自然收尾前完成切文档(20ms × 30-50 块)
-        state.ai.provider =
-            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(20));
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(20),
+        ));
         state.document.path = Some(path.clone()); // Save 直落盘,不弹对话框
 
         state.apply(Message::AiStart);
@@ -1383,7 +1569,9 @@ mod tests {
         for (initial, expected_pad) in cases {
             let mut state = State::default();
             state.editor.load(initial);
-            state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+            state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+                std::time::Duration::ZERO,
+            ));
             state.start_ai_stream();
             let expected = format!("{initial}{}", "\n".repeat(expected_pad));
             assert!(
@@ -1417,7 +1605,9 @@ mod tests {
     #[test]
     fn ai_link_clicked_streams_with_link_prompt_and_reentry_is_ignored() {
         let mut state = State::default();
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
         let base = state.editor.text().to_owned();
 
         state.apply(Message::AiLinkClicked {
@@ -1453,8 +1643,9 @@ mod tests {
         );
 
         // 防重入:慢 provider 发起后再点链接,忽略且不补空行
-        state.ai.provider =
-            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(50),
+        ));
         state.apply(Message::AiStart);
         let streaming_text = state.editor.text().to_owned();
         state.apply(Message::AiLinkClicked {
@@ -1738,8 +1929,9 @@ mod tests {
 
         let mut state = State::default();
         // 慢 provider:保证测试在流自然收尾前完成断言
-        state.ai.provider =
-            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(50),
+        ));
         state.document.path = Some(dir.join("README.md"));
 
         state.apply(Message::AiStart);
@@ -1780,7 +1972,9 @@ mod tests {
     #[test]
     fn ai_summary_replaces_old_section_and_streams_new_points() {
         let mut state = State::default();
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
         state
             .editor
             .load("# 设计\n\n正文段落。\n\n## AI 摘要\n\n> - 旧要点甲\n> - 旧要点乙\n");
@@ -1825,7 +2019,9 @@ mod tests {
     #[test]
     fn ai_summary_appends_when_document_has_no_section() {
         let mut state = State::default();
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
         state.editor.load("# 标题甲\n\n段落甲。\n");
 
         state.apply(Message::AiSummaryRequested);
@@ -1866,8 +2062,9 @@ mod tests {
     #[test]
     fn ai_summary_and_stream_reentry_guard_each_other() {
         let mut state = State::default();
-        state.ai.provider =
-            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(50),
+        ));
         state.editor.load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
 
         // 续写流在途 → 摘要请求忽略:文档一字未动(旧节还在)

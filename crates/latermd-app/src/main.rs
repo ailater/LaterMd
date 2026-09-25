@@ -6,6 +6,8 @@
 //! (docs/adr-005)。
 
 mod ai;
+mod ai_config;
+mod ai_key;
 mod ai_link;
 mod command;
 mod export;
@@ -14,7 +16,9 @@ mod filetree;
 mod fonts;
 mod git_diff;
 mod git_panel;
+mod keymap;
 mod search;
+mod settings;
 mod state;
 mod theme;
 mod ui;
@@ -80,6 +84,11 @@ impl LaterMdApp {
         let mut app = Self::default();
         app.state.theme = theme;
         app.state.file_tree = file_tree.into();
+        // 凭据状态启动即探测:设置浮窗状态行首见即真(后端不可用的
+        // Linux 环境直接给回退提示,而不是「未配置」的误报)
+        // 先探测凭据后端,再装载 AI 配置 —— 装配 provider 运行时要读 key
+        app.state.ai_key.probe();
+        app.state.load_preferences();
         app
     }
 }

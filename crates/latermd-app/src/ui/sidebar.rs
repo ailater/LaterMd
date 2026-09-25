@@ -68,13 +68,12 @@ pub fn ui(
     }
 }
 
-/// 页签栏。点击只发消息,归约在下一帧 `App::logic` 完成。
+/// 页签栏(图标 + 文字,docs/ui-polish.md §4)。点击只发消息,归约在下一帧
+/// `App::logic` 完成;wrapped:侧边栏拖窄时换行而不是压缩。
 fn tab_bar(panel: &mut egui::Ui, active_tab: &mut SidebarTab, outbox: &mut Vec<Message>) {
-    panel.horizontal(|ui| {
+    panel.horizontal_wrapped(|ui| {
         for tab in SidebarTab::ALL {
-            if ui
-                .selectable_label(*active_tab == tab, tab.label())
-                .clicked()
+            if crate::ui::icons::icon_tab(ui, tab.icon(), tab.label(), *active_tab == tab).clicked()
             {
                 outbox.push(Message::SidebarTabChanged(tab));
             }

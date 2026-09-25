@@ -3,6 +3,10 @@
 //! 解析器是纯函数:`data: {...}` 行提取 `choices[0].delta.content`,
 //! `data: [DONE]` 终止,可直接单测,不联网。HTTP 层只负责逐行喂给解析器,
 //! 面积刻意保持很小;真实端点验证留到有真实 key 时(不做造假网络测试)。
+//!
+//! 可调参数集中在 [`OpenAiSettings`]:端点、模型、采样参数、system prompt、
+//! 超时、流式开关。它们由 app 侧的 AI 配置页填写(`latermd-app::ai_config`),
+//! 本 crate 不读环境变量之外的任何配置来源。
 
 use std::fmt;
 use std::io::{BufRead, BufReader};
@@ -50,6 +54,57 @@ impl fmt::Display for AiError {
 
 impl std::error::Error for AiError {}
 
+/// OpenAI 兼容端点的可调参数(app 侧 AI 配置页的落点)。
+///
+/// 采样三参数用 `Option`:不填就不发给服务端,让它用自己的默认值 —— 各家
+/// 兼容端点的默认值并不一致,硬塞 0.7 反而可能改变用户期望的模型行为。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAiSettings {
+    /// 端点根地址。
+    pub base_url: String,
+    /// 模型名。
+    pub model: String,
+    /// 采样温度;不填则不发送该字段。
+    pub temperature: Option<f32>,
+    /// 核采样;不填则不发送。
+    pub top_p: Option<f32>,
+    /// 回复 token 上限;不填则不发送。
+    pub max_tokens: Option<u32>,
+    /// system prompt;空/空白 = 不发送 system 消息。
+    pub system_prompt: String,
+    /// 是否流式(SSE)。关闭则一次性取全文。
+    pub stream: bool,
+    /// 连接与响应超时(秒)。
+    pub timeout_secs: u64,
+}
+
+impl Default for OpenAiSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model: "gpt-4o-mini".to_owned(),
+            temperature: Some(0.7),
+            top_p: Some(1.0),
+            max_tokens: Some(2048),
+            system_prompt: String::new(),
+            stream: true,
+            timeout_secs: 60,
+        }
+    }
+}
+
+impl OpenAiSettings {
+    /// 端点根地址(去掉结尾斜杠,避免拼出 `//chat/completions`)。
+    pub fn base_url_trimmed(&self) -> &str {
+        self.base_url.trim().trim_end_matches('/')
+    }
+
+    /// 请求体里是否要带 system 消息。
+    fn has_system(&self) -> bool {
+        !self.system_prompt.trim().is_empty()
+    }
+}
+
 /// 解析一段 OpenAI 兼容 SSE 文本,产出 [`Chunk`] 序列。
 ///
 /// 规则:`data:` 前缀行取 JSON,提取 `choices[0].delta.content`;
@@ -95,55 +150,118 @@ fn delta_content(json: &str) -> Option<String> {
     content.as_str().map(str::to_owned)
 }
 
-/// OpenAI 兼容(`/chat/completions` + SSE)provider。
+/// 非流式响应取 `choices[0].message.content`;缺字段返回 `None`。
+fn message_content(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let content = value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?;
+    content.as_str().map(str::to_owned)
+}
+
+/// OpenAI 兼容(`/chat/completions`)provider。
 #[derive(Clone)]
 pub struct OpenAiProvider {
     api_key: String,
-    base_url: String,
-    model: String,
+    settings: OpenAiSettings,
     agent: Agent,
 }
 
 impl OpenAiProvider {
-    const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-    const DEFAULT_MODEL: &str = "gpt-4o-mini";
-
+    /// 以默认参数构造(测试与 `from_env` 用;生产走 [`Self::with_settings`])。
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_settings(api_key, OpenAiSettings::default())
+    }
+
+    /// 按完整参数构造。
+    pub fn with_settings(api_key: impl Into<String>, settings: OpenAiSettings) -> Self {
+        let agent = build_agent(Duration::from_secs(settings.timeout_secs.max(1)));
         Self {
             api_key: api_key.into(),
-            base_url: Self::DEFAULT_BASE_URL.to_owned(),
-            model: Self::DEFAULT_MODEL.to_owned(),
-            agent: build_agent(),
+            settings,
+            agent,
         }
+    }
+
+    /// 当前参数(UI 回显与测试断言用)。
+    pub fn settings(&self) -> &OpenAiSettings {
+        &self.settings
     }
 
     /// 从环境构造:key 必填(`LATERMD_AI_API_KEY`),base_url 与模型可选。
     /// 无 key 返回 [`AiError::MissingApiKey`],不 panic。
     pub fn from_env() -> Result<Self, AiError> {
         let api_key = read_api_key().ok_or(AiError::MissingApiKey)?;
-        let mut this = Self::new(api_key);
+        let mut settings = OpenAiSettings::default();
         if let Ok(base) = std::env::var(BASE_URL_ENV) {
             let base = base.trim().trim_end_matches('/');
             if !base.is_empty() {
-                this.base_url = base.to_owned();
+                settings.base_url = base.to_owned();
             }
         }
         if let Ok(model) = std::env::var(MODEL_ENV) {
             let model = model.trim();
             if !model.is_empty() {
-                this.model = model.to_owned();
+                settings.model = model.to_owned();
             }
         }
-        Ok(this)
+        Ok(Self::with_settings(api_key, settings))
+    }
+
+    fn url(&self) -> String {
+        format!("{}/chat/completions", self.settings.base_url_trimmed())
     }
 
     fn request_body(&self, prompt: &str) -> String {
-        json!({
-            "model": self.model,
-            "stream": true,
-            "messages": [{ "role": "user", "content": prompt }],
-        })
-        .to_string()
+        let mut messages = Vec::new();
+        if self.settings.has_system() {
+            messages.push(json!({ "role": "system", "content": self.settings.system_prompt }));
+        }
+        messages.push(json!({ "role": "user", "content": prompt }));
+
+        let mut body = json!({
+            "model": self.settings.model,
+            "stream": self.settings.stream,
+            "messages": messages,
+        });
+        if let Some(temperature) = self.settings.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = self.settings.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if let Some(max_tokens) = self.settings.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
+        body.to_string()
+    }
+
+    /// 非流式补全:commit message 这类「要一行结果」的场景用,不占流式通道
+    /// (commit 的建议是同步产物,流式对它没有意义)。
+    pub fn complete_sync(&self, prompt: &str) -> Result<String, AiError> {
+        let res = self
+            .agent
+            .post(&self.url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .content_type("application/json")
+            .send(self.request_body(prompt))
+            .map_err(|err| AiError::Http(err.to_string()))?;
+        if !res.status().is_success() {
+            let code = res.status().as_u16();
+            let detail = res.into_body().read_to_string().unwrap_or_default();
+            return Err(AiError::HttpStatus {
+                code,
+                detail: truncate_chars(&detail, 400),
+            });
+        }
+        let body = res
+            .into_body()
+            .read_to_string()
+            .map_err(|err| AiError::Http(err.to_string()))?;
+        message_content(&body)
+            .ok_or_else(|| AiError::Http("响应里没有 choices[0].message.content".to_owned()))
     }
 
     fn run(&self, prompt: &str, tx: &Sender<Chunk>) {
@@ -157,10 +275,9 @@ impl OpenAiProvider {
     }
 
     fn stream(&self, prompt: &str, tx: &Sender<Chunk>) -> Result<(), AiError> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let res = self
             .agent
-            .post(&url)
+            .post(&self.url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .content_type("application/json")
             .send(self.request_body(prompt))
@@ -173,6 +290,25 @@ impl OpenAiProvider {
                 code,
                 detail: truncate_chars(&detail, 400),
             });
+        }
+
+        // 非流式配置:整份响应一次性解析成单个正文块 + 结束块
+        if !self.settings.stream {
+            let body = res
+                .into_body()
+                .read_to_string()
+                .map_err(|err| AiError::Http(err.to_string()))?;
+            let text = message_content(&body)
+                .ok_or_else(|| AiError::Http("响应里没有 choices[0].message.content".to_owned()))?;
+            let _ = tx.send(Chunk {
+                delta: text,
+                done: false,
+            });
+            let _ = tx.send(Chunk {
+                delta: String::new(),
+                done: true,
+            });
+            return Ok(());
         }
 
         let mut saw_done = false;
@@ -206,10 +342,10 @@ impl AiProvider for OpenAiProvider {
     }
 }
 
-fn build_agent() -> Agent {
+fn build_agent(timeout: Duration) -> Agent {
     Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_connect(Some(timeout.min(Duration::from_secs(30))))
+        .timeout_recv_response(Some(timeout))
         // 注意:这是整个 body 的总量预算(逐读不重置)。单次续写流不会
         // 跑到 10 分钟,设它只为让死连接最终以 Timeout 收场,别永久挂住
         // 后台线程;真正的逐块空闲超时等有真实端点数据再加。
@@ -341,7 +477,7 @@ mod tests {
         assert_eq!(read_api_key().as_deref(), Some("sk-test"));
 
         let provider = OpenAiProvider::from_env().expect("有 key 时构造应成功");
-        assert_eq!(provider.model, OpenAiProvider::DEFAULT_MODEL);
+        assert_eq!(provider.settings().model, "gpt-4o-mini");
         env::remove_var(API_KEY_ENV);
         assert_eq!(read_api_key(), None);
     }
@@ -355,5 +491,71 @@ mod tests {
         assert_eq!(value["stream"], true);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][0]["content"], "续写");
+        // 默认带温度/核采样/上限;不设 system 就不发 system 消息
+        // f32 → JSON 有精度误差,按容差断言
+        assert!((value["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-3);
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+    }
+
+    /// 自定义端点/模型/采样参数/system 全部进请求体;`None` 的采样参数不发
+    /// 字段(让服务端用自己的默认值)。
+    #[test]
+    fn request_body_carries_settings() {
+        let provider = OpenAiProvider::with_settings(
+            "sk-test",
+            OpenAiSettings {
+                base_url: "https://open.bigmodel.cn/api/paas/v4/".to_owned(),
+                model: "glm-4.6".to_owned(),
+                temperature: None,
+                top_p: None,
+                max_tokens: Some(4096),
+                system_prompt: "你是技术文档助手".to_owned(),
+                stream: false,
+                timeout_secs: 120,
+            },
+        );
+        assert_eq!(
+            provider.url(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "尾斜杠被去掉,不拼出双斜杠"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&provider.request_body("续写")).unwrap();
+        assert_eq!(value["model"], "glm-4.6");
+        assert_eq!(value["stream"], false);
+        assert_eq!(value["max_tokens"], 4096);
+        assert!(value.get("temperature").is_none(), "None 不发送该字段");
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "你是技术文档助手");
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    /// 空白 system prompt 不产生 system 消息(空白也算「没写」)。
+    #[test]
+    fn blank_system_prompt_is_omitted() {
+        let provider = OpenAiProvider::with_settings(
+            "sk-test",
+            OpenAiSettings {
+                system_prompt: "   \n  ".to_owned(),
+                ..OpenAiSettings::default()
+            },
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&provider.request_body("续写")).unwrap();
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+    }
+
+    /// 非流式响应的正文提取:有 content 取值、没有则报错。
+    #[test]
+    fn message_content_extraction() {
+        assert_eq!(
+            message_content("{\"choices\":[{\"message\":{\"content\":\"docs: 新增 README\"}}]}")
+                .as_deref(),
+            Some("docs: 新增 README")
+        );
+        assert_eq!(message_content("{\"choices\":[]}"), None);
+        assert_eq!(message_content("不是 JSON"), None);
     }
 }
