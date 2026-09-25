@@ -4,6 +4,18 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #19 git status 的条数上限与超限文件的行为（2026-09-25）
+
+- **岔路**：独立评审指出 `latermd_git::status` 无条数上限（`recurse_untracked_dirs` 全量展开），叠加同步跑在 UI 线程的 3s 轮询与侧边栏每帧全量渲染，超大仓库会卡帧——log（50 条）与 diff（64KB）都有上限，唯独 status 没有。加多少、超限文件的行为（角标/选中/回滚）怎么定未指定。
+- **自动选择**：上限 **500**（`latermd_git::DEFAULT_STATUS_LIMIT`），与文件树 `MAX_CHILDREN`、搜索 `MAX_HITS` 两个既有先例同量级；`status(root, limit)` 返回 `StatusSnapshot { entries, truncated }`，**先按路径排序再截断**（保留字典序最小的前 500 条，保证确定性）；Git 页改动列表尾部渲染「…还有 N 项未显示」（与文件树同款提示行）。超限文件的降级：无文件树角标、不可选中/回滚（select/request_checkout 的「列表外路径忽略」防御天然覆盖）——与文件树截断、搜索 MAX_HITS 同语义。注意：libgit2 的 statuses 遍历本身无法提前截断（StatusOptions 无 limit），本上限消除的是「Vec 无界 + 每帧全量渲染」两项；遍历成本仍属 #17 已登记的「掉帧再挪线程」取舍。
+- **如何改**：嫌 500 太小改 `DEFAULT_STATUS_LIMIT` 一个常量（调用方 `git_panel.rs` 自动跟随）；要「显示全部」，给 Git 页加展开交互并让 `status` 支持分页或提高上限；要消除遍历成本，把 `recurse_untracked_dirs` 关掉（未跟踪目录只报目录一条，快得多，但文件树逐文件打标失效）或按 #17 的「如何改」挪后台线程。
+
+## #18 回滚目标恰是编辑器当前文档时，dirty 缓冲的处置（2026-09-25）
+
+- **岔路**：独立评审指出回滚（checkout 单文件）若目标正是编辑器当前打开的文档，归约后编辑器不重载、无提示——dirty 场景一次 Ctrl+S 就把被丢弃的改动静默写回（反转回滚）；非 dirty 场景编辑器显示与磁盘不一致。修法有两派：①回滚后无条件重载编辑器（强一致，但 dirty 时静默丢掉未保存稿）；②分 dirty 分流。
+- **自动选择**：**②分 dirty 分流**（`State::after_git_checkout`）：目标非当前文档不触碰编辑器；是当前文档且非 dirty → 重读磁盘换入缓冲（预览同帧联动，编辑器与磁盘重新一致）；是当前文档且 dirty → **保留未保存稿**（静默丢稿的代价大于不一致，与 `unsaved_guard` 的既有哲学一致），提示行明示「已回滚 X：编辑器里未保存的修改仍保留，保存(Ctrl+S)会把它们写回」。确认模态同步加针对性警示（`checkout_dialog` 的 `checkout_extra_warning`）：目标在编辑器中打开时按 dirty 显式告知上述行为，不再只有通用不可逆警示。
+- **如何改**：要①的强一致语义，把 `after_git_checkout` 的 dirty 分支改成同样调 `open_from(file)`（并在 `checkout_extra_warning` 的 dirty 文案里说明将丢弃编辑器修改）；要更保守的「dirty 时拒绝回滚」（像 unsaved_guard 那样拦下），在 `request_checkout` 前置检查并落提示行。
+
 ## #17 Git UI 接驳的刷新机制、仓库根定位与确认模态形态（2026-09-25）
 
 - **岔路**：把 latermd-git 接进侧边栏时任务留了三处自由度。①「每 N 秒或触发时刷新」的 N 未定，且同步归约执行还是后台线程未定（`git status` 大仓库冷缓存可能上百毫秒，卡帧风险真实存在）；②#16 ③ 已定 latermd-git API 层用 `Repository::open` 严格仓库根，但 UI 的文件树根常是**仓库子目录**（比如选了 `docs/` 当根），以哪个目录调 status/diff/log 没定；③「确认模态」在 egui 0.36 没有内建阻塞模态层，用什么形态承载。

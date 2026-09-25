@@ -67,6 +67,16 @@ pub struct FileStatus {
     pub code: StatusKind,
 }
 
+/// [`status`] 的返回:改动条目 + 截断计数。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StatusSnapshot {
+    /// 改动条目,按路径排序,至多调用方给的 `limit` 条。
+    pub entries: Vec<FileStatus>,
+    /// 超出上限被丢弃的条数;`0` = 快照完整。被截断的文件不出现在
+    /// 条目里(UI 侧随之无角标、不可选中),由调用方提示行兜底。
+    pub truncated: usize,
+}
+
 /// 一条提交记录。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CommitInfo {
@@ -96,6 +106,11 @@ pub struct BlameLine {
 /// [`log`] 的默认条数上限。
 pub const DEFAULT_LOG_LIMIT: usize = 50;
 
+/// [`status`] 的默认条数上限。与 app 侧文件树(`MAX_CHILDREN`)、搜索
+/// (`MAX_HITS`)的截断先例同量级:列表逐行渲染、每帧全量布局,500 行
+/// 是「大仓库不卡帧」与「日常改动全可见」的折中。
+pub const DEFAULT_STATUS_LIMIT: usize = 500;
+
 /// 从任意目录向上探测 Git 仓库的工作区根(`.git` 所在目录),起点自身
 /// 是仓库根也命中。UI 的文件树根可能是仓库子目录(例如选了 `docs/`),
 /// 其余 API 只认仓库根,先经本函数换算。裸仓库(只有 `.git` 内容、无
@@ -110,12 +125,15 @@ pub fn discover(start: &Path) -> Result<PathBuf, String> {
         })
 }
 
-/// 读取仓库全部改动(含未跟踪文件),按路径排序。
+/// 读取仓库全部改动(含未跟踪文件),按路径排序,至多 `limit` 条,超出
+/// 部分计入 `truncated`(与 log/diff 的上限同款口径:UI 逐行渲染 + 每帧
+/// 全量布局,无界列表会在超大仓库卡帧)。截断发生在排序之后,保留的是
+/// 字典序最小的前 `limit` 条。
 ///
 /// 未跟踪目录会递归展开到逐个文件,便于文件树打标;`.gitignore` 命中的
 /// 文件按 git 惯例不出现;非 UTF-8 文件名同样不出现(极罕见,libgit2
 /// 拿不到 &str 形式的路径)。
-pub fn status(root: &Path) -> Result<Vec<FileStatus>, String> {
+pub fn status(root: &Path, limit: usize) -> Result<StatusSnapshot, String> {
     let repo = open_repo(root)?;
     let mut options = StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
@@ -132,7 +150,9 @@ pub fn status(root: &Path) -> Result<Vec<FileStatus>, String> {
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(entries)
+    let truncated = entries.len().saturating_sub(limit);
+    entries.truncate(limit);
+    Ok(StatusSnapshot { entries, truncated })
 }
 
 /// 近期提交列表,新提交在前,最多 `limit` 条;还没有任何提交的空仓库
@@ -368,8 +388,9 @@ mod tests {
         std::fs::remove_file(dir.join("b.md")).unwrap(); // D
         std::fs::write(dir.join("untracked.md"), "?\n").unwrap(); // ?
 
-        let pairs: Vec<(String, String)> = status(&dir)
+        let pairs: Vec<(String, String)> = status(&dir, DEFAULT_STATUS_LIMIT)
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| (entry.path, entry.code.to_string()))
             .collect();
@@ -383,6 +404,30 @@ mod tests {
             ],
             "{pairs:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上限:超出 limit 的条目按字典序截断并计数;恰好等于 limit 不计
+    /// 截断;limit 0 是空列表 + 全量计数。
+    #[test]
+    fn status_truncates_entries_beyond_limit() {
+        let dir = temp_repo("status-cap");
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("f{i}.md")), "?\n").unwrap();
+        }
+
+        let snapshot = status(&dir, 3).unwrap();
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.truncated, 2);
+        assert_eq!(snapshot.entries[0].path, "f0.md", "字典序最小的保留");
+
+        let exact = status(&dir, 5).unwrap();
+        assert_eq!(exact.entries.len(), 5);
+        assert_eq!(exact.truncated, 0, "恰好等于上限不算截断");
+
+        let none = status(&dir, 0).unwrap();
+        assert!(none.entries.is_empty());
+        assert_eq!(none.truncated, 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -521,7 +566,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        assert!(status(&dir).is_err());
+        assert!(status(&dir, DEFAULT_STATUS_LIMIT).is_err());
         assert!(log(&dir, DEFAULT_LOG_LIMIT).is_err());
         assert!(diff_file(&dir, "a.md").is_err());
         assert!(blame_file(&dir, "a.md").is_err());

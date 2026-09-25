@@ -380,6 +380,9 @@ fn git_panel(panel: &mut egui::Ui, git: &GitPanelState, outbox: &mut Vec<Message
             for entry in &git.entries {
                 git_status_row(ui, git, entry, outbox);
             }
+            if git.truncated > 0 {
+                ui.weak(format!("…还有 {} 项未显示", git.truncated));
+            }
         });
 
     if let Some(selected) = git.selected.as_deref() {
@@ -785,18 +788,26 @@ mod tests {
             vec![Message::GitFileSelected("docs/note.md".to_owned())]
         );
 
-        // 降级态(非 git 仓库)与空历史:只渲染降级文案,同样不 panic
+        // 降级态(非 git 仓库)、空历史与截断态:只渲染降级文案/提示行,不 panic
         let degraded = GitPanelState {
             error: Some("当前目录不是 Git 仓库".to_owned()),
             ..GitPanelState::default()
         };
         let empty = GitPanelState::default();
+        let truncated = GitPanelState {
+            truncated: 7,
+            ..GitPanelState::default()
+        };
         ctx.run_ui(RawInput::default(), |ui| {
             git_panel(ui, &degraded, &mut Vec::new());
         })
         .drop_without_applying_deltas();
         ctx.run_ui(RawInput::default(), |ui| {
             git_panel(ui, &empty, &mut Vec::new());
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(RawInput::default(), |ui| {
+            git_panel(ui, &truncated, &mut Vec::new());
         })
         .drop_without_applying_deltas();
     }

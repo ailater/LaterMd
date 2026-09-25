@@ -375,8 +375,20 @@ impl State {
             Message::GitFileSelected(path) => self.git.select(&path),
             Message::GitCheckoutRequested(path) => self.git.request_checkout(path),
             Message::GitCheckoutConfirmed => {
-                if let Some(error) = self.git.confirm_checkout(self.file_tree.root.as_deref()) {
-                    self.document.notice = Some(error);
+                // 回滚目标与仓库根在 confirm_checkout 内被 take,先留档供
+                // 成功后的「当前文档一致性」判定
+                let target = self
+                    .git
+                    .confirm_checkout
+                    .clone()
+                    .zip(self.git.repo_root.clone());
+                match self.git.confirm_checkout(self.file_tree.root.as_deref()) {
+                    Some(error) => self.document.notice = Some(error),
+                    None => {
+                        if let Some((rel, root)) = target {
+                            self.after_git_checkout(&root.join(&rel));
+                        }
+                    }
                 }
             }
             Message::GitCheckoutCancelled => self.git.cancel_checkout(),
@@ -388,6 +400,28 @@ impl State {
     pub fn refresh_git(&mut self) {
         let root = self.file_tree.root.clone();
         self.git.refresh(root.as_deref());
+    }
+
+    /// 回滚成功后的编辑器一致性(`Message::GitCheckoutConfirmed` 的归约
+    /// 尾步):目标不是当前文档则无事;是则分两种情况——
+    ///
+    /// * 非 dirty:缓冲本与磁盘一致,磁盘已回 HEAD,重读换入(预览同帧
+    ///   联动),否则编辑器将显示已丢弃的工作区版本;
+    /// * dirty:磁盘回 HEAD 但**保留**编辑器里未保存的稿子(静默丢稿风险
+    ///   大于不一致风险,与 [`Self::unsaved_guard`] 同哲学),提示行告知
+    ///   「保存会写回」——否则一次 Ctrl+S 就静默反转回滚,用户毫不知情。
+    fn after_git_checkout(&mut self, file: &Path) {
+        if self.document.path.as_deref() != Some(file) {
+            return;
+        }
+        if self.editor.is_dirty() {
+            self.document.notice = Some(format!(
+                "已回滚 {}:编辑器里未保存的修改仍保留,保存(Ctrl+S)会把它们写回",
+                file.display()
+            ));
+        } else {
+            self.open_from(file);
+        }
     }
 
     /// 生成 commit message(`Message::AiCommitRequested` 的归约):定位仓库
@@ -1529,6 +1563,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&settings_dir);
+    }
+
+    /// 回滚目标正是编辑器当前文档(非 dirty):确认后编辑器重读磁盘的
+    /// HEAD 版本、预览同帧联动——不重载则编辑器仍显示已丢弃的工作区版本。
+    #[test]
+    fn git_checkout_of_current_document_reloads_editor() {
+        let dir = git_repo_with_dirty_file("git-reload");
+        let file = dir.join("a.md");
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.refresh_git();
+        state.editor.clear_dirty(); // 放行 open_from 的 unsaved_guard
+        state.apply(Message::FileSelected(file.clone()));
+        assert_eq!(
+            state.editor.text(),
+            "工作区乱改\n",
+            "前置:编辑器持有工作区版"
+        );
+
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert_eq!(state.editor.text(), "HEAD 版本\n", "编辑器随磁盘回滚重载");
+        assert_eq!(state.preview.text, "HEAD 版本\n", "预览快照同帧联动");
+        assert!(!state.editor.is_dirty());
+        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
+        assert!(state.document.notice.is_none(), "干净重载无提示");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚目标正是当前文档且编辑器 dirty:未保存的稿子保留(绝不静默
+    /// 丢稿),磁盘已回 HEAD,提示行说明「保存会写回」;非当前文档的回滚
+    /// 则完全不触碰编辑器。
+    #[test]
+    fn git_checkout_keeps_dirty_buffer_and_skips_unrelated_editor() {
+        let dir = git_repo_with_dirty_file("git-dirty");
+        let file = dir.join("a.md");
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.refresh_git();
+        state.editor.clear_dirty();
+        state.apply(Message::FileSelected(file.clone()));
+        state.editor.insert_chars(0, "未保存草稿\n"); // dirty
+        assert!(state.editor.is_dirty());
+
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "HEAD 版本\n",
+            "磁盘已回滚"
+        );
+        assert!(
+            state.editor.text().starts_with("未保存草稿"),
+            "缓冲里的未保存稿保留"
+        );
+        let notice = state.document.notice.as_deref().expect("有针对性提示");
+        assert!(notice.contains("写回"), "{notice}");
+        // 预览快照未被重置:dirty 分支不走 load_document(重载是 clean 分支
+        // 的行为);快照推进交给下一帧编辑器面板的修订号检查
+        assert_ne!(state.preview.text, "HEAD 版本\n", "未走重载路径");
+
+        // 回滚目标不是当前文档:编辑器与文档身份都不动
+        std::fs::write(dir.join("b.md"), "HEAD 版本\n").unwrap();
+        run_git(&dir, &["add", "b.md"]);
+        run_git(&dir, &["commit", "-q", "-m", "b"]);
+        std::fs::write(dir.join("b.md"), "乱改\n").unwrap();
+        state.refresh_git();
+        state.apply(Message::GitCheckoutRequested("b.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert!(
+            state.editor.text().starts_with("未保存草稿"),
+            "非当前文档的回滚不触碰编辑器"
+        );
+        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 切到 Git 页立即刷新:停了很久的快照不用于回滚决策。

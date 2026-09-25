@@ -6,6 +6,10 @@
 //!   回滚完成走同一入口立即刷新。同步执行——git status/log 是毫秒级本地
 //!   读,与 `git_diff.rs` 同一取舍,不值得上后台线程(大仓库冷缓存若实测
 //!   掉帧,再挪线程,接口不变)。
+//! - **条数上限**:改动列表截断在 [`latermd_git::DEFAULT_STATUS_LIMIT`]
+//!   (500,与文件树/搜索的截断先例同量级),超出计 `truncated`、渲染提示
+//!   行;被截断文件无角标、不可选中/回滚。防的是超大仓库的无界列表卡帧
+//!   (log/diff 各有 50 条/64KB 上限,status 同款口径)。
 //! - **降级**:文件树根不是 git 仓库时 `error` 置文案、角标与列表清空,
 //!   Git 页显示提示而非报错;降级后**停止轮询**(重探由换根/切 Git 页触发,
 //!   egui 得以收敛到深度空闲),无根时静默清空、由渲染层给引导。
@@ -34,8 +38,12 @@ pub struct GitPanelState {
     pub repo_root: Option<PathBuf>,
     /// 降级文案(非 git 仓库等);`Some` = Git 页显示它,列表与历史为空。
     pub error: Option<String>,
-    /// 改动列表(`latermd_git::status` 原样:相对仓库根、按路径排序)。
+    /// 改动列表(相对仓库根、按路径排序,至多
+    /// [`latermd_git::DEFAULT_STATUS_LIMIT`] 条,超出计 [`Self::truncated`])。
     pub entries: Vec<FileStatus>,
+    /// 超出条数上限被截断的改动数(渲染层给「…还有 N 项未显示」提示;
+    /// 被截断文件无角标、不可选中/回滚,与文件树/搜索的同款降级)。
+    pub truncated: usize,
     /// 状态角标:绝对路径 → 状态码,文件树 Files 页与 Git 页共用。
     pub badges: HashMap<PathBuf, StatusKind>,
     /// 近期提交(`latermd_git::log` 原样,新在前;log 失败静默为空——
@@ -61,6 +69,7 @@ impl Default for GitPanelState {
             repo_root: None,
             error: None,
             entries: Vec::new(),
+            truncated: 0,
             badges: HashMap::new(),
             commits: Vec::new(),
             fetched_at: 0,
@@ -90,8 +99,8 @@ impl GitPanelState {
                 return;
             }
         };
-        let entries = match latermd_git::status(&repo_root) {
-            Ok(entries) => entries,
+        let snapshot = match latermd_git::status(&repo_root, latermd_git::DEFAULT_STATUS_LIMIT) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.degrade(Some(error));
                 return;
@@ -99,19 +108,21 @@ impl GitPanelState {
         };
         self.repo_root = Some(repo_root.clone());
         self.error = None;
-        self.badges = entries
+        self.badges = snapshot
+            .entries
             .iter()
             .map(|entry| (repo_root.join(&entry.path), entry.code))
             .collect();
         if let Some(selected) = &self.selected {
-            if entries.iter().any(|entry| &entry.path == selected) {
+            if snapshot.entries.iter().any(|entry| &entry.path == selected) {
                 self.reload_diff();
             } else {
                 self.selected = None;
                 self.diff.clear();
             }
         }
-        self.entries = entries;
+        self.entries = snapshot.entries;
+        self.truncated = snapshot.truncated;
         self.commits =
             latermd_git::log(&repo_root, latermd_git::DEFAULT_LOG_LIMIT).unwrap_or_default();
     }
@@ -155,6 +166,12 @@ impl GitPanelState {
         self.badges.get(file).copied()
     }
 
+    /// 相对仓库根路径 → 绝对路径(`None` = 无仓库根)。确认模态与回滚
+    /// 归约都用它比较「回滚目标是否编辑器当前文档」,与角标同一拼接口径。
+    pub fn absolute_path(&self, rel: &str) -> Option<PathBuf> {
+        self.repo_root.as_ref().map(|root| root.join(rel))
+    }
+
     /// 自动刷新是否到点(归约侧每帧问一次)。
     pub fn due(&self) -> bool {
         self.refresh_due <= Instant::now()
@@ -171,6 +188,7 @@ impl GitPanelState {
         self.error = error;
         self.repo_root = None;
         self.entries.clear();
+        self.truncated = 0;
         self.badges.clear();
         self.commits.clear();
         self.selected = None;
@@ -367,6 +385,40 @@ mod tests {
         assert_eq!(git.selected, None, "选中项随 clean 失效清空");
         assert!(git.badges.is_empty(), "角标同步清空");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大量改动:条目截断到上限、truncated 计数就位,角标只覆盖保留的
+    /// 条目(被截断文件无角标,由提示行兜底)。
+    #[test]
+    fn refresh_truncates_entries_beyond_limit() {
+        let dir = temp_repo("truncate");
+        for i in 0..(latermd_git::DEFAULT_STATUS_LIMIT + 3) {
+            std::fs::write(dir.join(format!("f{i:03}.md")), "?\n").unwrap();
+        }
+
+        let mut git = GitPanelState::default();
+        git.refresh(Some(&dir));
+        assert_eq!(
+            git.entries.len(),
+            latermd_git::DEFAULT_STATUS_LIMIT,
+            "条目截断到上限"
+        );
+        assert_eq!(git.truncated, 3, "超出部分计数");
+        assert_eq!(git.badges.len(), latermd_git::DEFAULT_STATUS_LIMIT);
+        assert_eq!(git.entries[0].path, "f000.md", "字典序最小的保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 相对路径 → 绝对路径:有仓库根才可换算。
+    #[test]
+    fn absolute_path_requires_repo_root() {
+        let mut git = GitPanelState::default();
+        assert_eq!(git.absolute_path("a.md"), None);
+        git.repo_root = Some(PathBuf::from("/repo"));
+        assert_eq!(
+            git.absolute_path("docs/a.md"),
+            Some(PathBuf::from("/repo/docs/a.md"))
+        );
     }
 
     /// 到点与周期:refresh 顺延一个周期,due 到点翻转;until_refresh 单调递减。
