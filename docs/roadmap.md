@@ -13,8 +13,8 @@
 
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
-[~] M0 技术验证   自动化可测项已有结论「继续」;出口放行卡两条真机项(IME、Win/mac wgpu),挂账随 P0 载体补测,见 m0-report.md
-[~] P0 骨架       ← 当前(2026-09-25,模块批量落地中;剩打包分发与 M0 真机项)
+[~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。出口仍卡两条真机项(IME、Win/mac wgpu),见 m0-report.md
+[~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包已就位(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板),待首个 tag 跑通验证
 [ ] P1 差异化
 [ ] P2 版本层
 [ ] P2.5 界面打磨（皮肤系统批次 B，见「专题：界面美化与皮肤系统」）
@@ -37,7 +37,11 @@
 | 文件树基础版（懒加载 + .gitignore + 当前文件高亮） | `37c9e0c` |
 | 修复：大纲跳转 span 过期越界钳制 + 保存/导出原子落盘 | `efedd6b` |
 
-> P0 范围表对照：Markdown 与代码高亮已由 vendor 提供，上表已覆盖其余功能条目；**剩余 = 打包分发**（三平台 Release + macOS cask）**与 M0 两条真机项**。
+> P0 范围表对照：Markdown 与代码高亮已由 vendor 提供，上表已覆盖其余功能条目。
+>
+> **打包分发进展（2026-09-25）**：cargo-dist 0.33 已接入，`dist plan/build` 实测五目标齐备（Linux x64、macOS 双架构、Windows x64 + ARM64），资产名 `latermd-{triple}` 不含版本号；macOS universal2 dmg 走自建 job（`.github/workflows/macos-dmg.yml`：lipo + `.app` + hdiutil），cask 模板在 `packaging/latermd.rb`。**待首个 tag 在 CI 上跑通验证**（本机无 macOS，lipo/hdiutil/codesign 无法自测）。
+>
+> **剩余**：上段打包的首跑验证，与 M0 两条真机项（IME、Win/mac wgpu）。
 
 > Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 

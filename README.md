@@ -26,10 +26,20 @@
 brew install --cask crazykun/ailater/latermd
 ```
 
-- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 直下 `.exe`。首次运行 SmartScreen 会警告,点「更多信息 → 仍要运行」即可。
-- **Linux**:`.AppImage` / `.deb` / `.rpm` 从 Releases 直下,或使用 Linuxbrew。
+- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 下 `latermd-x86_64-pc-windows-msvc.zip`(ARM64 机器取 `aarch64-pc-windows-msvc`),解压即用。无签名,SmartScreen 会警告,点「更多信息 → 仍要运行」。
+- **Linux**:下 `latermd-x86_64-unknown-linux-gnu.tar.xz`,解包后 `./latermd`,或自行丢进 `~/.local/bin`。
+- **macOS**:universal2 单 dmg(`latermd-v{版本}-universal2-apple-darwin.dmg`),双架构 lipo 合一;走 brew 更省事(postflight 自动去 quarantine)。
 
-> 未发布前此节为渠道预告,当前无可安装产物。
+> **当前还没发过版。** 发布链路(cargo-dist 五目标 + macOS dmg + cask)已就位,首次 Release 需先合入打包 PR 并打 tag:`git tag v0.1.0 && git push origin v0.1.0`。在那之前请按上一节本地编译运行。
+
+### 发布一次版本的步骤
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0   # 触发 release.yml:五目标构建 + 建 Release
+                                            # Release 发布后自动触发 macos-dmg.yml 合成 dmg
+```
+
+产物命名固定为 `latermd-{target-triple}.tar.xz|.zip`(**不含版本号**,cask 热链依赖此格式)与 `latermd-v{版本}-universal2-apple-darwin.dmg`。
 
 ## 技术栈
 

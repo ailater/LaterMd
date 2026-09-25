@@ -62,23 +62,10 @@ jobs:
           APP="LaterMD.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           install -m 755 latermd-universal "$APP/Contents/MacOS/latermd"
-          cat > "$APP/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>LaterMD</string>
-            <key>CFBundleDisplayName</key><string>LaterMD</string>
-            <key>CFBundleIdentifier</key><string>cn.ailater.LaterMD</string>
-            <key>CFBundleExecutable</key><string>latermd</string>
-            <key>CFBundleVersion</key><string>${VERSION}</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>LSMinimumSystemVersion</key><string>14.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          PLIST
+          # Info.plist 作为仓库文件维护(packaging/macos/Info.plist),此处只替换版本:
+          # YAML block scalar 里的 heredoc 结束标记必然带缩进,shell 认不出来,别用 heredoc
+          sed "s/__VERSION__/${VERSION}/g" \
+            packaging/macos/Info.plist > "$APP/Contents/Info.plist"
           # ad-hoc 签名:不解决 Gatekeeper(quarantine 由 cask postflight 移除),
           # 但避免无签名 bundle 在部分系统上的启动异常
           codesign --force --deep --sign - "$APP" || true
