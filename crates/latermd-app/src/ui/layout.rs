@@ -123,7 +123,46 @@ impl LaterMdApp {
         egui::CentralPanel::default().show(ui, |ui| {
             crate::ui::preview::ui(ui, &self.state.preview, &self.state.ai, outbox);
         });
+
+        // ⑤ 顶层浮层:commit message 建议(存在才显示)。panel 顺序铁律只
+        // 约束 panel(浮窗是独立 Area 层,不参与嵌套),画在最后取语义上的
+        // 「最上层」。
+        if let Some(subject) = self.state.ai_commit_suggestion.clone() {
+            let (_, close) = commit_dialog(ui, &subject);
+            if close.clicked() {
+                self.outbox.push(Message::AiCommitDismissed);
+            }
+        }
     }
+}
+
+/// commit message 建议浮窗;返回(复制, 关闭)按钮的响应,测试定位用
+/// (与 `ui::menubar::item` 同款手法)。
+///
+/// 复制即时写系统剪贴板(`Context::copy_text`,UI 侧效果,不改状态——
+/// 不经用户动作覆盖剪贴板会冲掉用户正在搬运的内容);关闭只发消息,
+/// 清建议的归约在 `App::logic`。
+fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Response) {
+    let ctx = ui.ctx().clone();
+    let mut buttons = None;
+    egui::Window::new("AI: commit message")
+        // 固定初始位置:浮窗出现位置可预期(不与菜单栏重叠),拖动后由
+        // Area 记忆保持;显式初始位也让无头测试的帧间位置稳定。
+        .default_pos([80.0, 120.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label("建议的 commit subject:");
+            ui.label(egui::RichText::new(subject).strong());
+            ui.horizontal(|ui| {
+                let copy = ui.button("复制");
+                if copy.clicked() {
+                    ctx.copy_text(subject.to_owned());
+                }
+                buttons = Some((copy, ui.button("关闭")));
+            });
+        });
+    buttons.expect("浮窗必然绘制按钮")
 }
 
 impl eframe::App for LaterMdApp {
@@ -140,7 +179,11 @@ impl eframe::App for LaterMdApp {
 mod tests {
     use super::*;
     use crate::state;
-    use egui::{Event, FullOutput, Key, Modifiers, RawInput, ViewportCommand};
+    use egui::{
+        Event, FullOutput, Key, Modifiers, OutputCommand, PointerButton, RawInput, Rect,
+        ViewportCommand,
+    };
+    use std::cell::Cell;
 
     fn key_s(modifiers: Modifiers) -> Event {
         Event::Key {
@@ -422,5 +465,115 @@ mod tests {
         assert!(!ctx.global_style().visuals.dark_mode);
         assert!(dir.join("settings.json").exists(), "重启保持的数据已落盘");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// commit 建议浮窗:复制按钮把 subject 写进系统剪贴板输出命令;关闭按钮
+    /// 经完整 draw → reduce 链路清掉建议(浮窗随之消失)。
+    ///
+    /// 合成点击分三帧(moved / press / release):Window 层按钮的点击归属
+    /// 要求指针在按下帧之前已停在目标上(实测;panel 层的 menubar 测试无
+    /// 此限制),三帧节奏也更接近真实输入。
+    #[test]
+    fn commit_dialog_copies_and_close_clears_suggestion() {
+        let mut app = LaterMdApp::default();
+        app.state.ai_commit_suggestion = Some("docs: 新增README.md".into());
+        let ctx = egui::Context::default();
+        let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+
+        // 帧 1:单独渲染浮窗拿按钮位置(Area 按 id 记忆,draw 内位置一致)
+        ctx.run_ui(RawInput::default(), |ui| {
+            let (copy, close) = commit_dialog(ui, "docs: 新增README.md");
+            rects.set((copy.rect, close.rect));
+        })
+        .drop_without_applying_deltas();
+
+        let (copy_center, close_center) = {
+            let (copy, close) = rects.get();
+            (copy.center(), close.center())
+        };
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        // 帧 2-4:点「复制」→ 剪贴板输出命令携带 subject
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(copy_center)],
+                ..Default::default()
+            },
+            |ui| {
+                commit_dialog(ui, "docs: 新增README.md");
+            },
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![click(copy_center, true)],
+                ..Default::default()
+            },
+            |ui| {
+                commit_dialog(ui, "docs: 新增README.md");
+            },
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![click(copy_center, false)],
+                ..Default::default()
+            },
+            |ui| {
+                commit_dialog(ui, "docs: 新增README.md");
+            },
+        );
+        assert!(
+            output.platform_output.commands.iter().any(|cmd| matches!(
+                cmd,
+                OutputCommand::CopyText(text) if text.as_str() == "docs: 新增README.md"
+            )),
+            "复制按钮写剪贴板:{:?}",
+            output.platform_output.commands
+        );
+        output.drop_without_applying_deltas();
+
+        // 帧 5-7:完整 draw 下点「关闭」→ outbox 收到 AiCommitDismissed
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(close_center)],
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![click(close_center, true)],
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![click(close_center, false)],
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.drop_without_applying_deltas();
+        assert!(
+            app.outbox
+                .iter()
+                .any(|m| matches!(m, Message::AiCommitDismissed)),
+            "{:?}",
+            app.outbox
+        );
+
+        // 帧 8:归约清建议
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.ai_commit_suggestion, None);
     }
 }

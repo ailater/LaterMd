@@ -27,7 +27,7 @@
 | 2 | p1-search | 侧边栏全文搜索：`ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果 | ✅完成 | feat(app): 仓库全文搜索核心服务(遍历+行正则+可取消流式回传);feat(app): 侧边栏搜索 UI 与跳转接线(300ms 去抖 + 流式结果 + 点击跳行) |
 | 3 | p1-ai-base | latermd-ai 基础：provider trait（OpenAI/Anthropic/Ollama 兼容）+ `heal()` 流式接入 + 稳定 widget id；**mock provider 交付**（真实 key 见 decisions-pending #3） | ✅完成 | feat(ai): 新建 latermd-ai 核心 crate(provider trait + MockProvider + OpenAI SSE 解析 + ureq 阻塞 HTTP);feat(app): 接入 AI Mock 流式续写(菜单/Message 归约/防重入),预览启用 heal 并复测流式 bench |
 | 4 | p1-ai-links | `ai://` 链接协议 + AI 指令块（LinkHandler 五级扩展点落地），依赖 #3 | ✅完成 | feat(app): ai:// 链接协议——LinkHandler 样式区分与点击拦截触发 Mock 流式续写;feat(app): ```ai 指令卡——代码块级 block widget 渲染指令卡,执行走 ai:// 同通道 |
-| 5 | p1-ai-tools | AI commit message + AI 摘要大纲（基于 #3 的 provider，mock 可用） | ⏳待开始 | — |
+| 5 | p1-ai-tools | AI commit message + AI 摘要大纲（基于 #3 的 provider，mock 可用） | ✅完成 | feat(app): AI 生成 commit message——diff 采集、prompt 模板、Mock 合成与建议浮窗;feat(app): AI 生成摘要——全文喂 provider、引用块流式插入文档末尾、旧摘要节自动清理 |
 | 6 | p2-git | latermd-git 只读集成：状态、历史、diff、blame、回滚 + 文件树 M/A/U/? 标记 | ⏳待开始 | — |
 | 7 | p2-creds | 凭据管理三平台封装（Credential Manager / Keychain / libsecret） | ⏳待开始 | — |
 | 8 | p2b-theme | 皮肤批次 B：三态切换（亮/暗/跟随系统）+ 自定义皮肤文件（RON 导出至 themes/）+ 视觉打磨 | ⏳待开始 | — |

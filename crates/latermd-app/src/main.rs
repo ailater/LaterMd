@@ -12,6 +12,7 @@ mod export;
 mod file;
 mod filetree;
 mod fonts;
+mod git_diff;
 mod search;
 mod state;
 mod theme;
