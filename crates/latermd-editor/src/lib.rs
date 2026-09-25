@@ -75,6 +75,13 @@ impl EditorBuffer {
         self.rope.byte_to_char(byte_idx.min(self.rope.len_bytes()))
     }
 
+    /// 行号(0-based)→ 行首字节偏移。`line_idx` 超界时钳制到文末,不
+    /// panic —— 行号常来自点击时刻的快照(大纲/搜索结果),同帧编辑或
+    /// 换入更短文件都可能让它过期。
+    pub fn line_to_byte(&self, line_idx: usize) -> usize {
+        self.rope.line_to_byte(line_idx.min(self.rope.len_lines()))
+    }
+
     /// 在字符偏移处插入文本(增量)。空文本为无操作,不推进修订号。
     pub fn insert_chars(&mut self, char_idx: usize, text: &str) {
         if text.is_empty() {
@@ -249,5 +256,25 @@ mod tests {
     fn snapshot_matches_text() {
         let buf = EditorBuffer::new(CJK);
         assert_eq!(buf.snapshot(), CJK);
+    }
+
+    /// 行号 → 行首字节:0-based、末行之后钳制到文末、CRLF 的 `\r` 属于
+    /// 行内容(行首永远在 `\n` 之后)。
+    #[test]
+    fn line_to_byte_maps_lines_and_clamps() {
+        let buf = EditorBuffer::new("a\n你b\nc");
+        assert_eq!(buf.line_to_byte(0), 0);
+        assert_eq!(buf.line_to_byte(1), 2, "第二行始于首个 \\n 之后");
+        assert_eq!(buf.line_to_byte(2), 7, "跨过 3 字节 CJK + \"b\" + \\n");
+        assert_eq!(buf.line_to_byte(3), 8, "len_lines() == 3,行首即文末");
+        assert_eq!(
+            buf.line_to_byte(usize::MAX),
+            8,
+            "过期行号钳制到文末,不 panic"
+        );
+
+        let empty = EditorBuffer::new("");
+        assert_eq!(empty.line_to_byte(0), 0);
+        assert_eq!(empty.line_to_byte(1), 0, "空文本钳制到 0");
     }
 }

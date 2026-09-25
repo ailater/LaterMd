@@ -31,6 +31,11 @@ latermd-export = { path = "../latermd-export" }
 rfd = "0.17.2"
 # 文件树目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)
 ignore = "0.4.33"
+# 仓库搜索的行迭代(ADR-004 清单,P1 侧边栏搜索):只用其 LineIter,
+# 不用 Searcher 系 API——那需要 Matcher 实参,见 src/search.rs 模块注释
+grep-searcher = "0.1.17"
+# 搜索正则(ADR-004 清单):大小写开关经 RegexBuilder 承接
+regex = "1.13.1"
 
 [dev-dependencies]
 # M0 主验证 2「长文档性能」的自建基准(headless 单帧渲染耗时)。

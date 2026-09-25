@@ -32,6 +32,16 @@ impl LaterMdApp {
         state.theme.apply(ctx);
         state.end_of_logic();
 
+        // 搜索的重绘驱动(egui 空闲不来帧,后台进度必须显式要帧):
+        // 去抖等待中按剩余时长要一帧,到点判断在 `ui::sidebar` 发起接力;
+        // 流式结果进行中持续要帧,`Done` 落回 Idle 后自然停。
+        if let Some(due) = state.search.debounce_due {
+            ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
+        }
+        if state.search.is_running() {
+            ctx.request_repaint();
+        }
+
         // 窗口标题只在变化时下发,避免每帧一次原生 set_title
         let title = state.document.window_title();
         if *window_title != title {
@@ -66,8 +76,11 @@ impl LaterMdApp {
                     active_tab,
                     &self.state.file_tree,
                     self.state.document.path.as_deref(),
-                    &self.state.preview.outline,
-                    self.state.cursor.byte,
+                    crate::ui::sidebar::OutlineView {
+                        items: &self.state.preview.outline,
+                        cursor_byte: self.state.cursor.byte,
+                    },
+                    &mut self.state.search,
                     &mut self.outbox,
                 );
             });
