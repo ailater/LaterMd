@@ -84,7 +84,7 @@ pub struct AiState {
     /// 指令文本与它相等 → 流式中「进行中」/结束「已完成」,否则「未执行」。
     /// 只增不清是刻意的:`finish` 后保留才能显示「已完成」,失效时机只有
     /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与换文档
-    /// ([`crate::state::State::load_document`] 里清),卡片是文档的派生物。
+    /// (`State::switch_active` / `State::spawn_tab` 里清),卡片是文档的派生物。
     pub(crate) last_prompt: Option<String>,
     /// 当前生效的 AI 配置(端点/模型/采样参数……)。与 `runtime` 同源:
     /// 保存配置即重新装配 runtime,两者不会各说各话。

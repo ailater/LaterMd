@@ -12,11 +12,11 @@ use std::ops::Range;
 
 use eframe::egui;
 
-/// 编辑器 widget 的固定 id:显式指定(而非 `id_salt` 随面板 id 链派生),
-/// 光标/undo 状态跨帧、跨面板结构调整都保持;焦点管理与集成测试也靠它
-/// 稳定引用。
-pub(crate) fn editor_id() -> egui::Id {
-    egui::Id::new("source-editor")
+/// 编辑器 widget 的 id:由**标签的稳定 id** 派生(多标签 #11)—— 每个标签
+/// 一套 TextEdit 持久状态(光标/undo/焦点),切标签零恢复逻辑;标签关闭后
+/// id 不复用(`TabsState::next_id` 自增),新标签不会继承旧标签的光标。
+pub(crate) fn tab_editor_id(tab_id: u64) -> egui::Id {
+    egui::Id::new("source-editor").with(tab_id)
 }
 
 /// 把 [`EditorBuffer`] 适配成 egui `TextBuffer` 的 newtype。
@@ -58,6 +58,7 @@ pub fn ui(
     editor: &mut EditorBuffer,
     preview: &mut PreviewState,
     cursor: &mut OutlineCursor,
+    editor_id: egui::Id,
 ) -> egui::Response {
     panel.horizontal(|ui| {
         ui.weak("源码");
@@ -76,7 +77,7 @@ pub fn ui(
     let mut buffer = EditorText(editor);
     let output = egui::TextEdit::multiline(&mut buffer)
         // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
-        .id(editor_id())
+        .id(editor_id)
         .font(egui::TextStyle::Monospace)
         .desired_width(f32::INFINITY)
         .desired_rows(rows)
@@ -138,7 +139,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                id.set(super::ui(ui, editor, preview, cursor).id);
+                id.set(super::ui(ui, editor, preview, cursor, tab_editor_id(1)).id);
             },
         );
         // egui 0.36 的 TexturesDelta drop 检查:测试里不消费绘制增量,
