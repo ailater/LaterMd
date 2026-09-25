@@ -71,10 +71,10 @@ brew install --cask crazykun/ailater/latermd
 ```bash
 cargo run --release -p latermd-app     # 编译并直接运行
 cargo build --release                  # 只编译
-./target/release/latermd-app           # 跑已编译好的产物
+./target/release/latermd               # 跑已编译好的产物
 ```
 
-产物位置:`target/release/latermd-app`(Linux 约 31 MB)。另有 `target/debug/latermd-app`(约 393 MB,带调试信息、启动慢)。
+产物位置:`target/release/latermd`(Linux 约 31 MB;crate 名 `latermd-app` 不变,bin 名 `latermd`,与发布资产同名)。另有 `target/debug/latermd`(约 393 MB,带调试信息、启动慢)。
 
 ### Windows / macOS
 
