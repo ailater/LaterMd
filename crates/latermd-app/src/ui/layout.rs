@@ -118,9 +118,9 @@ impl LaterMdApp {
                 crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
-        // ④ 必须最后:预览
+        // ④ 必须最后:预览(outbox 供 ai:// 链接的 LinkHandler 产消息)
         egui::CentralPanel::default().show(ui, |ui| {
-            crate::ui::preview::ui(ui, &self.state.preview);
+            crate::ui::preview::ui(ui, &self.state.preview, outbox);
         });
     }
 }

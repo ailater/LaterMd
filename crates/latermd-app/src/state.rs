@@ -280,6 +280,10 @@ pub enum Message {
     /// AI 流式失败,载荷为面向用户的错误描述(provider 契约:done 且
     /// delta 非空)。失败文本不写入文档。
     AiFailed(String),
+    /// 点击 ai:// 链接,载荷为 [`crate::ai_link::parse`] 的结果:`Ok` 为解码
+    /// 后的提示词,归约走与 [`Message::AiStart`] 同一条流式启动路径(防重入
+    /// 同样生效);`Err` 为未实现动作 / 解析失败的提示语,落状态栏不执行。
+    AiLinkClicked { prompt: Result<String, String> },
 }
 
 impl State {
@@ -310,6 +314,10 @@ impl State {
                 self.ai.finish();
                 self.document.notice = Some(error);
             }
+            Message::AiLinkClicked { prompt } => match prompt {
+                Ok(prompt) => self.start_ai_stream_with_prompt(&prompt),
+                Err(reason) => self.document.notice = Some(reason),
+            },
         }
     }
 
@@ -329,7 +337,18 @@ impl State {
             "请续写以下文档内容:\n{}",
             text.chars().skip(skip).collect::<String>()
         );
-        self.ai.start(&prompt);
+        self.start_ai_stream_with_prompt(&prompt);
+    }
+
+    /// 流式启动的共用入口,两个来源:菜单命令(带文档尾部的 prompt)与
+    /// ai:// 链接点击(链接里的提示词,原样透传)。防重入在此把关,流式
+    /// 进行中连「补空行」都不发生。
+    fn start_ai_stream_with_prompt(&mut self, prompt: &str) {
+        if self.ai.is_streaming() {
+            return;
+        }
+        self.ensure_trailing_blank_line();
+        self.ai.start(prompt);
     }
 
     /// 文档非空且不以空行结尾时,补成恰好一个空行(空文档/已空行结尾不动)。
@@ -1208,5 +1227,69 @@ mod tests {
         assert!(!state.ai.is_streaming(), "失败同样收尾");
         assert_eq!(state.document.notice.as_deref(), Some("额度用尽"));
         assert_eq!(state.editor.text(), before, "失败文本不写入文档");
+    }
+
+    /// ai:// 链接点击归约:Ok(prompt) 复用流式启动路径(补空行 + 发起),
+    /// chunk 照常归约追加;流式进行中再点击被防重入忽略(连补空行都不发生,
+    /// 与 AiStart 的入口检查同一处);Err 落提示行且不动流式生命周期。
+    #[test]
+    fn ai_link_clicked_streams_with_link_prompt_and_reentry_is_ignored() {
+        let mut state = State::default();
+        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        let base = state.editor.text().to_owned();
+
+        state.apply(Message::AiLinkClicked {
+            prompt: Ok("续写一段 Markdown 介绍".into()),
+        });
+        assert!(state.ai.is_streaming(), "链接点击发起了流");
+        assert!(
+            state.editor.text().ends_with("\n\n"),
+            "发起时补成空行结尾,与 AiStart 同语义"
+        );
+
+        let mut done = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done && std::time::Instant::now() < deadline {
+            for message in state.poll_ai() {
+                if matches!(message, Message::AiDone | Message::AiFailed(_)) {
+                    done = true;
+                }
+                state.apply(message);
+            }
+            if !done {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert!(done, "流在超时前自然收尾");
+        assert!(!state.ai.is_streaming());
+        assert!(state.editor.text().len() > base.len() + 2, "AI 文本已追加");
+        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+
+        // 防重入:慢 provider 发起后再点链接,忽略且不补空行
+        state.ai.provider =
+            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.apply(Message::AiStart);
+        let streaming_text = state.editor.text().to_owned();
+        state.apply(Message::AiLinkClicked {
+            prompt: Ok("流式中再来一次".into()),
+        });
+        assert!(state.ai.is_streaming());
+        assert_eq!(
+            state.editor.text(),
+            streaming_text,
+            "流式中点击链接被忽略:文档一字未动"
+        );
+        state.ai.finish();
+
+        // Err:未实现动作 / 解析失败的提示语直接落状态栏,不发起、不碰文档
+        let mut idle = State::default();
+        idle.apply(Message::AiLinkClicked {
+            prompt: Err("未实现的 AI 动作:summarize".into()),
+        });
+        assert!(!idle.ai.is_streaming(), "解析失败不发起流");
+        assert_eq!(
+            idle.document.notice.as_deref(),
+            Some("未实现的 AI 动作:summarize")
+        );
     }
 }

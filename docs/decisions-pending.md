@@ -4,6 +4,13 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #11 `ai://` 链接协议语义与 prompt 编解码口径（2026-09-25）
+
+- **岔路**：roadmap 阶段 3 对「ai:// 链接协议」只写了「`.link_style()` + `.click()` 拦截」的实现方式，协议本体没有定稿——已实现动作是哪个、未实现动作点了怎么办、prompt 怎么编码、`+` 算不算空格，都得有个说法才能写测试。另实测发现 vendored 的 `LinkStyle.underline` 字段（`vendor/egui_markdown/src/link.rs:86`）当前**没有任何读取点**。
+- **定稿**：`ai://write?prompt=<urlencoded 提示词>` 触发 Mock 流式续写，prompt **原样透传** provider（不拼文档尾部——链接作者写的就是完整指令；续写仍落在当前文档末尾，防重入与菜单「AI 续写」同一入口 `start_ai_stream_with_prompt`）。其余 `ai://` 动作（`ai://summarize` 等）**识别但不拦截成执行**：点击提示「未实现的 AI 动作：<action>」。`ai://write` 缺 prompt 参数、prompt 为空、坏 `%` 序列、非 UTF-8 字节，均提示且不执行。解码只用严格 `%XX`（`percent-encoding` 2.3.2，坏序列自行校验补严——该 crate 默认原样放行），**`+` 不当空格**：markdown 链接里作者本就该用 `%20`。非 `ai://` 前缀完全不拦截，走 vendored 默认 `open_url`（系统浏览器）。
+- **证据**：vendored `layout.rs:144`（`link_style().color` 决定链接**文字色**）、`layout.rs:197`（hover 下划线对**全部**链接无条件绘制，颜色取 `link_style().color`）、`label.rs:1165`（`click` 返回 true 则跳过 `open_url`）。app 侧 `LinkStyle { color, underline: true }` 里 `underline` 是**声明意图**——vendored 层没人读它，样式区分实际由颜色承担；ai:// 链接取紫罗兰色（明暗主题两档），与默认 `hyperlink_color` 区分。
+- **如何改**：新增动作或让 `+` 当空格，改 `crates/latermd-app/src/ai_link.rs::parse` 一处（消息载荷 `Message::AiLinkClicked { prompt: Result<String, String> }` 不变，`Err` 文案在 parse 里拼）；要让 `underline` 字段真正生效需改 vendored 层（①上游可合类），本轮按「优先只用 app 侧扩展点」未动 vendor。
+
 ## #10 heal() 的作用时机：逐块(后台线程) vs 整篇(渲染帧)（2026-09-25）
 
 - **岔路**：AI 流式接线 ask 要求「后台线程每块先过 vendored heal()，经 mpsc 回 UI，delta 追加进编辑器 rope」。但 `heal(s)` 的语义是给**残缺文本前缀**补闭合标记（`vendor/egui_markdown/src/parser.rs:45`：`heal("```rust\nlet x = 1;")` → 追加闭合 fence、`heal("**bold text")` → 追加 `**`）。MockProvider 按固定 20 字符切块，块边界会切在代码 fence/加粗中间：若把逐块 healed 文本追加进 rope，闭合标记会被**永久写进文档**，且下一块拼在闭合 fence 之后产生非法残文（例：块尾 `fn invalidate(cache: &mut C` 被补成 `…C\n```` ，下一块 `ache, doc_id…` 紧跟其后再开一个 fence）。
