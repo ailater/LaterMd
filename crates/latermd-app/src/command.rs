@@ -30,6 +30,9 @@ pub enum Command {
     ToggleTheme,
     /// 侧边栏展开/折叠。
     ToggleSidebar,
+    /// AI:Mock 流式续写(P1 联调入口,decisions-pending #3)。流式进行中
+    /// 再次触发在归约侧被忽略;不绑快捷键,避免与现有键位冲突。
+    AiMockStream,
 }
 
 impl Command {
@@ -46,15 +49,19 @@ impl Command {
             Self::ExportHtml => "导出 HTML",
             Self::ToggleTheme => "切换主题",
             Self::ToggleSidebar => "切换侧边栏",
+            Self::AiMockStream => "AI: Mock 流式续写",
         }
     }
 
-    /// 绑定的快捷键;全部命令都有绑定,菜单栏负责展示以保证可发现性。
+    /// 绑定的快捷键;`None` = 不绑定(菜单里只显示名字)。
+    ///
+    /// 全部文件/视图命令都有绑定,菜单栏负责展示以保证可发现性;AI 命令是
+    /// 唯一的 `None`:联调入口不抢键位,等 provider 选型定案再定。
     ///
     /// ToggleSidebar 取 Ctrl/Cmd+\\ 而非更常见的 Ctrl+B:Markdown 工作台的
     /// Ctrl+B 要留给将来的加粗(与主流 Markdown 编辑器一致)。
-    pub fn shortcut(self) -> egui::KeyboardShortcut {
-        match self {
+    pub fn shortcut(self) -> Option<egui::KeyboardShortcut> {
+        let shortcut = match self {
             Self::New => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N),
             Self::Open => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O),
             Self::Save => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S),
@@ -68,7 +75,10 @@ impl Command {
             Self::ToggleSidebar => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
-        }
+            // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
+            Self::AiMockStream => return None,
+        };
+        Some(shortcut)
     }
 
     /// 归约入口:命令翻成状态消息,执行在 `State::apply`。
@@ -81,6 +91,7 @@ impl Command {
             Self::ExportHtml => Message::ExportHtml,
             Self::ToggleTheme => Message::ToggleTheme,
             Self::ToggleSidebar => Message::SidebarToggled,
+            Self::AiMockStream => Message::AiStart,
         }
     }
 }
@@ -88,7 +99,7 @@ impl Command {
 /// 快捷键消费顺序:SaveAs 必须先于 Save —— `consume_shortcut` 底层的
 /// `matches_logically` 忽略多余 Shift,先问 Save 的话 Ctrl/Cmd+Shift+S
 /// 会被它抢先吃掉(egui 文档要求 most specific first)。其余命令键位
-/// 互不相撞,顺序无关。
+/// 互不相撞,顺序无关。无快捷键的命令(如 AiMockStream)不进本表。
 const POLL_ORDER: [Command; 7] = [
     Command::SaveAs,
     Command::Save,
@@ -108,7 +119,7 @@ pub fn poll_shortcuts(ctx: &egui::Context) -> Vec<Command> {
     POLL_ORDER
         .iter()
         .filter_map(|cmd| {
-            let shortcut = cmd.shortcut();
+            let shortcut = cmd.shortcut()?;
             ctx.input_mut(|input| input.consume_shortcut(&shortcut))
                 .then_some(*cmd)
         })
@@ -229,5 +240,23 @@ mod tests {
         assert_eq!(Command::ExportHtml.message(), Message::ExportHtml);
         assert_eq!(Command::ToggleTheme.message(), Message::ToggleTheme);
         assert_eq!(Command::ToggleSidebar.message(), Message::SidebarToggled);
+        assert_eq!(Command::AiMockStream.message(), Message::AiStart);
+    }
+
+    /// AI 命令不绑快捷键(ask 约束:避免与现有键位冲突),其余命令全部有绑定。
+    #[test]
+    fn only_ai_command_lacks_shortcut() {
+        for cmd in [
+            Command::New,
+            Command::Open,
+            Command::Save,
+            Command::SaveAs,
+            Command::ExportHtml,
+            Command::ToggleTheme,
+            Command::ToggleSidebar,
+        ] {
+            assert!(cmd.shortcut().is_some(), "{cmd:?} 应有快捷键");
+        }
+        assert_eq!(Command::AiMockStream.shortcut(), None);
     }
 }

@@ -18,8 +18,10 @@ pub fn ui(
     // wrapped:面板被拖窄时按钮换行而不是溢出裁切
     panel.horizontal_wrapped(|ui| {
         for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
-            let button = egui::Button::new(cmd.label())
-                .shortcut_text(ui.ctx().format_shortcut(&cmd.shortcut()));
+            let mut button = egui::Button::new(cmd.label());
+            if let Some(shortcut) = cmd.shortcut() {
+                button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+            }
             if ui.add(button).clicked() {
                 outbox.push(cmd.message());
             }

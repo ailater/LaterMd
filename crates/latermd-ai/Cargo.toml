@@ -1,0 +1,13 @@
+[package]
+name = "latermd-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI provider streaming contract, mock provider and OpenAI-compatible SSE parsing (no UI deps)"
+
+[dependencies]
+# 阻塞 HTTP 客户端(ADR-004 已登记):SSE 流式读取;零 async 依赖,
+# 默认 features 关掉 gzip,只留 rustls,不引入 tokio(流式 = std 线程 + mpsc)
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# SSE data 行的 JSON 解析(choices[0].delta.content 提取);ADR-004 清单内
+serde_json = "1"

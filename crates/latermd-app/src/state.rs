@@ -9,7 +9,17 @@
 //! 原地维护 —— `TextEdit` 是立即模式控件,必须拿到 `&mut` 缓冲才能绘制
 //! (AGENTS.md §8「UI 与状态机天然耦合」),快照与光标又是它的派生缓存,
 //! 归约进下一帧反而让预览滞后一帧。
+//!
+//! AI 流式追加的 dirty 与 undo 语义(P1):[`Message::AiChunk`] 走
+//! `EditorBuffer::insert_chars` —— dirty 照常置位(AI 写入是真实内容,
+//! 保存前与手敲同责),修订号照常推进(预览每 chunk 重建一次快照)。
+//! undo 栈是 TextEdit 内建 undoer 的快照,看不到程序化插入:流式结束后的
+//! 第一次 Ctrl+Z 会整体回退到最近一次用户编辑的快照(表现为「一步撤销
+//! 整段 AI 续写」,redo 可恢复),用户在流式期间的手敲一并被归入同一步。
+//! 在途流随文档切换一并作废([`State::load_document`] 里收尾):chunk 只
+//! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
 
+use crate::ai::AiState;
 use crate::export;
 use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
@@ -23,6 +33,11 @@ use std::time::Duration;
 
 /// 搜索输入去抖间隔(roadmap 阶段 3 的既定值)。
 const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// 组装 AI 续写 prompt 时的文档尾部上限(字符):MockProvider 只按关键词
+/// 选脚本,真实 provider 的上下文窗口截断是 app 层的职责(latermd-ai
+/// trait 契约),先按 2k 字符封顶。
+const AI_PROMPT_TAIL_CHARS: usize = 2000;
 
 /// 侧边栏功能页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +130,8 @@ pub struct State {
     pub file_tree: FileTreeState,
     /// 全文搜索(Search 页签):输入去抖、后台服务与结果缓存。
     pub search: SearchState,
+    /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
+    pub ai: AiState,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
     /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
@@ -199,6 +216,7 @@ impl Default for State {
             cursor: OutlineCursor::default(),
             file_tree: FileTreeState::default(),
             search: SearchState::default(),
+            ai: AiState::default(),
             editor,
             document: DocumentState {
                 path: None,
@@ -251,6 +269,17 @@ pub enum Message {
     SearchResultClicked(PathBuf, usize),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
+    /// 发起 AI Mock 流式续写(命令层入口);流式进行中在归约里被忽略
+    /// (防重入,见 [`AiState::start`])。
+    AiStart,
+    /// AI 流式的一个增量块,载荷为要追加到文档末尾的原文。后台线程产出,
+    /// 每帧由归约侧从 channel 收流翻成本消息(见 `State::poll_ai`)。
+    AiChunk { delta: String },
+    /// AI 流式成功收尾。
+    AiDone,
+    /// AI 流式失败,载荷为面向用户的错误描述(provider 契约:done 且
+    /// delta 非空)。失败文本不写入文档。
+    AiFailed(String),
 }
 
 impl State {
@@ -274,7 +303,62 @@ impl State {
                 self.open_search_hit(&path, line_no);
             }
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
+            Message::AiStart => self.start_ai_stream(),
+            Message::AiChunk { delta } => self.append_ai_delta(&delta),
+            Message::AiDone => self.ai.finish(),
+            Message::AiFailed(error) => {
+                self.ai.finish();
+                self.document.notice = Some(error);
+            }
         }
+    }
+
+    /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。流式进行中
+    /// 忽略(防重入);成功发起前把文档收成「以空行结尾」,让续写从新段落
+    /// 开始 —— 直接拼在末行会与 AI 首行粘连成一行。
+    fn start_ai_stream(&mut self) {
+        if self.ai.is_streaming() {
+            return;
+        }
+        self.ensure_trailing_blank_line();
+        // prompt 透传文档尾部,provider 按原样消费(latermd-ai trait 契约:
+        // 截断与拼装是调用方的职责)
+        let text = self.editor.text();
+        let skip = text.chars().count().saturating_sub(AI_PROMPT_TAIL_CHARS);
+        let prompt = format!(
+            "请续写以下文档内容:\n{}",
+            text.chars().skip(skip).collect::<String>()
+        );
+        self.ai.start(&prompt);
+    }
+
+    /// 文档非空且不以空行结尾时,补成恰好一个空行(空文档/已空行结尾不动)。
+    fn ensure_trailing_blank_line(&mut self) {
+        let text = self.editor.text();
+        let pad = if text.is_empty() || text.ends_with("\n\n") {
+            0
+        } else if text.ends_with('\n') {
+            1
+        } else {
+            2
+        };
+        if pad > 0 {
+            self.editor
+                .insert_chars(self.editor.len_chars(), &"\n".repeat(pad));
+        }
+    }
+
+    /// 追加 AI 增量块到文档末尾(`Message::AiChunk` 的归约)。走
+    /// `insert_chars` 的增量 splice 双写,dirty 与修订号照常推进 —— AI 写
+    /// 进来的是真实内容,保存前与手敲同责;undo 语义见模块文档。
+    fn append_ai_delta(&mut self, delta: &str) {
+        self.editor.insert_chars(self.editor.len_chars(), delta);
+    }
+
+    /// 收流(每帧归约调用一次):把 AI channel 里积压的 chunk 翻成消息,
+    /// 由调用方(`ui::layout::reduce`)并入本帧的归约队列。
+    pub fn poll_ai(&mut self) -> Vec<Message> {
+        self.ai.poll()
     }
 
     /// 切换主题(设置菜单的归约):改状态并即时落盘(重启保持);投影到
@@ -458,7 +542,13 @@ impl State {
     }
 
     /// 换入整篇内容并复位文档身份(新建/打开共用)。
+    ///
+    /// 在途 AI 流随缓冲一起作废:chunk 归约无条件追加到「当前缓冲末尾」,
+    /// 缓冲一换,剩余块就会写进新文档(Save 清 dirty 放行的 New/Open 同样
+    /// 命中)。接收端 drop 后 worker 下一次 send 失败即退出(latermd-ai 的
+    /// 取消约定),重绘驱动随标志清零自然停;与搜索换根复位同款静默。
     fn load_document(&mut self, path: Option<PathBuf>, text: &str) {
+        self.ai.finish();
         self.editor.load(text);
         self.document.path = path;
         self.document.notice = None;
@@ -963,5 +1053,160 @@ mod tests {
         assert!(!state.search.is_running());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&settings_dir);
+    }
+
+    /// AI 流式全链路归约:发起(补空行 + 流式标志)、防重入、chunk 追加、
+    /// 收尾。provider 用零间隔,流会瞬时跑完,归约侧按消息逐条喂。
+    #[test]
+    fn ai_messages_stream_append_and_reentry_guard() {
+        let mut state = State::default();
+        // 快速 provider:测试不等 3-5 秒的联调节奏
+        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        let base = state.editor.text().to_owned();
+
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming(), "发起后流式标志置位");
+        assert!(
+            state.editor.text().ends_with("\n\n"),
+            "示例文档不以空行结尾,发起时补成空行"
+        );
+
+        // 防重入:流式中再次触发被忽略(标志仍置位、只发起了这一个流)
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+
+        // 收流到自然结束:chunk 追加到末尾,AiDone 收尾清标志
+        let mut done = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done && std::time::Instant::now() < deadline {
+            for message in state.poll_ai() {
+                if matches!(message, Message::AiDone | Message::AiFailed(_)) {
+                    done = true;
+                }
+                state.apply(message);
+            }
+            if !done {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert!(done, "流在超时前自然收尾");
+        assert!(!state.ai.is_streaming(), "AiDone 归约清流式标志");
+
+        let text = state.editor.text();
+        assert!(text.starts_with(&base), "已有内容原样保留在头部");
+        assert!(text.len() > base.len() + 2, "AI 文本已追加");
+        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(state.editor.revision() > 0);
+
+        // 收尾后可再次发起(防重入不拦新流)
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        state.ai.finish();
+    }
+
+    /// 评审回归:流式进行中切文档必须取消在途流。AI 写入置 dirty →
+    /// Ctrl+S 清 dirty → New 的 unsaved_guard 放行 → load_document 换入
+    /// 新缓冲;若不收尾,剩余 chunk 会经 poll_ai 追加进新文档。文件树点击
+    /// 与搜索跳转同走 load_document,一处收口。
+    #[test]
+    fn switching_document_cancels_inflight_ai_stream() {
+        let path = temp_path("ai-switch.md");
+        let mut state = State::default();
+        // 慢 provider:保证测试在流自然收尾前完成切文档(20ms × 30-50 块)
+        state.ai.provider =
+            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(20));
+        state.document.path = Some(path.clone()); // Save 直落盘,不弹对话框
+
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        // 前置:流确实在产块(对照取消后的空收流)
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            state
+                .poll_ai()
+                .iter()
+                .any(|m| matches!(m, Message::AiChunk { .. })),
+            "前置:流在切文档前已产出正文块"
+        );
+        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+
+        // 复刻评审路径:Save 清 dirty,放行 New 的 unsaved_guard
+        state.apply(Message::FileCommand(FileCmd::Save));
+        assert!(path.exists(), "已落盘");
+        assert!(!state.editor.is_dirty());
+
+        state.apply(Message::FileCommand(FileCmd::New));
+        assert_eq!(state.document.path, None);
+        assert_eq!(state.editor.text(), "", "新文档为空");
+        assert!(!state.ai.is_streaming(), "换文档取消在途流");
+
+        // 给 worker 留出再发几块的时间:接收端已 drop,chunk 不得再进文档
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let messages = state.poll_ai();
+        assert!(
+            messages
+                .iter()
+                .all(|m| !matches!(m, Message::AiChunk { .. })),
+            "取消后 poll 不再产出正文块,实际 {messages:?}"
+        );
+        assert_eq!(state.editor.text(), "", "新文档未被 AI 追加");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AiChunk 追加语义:精确接在文档末尾;空 delta 是无操作(不推进修订号)。
+    #[test]
+    fn ai_chunk_appends_at_end_and_empty_delta_is_noop() {
+        let mut state = State::default();
+        state.apply(Message::AiChunk {
+            delta: "续写".into(),
+        });
+        assert!(state.editor.text().ends_with("续写"));
+        assert!(state.editor.is_dirty());
+
+        let (rev, len) = (state.editor.revision(), state.editor.len_chars());
+        state.apply(Message::AiChunk {
+            delta: String::new(),
+        });
+        assert_eq!(state.editor.revision(), rev, "空 delta 不推进修订号");
+        assert_eq!(state.editor.len_chars(), len);
+    }
+
+    /// 发起归约的空行补齐矩阵:空文档不动、单换行补一个、空行结尾不动、
+    /// 行中结尾补两个(让 AI 首行独立成段)。
+    #[test]
+    fn ai_start_normalizes_trailing_blank_line() {
+        let cases: [(&str, usize); 4] = [
+            ("", 0),       // 空文档不动
+            ("甲\n", 1),   // 单换行 → 补一个变空行
+            ("甲\n\n", 0), // 已是空行结尾
+            ("甲乙", 2),   // 行中 → 补两个
+        ];
+        for (initial, expected_pad) in cases {
+            let mut state = State::default();
+            state.editor.load(initial);
+            state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+            state.start_ai_stream();
+            let expected = format!("{initial}{}", "\n".repeat(expected_pad));
+            assert!(
+                state.editor.text().starts_with(&expected),
+                "初始 {initial:?} 的补行结果应为 {expected:?},实际 {:?}",
+                &state.editor.text()[..expected.len()]
+            );
+            state.ai.finish();
+        }
+    }
+
+    /// AiFailed 归约:清流式标志 + 错误描述进提示行,文档不被触碰。
+    #[test]
+    fn ai_failed_finishes_stream_and_lands_in_notice() {
+        let mut state = State::default();
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        let before = state.editor.text().to_owned();
+
+        state.apply(Message::AiFailed("额度用尽".into()));
+        assert!(!state.ai.is_streaming(), "失败同样收尾");
+        assert_eq!(state.document.notice.as_deref(), Some("额度用尽"));
+        assert_eq!(state.editor.text(), before, "失败文本不写入文档");
     }
 }

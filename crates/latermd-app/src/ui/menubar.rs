@@ -24,14 +24,20 @@ pub fn ui(bar: &mut egui::Ui, outbox: &mut Vec<Message>) {
             item(ui, Command::ToggleSidebar, outbox);
             item(ui, Command::ToggleTheme, outbox);
         });
+        ui.menu_button("AI", |ui| {
+            item(ui, Command::AiMockStream, outbox);
+        });
     });
 }
 
-/// 单个菜单项:显示名 + 按平台格式化的快捷键;点击发消息(egui 菜单内
-/// 点击任意控件自动收起)。返回按钮响应,独立成函数便于点击测试定位。
+/// 单个菜单项:显示名 + 按平台格式化的快捷键(未绑快捷键的命令只显示
+/// 名字);点击发消息(egui 菜单内点击任意控件自动收起)。返回按钮响应,
+/// 独立成函数便于点击测试定位。
 fn item(ui: &mut egui::Ui, cmd: Command, outbox: &mut Vec<Message>) -> egui::Response {
-    let button =
-        egui::Button::new(cmd.label()).shortcut_text(ui.ctx().format_shortcut(&cmd.shortcut()));
+    let mut button = egui::Button::new(cmd.label());
+    if let Some(shortcut) = cmd.shortcut() {
+        button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+    }
     let response = ui.add(button);
     if response.clicked() {
         outbox.push(cmd.message());
@@ -78,5 +84,38 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(outbox, vec![Message::SidebarToggled]);
+    }
+
+    /// AI 菜单项(唯一无快捷键的命令)正常渲染并可点击发起:item() 的
+    /// shortcut 分支在 None 时不得触碰 format_shortcut。
+    #[test]
+    fn ai_item_renders_without_shortcut_and_sends_start() {
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        ctx.run_ui(RawInput::default(), |ui| {
+            rect.set(item(ui, Command::AiMockStream, &mut outbox).rect);
+        })
+        .drop_without_applying_deltas();
+
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                item(ui, Command::AiMockStream, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(outbox, vec![Message::AiStart]);
     }
 }

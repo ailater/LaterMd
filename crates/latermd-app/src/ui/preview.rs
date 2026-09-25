@@ -17,6 +17,11 @@ pub fn ui(panel: &mut egui::Ui, preview: &PreviewState) {
             // 拿到的都是"仅在变化时重建"的同一字符串。
             MarkdownLabel::new(egui::Id::new("preview-md"), &preview.text)
                 .wrap()
+                // heal:true = 每帧渲染前对整篇文本补闭合(vendored parser::heal),
+                // AI 流式输出的残缺帧(未闭合 fence/加粗)语法合法,完整文档
+                // 上是恒等变换(Cow::Borrowed 原样返回)。P1 流式的必需品
+                // (AGENTS.md §6.5),岔路登记见 docs/decisions-pending.md #10。
+                .heal(true)
                 .show(ui);
         });
 }
