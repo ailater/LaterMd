@@ -1,0 +1,114 @@
+# macOS universal2 dmg —— cargo-dist 不产 dmg,且 0.33 无 universal2 target
+# (上游 config/v1/mod.rs 标 FIXME),故自建本 job。
+#
+# 时序:dist 的 release.yml 在 tag push 时构建各架构 tar.xz 并创建 Release,
+# 本 workflow 监听「Release 已发布」,下载两个架构的二进制 → lipo 合一 →
+# 打成 .app bundle → 合成 dmg → 回传同一 Release。
+#
+# 为什么要 .app 而不是裸二进制:macOS 的 GUI 应用必须走 bundle 才能正常获得
+# 窗口焦点与输入法上下文(直接跑命令行二进制会丢 IME 候选框跟随),这是
+# M0 头号风险项(IME)的前置条件,不是可选项。
+#
+# 产出资产名:latermd-v{version}-universal2-apple-darwin.dmg
+# 与 homebrew-ailater tap 的 cask URL 模板对应(复刻 lscreen 模式)。
+
+name: macOS dmg
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  universal-dmg:
+    runs-on: macos-14
+    steps:
+      - name: 取版本号
+        id: ver
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 下载两个架构的 tar.xz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.ver.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'latermd-*-apple-darwin.tar.xz'
+          ls -l
+
+      - name: lipo 合一
+        run: |
+          set -euo pipefail
+          tar -xf latermd-x86_64-apple-darwin.tar.xz
+          tar -xf latermd-aarch64-apple-darwin.tar.xz
+          lipo -create \
+            -output latermd-universal \
+            latermd-x86_64-apple-darwin/latermd \
+            latermd-aarch64-apple-darwin/latermd
+          # 两个架构都在,缺一个说明 dist 矩阵漏了目标
+          lipo -archs latermd-universal | tee /dev/stderr | grep -q x86_64
+          lipo -archs latermd-universal | tee /dev/stderr | grep -q arm64
+
+      - name: 组装 .app bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP="LaterMD.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          install -m 755 latermd-universal "$APP/Contents/MacOS/latermd"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>LaterMD</string>
+            <key>CFBundleDisplayName</key><string>LaterMD</string>
+            <key>CFBundleIdentifier</key><string>cn.ailater.LaterMD</string>
+            <key>CFBundleExecutable</key><string>latermd</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # ad-hoc 签名:不解决 Gatekeeper(quarantine 由 cask postflight 移除),
+          # 但避免无签名 bundle 在部分系统上的启动异常
+          codesign --force --deep --sign - "$APP" || true
+
+      - name: 合成 dmg
+        id: dmg
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="latermd-v${VERSION}-universal2-apple-darwin.dmg"
+          hdiutil create -volname "LaterMD" -srcfolder LaterMD.app \
+            -ov -format UDZO "$DMG"
+          echo "file=$DMG" >> "$GITHUB_OUTPUT"
+          SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "### macOS universal2 dmg"
+            echo ""
+            echo "- 文件: \`$DMG\`"
+            echo "- sha256: \`$SHA\`"
+            echo ""
+            echo "cask 更新需要这个 sha256(homebrew-ailater 的 auto-bump 目前只管 Formula,"
+            echo "Casks/ 需人工或后续扩展流水线填值)。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 回传 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.ver.outputs.tag }}" \
+            "${{ steps.dmg.outputs.file }}" --clobber \
+            --repo "${{ github.repository }}"
