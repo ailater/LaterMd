@@ -117,7 +117,7 @@ impl eframe::App for ScrollBench {
 }
 
 /// 输出分位数:p50 / p95 / p99 / max 的帧耗时(ms)与折算 fps。
-fn report(samples: &mut Vec<f32>) {
+fn report(samples: &mut [f32]) {
     if samples.is_empty() {
         eprintln!("scrollbench: 没有采到帧");
         return;
