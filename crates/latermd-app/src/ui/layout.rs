@@ -128,7 +128,13 @@ impl LaterMdApp {
             .resizable(true)
             .default_size(500.0)
             .show(ui, |ui| {
-                crate::ui::toolbar::ui(ui, &state.document, state.theme.mode, outbox);
+                crate::ui::toolbar::ui(
+                    ui,
+                    &state.document,
+                    state.theme.mode,
+                    &mut state.ai_key,
+                    outbox,
+                );
                 crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
@@ -148,7 +154,14 @@ impl LaterMdApp {
             }
         }
 
-        // ⑥ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
+        // ⑥ 顶层浮层:AI Provider 凭据设置(设置菜单「AI Provider…」翻开,
+        // 关闭由浮窗 X 原地翻转)。凭据读写只在归约(Message),浮窗只持草稿
+        // 与展示状态。
+        if self.state.ai_key.dialog_open {
+            crate::ai_key::ai_key_dialog(ui, &mut self.state.ai_key, &mut self.outbox);
+        }
+
+        // ⑦ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
         // 即确认弹窗(与 commit 建议浮窗同模式);文案显式警示不可逆,目标
         // 恰是编辑器当前文档时追加针对性警示(见 `checkout_extra_warning`),
         // checkout 只在「回滚」按钮点击之后的归约里执行。
@@ -790,6 +803,23 @@ mod tests {
             "{:?}",
             app.outbox
         );
+    }
+
+    /// AI Provider 设置浮窗的接线:`dialog_open` 时完整 `draw` 渲染浮窗不
+    /// panic,关闭后浮窗不再进入绘制路径(渲染全程不触碰凭据后端——读写
+    /// 只在归约)。
+    #[test]
+    fn draw_renders_ai_key_dialog_without_panic() {
+        let mut app = LaterMdApp::default();
+        app.state.ai_key.dialog_open = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+        output.drop_without_applying_deltas();
+        assert!(app.state.ai_key.dialog_open, "渲染不翻转开关");
+
+        app.state.ai_key.dialog_open = false;
+        let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+        output.drop_without_applying_deltas();
     }
 
     /// 针对性警示只看「目标是否当前文档」:不在编辑器中无追加;在则按

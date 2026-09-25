@@ -20,6 +20,7 @@
 //! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
 
 use crate::ai::AiState;
+use crate::ai_key::AiKeyState;
 use crate::export;
 use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
@@ -44,6 +45,9 @@ const AI_PROMPT_TAIL_CHARS: usize = 2000;
 /// [`latermd_md::heading_section_span`] 的定位键(层级 + 文本精确匹配)
 /// 保持一致 —— 重复生成时凭它移除旧节,避免摘要堆积。
 const AI_SUMMARY_HEADING: &str = "AI 摘要";
+
+/// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
+const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
 
 /// 侧边栏功能页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +148,9 @@ pub struct State {
     pub search: SearchState,
     /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
     pub ai: AiState,
+    /// AI Provider 凭据设置区(P2「凭据管理」):草稿、三态与凭据操作集,
+    /// 读写全部经 latermd-creds 在归约发生。
+    pub ai_key: AiKeyState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -234,6 +241,7 @@ impl Default for State {
             git: GitPanelState::default(),
             search: SearchState::default(),
             ai: AiState::default(),
+            ai_key: AiKeyState::default(),
             ai_commit_suggestion: None,
             editor,
             document: DocumentState {
@@ -314,6 +322,16 @@ pub enum Message {
     AiCommitSuggestion { subject: String },
     /// 关闭 commit message 建议浮窗。
     AiCommitDismissed,
+    /// 保存 AI API key 草稿到系统凭据(设置浮窗「保存」):归约里经
+    /// latermd-creds 写入,成功置已配置并清空草稿(UI 不回显值);空白
+    /// 拒绝;后端失败落提示行并转 [`Message::AiKeyBackendUnavailable`]。
+    AiKeySaved,
+    /// 从系统凭据删除 AI API key(设置浮窗「清除」):幂等,成功置
+    /// 未配置;后端失败同 [`Message::AiKeySaved`] 的降级。
+    AiKeyCleared,
+    /// 凭据后端不可用:置不可用状态,设置浮窗状态行提示回退环境变量。
+    /// 归约内部的结果消息(保存/清除失败时再归约),UI 不直接产出。
+    AiKeyBackendUnavailable,
     /// 点击 Git 页改动列表里的文件,载荷为相对仓库根的路径:归约里选中
     /// 并读它的 diff(列表外的过期路径被忽略)。
     GitFileSelected(String),
@@ -365,13 +383,29 @@ impl State {
                 self.document.notice = Some(error);
             }
             Message::AiLinkClicked { prompt } => match prompt {
-                Ok(prompt) => self.start_ai_stream_with_prompt(&prompt),
+                Ok(prompt) => {
+                    // key 闸门与防重入同判:流式中静默忽略,无 key 才落提示
+                    if !self.ai.is_streaming() && self.ai_key_gate() {
+                        self.start_ai_stream_with_prompt(&prompt);
+                    }
+                }
                 Err(reason) => self.document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
+            Message::AiKeySaved => {
+                if let Err(err) = self.ai_key.save() {
+                    self.ai_key_failure(err);
+                }
+            }
+            Message::AiKeyCleared => {
+                if let Err(err) = self.ai_key.clear() {
+                    self.ai_key_failure(err);
+                }
+            }
+            Message::AiKeyBackendUnavailable => self.ai_key.backend_ok = false,
             Message::GitFileSelected(path) => self.git.select(&path),
             Message::GitCheckoutRequested(path) => self.git.request_checkout(path),
             Message::GitCheckoutConfirmed => {
@@ -424,6 +458,31 @@ impl State {
         }
     }
 
+    /// `Message::AiKeySaved` / `AiKeyCleared` 的失败归约:消毒后的错误文案
+    /// 进提示行(文案由 latermd-creds 保证不含凭据值);后端类失败再归约
+    /// [`Message::AiKeyBackendUnavailable`] 置不可用状态(状态行提示回退
+    /// 环境变量)。空白拒绝等非后端错误只落提示行,不动可用性。
+    fn ai_key_failure(&mut self, err: latermd_creds::CredentialError) {
+        self.document.notice = Some(err.to_string());
+        if matches!(err, latermd_creds::CredentialError::Backend { .. }) {
+            self.apply(Message::AiKeyBackendUnavailable);
+        }
+    }
+
+    /// AI 命令发起前的 key 闸门:provider 需要 key 且 latermd-creds →
+    /// `LATERMD_AI_API_KEY`(latermd-creds 定死的顺序)都解析不到时,落
+    /// 状态栏提示并返回 `false`。调用点必须在各命令归约的**最前面**、任何
+    /// 副作用(补空行/移除旧摘要节/采 diff)之前,被拦下的命令不留痕迹。
+    /// 当前 MockProvider 无 key 也能跑(`provider_requires_key` 恒 false,
+    /// 闸门直通),链路为主模型启用预留(decisions-pending #3)。
+    fn ai_key_gate(&mut self) -> bool {
+        if !self.ai.provider_requires_key || self.ai_key.creds.ai_api_key().is_some() {
+            return true;
+        }
+        self.document.notice = Some(AI_KEY_MISSING_NOTICE.to_owned());
+        false
+    }
+
     /// 生成 commit message(`Message::AiCommitRequested` 的归约):定位仓库
     /// 目录 → 采 diff → 拼 prompt → 取建议。结果经
     /// [`Message::AiCommitSuggestion`] 再归约一次落 state,与其它 AI 结果
@@ -433,7 +492,7 @@ impl State {
     /// 里跑也返回全仓改动);两者皆无 → 提示行。演示期同步完成(Mock 的
     /// 关键词合成,流式通道是续写文本不适用);流式进行中忽略(防重入)。
     fn request_commit_message(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         let Some(dir) = self
@@ -471,9 +530,10 @@ impl State {
     /// 全文拼 prompt → 复用流式通道发块,「## AI 摘要」标题与空行在发起
     /// 时落到文档末尾,要点 chunk(`> - …` 引用块行)经 [`Message::AiChunk`]
     /// 追加长在标题下。移除旧节走 AST 定位 + rope 删除,且只发生在归约里
-    /// (铁律三);流式进行中忽略(防重入,与其它 AI 命令同一道闸)。
+    /// (铁律三);key 闸门在最前,被拦时连旧节都不动;流式进行中忽略
+    /// (防重入,与其它 AI 命令同一道闸)。
     fn request_summary(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         let text = self.editor.text().to_owned();
@@ -497,11 +557,12 @@ impl State {
         );
     }
 
-    /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。流式进行中
-    /// 忽略(防重入);成功发起前把文档收成「以空行结尾」,让续写从新段落
-    /// 开始 —— 直接拼在末行会与 AI 首行粘连成一行。
+    /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。key 闸门与防
+    /// 重入在最前(被拦的命令不补空行、不留任何痕迹);成功发起前把文档
+    /// 收成「以空行结尾」,让续写从新段落开始 —— 直接拼在末行会与 AI 首行
+    /// 粘连成一行。
     fn start_ai_stream(&mut self) {
-        if self.ai.is_streaming() {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
         self.ensure_trailing_blank_line();
@@ -518,7 +579,8 @@ impl State {
 
     /// 流式启动的共用入口,两个来源:菜单命令(带文档尾部的 prompt)与
     /// ai:// 链接点击(链接里的提示词,原样透传)。防重入在此把关,流式
-    /// 进行中连「补空行」都不发生。
+    /// 进行中连「补空行」都不发生;key 闸门在两处入口的归约最前面
+    /// (见 [`Self::ai_key_gate`]),走到这里必然已过闸。
     fn start_ai_stream_with_prompt(&mut self, prompt: &str) {
         if self.ai.is_streaming() {
             return;

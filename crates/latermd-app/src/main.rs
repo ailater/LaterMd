@@ -6,6 +6,7 @@
 //! (docs/adr-005)。
 
 mod ai;
+mod ai_key;
 mod ai_link;
 mod command;
 mod export;
@@ -80,6 +81,9 @@ impl LaterMdApp {
         let mut app = Self::default();
         app.state.theme = theme;
         app.state.file_tree = file_tree.into();
+        // 凭据状态启动即探测:设置浮窗状态行首见即真(后端不可用的
+        // Linux 环境直接给回退提示,而不是「未配置」的误报)
+        app.state.ai_key.probe();
         app
     }
 }

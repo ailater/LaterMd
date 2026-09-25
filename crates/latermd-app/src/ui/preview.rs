@@ -264,6 +264,7 @@ mod tests {
             rx: None,
             streaming,
             last_prompt: last_prompt.map(str::to_owned),
+            provider_requires_key: false,
         }
     }
 

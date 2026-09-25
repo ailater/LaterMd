@@ -35,6 +35,13 @@ pub struct AiState {
     /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与换文档
     /// ([`crate::state::State::load_document`] 里清),卡片是文档的派生物。
     pub(crate) last_prompt: Option<String>,
+    /// 当前 provider 是否需要 API key 才能发起命令:Mock 恒 `false`(无
+    /// key 也能跑);置 `true` 时所有 AI 命令入口先过
+    /// [`crate::state::State::ai_key_gate`](latermd-creds →
+    /// `LATERMD_AI_API_KEY` 都无则拦在状态栏)。主模型启用
+    /// (decisions-pending #3)的预留接线,换真实 provider 时随 provider
+    /// 一起置位。
+    pub(crate) provider_requires_key: bool,
 }
 
 impl Default for AiState {
@@ -44,6 +51,7 @@ impl Default for AiState {
             rx: None,
             streaming: false,
             last_prompt: None,
+            provider_requires_key: false,
         }
     }
 }
@@ -199,6 +207,7 @@ mod tests {
             rx: None,
             streaming: true,
             last_prompt: None,
+            provider_requires_key: false,
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {
@@ -220,6 +229,7 @@ mod tests {
             rx: None,
             streaming: true,
             last_prompt: None,
+            provider_requires_key: false,
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {

@@ -2468,6 +2468,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "latermd-ai",
+ "latermd-creds",
  "latermd-editor",
  "latermd-export",
  "latermd-git",

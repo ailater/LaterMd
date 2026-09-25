@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #21 设置面板 AI key 接线的三岔路：浮窗形态、状态分组、key 闸门位置（2026-09-25）
+
+- **岔路**：任务写「Settings 面板新增 AI Provider 区」，但仓库没有独立 Settings 面板实体——设置只有工具栏的「设置」`menu_button`（`ui/toolbar.rs`），且仓库自己的注释证明「egui 菜单内点击任意控件自动收起」，把密码框 TextEdit 直接嵌进菜单有「点进输入框菜单即收起」的交互风险；任务又写「State 增加 `ai_key_configured: bool`」，字面平铺与仓库的状态分组风格（`SidebarState`/`SearchState`/`AiState`）相悖；key 闸门（provider 启动链路）若放流式共用入口 `start_ai_stream_with_prompt`，`AiStart` 的外层归约会先补空行、`AiSummaryRequested` 会先移除旧摘要节——被拦的命令留下副作用。
+- **自动选择**：①「设置」菜单加「AI Provider…」入口（原地翻转 `dialog_open`，同 `SidebarState::visible` 的 UI 关注点口径），密码框/保存/清除/状态行放独立 Window 浮窗（与 commit 建议浮窗、回滚确认浮窗同模式，`crates/latermd-app/src/ai_key.rs::ai_key_dialog`）；②状态分组成 `State.ai_key: AiKeyState`（`configured`/`backend_ok`/`draft` 在内），任务字段的语义落点 = `state.ai_key.configured`；③key 闸门放在**每个 AI 命令归约的最前面**（`AiStart`/`AiLinkClicked`/`AiCommitRequested`/`AiSummaryRequested` 四入口，模式 `if self.ai.is_streaming() || !self.ai_key_gate() { return; }`），被拦命令零副作用；provider 是否需 key 由 `AiState::provider_requires_key` 表达，当前 Mock 恒 `false` 直通（无 key 也能跑），主模型启用时随 provider 置 `true` 即生效——测试已覆盖置 `true` 后的拦截/放行两分支。
+- **如何改**：要密码框直接长在菜单里，把控件从浮窗搬进 `menu_button` 闭包并实测菜单收起行为；要平铺字段就把 `AiKeyState` 拆散上提到 `State`；要 Mock 也强制配 key，把 `provider_requires_key` 默认值改 `true`（测试 `ai_stream_blocked_without_key_when_provider_requires_it`/`mock_provider_runs_without_key` 同步改）。
+
 ## #20 latermd-creds 的四岔路：keyring 维护线、get_secret 签名、env 回退测试注入、测试值口径（2026-09-25）
 
 - **岔路**：P2 凭据 crate 落地时任务留了四处自由度。①keyring crate 有两条版本线：3.6.3（hwchen 原维护线终版，无默认 features，需手工配平台组合，已随项目移交停更）与 4.2.0（open-source-cooperative 接管后的重构线，2026-08 仍更新，默认 feature `v1` 即三平台 store）；②任务签名写作 `get_secret(...) -> Option<String>`，但同批约束要求「所有后端调用优雅降级（Err 返回）」且单测要「断言错误文案不含 secret」——Option 装不下错误文案；③环境变量回退顺序的测试：临时改进程环境变量（并行测试竞态）还是注入；④红线「凭据值不进测试断言明文、测试只断言存在性/删除成功」与「内存后端全 CRUD」的关系——CRUD 的 R 不验证读回值就测不出后端正确性。
