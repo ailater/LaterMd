@@ -13,7 +13,7 @@
 
 | # | 验收标准(roadmap 阶段 2) | 状态 | 证据 / 缺口 |
 |---|---|---|---|
-| 1 | **三平台可安装** | 🟨 产物链路就位,待首跑 | `dist plan` 五目标齐备、`dist build` 实测出 Linux 产物;`macos-dmg.yml` 与 cask 模板待首个 tag 在 CI 验证。**真机安装未做过** |
+| 1 | **三平台可安装** | 🟨 Linux 已本地验证;Win / mac 待 CI 首跑 | **Linux**:`dist build` 出的 `latermd-x86_64-unknown-linux-gnu.tar.xz` 解压即跑(31 MB 二进制 + LICENSE + README,实测运行 6 秒无 panic),动态链 libgcc_s / libm / libc,**要求 glibc ≥ 2.35**(Ubuntu 22.04+ / Debian 12+ 量级)。`dist plan` 五目标齐备。**macOS** dmg job 与 cask 模板待首个 tag 在 CI 验证;**Windows 产物尚未在任何机器上跑过** |
 | 2 | **能连续写 1 小时技术文档不崩、不卡** | 🟨 部分 | 性能有实测(下 §3);「连续 1 小时」的稳定性**无自动化验证**,需人工长跑 |
 | 3 | **导出的 HTML 可直接交付他人阅读** | ✅ 逻辑已测 | `latermd-export` 9 项测试:完整文档骨架、内嵌最小 CSS、代码块 language class、GFM 表格、任务列表复选框、标题转义、删除线/脚注。**未做**:在真实浏览器里打开导出件的观感确认 |
 | 4 | **`.md` 文件保持原样(无格式化篡改)** | ✅ 已测 | `file.rs::write_then_read_is_byte_exact`(CRLF/LF 混排、尾随空行逐字节一致);另测非 UTF-8 报错、原子落盘、权限位保留。**未做**:Windows CRLF 实机往返 |
