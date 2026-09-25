@@ -47,6 +47,17 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Settings 面板显示的当前渲染后端(AGENTS.md §5)。只镜像 `main` 的启动
+/// 选择,同一套规则:仅 `glow` feature 构建且变量精确为 `glow` 才是 glow,
+/// 未设/值不认/feature 未开一律 wgpu。`env` 由调用方传入以便无头测试。
+pub(crate) fn renderer_label(env: Option<&str>) -> &'static str {
+    match env {
+        #[cfg(feature = "glow")]
+        Some("glow") => "glow",
+        _ => "wgpu",
+    }
+}
+
 /// 应用根:状态 + 待归约消息队列。归约在 [`eframe::App::logic`],绘制在
 /// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
 #[derive(Default)]
@@ -65,5 +76,23 @@ impl LaterMdApp {
         app.state.theme = theme;
         app.state.file_tree = file_tree.into();
         app
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renderer_label;
+
+    /// 判定与 `main` 的启动选择同规则:认不认 `glow` 取决于 glow feature
+    /// (两条产线都会跑到对应分支);值精确匹配小写,大小写变体不认。
+    #[test]
+    fn renderer_label_follows_feature_and_exact_env_value() {
+        #[cfg(feature = "glow")]
+        assert_eq!(renderer_label(Some("glow")), "glow");
+        #[cfg(not(feature = "glow"))]
+        assert_eq!(renderer_label(Some("glow")), "wgpu");
+        assert_eq!(renderer_label(Some("wgpu")), "wgpu");
+        assert_eq!(renderer_label(Some("GLOW")), "wgpu");
+        assert_eq!(renderer_label(None), "wgpu");
     }
 }
