@@ -10,6 +10,7 @@ mod export;
 mod file;
 mod filetree;
 mod fonts;
+mod search;
 mod state;
 mod theme;
 mod ui;
