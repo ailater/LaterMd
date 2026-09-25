@@ -3,7 +3,7 @@
 //! 顺序铁律:panel 添加顺序决定嵌套,先加的最外层;`CentralPanel` 必须最后加。
 //! `App::logic` 只归约状态,`App::ui` 只绘制,两者严格分离(铁律)。
 
-use crate::state::SidebarState;
+use crate::state::{Message, SidebarState};
 use crate::LaterMdApp;
 use eframe::egui;
 
@@ -32,9 +32,20 @@ impl LaterMdApp {
         state.theme.apply(ctx);
         state.end_of_logic();
 
+        // 搜索去抖到点:在归约侧发起,不放 `ui::sidebar`——归约每帧必跑、
+        // 不看侧边栏页签,输入后 300ms 内切走也照常搜;`SearchState::start`
+        // 入口先清计时,过期时刻不残留,下方按 due 要帧的逻辑才不会在
+        // due 过期后每帧 request_repaint(立即)满帧空转。
+        if state
+            .search
+            .debounce_due
+            .is_some_and(|due| due <= std::time::Instant::now())
+        {
+            state.apply(Message::SearchRequested);
+        }
         // 搜索的重绘驱动(egui 空闲不来帧,后台进度必须显式要帧):
-        // 去抖等待中按剩余时长要一帧,到点判断在 `ui::sidebar` 发起接力;
-        // 流式结果进行中持续要帧,`Done` 落回 Idle 后自然停。
+        // 去抖等待中按剩余时长要一帧,到点由上一段发起;流式结果进行中
+        // 持续要帧,`Done` 落回 Finished 后自然停。
         if let Some(due) = state.search.debounce_due {
             ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
         }
@@ -264,6 +275,89 @@ mod tests {
             "普通字符输入未被劫持"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 搜索去抖到点在归约侧发起:到点帧即清 `debounce_due`,且不看侧边栏
+    /// 页签——停在 Files 页照样发起(到点判断若放在 Search 页渲染里,输入
+    /// 后切走页签即滞留过期时刻,每帧要帧空转)。
+    #[test]
+    fn search_debounce_fires_in_reduce_even_when_tab_switched_away() {
+        let root =
+            std::env::temp_dir().join(format!("latermd-layout-{}-debounce", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "latermd 命中\n").unwrap();
+
+        let mut app = LaterMdApp::default();
+        app.state.file_tree.root = Some(root.clone());
+        app.state.sidebar.active_tab = state::SidebarTab::Files;
+        app.state.search.query = "latermd".into();
+        app.state.search.debounce_due =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+
+        assert_eq!(app.state.search.debounce_due, None, "到点帧即清去抖计时");
+        assert_eq!(
+            app.state.search.status,
+            crate::search::SearchStatus::Running,
+            "切离 Search 页也照常发起"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 空输入的去抖计时到点:同样被清空(不发起、不残留过期时刻),且后续
+    /// 归约不再安排任何重绘——修复点:过期 due 曾驱动每帧
+    /// request_repaint(立即)满帧空转。egui 在无未偿付要帧请求时
+    /// repaint_delay 为 Duration::MAX;但视口首帧自带约两帧 settle 重绘
+    /// (egui `ViewportRepaintInfo` 默认 `outstanding: 1`),断言落在第 4 帧。
+    #[test]
+    fn search_debounce_due_cleared_for_empty_query_without_repaint_loop() {
+        let root = std::env::temp_dir().join(format!(
+            "latermd-layout-{}-debounce-empty",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = LaterMdApp::default();
+        app.state.file_tree.root = Some(root.clone());
+        app.state.search.debounce_due =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+
+        let ctx = egui::Context::default();
+
+        // 帧 1:到点即清计时,due 不残留到下一帧
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            app.state.search.debounce_due, None,
+            "空输入到点也清计时,不残留过期时刻"
+        );
+        assert_eq!(app.state.search.status, crate::search::SearchStatus::Idle);
+
+        // 帧 2-4:due 已清、无搜索在途。egui 视口自带约两帧 settle(实测
+        // 帧 2 仍有一次 0ns,帧 3 起 MAX),关键在收敛到 MAX——修复前
+        // 过期 due 使每帧输出都是 0ns(request_repaint 即 ZERO),满帧空转。
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(
+                output
+                    .viewport_output
+                    .values()
+                    .map(|viewport| viewport.repaint_delay)
+                    .min()
+                    .unwrap(),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            delay,
+            Some(std::time::Duration::MAX),
+            "到点清空后不再安排任何重绘(过期 due 曾致满帧空转)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 主题切换消息走完整归约链:同帧内 egui 主题已翻转(设置菜单点击的下一

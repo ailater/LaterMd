@@ -6,10 +6,10 @@
 //! 不用 `CollapsingHeader`(ADR-005 §4.1);行点击只发消息,子项列举在
 //! `logic` 归约的 `FileTreeState::ensure_loaded`(懒加载落点)。
 //!
-//! 搜索面板的去抖是两段接力:`ui` 把输入变化原地写入 `SearchState` 并发
-//! `SearchQueryChanged`,`logic` 归约顺延去抖计时;计时到点由本层发
-//! `SearchRequested`、`logic` 再发起后台搜索——到点判断必须在每帧都跑的
-//! `ui` 侧,egui 空闲时不来帧,`logic` 单靠自己等不到到点那一刻。
+//! 搜索面板的去抖:`ui` 把输入变化原地写入 `SearchState` 并发
+//! `SearchQueryChanged`,`logic` 归约顺延去抖计时;到点发起在归约侧
+//! (`layout.rs` 的 reduce,每帧必跑、不看本面板是否可见——输入后切走
+//! 页签也照常搜),本层只把输入与开关写进状态。
 
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
 use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
@@ -18,7 +18,6 @@ use latermd_md::OutlineItem;
 
 use eframe::egui;
 use std::path::Path;
-use std::time::Instant;
 
 /// 大纲层级每深一级的缩进宽度(px)。
 const OUTLINE_INDENT: f32 = 14.0;
@@ -146,10 +145,6 @@ fn search_panel(
             outbox.push(Message::SearchQueryChanged);
         }
     });
-    // 去抖到点:本层发 SearchRequested,发起在下一帧归约(模块注释)。
-    if search.debounce_due.is_some_and(|due| due <= Instant::now()) && !search.query.is_empty() {
-        outbox.push(Message::SearchRequested);
-    }
     match &search.status {
         SearchStatus::Running => {
             panel.weak(format!("搜索中…(已 {} 条)", search.hits.len()));
@@ -539,53 +534,6 @@ mod tests {
             outbox,
             vec![Message::SearchResultClicked(root.join("docs/note.md"), 7)]
         );
-    }
-
-    /// 去抖接力(search_panel 层):计时到点 + 非空输入 → SearchRequested;
-    /// 未到点不发;无根目录时提前返回,到点也不发。
-    #[test]
-    fn search_panel_sends_requested_only_when_due_and_rooted() {
-        let ctx = egui::Context::default();
-        let render = |search: &mut SearchState, root: Option<&Path>, outbox: &mut Vec<Message>| {
-            let output = ctx.run_ui(RawInput::default(), |ui| {
-                search_panel(ui, search, root, outbox);
-            });
-            output.drop_without_applying_deltas();
-        };
-
-        // 未到点:不发
-        let mut search = SearchState {
-            query: "latermd".into(),
-            debounce_due: Some(Instant::now() + std::time::Duration::from_secs(60)),
-            ..SearchState::default()
-        };
-        let mut outbox = Vec::new();
-        render(&mut search, Some(Path::new("/vault")), &mut outbox);
-        assert!(outbox.is_empty(), "计时未到点,不发起");
-
-        // 到点 + 有根:发
-        search.debounce_due = Some(Instant::now() - std::time::Duration::from_secs(1));
-        render(&mut search, Some(Path::new("/vault")), &mut outbox);
-        assert_eq!(outbox, vec![Message::SearchRequested]);
-
-        // 到点 + 无根:面板短路(显示引导),不发起
-        let mut unrooted = SearchState {
-            query: "latermd".into(),
-            debounce_due: Some(Instant::now() - std::time::Duration::from_secs(1)),
-            ..SearchState::default()
-        };
-        let mut outbox = Vec::new();
-        render(&mut unrooted, None, &mut outbox);
-        assert!(outbox.is_empty(), "无根目录不发 SearchRequested");
-
-        // 空输入:即使到点也不发(归约里同样短路,这里先挡一道)
-        let mut empty = SearchState {
-            debounce_due: Some(Instant::now() - std::time::Duration::from_secs(1)),
-            ..SearchState::default()
-        };
-        let mut outbox = Vec::new();
-        render(&mut empty, Some(Path::new("/vault")), &mut outbox);
-        assert!(outbox.is_empty());
     }
 
     /// 摘要截断按字符不切断多字节序列,短行原样返回。
