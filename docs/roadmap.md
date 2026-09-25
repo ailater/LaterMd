@@ -13,8 +13,8 @@
 
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
-[~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。出口仍卡两条真机项(IME、Win/mac wgpu),见 m0-report.md
-[~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包已就位(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板),待首个 tag 跑通验证
+[~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。验证 1 IME Linux 已首测:输入可用,候选框不跟随光标,排查挂账(m0-report.md 验证 1)。出口仍卡两条真机项(Win/mac IME、Win/mac wgpu),见 m0-report.md
+[~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包配置已就绪(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板,发布 runbook 见 [distribution.md](distribution.md));P0 剩余 = 首个 Release 发布(tag 触发 CI 全链路跑通)+ 三平台真机验收
 [ ] P1 差异化
 [ ] P2 版本层
 [ ] P2.5 界面打磨（皮肤系统批次 B，见「专题：界面美化与皮肤系统」）
@@ -41,7 +41,7 @@
 >
 > **打包分发进展（2026-09-25）**：cargo-dist 0.33 已接入，`dist plan/build` 实测五目标齐备（Linux x64、macOS 双架构、Windows x64 + ARM64），资产名 `latermd-{triple}` 不含版本号；macOS universal2 dmg 走自建 job（`.github/workflows/macos-dmg.yml`：lipo + `.app` + hdiutil），cask 模板在 `packaging/latermd.rb`。**待首个 tag 在 CI 上跑通验证**（本机无 macOS，lipo/hdiutil/codesign 无法自测）。
 >
-> **剩余**：上段打包的首跑验证，与 M0 两条真机项（IME、Win/mac wgpu）。
+> **剩余**：上段打包的首跑验证，与 M0 两条真机项（Win/mac IME、Win/mac wgpu；Linux IME 已首测 —— 输入可用、候选框不跟随，缺陷排查挂账见 m0-report.md 验证 1）。
 
 > Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 
@@ -293,7 +293,7 @@ token 只做**语义级**：背景层级（surface / surface_alt）、前景两�
 
 | # | 风险 | 等级 | 缓解 | 触发信号 | 应对 |
 |---|---|---|---|---|---|
-| 1 | **IME 缺陷**（吞字 / 候选框不跟随 / 抢焦点） | 高 | M0 第 1 条验证 | M0 实测不过 | 停止或换 iced 备选（ADR-001 §2.5），不硬修 egui |
+| 1 | **IME 缺陷**（吞字 / 候选框不跟随 / 抢焦点） | 高 | M0 第 1 条验证;Linux 已首测(2026-09-25,X11 + fcitx5):输入可用、候选框不跟随 —— 非放行线失败,故障排查中(m0-report.md 验证 1) | M0 实测不过 | 停止或换 iced 备选（ADR-001 §2.5），不硬修 egui |
 | 2 | **单人 9 个月工期** | 高 | 每阶段出口评审；P0 完成即有自用价值 | 连续两阶段超期 50% | 砍 P2/P3 范围，P1 收敛为「流式写作」单功能 |
 | 3 | **无签名的信任门槛**（Gatekeeper「已损坏」/ SmartScreen 警告） | 低 | brew cask `postflight` 去 quarantine；README 写明 Windows「仍要运行」指引 | 非 brew 用户首次打开受阻 | 已是 lscreen 验证过的成熟路径，不新增投入 |
 | 4 | **上游 egui_markdown 停更** | 中 | 已 vendor（subtree），不受上游发布节奏约束 | 上游 6 个月无提交 | fork 并公开维护；升级决策权完全在我们 |
