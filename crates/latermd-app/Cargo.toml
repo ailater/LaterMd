@@ -20,7 +20,7 @@ egui_markdown = { path = "../../vendor/egui_markdown" }
 egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
 # 主题设置(ThemeSettings/ThemeMode)的序列化 derive
 serde = { version = "1", features = ["derive"] }
-# 主题设置落盘为 JSON;本就在依赖图中(criterion 的传递依赖),此处转直接依赖
+# 主题持久化(settings.json)与文件树状态(file_tree.json)落盘 JSON;ADR-004 已登记
 serde_json = "1"
 latermd-editor = { path = "../latermd-editor" }
 # 大纲条目(OutlineItem)与标题提取的快路径

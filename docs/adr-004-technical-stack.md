@@ -36,6 +36,8 @@
 | **文件对话框** | `rfd` | 0.17.2 | Win32 / Cocoa / GTK+XDG Portal |
 | **文件监听** | `notify` | 8.2.0 | inotify / FSEvents / ReadDirectoryChangesW |
 | **异步运行时** | `tokio` | 1.53.1 | — |
+| **序列化** | `serde` | 1（lock 1.0.229） | Theme 持久化（settings.json）等状态落盘的序列化 derive；P0 主题模块引入 |
+| **JSON 序列化** | `serde_json` | 1（lock 1.0.151） | Theme 持久化落盘 settings.json（文件树 file_tree.json 同用）；P0 主题模块引入 |
 | **CLI** | `clap` | 4.6.7 | — |
 | **目录遍历** | `ignore` | 0.4.33 | 文件树与搜索共用（ADR-005 §4） |
 | **LLM 接入** | OpenAI / Anthropic / Ollama | — | HTTP + SSE 流式，异步 |
@@ -165,3 +167,4 @@ LaterMD/
 | 2026-09-24 | 初版：技术栈汇总（当时还承担「最终汇总」职责，含功能范围与排期） |
 | 2026-09-24 | **重构**：原 §六功能范围、§七演进路线是过期快照（P0 6-8 周、无文件树/大纲/搜索），与 ADR-005 修订后的 roadmap 冲突。按「单一事实来源」原则，范围与排期全部移交 roadmap.md，本文收敛为纯技术栈 ADR。同步删除与 ADR-001/002/003 重复的铁律、heal/LinkHandler、架构约束三节 |
 | 2026-09-24 | **分发策略修订**：确认无 Apple Developer 账号与签名证书，分发改为 GitHub Release + Homebrew tap `crazykun/homebrew-ailater`（cask 复刻 lscreen 模式）。原「存在性阻塞」小节的公证/证书结论作废，排期中证书申请动作移除 |
+| 2026-09-25 | **依赖表补登**（P0 评审整改）：latermd-app 为主题持久化新增的 serde / serde_json 此前漏登，补两行（P0 批次）。同步订正 latermd-app/Cargo.toml 中「本就在依赖图中（criterion 的传递依赖）」的错误注释——criterion 是 dev-dependency，不进运行时依赖图，真实理由是主题持久化需要 |
