@@ -4,6 +4,13 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #16 latermd-git 的三个落地口径：U 的语义、git2 features、仓库根定位（2026-09-25）
+
+- **岔路**：P2 首个 Git crate 落地时任务留了三处歧义。①状态码集合写作 `M|A|U|D|?`，U 是 unmerged（git CLI short format 语义）还是 untracked（VS Code 装饰字母语义）——若 U=untracked 则 `?` 无含义。②ADR-004 登记 git2 0.21.0 的组合是 `vendored-libgit2 + vendored-openssl`，但 vendored-openssl 会拉 openssl-src 全量编译（三平台 CI 各多数分钟），而它的唯一用途是 https 传输。③API 以仓库路径为参数：`Repository::open`（严格根）还是 `Repository::discover`（向上层搜 `.git`）。
+- **自动选择**：①**U=unmerged（合并冲突），?=untracked**，按 git CLI `--short` 语义（`crates/latermd-git/src/lib.rs::StatusKind`），与 roadmap「文件树 Git 标记 M/A/U/?」并排五码自洽；②git2 取 **`default-features = false, features = ["vendored-libgit2"]`**（版本 0.21 与 ADR-004 一致）：P2 明确只读、无 fetch/push/pull，ssh/https 传输层整层用不上，关掉后零 openssl 面（不依赖系统包、不编译 openssl-src）；若将来做 remote 再加 `vendored-openssl` 即可；③**`Repository::open` 严格仓库根**，不向上搜——与 #14 app 侧「不向上搜 `.git`」的既有口径一致，非 git 目录一律 `Err` 交给 UI 降级成提示。
+- **已知并接受的边界**：status 里非 UTF-8 文件名不出现（libgit2 的 `entry.path()` 返回 `Option<&str>`，非 UTF-8 时为 None，极罕见）；blame 基于 HEAD 提交内容，工作区未提交的行不参与行级归属（libgit2 限制，doc 已注明）；`checkout_file` 的 path 走 git pathspec 语义（与 `git checkout -- <path>` 一致，含 glob 元字符的文件名理论上可被通配匹配）。
+- **如何改**：要改 U=untracked，改 `lib.rs::status_kind` 的优先级映射一处（untracked 同时映射 U 与 `?` 的需求不存在，五码本来就单字母）；要恢复 ADR 原样的 openssl 组合，把 crate Cargo.toml 的 features 改回 `["vendored-libgit2", "vendored-openssl"]`（须同时去掉 `default-features = false`，否则 https feature 仍关着）；要支持从子目录自动定位仓库根，把 `open_repo` 的 `Repository::open` 换成 `Repository::discover`，但 status/diff 的相对路径语义需随之在 UI 侧重排。
+
 ## #15 AI 摘要的插入形态、引用块前缀来源与 Mock 请求识别（2026-09-25）
 
 - **岔路**：任务把展示形态留成二选一——「以引用块形式插入文档末尾」或「展示给用户可选插入」。另外 prompt 输出要求固定为「每条一行中文，以 '- ' 开头」，而最终插入形态是引用块（`> - …` 行），`> ` 前缀由谁加上、Mock provider 在共用 `stream_complete` 通道里如何区分摘要请求与续写请求，都需要定口径。

@@ -1,0 +1,12 @@
+[package]
+name = "latermd-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only Git access via git2: status/log/diff/blame plus confirmed single-file checkout (no UI deps)"
+
+[dependencies]
+# 只读本地仓库操作(ADR-004 已登记 git2 0.21.0)。default-features 自带
+# ssh/https 传输层,会牵出 openssl 依赖;P2 明确不做 remote(fetch/push/
+# pull),故只留 vendored-libgit2,libgit2 静态编译,不依赖系统 openssl。
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
