@@ -71,6 +71,22 @@ pub trait LinkHandler {
     None
   }
 
+  /// Should this fenced code block render as a standalone block-level widget?
+  /// Keyed on the block's info string, just as [`Self::is_block_widget`] is keyed
+  /// on the href. When true, the block becomes a segment break and
+  /// [`Self::block_code_widget`] is called to render it outside the text galley.
+  fn is_block_code_widget(&self, _language: Option<&str>) -> bool {
+    false
+  }
+
+  /// Render a block-level widget for this fenced code block.
+  /// Called when [`Self::is_block_code_widget`] returned true. The handler has
+  /// full control: render any widget, handle interaction via the Response.
+  /// Returns `None` if not handled.
+  fn block_code_widget(&self, _ui: &mut Ui, _text: &str, _language: Option<&str>) -> Option<Response> {
+    None
+  }
+
   /// Identity key for cache invalidation. Change when handler behavior
   /// changes for the same markdown text.
   fn id(&self) -> u64 {

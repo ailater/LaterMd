@@ -6,6 +6,7 @@
 //! (docs/adr-005)。
 
 mod ai;
+mod ai_link;
 mod command;
 mod export;
 mod file;

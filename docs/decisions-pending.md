@@ -4,6 +4,26 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #13 ```ai 指令卡状态行的键控口径（2026-09-25）
+
+- **岔路**：指令卡状态行要求「未执行 / 进行中 / 已完成」三态，需要回答「哪张卡算进行中/已完成」。可选：①按卡片指令文本与最近一次发起的 prompt 匹配（`AiState::last_prompt`）；②按块在文档中的序号维护每卡状态表。
+- **自动选择**：①（`crates/latermd-app/src/ui/preview.rs::AiLinkHandler::card_status`）。理由：防重入保证同时至多一个流，「哪张卡发起」由 prompt 文本即足以判定；序号表在用户增删块时会整体错位，还要处理失效清理；文本匹配零新增结构。已知并接受的简化：**两卡片指令文本完全相同则状态同亮**；指令文本被编辑后状态回「未执行」（文本变了=另一条指令，语义自洽）。菜单入口（`AiStart`）的 prompt 是文档尾部拼装文本，不会与任何指令文本相等，菜单流不点亮卡片。
+- **失效时机**：`last_prompt` 只在两处清空——流失败（`Message::AiFailed` 归约，失败不算完成）与换文档（`State::load_document`，卡片是文档的派生物）；`AiDone` 后保留，让「已完成」可见。
+- **如何改**：要按序号键控（同文卡片状态独立），在 `PreviewState` 加 `card_status: HashMap<usize, AiCardStatus>` 并把 `block_code_widget` 的 `index` 传进消息，即可替换匹配逻辑；消息归约与 vendored 扩展点无需动。
+
+## #12 ```ai 指令块走最小 vendor 改动（代码块级 block widget 扩展点）（2026-09-25）
+
+- **岔路**：任务优先「只用 app 侧扩展点，不动 vendor」。实测 vendored `LinkHandler::is_block_widget`/`block_widget`（`vendor/egui_markdown/src/link.rs`）只作用于 **`Token::Link` 的 href**（判定点 `layout.rs` `append_link_to_job`/`needs_segmentation`/`build_layout`），**够不到围栏代码块**——roadmap 阶段 3 写的「`.is_block_widget()` → `.block_widget()`」对 ```ai 围栏不成立。app 侧唯一代码块扩展点是 `code_block_buttons` 头部 overlay 回调（回调签名 `(ui, text, lang)`，无块序号/span），画不出「卡片 + 状态行」，也拿不到稳定块身份（AGENTS §6.7 的 id 稳定性无从谈起）。
+- **自动选择**：给 vendored `LinkHandler` 加**代码块级 block widget** 两方法（`is_block_code_widget(language)` / `block_code_widget(ui, text, language)`，按 info string 判定），与链接 block widget 同构：命中即 segment break，在 `render_token_range` 独立渲染；`needs_segmentation` / `build_layout` / `render_token_range` 三处按上游既有「必须同步」约定同步改。类别 **①上游可合**（通用能力、带 tests/block_code_widget.rs，可 cherry-pick 提上游 PR），登记见 `vendor/README.md` 提交级登记表与 `vendor/egui_markdown/README.md` 差异表 #7。
+- **如何改**：若不认可动 vendor，revert 该 ① 类 commit 并把 app 侧退到 `code_block_buttons` overlay 形态（功能降级：状态行并入代码块头、卡片视觉消失、多卡身份按内容 hash 近似）——代价已实测如上，不建议。
+
+## #11 `ai://` 链接协议语义与 prompt 编解码口径（2026-09-25）
+
+- **岔路**：roadmap 阶段 3 对「ai:// 链接协议」只写了「`.link_style()` + `.click()` 拦截」的实现方式，协议本体没有定稿——已实现动作是哪个、未实现动作点了怎么办、prompt 怎么编码、`+` 算不算空格，都得有个说法才能写测试。另实测发现 vendored 的 `LinkStyle.underline` 字段（`vendor/egui_markdown/src/link.rs:86`）当前**没有任何读取点**。
+- **定稿**：`ai://write?prompt=<urlencoded 提示词>` 触发 Mock 流式续写，prompt **原样透传** provider（不拼文档尾部——链接作者写的就是完整指令；续写仍落在当前文档末尾，防重入与菜单「AI 续写」同一入口 `start_ai_stream_with_prompt`）。其余 `ai://` 动作（`ai://summarize` 等）**识别但不拦截成执行**：点击提示「未实现的 AI 动作：<action>」。`ai://write` 缺 prompt 参数、prompt 为空、坏 `%` 序列、非 UTF-8 字节，均提示且不执行。解码只用严格 `%XX`（`percent-encoding` 2.3.2，坏序列自行校验补严——该 crate 默认原样放行），**`+` 不当空格**：markdown 链接里作者本就该用 `%20`。非 `ai://` 前缀完全不拦截，走 vendored 默认 `open_url`（系统浏览器）。
+- **证据**：vendored `layout.rs:144`（`link_style().color` 决定链接**文字色**）、`layout.rs:197`（hover 下划线对**全部**链接无条件绘制，颜色取 `link_style().color`）、`label.rs:1165`（`click` 返回 true 则跳过 `open_url`）。app 侧 `LinkStyle { color, underline: true }` 里 `underline` 是**声明意图**——vendored 层没人读它，样式区分实际由颜色承担；ai:// 链接取紫罗兰色（明暗主题两档），与默认 `hyperlink_color` 区分。
+- **如何改**：新增动作或让 `+` 当空格，改 `crates/latermd-app/src/ai_link.rs::parse` 一处（消息载荷 `Message::AiLinkClicked { prompt: Result<String, String> }` 不变，`Err` 文案在 parse 里拼）；要让 `underline` 字段真正生效需改 vendored 层（①上游可合类），本轮按「优先只用 app 侧扩展点」未动 vendor。
+
 ## #10 heal() 的作用时机：逐块(后台线程) vs 整篇(渲染帧)（2026-09-25）
 
 - **岔路**：AI 流式接线 ask 要求「后台线程每块先过 vendored heal()，经 mpsc 回 UI，delta 追加进编辑器 rope」。但 `heal(s)` 的语义是给**残缺文本前缀**补闭合标记（`vendor/egui_markdown/src/parser.rs:45`：`heal("```rust\nlet x = 1;")` → 追加闭合 fence、`heal("**bold text")` → 追加 `**`）。MockProvider 按固定 20 字符切块，块边界会切在代码 fence/加粗中间：若把逐块 healed 文本追加进 rope，闭合标记会被**永久写进文档**，且下一块拼在闭合 fence 之后产生非法残文（例：块尾 `fn invalidate(cache: &mut C` 被补成 `…C\n```` ，下一块 `ache, doc_id…` 紧跟其后再开一个 fence）。

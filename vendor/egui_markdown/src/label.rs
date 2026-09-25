@@ -732,6 +732,15 @@ impl<'a> MarkdownLabel<'a> {
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
         }
+        Token::CodeBlock { text, language }
+          if self.link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref())) =>
+        {
+          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          let handler = self.link_handler.unwrap();
+          handler.block_code_widget(ui, text, language.as_deref());
+          i += 1;
+          text_start = i;
+        }
         Token::CodeBlock { text, language } if self.scroll_code_blocks => {
           let had_content = text_start < i;
           self.flush_text_range(ui, md, font, color, text_start, i, style);

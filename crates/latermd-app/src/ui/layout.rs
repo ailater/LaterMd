@@ -118,9 +118,10 @@ impl LaterMdApp {
                 crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
-        // ④ 必须最后:预览
+        // ④ 必须最后:预览(outbox 供 ai:// 链接与 ```ai 指令卡的 LinkHandler 产消息;
+        // ai 只读,供指令卡状态行取流式标志与最近 prompt)
         egui::CentralPanel::default().show(ui, |ui| {
-            crate::ui::preview::ui(ui, &self.state.preview);
+            crate::ui::preview::ui(ui, &self.state.preview, &self.state.ai, outbox);
         });
     }
 }

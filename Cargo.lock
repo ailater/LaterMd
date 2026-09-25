@@ -2269,6 +2269,7 @@ dependencies = [
  "latermd-editor",
  "latermd-export",
  "latermd-md",
+ "percent-encoding",
  "regex",
  "rfd",
  "serde",

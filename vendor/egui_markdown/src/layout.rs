@@ -236,7 +236,9 @@ pub fn needs_segmentation(
   link_handler: Option<&dyn LinkHandler>,
 ) -> bool {
   tokens.iter().any(|token| match token {
-    Token::CodeBlock { .. } => scroll_code_blocks,
+    Token::CodeBlock { language, .. } => {
+      scroll_code_blocks || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref()))
+    }
     Token::Link { href, .. } => link_handler.is_some_and(|h| h.is_block_widget(href)),
     Token::Image { .. } | Token::Table(_) | Token::BlockquoteStart | Token::BlockquoteEnd => true,
     _ => false,
@@ -335,7 +337,7 @@ pub fn build_layout(
         section_to_token.push(token_index);
       }
       Token::CodeBlock { text, language } => {
-        if scroll_code_blocks {
+        if scroll_code_blocks || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref())) {
           segment_breaks.push(token_index);
         } else {
           let lang = language.as_deref().unwrap_or(style_ref.default_code_language.as_str());
