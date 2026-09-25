@@ -15,7 +15,7 @@
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
 [~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。验证 1 IME Linux 已首测:输入可用,候选框不跟随光标,排查挂账(m0-report.md 验证 1)。出口仍卡两条真机项(Win/mac IME、Win/mac wgpu),见 m0-report.md
 [~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包配置已就绪(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板,发布 runbook 见 [distribution.md](distribution.md));收尾修补(跨平台字体候选/ADR 登记/后端显示)已于 2026-09-25 完成;P0 剩余 = 首个 Release 发布(tag 触发 CI 全链路跑通)+ 三平台真机验收
-[~] P1 差异化     全文搜索已落地(2026-09-25),latermd-ai 基础(Mock 流式)已落地(2026-09-25),P1 其余模块待开始
+[~] P1 差异化     全文搜索已落地(2026-09-25),latermd-ai 基础(Mock 流式)已落地(2026-09-25),ai:// 链接与 AI 指令块已落地(2026-09-25),P1 其余模块待开始
 [ ] P2 版本层
 [ ] P2.5 界面打磨（皮肤系统批次 B，见「专题：界面美化与皮肤系统」）
 [ ] P3 深水区
@@ -151,7 +151,7 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 |---|---|---|
 | AI 流式写作 | `heal()` + `LinkHandler` + provider trait（OpenAI / Anthropic / Ollama） | 3 周 |
 | `ai://` 链接协议 | `.link_style()` + `.click()` 拦截 | 0.5 周 |
-| AI 指令块 | `.is_block_widget()` → `.block_widget()` | 1 周 |
+| AI 指令块 | `.is_block_code_widget()` → `.block_code_widget()`（原写法 `.is_block_widget()` 实测仅作用于 `Token::Link` 的 href、够不到围栏代码块，见 decisions-pending #12） | 1 周 |
 | AI commit message | — | 0.5 周 |
 | AI 摘要 / 大纲 | — | 1 周 |
 | **搜索**（即全文检索，P3 不再重复） | `ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果 | 1.5 周 |

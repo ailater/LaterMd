@@ -38,7 +38,7 @@ git subtree pull --prefix=vendor/egui_markdown \
 
 | 状态 | commit | 类别 | 说明 |
 |---|---|---|---|
-| 待提交 | — | ① | `LinkHandler` 新增围栏代码块级 block widget 扩展点：`is_block_code_widget` / `block_code_widget`（link.rs），`needs_segmentation` / `build_layout` / `render_token_range` 三处分段同步（layout.rs / label.rs），测试 tests/block_code_widget.rs。首个消费方是 app 侧 ```ai 指令卡：按 info string 判定，与既有链接 block widget 同构，上游可合 |
+| 已提交 | b9d5070 | ① | `LinkHandler` 新增围栏代码块级 block widget 扩展点：`is_block_code_widget` / `block_code_widget`（link.rs），`needs_segmentation` / `build_layout` / `render_token_range` 三处分段同步（layout.rs / label.rs），测试 tests/block_code_widget.rs。首个消费方是 app 侧 ```ai 指令卡：按 info string 判定，与既有链接 block widget 同构，上游可合（注：随 feat(app) commit 一并入库，未拆独立 `vendor:` 前缀 commit） |
 | 待提交 | — | ① | egui 0.34 → 0.36.2：两个 Cargo.toml 的版本三件套 + pulldown-cmark 0.13.4 + `layout.rs` `ByteIndex`/`ByteRangeExt` 迁移 |
 | 待提交 | — | ② | 删 membrane feature：Cargo.toml feature 行、`layout.rs` cfg 块、`style.rs` `InlineCodeStyle` 五个 membrane 字段与 `Stroke` 导入、`tests/indent.rs` 整文件、`tests/width.rs` 的 membrane 测试 |
 | 待提交 | — | ③ | 删上游 `[workspace]` 段（两个 Cargo.toml）与嵌套 `rust-toolchain.toml`；Cargo.toml 头部 vendor 注释 |

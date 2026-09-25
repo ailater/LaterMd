@@ -26,7 +26,7 @@
 | 1 | p0-fixes | P0 收尾修补：跨平台 CJK 字体候选、ADR-004 登记 serde/serde_json、设置面板显示渲染后端 | ✅完成 | feat(app): CJK 字体候选表补全三平台路径,单候选失败跳下一候选;docs(adr-004): 补登 serde/serde_json 依赖两行,订正 latermd-app Cargo.toml 错误注释;feat(app): 设置菜单显示当前渲染后端(wgpu/glow) |
 | 2 | p1-search | 侧边栏全文搜索：`ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果 | ✅完成 | feat(app): 仓库全文搜索核心服务(遍历+行正则+可取消流式回传);feat(app): 侧边栏搜索 UI 与跳转接线(300ms 去抖 + 流式结果 + 点击跳行) |
 | 3 | p1-ai-base | latermd-ai 基础：provider trait（OpenAI/Anthropic/Ollama 兼容）+ `heal()` 流式接入 + 稳定 widget id；**mock provider 交付**（真实 key 见 decisions-pending #3） | ✅完成 | feat(ai): 新建 latermd-ai 核心 crate(provider trait + MockProvider + OpenAI SSE 解析 + ureq 阻塞 HTTP);feat(app): 接入 AI Mock 流式续写(菜单/Message 归约/防重入),预览启用 heal 并复测流式 bench |
-| 4 | p1-ai-links | `ai://` 链接协议 + AI 指令块（LinkHandler 五级扩展点落地），依赖 #3 | ⏳待开始 | — |
+| 4 | p1-ai-links | `ai://` 链接协议 + AI 指令块（LinkHandler 五级扩展点落地），依赖 #3 | ✅完成 | feat(app): ai:// 链接协议——LinkHandler 样式区分与点击拦截触发 Mock 流式续写;feat(app): ```ai 指令卡——代码块级 block widget 渲染指令卡,执行走 ai:// 同通道 |
 | 5 | p1-ai-tools | AI commit message + AI 摘要大纲（基于 #3 的 provider，mock 可用） | ⏳待开始 | — |
 | 6 | p2-git | latermd-git 只读集成：状态、历史、diff、blame、回滚 + 文件树 M/A/U/? 标记 | ⏳待开始 | — |
 | 7 | p2-creds | 凭据管理三平台封装（Credential Manager / Keychain / libsecret） | ⏳待开始 | — |
