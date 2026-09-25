@@ -30,6 +30,8 @@ latermd-md = { path = "../latermd-md" }
 latermd-ai = { path = "../latermd-ai" }
 # HTML 导出(ADR-004 清单内,P0 验收项)
 latermd-export = { path = "../latermd-export" }
+# Git 只读集成(P2 版本层):状态角标、Git 面板与确认式单文件回滚
+latermd-git = { path = "../latermd-git" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
 # 文件树目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)

@@ -13,6 +13,7 @@ mod file;
 mod filetree;
 mod fonts;
 mod git_diff;
+mod git_panel;
 mod search;
 mod state;
 mod theme;

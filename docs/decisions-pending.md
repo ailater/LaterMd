@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #17 Git UI 接驳的刷新机制、仓库根定位与确认模态形态（2026-09-25）
+
+- **岔路**：把 latermd-git 接进侧边栏时任务留了三处自由度。①「每 N 秒或触发时刷新」的 N 未定，且同步归约执行还是后台线程未定（`git status` 大仓库冷缓存可能上百毫秒，卡帧风险真实存在）；②#16 ③ 已定 latermd-git API 层用 `Repository::open` 严格仓库根，但 UI 的文件树根常是**仓库子目录**（比如选了 `docs/` 当根），以哪个目录调 status/diff/log 没定；③「确认模态」在 egui 0.36 没有内建阻塞模态层，用什么形态承载。
+- **自动选择**：①**N=3 秒，同步在归约里执行**（`crates/latermd-app/src/git_panel.rs::REFRESH_INTERVAL`）：与 `git_diff.rs` 的既有口径一致（本地 git 读是毫秒级，不上后台线程），到点由 `ui::layout::reduce` 触发并 `request_repaint_after` 要帧；触发式刷新 = 换根 / 切到 Git 页 / 回滚完成；**降级（非 git 目录）即停轮询**，重探由换根/切页签触发——保证 egui 空闲收敛（search 去抖测试守护的不变量），零成本挂着的失败探测没有价值。②新增 `latermd_git::discover`（`Repository::discover` 向上探测，裸仓库显式 Err）：crate 其余 API 的「严格仓库根」口径不动，UI 接驳层先 discover 把文件树根换算成仓库根；状态条目仍记「相对仓库根」路径，角标拼成绝对路径与文件树条目匹配。③确认模态用**非阻塞 `egui::Window` 浮窗 + 红色警示文案「未提交的改动将被丢弃，此操作不可撤销」**（与 AI commit 建议浮窗同模式）：checkout 只在「回滚」按钮点击后的消息归约里执行，浮窗本身零 git 调用。
+- **如何改**：嫌 3s 太钝/太勤，改 `REFRESH_INTERVAL` 一个常量；大仓库实测掉帧，把 `GitPanelState::refresh` 的两次 git 读挪后台线程（对 UI 的接口不变，参照 search 的代际号取消模式）；要收紧回「文件树根必须是仓库根」，删 `latermd_git::discover` 并让 `GitPanelState::refresh` 直接以文件树根调 status（非根目录会走降级提示）；要真阻塞式模态，等 egui 内建 modal 层（0.36 无）或自绘全屏遮罩 Area。
+
 ## #16 latermd-git 的三个落地口径：U 的语义、git2 features、仓库根定位（2026-09-25）
 
 - **岔路**：P2 首个 Git crate 落地时任务留了三处歧义。①状态码集合写作 `M|A|U|D|?`，U 是 unmerged（git CLI short format 语义）还是 untracked（VS Code 装饰字母语义）——若 U=untracked 则 `?` 无含义。②ADR-004 登记 git2 0.21.0 的组合是 `vendored-libgit2 + vendored-openssl`，但 vendored-openssl 会拉 openssl-src 全量编译（三平台 CI 各多数分钟），而它的唯一用途是 https 传输。③API 以仓库路径为参数：`Repository::open`（严格根）还是 `Repository::discover`（向上层搜 `.git`）。

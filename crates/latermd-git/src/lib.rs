@@ -17,7 +17,7 @@
 //!   ssh/https 传输 feature。
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use git2::build::CheckoutBuilder;
 use git2::{DiffOptions, Patch, Repository, Signature, StatusOptions};
@@ -96,6 +96,20 @@ pub struct BlameLine {
 /// [`log`] 的默认条数上限。
 pub const DEFAULT_LOG_LIMIT: usize = 50;
 
+/// 从任意目录向上探测 Git 仓库的工作区根(`.git` 所在目录),起点自身
+/// 是仓库根也命中。UI 的文件树根可能是仓库子目录(例如选了 `docs/`),
+/// 其余 API 只认仓库根,先经本函数换算。裸仓库(只有 `.git` 内容、无
+/// 工作区)返回 Err——本 crate 的全部操作都针对工作区文件。
+pub fn discover(start: &Path) -> Result<PathBuf, String> {
+    Repository::discover(start)
+        .map_err(|error| format!("当前目录不是 Git 仓库: {error}"))
+        .and_then(|repo| {
+            repo.workdir()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "当前是裸仓库,没有工作区文件".to_owned())
+        })
+}
+
 /// 读取仓库全部改动(含未跟踪文件),按路径排序。
 ///
 /// 未跟踪目录会递归展开到逐个文件,便于文件树打标;`.gitignore` 命中的
@@ -164,7 +178,7 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitInfo>, String> {
 /// 无改动、文件不在 HEAD 与工作区时返回空串,由调用方显示「无改动」;
 /// 空仓库(没有 HEAD 提交)返回 Err。未跟踪文件不参与 diff(与
 /// `git diff` 一致)。pathspec 命中二进制文件时输出占位提示;输出超过
-/// [`MAX_DIFF_BYTES`] 时截断并追加提示行。
+/// ~64KB 上限时截断并追加提示行。
 pub fn diff_file(root: &Path, path: &str) -> Result<String, String> {
     let repo = open_repo(root)?;
     if repo
@@ -512,6 +526,30 @@ mod tests {
         assert!(diff_file(&dir, "a.md").is_err());
         assert!(blame_file(&dir, "a.md").is_err());
         assert!(checkout_file(&dir, "a.md").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// discover 从仓库子目录向上找到工作区根;裸仓库没有工作区,显式 Err。
+    #[test]
+    fn discover_walks_up_to_workdir_root() {
+        let dir = temp_repo("discover");
+        std::fs::create_dir_all(dir.join("docs/deep")).unwrap();
+        std::fs::write(dir.join("docs/deep/a.md"), "一\n").unwrap();
+
+        assert_eq!(discover(&dir).unwrap(), dir, "起点即仓库根");
+        assert_eq!(
+            discover(&dir.join("docs/deep")).unwrap(),
+            dir,
+            "子目录向上探测"
+        );
+
+        let bare =
+            std::env::temp_dir().join(format!("latermd-gitcrate-{}-bare", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&bare, &["init", "-q", "--bare", "."]);
+        assert!(discover(&bare).is_err(), "裸仓库无工作区");
+        let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

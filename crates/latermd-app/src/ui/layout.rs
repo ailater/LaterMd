@@ -55,6 +55,19 @@ impl LaterMdApp {
         if state.search.is_running() {
             ctx.request_repaint();
         }
+        // Git 状态轮询:有文件树根且尚未降级才轮询(无根无事可刷;非 git
+        // 目录零轮询——重探由换根/切 Git 页触发,egui 得以收敛到深度空闲,
+        // 这正是 search 去抖测试守护的不变量)。到点即刷(同步毫秒级,见
+        // `git_panel` 模块文档),并在到点前要一帧(空闲不来帧,轮询依赖
+        // 显式 repaint)。
+        if state.file_tree.root.is_some() && state.git.error.is_none() {
+            if state.git.due() {
+                state.refresh_git();
+            }
+            if state.git.error.is_none() {
+                ctx.request_repaint_after(state.git.until_refresh());
+            }
+        }
         // AI 流式的重绘驱动:chunk 到达即要在下一帧收流归约,预览才跟得上
         // 100ms/chunk 的节奏;AiDone 归约清标志后自然停。
         if state.ai.is_streaming() {
@@ -100,6 +113,7 @@ impl LaterMdApp {
                         cursor_byte: self.state.cursor.byte,
                     },
                     &mut self.state.search,
+                    &self.state.git,
                     &mut self.outbox,
                 );
             });
@@ -133,6 +147,19 @@ impl LaterMdApp {
                 self.outbox.push(Message::AiCommitDismissed);
             }
         }
+
+        // ⑥ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
+        // 即确认弹窗(与 commit 建议浮窗同模式);文案显式警示不可逆,
+        // checkout 只在「回滚」按钮点击之后的归约里执行。
+        if let Some(path) = self.state.git.confirm_checkout.clone() {
+            let (confirm, cancel) = checkout_dialog(ui, &path);
+            if confirm.clicked() {
+                self.outbox.push(Message::GitCheckoutConfirmed);
+            }
+            if cancel.clicked() {
+                self.outbox.push(Message::GitCheckoutCancelled);
+            }
+        }
     }
 }
 
@@ -160,6 +187,30 @@ fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Res
                     ctx.copy_text(subject.to_owned());
                 }
                 buttons = Some((copy, ui.button("关闭")));
+            });
+        });
+    buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 回滚确认浮窗;返回(回滚, 取消)按钮的响应,测试定位用(与
+/// `commit_dialog` 同款手法)。只展示与收集点击,checkout 在归约。
+fn checkout_dialog(ui: &mut egui::Ui, path: &str) -> (egui::Response, egui::Response) {
+    let mut buttons = None;
+    egui::Window::new("Git: 回滚文件")
+        .default_pos([80.0, 120.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(format!("把 {path} 恢复到 HEAD 版本。"));
+            ui.label(
+                egui::RichText::new("未提交的改动将被丢弃,此操作不可撤销。")
+                    .strong()
+                    .color(egui::Color32::from_rgb(235, 96, 96)),
+            );
+            ui.horizontal(|ui| {
+                let confirm = ui.button("回滚");
+                let cancel = ui.button("取消");
+                buttons = Some((confirm, cancel));
             });
         });
     buttons.expect("浮窗必然绘制按钮")
@@ -575,5 +626,130 @@ mod tests {
         let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
         output.drop_without_applying_deltas();
         assert_eq!(app.state.ai_commit_suggestion, None);
+    }
+
+    /// 在临时目录里装配一次性 git 仓库(一笔提交 + 一个工作区改动)。
+    fn dirty_repo(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-layout-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=LaterMD", "-c", "user.email=latermd@test"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} 失败");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.md"), "HEAD 版本\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("a.md"), "乱改\n").unwrap();
+        dir
+    }
+
+    /// Git 轮询在归约侧到点即刷:有根 + due 过期的一帧 reduce 后改动列表
+    /// 就位;无根时到点也不刷(不空转)。
+    #[test]
+    fn git_poll_refreshes_when_due_with_root() {
+        let dir = dirty_repo("git-poll");
+        let mut app = LaterMdApp::default();
+        app.state.file_tree.root = Some(dir.clone());
+        app.state.git.refresh_due = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.git.entries.len(), 1, "到点帧已刷新");
+        assert!(!app.state.git.due(), "刷新顺延了下一周期");
+
+        // 无根 + 到点:不刷(无根不轮询)
+        let mut rootless = LaterMdApp::default();
+        rootless.state.git.refresh_due =
+            std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let output = ctx.run_ui(RawInput::default(), |ui| rootless.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(rootless.state.git.entries.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚确认浮窗:「回滚」与「取消」按钮点击分别发 GitCheckoutConfirmed /
+    /// GitCheckoutCancelled 进 outbox,由下一帧归约执行(浮窗本身不做 git)。
+    #[test]
+    fn checkout_dialog_buttons_send_messages() {
+        let mut app = LaterMdApp::default();
+        app.state.git.confirm_checkout = Some("a.md".to_owned());
+        let ctx = egui::Context::default();
+        let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+
+        // 帧 1:渲染浮窗拿按钮位置(Area 按 id 记忆,draw 内位置一致)
+        ctx.run_ui(RawInput::default(), |ui| {
+            let (confirm, cancel) = checkout_dialog(ui, "a.md");
+            rects.set((confirm.rect, cancel.rect));
+        })
+        .drop_without_applying_deltas();
+
+        let (confirm_center, cancel_center) = {
+            let (confirm, cancel) = rects.get();
+            (confirm.center(), cancel.center())
+        };
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        // 帧 2-4:完整 draw 下点「取消」→ GitCheckoutCancelled(消息的
+        // 产出在 draw 的浮窗接线里,单独渲染浮窗不够)
+        for events in [
+            vec![Event::PointerMoved(cancel_center)],
+            vec![click(cancel_center, true)],
+            vec![click(cancel_center, false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            app.outbox
+                .iter()
+                .any(|m| matches!(m, Message::GitCheckoutCancelled)),
+            "{:?}",
+            app.outbox
+        );
+        app.outbox.clear();
+        // 帧 5-7:完整 draw 下点「回滚」→ GitCheckoutConfirmed(消息同样
+        // 产自 draw;真正的 checkout 在下一帧归约,state::tests 已覆盖)
+        for events in [
+            vec![Event::PointerMoved(confirm_center)],
+            vec![click(confirm_center, true)],
+            vec![click(confirm_center, false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            app.outbox
+                .iter()
+                .any(|m| matches!(m, Message::GitCheckoutConfirmed)),
+            "{:?}",
+            app.outbox
+        );
     }
 }

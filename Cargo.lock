@@ -2280,6 +2280,7 @@ dependencies = [
  "latermd-ai",
  "latermd-editor",
  "latermd-export",
+ "latermd-git",
  "latermd-md",
  "percent-encoding",
  "regex",
