@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "LaterMD desktop application (the only GUI crate)"
+repository.workspace = true
+
+# 发布二进制名统一 latermd(crate 名不动,资产名由 dist.toml shadow 对齐);
+# 显式声明 [[bin]] 会关闭该 target 的路径自动发现,故必须写 path
+[[bin]]
+name = "latermd"
+path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.2"
