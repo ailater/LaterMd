@@ -1,6 +1,7 @@
 //! 文件工具栏(编辑面板顶部):命令按钮(label/快捷键统一取自
-//! `crate::command`)+ 设置菜单(主题定向选择)+ 当前文件名/未保存标记 +
-//! 上次文件操作的失败提示。点击只发消息,执行在 `App::logic`。
+//! `crate::command`)+ 设置菜单(主题定向选择 + 当前渲染后端只读显示)+
+//! 当前文件名/未保存标记 + 上次文件操作的失败提示。点击只发消息,执行在
+//! `App::logic`。
 
 use crate::command::Command;
 use crate::state::{DocumentState, Message};
@@ -33,6 +34,13 @@ pub fn ui(
                     outbox.push(Message::ThemeChanged(mode));
                 }
             }
+            // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
+            // 决策,这里只显示不切换;读取时机仅在菜单展开的帧,无每帧开销
+            ui.separator();
+            ui.weak(format!(
+                "渲染后端: {}",
+                crate::renderer_label(std::env::var("LATERMD_RENDERER").ok().as_deref())
+            ));
         });
         ui.separator();
         ui.weak(document.display_name());

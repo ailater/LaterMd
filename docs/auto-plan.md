@@ -23,7 +23,7 @@
 
 | # | id | 功能 | 状态 | run / commit |
 |---|---|---|---|---|
-| 1 | p0-fixes | P0 收尾修补：跨平台 CJK 字体候选、ADR-004 登记 serde/serde_json、设置面板显示渲染后端 | 🔄进行中 | 启动于 2026-09-25 |
+| 1 | p0-fixes | P0 收尾修补：跨平台 CJK 字体候选、ADR-004 登记 serde/serde_json、设置面板显示渲染后端 | ✅完成 | feat(app): CJK 字体候选表补全三平台路径,单候选失败跳下一候选;docs(adr-004): 补登 serde/serde_json 依赖两行,订正 latermd-app Cargo.toml 错误注释;feat(app): 设置菜单显示当前渲染后端(wgpu/glow) |
 | 2 | p1-search | 侧边栏全文搜索：`ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果 | ⏳待开始 | — |
 | 3 | p1-ai-base | latermd-ai 基础：provider trait（OpenAI/Anthropic/Ollama 兼容）+ `heal()` 流式接入 + 稳定 widget id；**mock provider 交付**（真实 key 见 decisions-pending #3） | ⏳待开始 | — |
 | 4 | p1-ai-links | `ai://` 链接协议 + AI 指令块（LinkHandler 五级扩展点落地），依赖 #3 | ⏳待开始 | — |
