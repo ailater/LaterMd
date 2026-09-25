@@ -192,8 +192,9 @@ pub enum SearchStatus {
 /// 输入文本(`query` / `case_insensitive`)由 `ui` 层的 TextEdit/checkbox
 /// 原地改写(同编辑器缓冲的例外:这类控件必须拿 `&mut`),变更当帧发
 /// `Message::SearchQueryChanged`;归约里取消旧搜索并把 `debounce_due`
-/// 顺延 300ms,`ui` 层下一帧到点发 `Message::SearchRequested`,归约再
-/// 调 [`SearchState::start`]。
+/// 顺延 300ms,到点由归约侧(`layout.rs` 的 reduce,每帧必跑、不看
+/// Search 页是否可见)发 `Message::SearchRequested`,归约再调
+/// [`SearchState::start`]。
 #[derive(Debug)]
 pub struct SearchState {
     /// 后台搜索服务(单线程持有,见 [`SearchService`] 文档)。

@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #8 搜索去抖到点发起从 `ui::sidebar` 挪进归约侧（2026-09-25）
+
+- **岔路**：修复「清空搜索输入 / 输入后切走页签后 `debounce_due` 残留过期时刻，`layout.rs` 每帧 `request_repaint_after(ZERO)` 满帧空转」时，评审给了两个薄修：①去掉 `ui::sidebar` 到点判断里的非空输入条件；②`layout.rs` 对已过期的 due 不再要帧。①只修「清空输入」主路径，「输入后切到 Files/Outline 页签」路径 `search_panel` 不渲染、无人清计时，依旧空转；②会打断接力最后一环——到点帧 reduce 先于 ui 执行，reduce 见 remaining==0 不要帧后，同帧 `ui::sidebar` 发出的 `SearchRequested` 滞留 outbox，无下一帧 apply，表现为「输入完不动鼠标搜索永不发起」。
+- **自动选择**：把到点判断整体挪进 `layout.rs` 的 `reduce`（每帧必跑、不看页签可见性），到点当帧 `apply(SearchRequested)` → `SearchState::start` 入口清计时，过期 due 活不过一帧；重绘驱动与到点判断同处一处，两类残留（空输入 / 切页签）一并消除。副产品：输入后 300ms 内切走页签也照常发起，切回来即见结果（比「切回 Search 页才自愈」更符合直觉）。
+- **如何改**：若更在意「只在 Search 页可见时才发起」，把 reduce 里的到点块移回 `ui::sidebar::search_panel` 并同时采纳②之外的方案（例如 reduce 里对过期 due 保留一次要帧兜底）；三个测试锚点在 `layout.rs`（`search_debounce_fires_in_reduce_even_when_tab_switched_away`、`search_debounce_due_cleared_for_empty_query_without_repaint_loop`）。
+
 ## #7 搜索核心不用 `grep-regex` 桥接（2026-09-25）
 
 - **岔路**：roadmap 阶段 3 搜索条目的组件清单写作「`grep_searcher::Searcher` + `regex`」，但 `grep_searcher::Searcher::search_*` 全系 API 要求 `grep_matcher::Matcher` 实参，`regex::Regex` 并未实现该 trait，二者**无法直连**。要么补引 `grep-regex`（ripgrep 官方桥，连带 `grep-matcher`），要么改用同 crate 的 `grep_searcher::LineIter` 做行迭代、`regex` 直接匹配。
