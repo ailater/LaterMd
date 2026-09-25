@@ -41,6 +41,10 @@ pub enum Command {
     /// 流式追加到文档末尾;文档已含「AI 摘要」节则先移除再插入。流式
     /// 进行中触发同样被忽略(共用防重入)。
     AiSummary,
+    /// 切到下一个标签(P1.5「多标签」,Ctrl/Cmd+Tab 循环)。
+    TabNext,
+    /// 关闭当前标签(脏则确认模态;Ctrl/Cmd+W)。
+    TabClose,
 }
 
 impl Command {
@@ -48,7 +52,7 @@ impl Command {
     pub const FILE: [Command; 4] = [Self::New, Self::Open, Self::Save, Self::SaveAs];
 
     /// 全部命令(快捷键设置页与绑定表遍历的顺序,见 `crate::keymap`)。
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 12] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -59,6 +63,8 @@ impl Command {
         Self::AiMockStream,
         Self::AiCommitMessage,
         Self::AiSummary,
+        Self::TabNext,
+        Self::TabClose,
     ];
 
     /// 稳定 id:快捷键表 `keymap.json` 的键。命令的显示名会随文案调整,
@@ -75,6 +81,8 @@ impl Command {
             Self::AiMockStream => "ai_mock_stream",
             Self::AiCommitMessage => "ai_commit_message",
             Self::AiSummary => "ai_summary",
+            Self::TabNext => "tab_next",
+            Self::TabClose => "tab_close",
         }
     }
 
@@ -91,6 +99,8 @@ impl Command {
             Self::AiMockStream => "AI: Mock 流式续写",
             Self::AiCommitMessage => "AI: 生成 commit message",
             Self::AiSummary => "AI: 生成摘要",
+            Self::TabNext => "下一个标签",
+            Self::TabClose => "关闭标签",
         }
     }
 
@@ -118,6 +128,8 @@ impl Command {
             Self::ToggleSidebar => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
+            Self::TabNext => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Tab),
+            Self::TabClose => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::W),
             // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => return None,
         };
@@ -136,6 +148,7 @@ impl Command {
             Self::ToggleTheme => Icon::Theme,
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
+            Self::TabNext | Self::TabClose => Icon::Files,
         }
     }
 
@@ -152,6 +165,8 @@ impl Command {
             Self::AiMockStream => Message::AiStart,
             Self::AiCommitMessage => Message::AiCommitRequested,
             Self::AiSummary => Message::AiSummaryRequested,
+            Self::TabNext => Message::TabNext,
+            Self::TabClose => Message::TabCloseActive,
         }
     }
 }

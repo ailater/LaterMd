@@ -234,7 +234,10 @@ mod tests {
                 .has_secret(latermd_creds::SERVICE, latermd_creds::AI_ACCOUNT),
             "系统凭据里确实存在条目"
         );
-        assert!(state.document.notice.is_none(), "成功路径无提示");
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "成功路径无提示"
+        );
         assert_eq!(state.ai_key.status_text(), "已配置");
 
         // 重复保存(覆盖语义)与清除
@@ -245,7 +248,7 @@ mod tests {
         assert_eq!(state.ai_key.status_text(), "未配置");
         // 幂等:未配置再清一次也无提示
         state.apply(Message::AiKeyCleared);
-        assert!(state.document.notice.is_none());
+        assert!(state.tabs.current().document.notice.is_none());
         assert!(!state
             .ai_key
             .creds
@@ -259,7 +262,7 @@ mod tests {
         state.ai_key.draft = "   ".into();
         state.apply(Message::AiKeySaved);
         assert!(!state.ai_key.configured);
-        let notice = state.document.notice.as_deref().unwrap();
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("空白"), "{notice}");
         assert!(
             !state
@@ -285,7 +288,7 @@ mod tests {
             state.ai_key.status_text(),
             "系统凭据后端不可用,将回退环境变量 LATERMD_AI_API_KEY"
         );
-        let notice = state.document.notice.as_deref().unwrap();
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(
             !notice.contains("placeholder-leaky"),
             "notice 不含凭据值:{notice}"
@@ -348,11 +351,11 @@ mod tests {
         state.apply(Message::AiStart);
         assert!(!state.ai.is_streaming(), "无 key 不发起流");
         assert!(
-            !state.editor.text().ends_with("\n\n"),
+            !state.tabs.current_mut().editor.text().ends_with("\n\n"),
             "补空行等发起前置步骤未发生"
         );
         assert_eq!(
-            state.document.notice.as_deref(),
+            state.tabs.current().document.notice.as_deref(),
             Some("未配置 API key(设置 → AI Provider)")
         );
 
@@ -360,21 +363,25 @@ mod tests {
         state.apply(Message::AiCommitRequested);
         assert_eq!(state.ai_commit_suggestion, None);
         assert_eq!(
-            state.document.notice.as_deref(),
+            state.tabs.current().document.notice.as_deref(),
             Some("未配置 API key(设置 → AI Provider)")
         );
 
         // 摘要入口被拦时必须零副作用:旧摘要节原样保留(闸门在任何
         // 归约副作用之前,含「移除旧节」这步)
-        state.editor.load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
         state.apply(Message::AiSummaryRequested);
         assert!(
-            state.editor.text().contains("旧要点"),
+            state.tabs.current_mut().editor.text().contains("旧要点"),
             "被拦的摘要请求不移除旧节"
         );
         assert!(!state.ai.is_streaming());
         assert_eq!(
-            state.document.notice.as_deref(),
+            state.tabs.current().document.notice.as_deref(),
             Some("未配置 API key(设置 → AI Provider)")
         );
 
@@ -404,7 +411,7 @@ mod tests {
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
-        assert!(state.document.notice.is_none());
+        assert!(state.tabs.current().document.notice.is_none());
         state.ai.finish();
     }
 

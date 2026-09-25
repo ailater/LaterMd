@@ -16,7 +16,8 @@
 //! undo 栈是 TextEdit 内建 undoer 的快照,看不到程序化插入:流式结束后的
 //! 第一次 Ctrl+Z 会整体回退到最近一次用户编辑的快照(表现为「一步撤销
 //! 整段 AI 续写」,redo 可恢复),用户在流式期间的手敲一并被归入同一步。
-//! 在途流随文档切换一并作废([`State::load_document`] 里收尾):chunk 只
+//! 在途流随当前标签切换一并作废([`State::switch_active`] /
+//! [`State::spawn_tab`] 里收尾):chunk 只
 //! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
 
 use crate::ai::AiState;
@@ -30,6 +31,7 @@ use crate::git_panel::GitPanelState;
 use crate::keymap::{Keymap, Shortcut};
 use crate::search::SearchState;
 use crate::settings::SettingsState;
+use crate::tabs::TabsState;
 use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_md::OutlineItem;
@@ -148,12 +150,8 @@ pub struct OutlineCursor {
 pub struct State {
     /// 侧边栏。
     pub sidebar: SidebarState,
-    /// 编辑器缓冲(唯一正文真源)。
-    pub editor: EditorBuffer,
-    /// 预览快照(含大纲)。
-    pub preview: PreviewState,
-    /// 大纲↔编辑器光标协调。
-    pub cursor: OutlineCursor,
+    /// 多标签(每个标签持有自己的缓冲/预览/大纲光标/落盘身份,#11)。
+    pub tabs: TabsState,
     /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
     pub file_tree: FileTreeState,
     /// Git 面板(Git 页签 + Files 页角标,P2):状态/历史/diff 快照与
@@ -174,8 +172,6 @@ pub struct State {
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
     pub ai_commit_suggestion: Option<String>,
-    /// 当前文档的落盘身份。
-    pub document: DocumentState,
     /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
     /// 投影到 context,切换即时生效。
     pub theme: ThemeSettings,
@@ -248,14 +244,12 @@ fn main() {
 
 impl Default for State {
     fn default() -> Self {
-        let editor = EditorBuffer::new(SAMPLE_MD);
         Self {
             sidebar: SidebarState {
                 visible: true,
                 active_tab: SidebarTab::Files,
             },
-            preview: PreviewState::new(&editor),
-            cursor: OutlineCursor::default(),
+            tabs: TabsState::new(SAMPLE_MD),
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
             search: SearchState::default(),
@@ -264,12 +258,6 @@ impl Default for State {
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
             ai_commit_suggestion: None,
-            editor,
-            document: DocumentState {
-                path: None,
-                dirty: false,
-                notice: None,
-            },
             theme: ThemeSettings::default(),
             settings_dir: None,
         }
@@ -368,6 +356,18 @@ pub enum Message {
     KeymapResetAll,
     /// 打开设置对话框并切到指定分页(工具栏齿轮 / 菜单「设置…」入口)。
     SettingsOpened(crate::settings::SettingsTab),
+    /// 激活某标签(标签条点击 / 文件树与搜索跳转的已开路径)。
+    TabActivate(usize),
+    /// 请求关闭某标签:脏则弹确认模态,干净直接关。
+    TabCloseRequested(usize),
+    /// 关闭当前标签(Ctrl+W 的归约入口)。
+    TabCloseActive,
+    /// 确认模态里确认关闭(丢弃该标签未保存的修改)。
+    TabCloseConfirmed,
+    /// 确认模态取消,不关。
+    TabCloseCancelled,
+    /// 切到下一个标签(Ctrl/Cmd+Tab 循环)。
+    TabNext,
     /// 点击 Git 页改动列表里的文件,载荷为相对仓库根的路径:归约里选中
     /// 并读它的 diff(列表外的过期路径被忽略)。
     GitFileSelected(String),
@@ -394,7 +394,7 @@ impl State {
                 }
             }
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
-            Message::NoticeDismissed => self.document.notice = None,
+            Message::NoticeDismissed => self.tabs.current_mut().document.notice = None,
             Message::ExportHtml => self.run_export_html(),
             Message::ThemeChanged(mode) => self.change_theme(mode),
             Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
@@ -416,7 +416,7 @@ impl State {
                 self.ai.finish();
                 // 失败不算完成:指令卡状态随 last_prompt 清空回到未执行
                 self.ai.forget_last_prompt();
-                self.document.notice = Some(error);
+                self.tabs.current_mut().document.notice = Some(error);
             }
             Message::AiLinkClicked { prompt } => match prompt {
                 Ok(prompt) => {
@@ -425,7 +425,7 @@ impl State {
                         self.start_ai_stream_with_prompt(&prompt);
                     }
                 }
-                Err(reason) => self.document.notice = Some(reason),
+                Err(reason) => self.tabs.current_mut().document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
             Message::AiSummaryRequested => self.request_summary(),
@@ -460,6 +460,22 @@ impl State {
                 self.settings.open = true;
                 self.settings.tab = tab;
             }
+            Message::TabActivate(index) => self.switch_active(index),
+            Message::TabCloseRequested(index) => self.request_close_tab(index),
+            Message::TabCloseActive => {
+                let active = self.tabs.active;
+                self.request_close_tab(active);
+            }
+            Message::TabCloseConfirmed => {
+                if let Some(index) = self.tabs.confirm_close.take() {
+                    self.remove_tab(index);
+                }
+            }
+            Message::TabCloseCancelled => self.tabs.confirm_close = None,
+            Message::TabNext => {
+                let next = self.tabs.next_index();
+                self.switch_active(next);
+            }
             Message::GitFileSelected(path) => self.git.select(&path),
             Message::GitCheckoutRequested(path) => self.git.request_checkout(path),
             Message::GitCheckoutConfirmed => {
@@ -471,7 +487,7 @@ impl State {
                     .clone()
                     .zip(self.git.repo_root.clone());
                 match self.git.confirm_checkout(self.file_tree.root.as_deref()) {
-                    Some(error) => self.document.notice = Some(error),
+                    Some(error) => self.tabs.current_mut().document.notice = Some(error),
                     None => {
                         if let Some((rel, root)) = target {
                             self.after_git_checkout(&root.join(&rel));
@@ -496,19 +512,26 @@ impl State {
     /// * 非 dirty:缓冲本与磁盘一致,磁盘已回 HEAD,重读换入(预览同帧
     ///   联动),否则编辑器将显示已丢弃的工作区版本;
     /// * dirty:磁盘回 HEAD 但**保留**编辑器里未保存的稿子(静默丢稿风险
-    ///   大于不一致风险,与 [`Self::unsaved_guard`] 同哲学),提示行告知
+    ///   大于不一致风险,与「关闭脏标签要确认」同哲学),提示行告知
     ///   「保存会写回」——否则一次 Ctrl+S 就静默反转回滚,用户毫不知情。
     fn after_git_checkout(&mut self, file: &Path) {
-        if self.document.path.as_deref() != Some(file) {
+        // 回滚目标可能在任意标签打开(不必是当前标签):找到才处理
+        let Some(index) = self.tabs.find_by_path(file) else {
             return;
-        }
-        if self.editor.is_dirty() {
-            self.document.notice = Some(format!(
-                "已回滚 {}:编辑器里未保存的修改仍保留,保存(Ctrl+S)会把它们写回",
+        };
+        if self.tabs.tabs[index].editor.is_dirty() {
+            // 与单标签时代同哲学:静默丢稿的代价大于不一致,保留未保存稿
+            self.tabs.tabs[index].document.notice = Some(format!(
+                "已回滚 {}:该标签里未保存的修改仍保留,保存(Ctrl+S)会把它们写回",
                 file.display()
             ));
         } else {
-            self.open_from(file);
+            match file::read(file) {
+                Ok(text) => self.tabs.tabs[index].load(Some(file.to_path_buf()), &text),
+                Err(error) => {
+                    self.tabs.tabs[index].document.notice = Some(error.to_string());
+                }
+            }
         }
     }
 
@@ -517,7 +540,7 @@ impl State {
     /// [`Message::AiKeyBackendUnavailable`] 置不可用状态(状态行提示回退
     /// 环境变量)。空白拒绝等非后端错误只落提示行,不动可用性。
     fn ai_key_failure(&mut self, err: latermd_creds::CredentialError) {
-        self.document.notice = Some(err.to_string());
+        self.tabs.current_mut().document.notice = Some(err.to_string());
         if matches!(err, latermd_creds::CredentialError::Backend { .. }) {
             self.apply(Message::AiKeyBackendUnavailable);
         }
@@ -533,7 +556,7 @@ impl State {
         if !self.ai.requires_key() || self.ai_key.creds.ai_api_key().is_some() {
             return true;
         }
-        self.document.notice = Some(AI_KEY_MISSING_NOTICE.to_owned());
+        self.tabs.current_mut().document.notice = Some(AI_KEY_MISSING_NOTICE.to_owned());
         false
     }
 
@@ -550,6 +573,8 @@ impl State {
             return;
         }
         let Some(dir) = self
+            .tabs
+            .current()
             .document
             .path
             .as_deref()
@@ -558,18 +583,19 @@ impl State {
             .map(Path::to_path_buf)
             .or_else(|| self.file_tree.root.clone())
         else {
-            self.document.notice =
+            self.tabs.current_mut().document.notice =
                 Some("生成 commit message 需要先保存文档或设置文件树根目录".to_owned());
             return;
         };
         let diff = match crate::git_diff::uncommitted_diff(&dir) {
             Ok(diff) if !diff.trim().is_empty() => diff,
             Ok(_) => {
-                self.document.notice = Some("没有未提交的改动,无需生成 commit message".to_owned());
+                self.tabs.current_mut().document.notice =
+                    Some("没有未提交的改动,无需生成 commit message".to_owned());
                 return;
             }
             Err(error) => {
-                self.document.notice = Some(error);
+                self.tabs.current_mut().document.notice = Some(error);
                 return;
             }
         };
@@ -578,7 +604,7 @@ impl State {
         // (commit 建议是「一行结果」,流式对它没有意义)
         match self.ai.runtime.commit_subject(&prompt) {
             Ok(subject) => self.apply(Message::AiCommitSuggestion { subject }),
-            Err(error) => self.document.notice = Some(error),
+            Err(error) => self.tabs.current_mut().document.notice = Some(error),
         }
     }
 
@@ -592,23 +618,25 @@ impl State {
         if self.ai.is_streaming() || !self.ai_key_gate() {
             return;
         }
-        let text = self.editor.text().to_owned();
+        let text = self.tabs.current().editor.text().to_owned();
         if text.trim().is_empty() {
-            self.document.notice = Some("文档为空,没有可摘要的内容".to_owned());
+            self.tabs.current_mut().document.notice = Some("文档为空,没有可摘要的内容".to_owned());
             return;
         }
         // 先移除旧节再取全文:摘要不总结自己;定位用移除前的快照,span 与
         // 此刻缓冲一致(同帧无人改它)
         if let Some(span) = latermd_md::heading_section_span(&text, 2, AI_SUMMARY_HEADING) {
-            let range = self.editor.byte_to_char(span.start)..self.editor.byte_to_char(span.end);
-            self.editor.remove_chars(range);
+            let tab = self.tabs.current_mut();
+            let range = tab.editor.byte_to_char(span.start)..tab.editor.byte_to_char(span.end);
+            tab.editor.remove_chars(range);
         }
-        let prompt = latermd_ai::summary_prompt(self.editor.text());
+        let prompt = latermd_ai::summary_prompt(self.tabs.current().editor.text());
         // 共用流式入口(二次防重入 + 补空行 + 发起);标题在发起后、首个
         // chunk 到达前的同一归约里插入,流式块自然接在标题与空行之后
         self.start_ai_stream_with_prompt(&prompt);
-        self.editor.insert_chars(
-            self.editor.len_chars(),
+        let tab = self.tabs.current_mut();
+        tab.editor.insert_chars(
+            tab.editor.len_chars(),
             &format!("## {AI_SUMMARY_HEADING}\n\n"),
         );
     }
@@ -624,7 +652,7 @@ impl State {
         self.ensure_trailing_blank_line();
         // prompt 透传文档尾部,provider 按原样消费(latermd-ai trait 契约:
         // 截断与拼装是调用方的职责)
-        let text = self.editor.text();
+        let text = self.tabs.current().editor.text();
         let skip = text.chars().count().saturating_sub(AI_PROMPT_TAIL_CHARS);
         let prompt = format!(
             "请续写以下文档内容:\n{}",
@@ -647,7 +675,7 @@ impl State {
 
     /// 文档非空且不以空行结尾时,补成恰好一个空行(空文档/已空行结尾不动)。
     fn ensure_trailing_blank_line(&mut self) {
-        let text = self.editor.text();
+        let text = self.tabs.current_mut().editor.text();
         let pad = if text.is_empty() || text.ends_with("\n\n") {
             0
         } else if text.ends_with('\n') {
@@ -656,8 +684,9 @@ impl State {
             2
         };
         if pad > 0 {
-            self.editor
-                .insert_chars(self.editor.len_chars(), &"\n".repeat(pad));
+            let tab = self.tabs.current_mut();
+            tab.editor
+                .insert_chars(tab.editor.len_chars(), &"\n".repeat(pad));
         }
     }
 
@@ -665,7 +694,8 @@ impl State {
     /// `insert_chars` 的增量 splice 双写,dirty 与修订号照常推进 —— AI 写
     /// 进来的是真实内容,保存前与手敲同责;undo 语义见模块文档。
     fn append_ai_delta(&mut self, delta: &str) {
-        self.editor.insert_chars(self.editor.len_chars(), delta);
+        let tab = self.tabs.current_mut();
+        tab.editor.insert_chars(tab.editor.len_chars(), delta);
     }
 
     /// 收流(每帧归约调用一次):把 AI channel 里积压的 chunk 翻成消息,
@@ -699,7 +729,7 @@ impl State {
             return;
         };
         if let Err(error) = self.keymap.save_to(&dir) {
-            self.document.notice = Some(format!("快捷键保存失败:{error}"));
+            self.tabs.current_mut().document.notice = Some(format!("快捷键保存失败:{error}"));
         }
     }
 
@@ -707,13 +737,13 @@ impl State {
     /// 不静默抢占另一个命令的键位。
     fn assign_shortcut(&mut self, cmd: Command, shortcut: Shortcut) {
         if !shortcut.bindable() {
-            self.document.notice = Some(
+            self.tabs.current_mut().document.notice = Some(
                 "请带上 Ctrl/Cmd、Shift 或 Alt 等修饰键 —— 裸字母会被编辑器当输入吞掉".to_owned(),
             );
             return;
         }
         if let Some(holder) = self.keymap.conflict(cmd, shortcut) {
-            self.document.notice = Some(format!(
+            self.tabs.current_mut().document.notice = Some(format!(
                 "{} 已被「{}」占用,未修改",
                 shortcut.platform_text(),
                 holder.label()
@@ -731,7 +761,7 @@ impl State {
         config.normalize();
         if let Some(dir) = self.config_dir() {
             if let Err(error) = config.save_to(&dir) {
-                self.document.notice = Some(format!("AI 配置保存失败:{error}"));
+                self.tabs.current_mut().document.notice = Some(format!("AI 配置保存失败:{error}"));
                 return;
             }
         }
@@ -745,7 +775,7 @@ impl State {
     fn change_theme(&mut self, mode: ThemeMode) {
         self.theme.mode = mode;
         if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
-            self.document.notice = Some(error.to_string());
+            self.tabs.current_mut().document.notice = Some(error.to_string());
         }
     }
 
@@ -756,19 +786,21 @@ impl State {
     /// 的快照,同帧编辑器面板仍可能改动文本,归约时缓冲或已变短:切片前
     /// 按当前长度钳制,`byte_to_char` 把落在字符中间的偏移归到起点。
     fn jump_cursor_to_heading(&mut self, span: Range<usize>) {
-        let mut byte = span.start.min(self.editor.text().len());
-        for b in &self.editor.text().as_bytes()[byte..] {
+        let tab = self.tabs.current_mut();
+        let mut byte = span.start.min(tab.editor.text().len());
+        for b in &tab.editor.text().as_bytes()[byte..] {
             match b {
                 b'\n' | b'\r' => byte += 1,
                 _ => break,
             }
         }
-        self.cursor.jump_to = Some(self.editor.byte_to_char(byte));
+        tab.cursor.jump_to = Some(tab.editor.byte_to_char(byte));
     }
 
     /// 帧末刷新派生状态。`App::logic` 每帧调用一次。
     pub fn end_of_logic(&mut self) {
-        self.document.dirty = self.editor.is_dirty();
+        let dirty = self.tabs.current().editor.is_dirty();
+        self.tabs.current_mut().document.dirty = dirty;
         // 文件树懒加载落点:根 + 展开中目录的子项缓存补齐(键缺席才 IO)。
         self.file_tree.ensure_loaded();
         // 搜索结果收流:非阻塞收空 channel(重绘驱动见 `ui::layout::reduce`)。
@@ -778,22 +810,17 @@ impl State {
     fn run_file_cmd(&mut self, cmd: FileCmd) {
         match cmd {
             FileCmd::New => {
-                if self.unsaved_guard() {
-                    return;
-                }
-                self.load_document(None, "");
+                // 多标签:新建永远开新标签,当前标签的未保存稿不受影响
+                self.spawn_tab(None, "");
             }
             FileCmd::Open => {
-                if self.unsaved_guard() {
-                    return;
-                }
-                let start = file::start_dir(self.document.path.as_deref());
+                let start = file::start_dir(self.tabs.current().document.path.as_deref());
                 if let Some(path) = file::open_dialog(&start) {
-                    self.open_from(&path);
+                    self.open_in_tab(&path);
                 }
             }
             FileCmd::Save => {
-                let target = match self.document.path.clone() {
+                let target = match self.tabs.current().document.path.clone() {
                     Some(path) => Some(path),
                     None => file::save_dialog(&file::start_dir(None), file::UNTITLED_FILE_NAME),
                 };
@@ -802,8 +829,10 @@ impl State {
                 }
             }
             FileCmd::SaveAs => {
-                let start = file::start_dir(self.document.path.as_deref());
+                let start = file::start_dir(self.tabs.current().document.path.as_deref());
                 let default = self
+                    .tabs
+                    .current()
                     .document
                     .path
                     .as_deref()
@@ -817,38 +846,68 @@ impl State {
         }
     }
 
-    /// dirty 时拦住会覆盖缓冲的命令(新建/打开)。模态确认属于后续的
-    /// 「未保存关闭」模块,这里先用提示行挡住静默丢稿。
-    fn unsaved_guard(&mut self) -> bool {
-        if self.editor.is_dirty() {
-            self.document.notice =
-                Some("有未保存修改:请先保存(Ctrl+S)或另存为(Ctrl+Shift+S)".to_owned());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 读盘并换入缓冲。读取失败只落提示行,不动当前文档。
+    /// 读盘并**开新标签**换入(多标签语义:打开不覆盖当前标签)。读取失败
+    /// 只落提示行,当前标签的缓冲与 dirty 不受影响。
     ///
-    /// 同时展开该文件在树内的祖先目录:无论从文件树、菜单还是快捷键打开,
-    /// 当前文件的高亮行都应当在 Files 页里可见。
-    fn open_from(&mut self, path: &Path) {
+    /// 同时展开该文件在树内的祖先目录:无论从文件树、菜单还是搜索跳转打开,
+    /// 该文件的高亮行都应当在 Files 页里可见。
+    fn open_in_tab(&mut self, path: &Path) {
         match file::read(path) {
             Ok(text) => {
-                self.load_document(Some(path.to_path_buf()), &text);
+                self.spawn_tab(Some(path.to_path_buf()), &text);
                 self.file_tree.expand_ancestors_of(path);
             }
-            Err(error) => self.document.notice = Some(error.to_string()),
+            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
     }
 
-    /// 文件树点击文件:与「打开」命令同一语义(dirty 拦截 + 换入缓冲)。
+    /// 文件树点击文件:已开则激活该标签,否则开新标签。
     fn open_from_file_tree(&mut self, path: &Path) {
-        if self.unsaved_guard() {
+        if let Some(index) = self.tabs.find_by_path(path) {
+            self.switch_active(index);
+        } else {
+            self.open_in_tab(path);
+        }
+    }
+
+    /// 开新标签的统一入口:作废在途 AI 流后再换入 —— 新标签随即成为
+    /// 「当前缓冲」,旧流的剩余块会写进新文档,与换文档作废是同一条风险。
+    fn spawn_tab(&mut self, path: Option<PathBuf>, text: &str) -> usize {
+        self.ai.finish();
+        self.ai.forget_last_prompt();
+        self.tabs.open_tab(path, text)
+    }
+
+    /// 激活某标签;切换会作废在途 AI 流(chunk 只认当前缓冲末尾,缓冲一换
+    /// 剩余块会写进别的文档)。
+    fn switch_active(&mut self, index: usize) {
+        if self.tabs.active != index {
+            self.ai.finish();
+            self.ai.forget_last_prompt();
+        }
+        self.tabs.activate(index);
+    }
+
+    /// 关闭请求(标签条 × / Ctrl+W):脏标签先弹确认模态,干净标签直接关。
+    fn request_close_tab(&mut self, index: usize) {
+        if index >= self.tabs.tabs.len() {
             return;
         }
-        self.open_from(path);
+        if self.tabs.tabs[index].editor.is_dirty() {
+            self.tabs.confirm_close = Some(index);
+        } else {
+            self.remove_tab(index);
+        }
+    }
+
+    /// 真正移除(确认后或干净标签)。关的是当前标签则作废在途流。
+    fn remove_tab(&mut self, index: usize) {
+        let closing_active = index == self.tabs.active;
+        self.tabs.remove(index);
+        if closing_active {
+            self.ai.finish();
+            self.ai.forget_last_prompt();
+        }
     }
 
     /// 去抖到点发起搜索(`Message::SearchRequested` 的归约)。无根目录
@@ -871,17 +930,22 @@ impl State {
     /// [`EditorBuffer::line_to_byte`] 按当前缓冲钳制到文末,绝不 panic
     /// (大纲跳转 span 过期的同款教训)。
     fn open_search_hit(&mut self, path: &Path, line_no: usize) {
-        if self.document.path.as_deref() != Some(path) {
-            if self.unsaved_guard() {
-                return;
-            }
-            self.open_from(path);
-            if self.document.path.as_deref() != Some(path) {
-                return; // 读盘失败:notice 已带原因,不跳
-            }
-        }
-        let byte = self.editor.line_to_byte(line_no.saturating_sub(1));
-        self.cursor.jump_to = Some(self.editor.byte_to_char(byte));
+        let index = match self.tabs.find_by_path(path) {
+            Some(index) => index, // 已开:直接激活并跳行
+            None => match file::read(path) {
+                Ok(text) => self.spawn_tab(Some(path.to_path_buf()), &text),
+                Err(error) => {
+                    self.tabs.current_mut().document.notice = Some(error.to_string());
+                    return; // 读盘失败:notice 已带原因,不跳
+                }
+            },
+        };
+        self.switch_active(index);
+        self.file_tree.expand_ancestors_of(path);
+        let tab = self.tabs.current_mut();
+        // 行号来自点击时刻的搜索快照,文件可能已变短:line_to_byte 内部钳制
+        let byte = tab.editor.line_to_byte(line_no.saturating_sub(1));
+        tab.cursor.jump_to = Some(tab.editor.byte_to_char(byte));
     }
 
     /// 弹目录对话框选文件树根目录(Files 页「选择…」按钮的归约)。起始目录
@@ -893,7 +957,9 @@ impl State {
             .first()
             .cloned()
             .or_else(|| {
-                self.document
+                self.tabs
+                    .current()
+                    .document
                     .path
                     .as_deref()
                     .and_then(Path::parent)
@@ -917,44 +983,27 @@ impl State {
         if let Err(error) =
             FileTreeSettings::from(&self.file_tree).save_to(self.settings_dir.as_deref())
         {
-            self.document.notice = Some(error.to_string());
+            self.tabs.current_mut().document.notice = Some(error.to_string());
         }
-    }
-
-    /// 换入整篇内容并复位文档身份(新建/打开共用)。
-    ///
-    /// 在途 AI 流随缓冲一起作废:chunk 归约无条件追加到「当前缓冲末尾」,
-    /// 缓冲一换,剩余块就会写进新文档(Save 清 dirty 放行的 New/Open 同样
-    /// 命中)。接收端 drop 后 worker 下一次 send 失败即退出(latermd-ai 的
-    /// 取消约定),重绘驱动随标志清零自然停;与搜索换根复位同款静默。
-    fn load_document(&mut self, path: Option<PathBuf>, text: &str) {
-        self.ai.finish();
-        // 指令卡是文档的派生物:新文档的 ```ai 块与新流无关,状态一并复位
-        self.ai.forget_last_prompt();
-        self.editor.load(text);
-        self.document.path = path;
-        self.document.notice = None;
-        // 预览快照就地重建,不等下一帧编辑面板的修订号检查
-        self.preview.rebuild(&self.editor);
     }
 
     /// 写盘成功后复位 dirty 并认领新路径;失败只落提示行。
     fn save_to(&mut self, path: PathBuf) {
-        match file::write(&path, self.editor.text()) {
+        match file::write(&path, self.tabs.current_mut().editor.text()) {
             Ok(()) => {
-                self.editor.clear_dirty();
-                self.document.path = Some(path);
-                self.document.notice = None;
+                self.tabs.current_mut().editor.clear_dirty();
+                self.tabs.current_mut().document.path = Some(path);
+                self.tabs.current_mut().document.notice = None;
             }
-            Err(error) => self.document.notice = Some(error.to_string()),
+            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
     }
 
     /// 导出 HTML(消息归约):弹保存对话框,把当前缓冲渲染成完整 HTML 落盘。
     /// 导出物是派生物:文档路径与 dirty 均不动。
     fn run_export_html(&mut self) {
-        let start = file::start_dir(self.document.path.as_deref());
-        let default = export::default_name(self.document.path.as_deref());
+        let start = file::start_dir(self.tabs.current().document.path.as_deref());
+        let default = export::default_name(self.tabs.current().document.path.as_deref());
         if let Some(path) = export::save_dialog(&start, &default) {
             self.export_html_to(&path);
         }
@@ -962,10 +1011,10 @@ impl State {
 
     /// 渲染并写出;失败只落提示行。绕开对话框直测落盘路径,单独成函数供测试。
     fn export_html_to(&mut self, path: &Path) {
-        let html = latermd_export::export_html(self.editor.text());
+        let html = latermd_export::export_html(self.tabs.current_mut().editor.text());
         match file::write_as("导出", path, &html) {
-            Ok(()) => self.document.notice = None,
-            Err(error) => self.document.notice = Some(error.to_string()),
+            Ok(()) => self.tabs.current_mut().document.notice = None,
+            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
     }
 }
@@ -1018,31 +1067,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 打开:内容进缓冲、dirty 复位、路径认领、预览快照同帧联动。
+    /// 打开:内容进**新标签**、dirty 复位、路径认领、预览快照同帧联动;
+    /// 原标签的未保存稿不受影响(多标签 #11:「新建/打开」不再覆盖当前缓冲)。
     #[test]
     fn open_loads_buffer_and_syncs_preview() {
         let path = temp_path("open.md");
         std::fs::write(&path, "# 磁盘标题\r\nCRLF 行").unwrap();
 
         let mut state = State::default();
-        state.editor.insert_chars(0, "草稿"); // 制造未保存状态
-        state.apply(Message::FileCommand(FileCmd::New)); // 被 unsaved_guard 拦下
-        assert!(state.editor.text().starts_with("草稿"), "新建未清掉草稿");
-        assert!(state.document.notice.is_some());
-
-        state.editor.clear_dirty();
-        state.open_from(&path);
+        state.tabs.current_mut().editor.insert_chars(0, "草稿"); // 制造未保存状态
+        state.apply(Message::FileCommand(FileCmd::New)); // 多标签:开新标签,不拦
+        assert_eq!(state.tabs.tabs.len(), 2, "新建开出新标签");
+        assert_eq!(state.tabs.current_mut().editor.text(), "", "新标签为空");
+        assert!(
+            state.tabs.tabs[0].editor.text().starts_with("草稿"),
+            "原标签草稿原样保留"
+        );
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.clear_dirty();
+        state.open_in_tab(&path);
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "# 磁盘标题\r\nCRLF 行",
             "CRLF 原样进缓冲"
         );
-        assert_eq!(state.document.path.as_deref(), Some(path.as_path()));
-        assert!(!state.document.dirty);
-        assert_eq!(state.preview.text, state.editor.text(), "预览快照已联动");
-        assert_eq!(state.preview.synced_rev, state.editor.revision());
-        assert_eq!(state.preview.outline.len(), 1);
-        assert_eq!(state.preview.outline[0].text, "磁盘标题");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(path.as_path())
+        );
+        assert!(!state.tabs.current().document.dirty);
+        let (preview_text, editor_text) = {
+            let tab = state.tabs.current();
+            (tab.preview.text.clone(), tab.editor.text().to_owned())
+        };
+        assert_eq!(preview_text, editor_text, "预览快照已联动");
+        let (rev, editor_rev) = {
+            let tab = state.tabs.current();
+            (tab.preview.synced_rev, tab.editor.revision())
+        };
+        assert_eq!(rev, editor_rev);
+        assert_eq!(state.tabs.current().preview.outline.len(), 1);
+        assert_eq!(state.tabs.current().preview.outline[0].text, "磁盘标题");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1050,12 +1115,12 @@ mod tests {
     #[test]
     fn default_state_outline_matches_sample() {
         let state = State::default();
-        let outline = &state.preview.outline;
+        let outline = &state.tabs.current().preview.outline;
         let levels: Vec<u8> = outline.iter().map(|item| item.level).collect();
         assert_eq!(levels, vec![1, 2]);
         assert_eq!(outline[0].text, "LaterMD");
         assert_eq!(outline[1].text, "常用元素");
-        assert!(state.preview.text[outline[1].span.clone()].contains("## 常用元素"));
+        assert!(state.tabs.current().preview.text[outline[1].span.clone()].contains("## 常用元素"));
     }
 
     /// 大纲点击归约:跳过 span 吸收的前置换行落到标题行首,并按当前缓冲
@@ -1063,16 +1128,30 @@ mod tests {
     #[test]
     fn outline_click_converts_to_char_offset_on_heading_line() {
         let mut state = State::default();
-        let span = state.preview.outline[1].span.clone();
+        let span = state.tabs.current().preview.outline[1].span.clone();
         state.apply(Message::OutlineItemClicked(span));
 
-        let heading_byte = state.editor.text().find("## 常用元素").unwrap();
-        let jump = state.cursor.jump_to.expect("已设置跳转目标");
-        assert_eq!(jump, state.editor.byte_to_char(heading_byte));
+        let heading_byte = state
+            .tabs
+            .current_mut()
+            .editor
+            .text()
+            .find("## 常用元素")
+            .unwrap();
+        let jump = state
+            .tabs
+            .current_mut()
+            .cursor
+            .jump_to
+            .expect("已设置跳转目标");
+        assert_eq!(
+            jump,
+            state.tabs.current_mut().editor.byte_to_char(heading_byte)
+        );
         assert!(jump < heading_byte, "目标前有 CJK,字符偏移必须小于字节偏移");
-        let bytes = state.editor.text().as_bytes();
+        let bytes = state.tabs.current().editor.text().as_bytes();
         assert_ne!(
-            bytes[state.editor.char_to_byte(jump)],
+            bytes[state.tabs.current().editor.char_to_byte(jump)],
             b'\n',
             "落在标题行首"
         );
@@ -1083,19 +1162,22 @@ mod tests {
     #[test]
     fn outline_click_with_stale_span_clamps_to_text_end() {
         let mut state = State::default();
-        let stale = state.preview.outline[1].span.clone();
-        state.editor.replace_all("短");
+        let stale = state.tabs.current().preview.outline[1].span.clone();
+        state.tabs.current_mut().editor.replace_all("短");
         assert!(
-            stale.start > state.editor.text().len(),
+            stale.start > state.tabs.current_mut().editor.text().len(),
             "前置:span 确已越界"
         );
 
         state.apply(Message::OutlineItemClicked(stale));
-        assert_eq!(
-            state.cursor.jump_to,
-            Some(state.editor.len_chars()),
-            "钳制到末尾(byte_to_char 再把字节偏移换成字符偏移)"
-        );
+        {
+            let tab = state.tabs.current();
+            assert_eq!(
+                tab.cursor.jump_to,
+                Some(tab.editor.len_chars()),
+                "钳制到末尾(byte_to_char 再把字节偏移换成字符偏移)"
+            );
+        }
     }
 
     /// 保存:字节原样落盘、dirty 复位;写入失败保留 dirty 并给出带路径的提示。
@@ -1103,23 +1185,26 @@ mod tests {
     fn save_writes_bytes_and_resets_dirty() {
         let path = temp_path("save.md");
         let mut state = State::default();
-        state.editor.insert_chars(0, "改动\r\n");
-        assert!(state.editor.is_dirty());
+        state.tabs.current_mut().editor.insert_chars(0, "改动\r\n");
+        assert!(state.tabs.current_mut().editor.is_dirty());
 
         state.save_to(path.clone());
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            state.editor.text().as_bytes()
+            state.tabs.current().editor.text().as_bytes()
         );
-        assert!(!state.editor.is_dirty());
-        assert_eq!(state.document.path.as_deref(), Some(path.as_path()));
+        assert!(!state.tabs.current_mut().editor.is_dirty());
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(path.as_path())
+        );
         let _ = std::fs::remove_file(&path);
 
         // 目录不存在 → 失败路径:dirty 保留,提示含路径
-        state.editor.insert_chars(0, "再改");
+        state.tabs.current_mut().editor.insert_chars(0, "再改");
         state.save_to(PathBuf::from("/latermd/no/such/dir.md"));
-        assert!(state.editor.is_dirty());
-        let notice = state.document.notice.as_deref().unwrap();
+        assert!(state.tabs.current_mut().editor.is_dirty());
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("dir.md"), "{notice}");
     }
 
@@ -1128,11 +1213,11 @@ mod tests {
     fn end_of_logic_mirrors_editor_dirty() {
         let mut state = State::default();
         state.end_of_logic();
-        assert!(!state.document.dirty);
-        state.editor.insert_chars(0, "x");
-        assert!(!state.document.dirty, "编辑动作本身不动镜像");
+        assert!(!state.tabs.current().document.dirty);
+        state.tabs.current_mut().editor.insert_chars(0, "x");
+        assert!(!state.tabs.current().document.dirty, "编辑动作本身不动镜像");
         state.end_of_logic();
-        assert!(state.document.dirty);
+        assert!(state.tabs.current().document.dirty);
     }
 
     /// 主题切换归约:状态翻转 + settings.json 落盘(注入临时目录,不碰
@@ -1147,7 +1232,7 @@ mod tests {
 
         state.apply(Message::ThemeChanged(ThemeMode::Light));
         assert_eq!(state.theme.mode, ThemeMode::Light);
-        assert!(state.document.notice.is_none());
+        assert!(state.tabs.current().document.notice.is_none());
         // "light" 必须在盘上,重启 load 才能还原
         let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(json.contains("\"light\""), "{json}");
@@ -1166,7 +1251,7 @@ mod tests {
 
         state.apply(Message::ThemeChanged(ThemeMode::Light));
         assert_eq!(state.theme.mode, ThemeMode::Light, "持久化失败不影响切换");
-        let notice = state.document.notice.as_deref().unwrap();
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("主题保存失败"), "{notice}");
         assert!(notice.contains("theme-blocker"), "{notice}");
         let _ = std::fs::remove_file(&blocker);
@@ -1219,20 +1304,40 @@ mod tests {
         // 点击文件:换入缓冲、树内祖先展开(为高亮行可见)
         let note = dir.join("docs/note.md");
         state.apply(Message::FileSelected(note.clone()));
-        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
-        assert_eq!(state.editor.text(), "# 树内标题\n");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(note.as_path())
+        );
+        assert_eq!(state.tabs.current_mut().editor.text(), "# 树内标题\n");
         assert_eq!(
             state.file_tree.expanded.get(dir.join("docs").as_path()),
             Some(&true),
             "打开的文件的父目录已展开"
         );
 
-        // dirty 保护:未保存时点击树上另一文件不动当前文档
-        state.editor.insert_chars(0, "草稿");
+        // 多标签:dirty 时点击树上另一文件不再拦截,而是另开新标签;
+        // 原标签的草稿与落盘身份原样保留
+        state.tabs.current_mut().editor.insert_chars(0, "草稿");
         state.apply(Message::FileSelected(dir.join("top.md")));
-        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
-        assert!(state.document.notice.is_some());
-        assert!(state.editor.text().starts_with("草稿"));
+        assert_eq!(
+            state.tabs.tabs.len(),
+            3,
+            "另开了一个新标签(此前 note 占一个)"
+        );
+        assert_eq!(
+            state.tabs.tabs[1].document.path.as_deref(),
+            Some(note.as_path()),
+            "note 标签身份不动"
+        );
+        assert!(
+            state.tabs.tabs[1].editor.text().starts_with("草稿"),
+            "草稿保留"
+        );
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("top.md").as_path()),
+            "当前切到新标签"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&settings_dir);
@@ -1244,8 +1349,12 @@ mod tests {
     fn export_writes_html_without_touching_document_identity() {
         let path = temp_path("export.html");
         let mut state = State::default();
-        state.editor.insert_chars(0, "# 导出标题\n");
-        assert!(state.editor.is_dirty());
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "# 导出标题\n");
+        assert!(state.tabs.current_mut().editor.is_dirty());
 
         state.export_html_to(&path);
         let html = std::fs::read_to_string(&path).unwrap();
@@ -1253,12 +1362,12 @@ mod tests {
         assert!(html.contains("<h1>导出标题</h1>"), "{html}");
         assert!(html.contains("max-width: 46em"), "{html}");
         // 派生物:dirty 保留、路径不认领
-        assert!(state.editor.is_dirty());
-        assert_eq!(state.document.path, None);
+        assert!(state.tabs.current_mut().editor.is_dirty());
+        assert_eq!(state.tabs.current().document.path, None);
         let _ = std::fs::remove_file(&path);
 
         state.export_html_to(&PathBuf::from("/latermd/no/such/dir.html"));
-        let notice = state.document.notice.as_deref().unwrap();
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("导出失败"), "{notice}");
         assert!(notice.contains("dir.html"), "{notice}");
     }
@@ -1275,15 +1384,24 @@ mod tests {
         let mut state = State::default();
         state.apply(Message::SearchResultClicked(note.clone(), 2));
 
-        assert_eq!(state.document.path.as_deref(), Some(note.as_path()));
-        assert_eq!(state.editor.text(), "# 甲\n你好 world\n第三行\n");
-        let line2_byte = state.editor.line_to_byte(1);
-        assert_eq!(line2_byte, 6, "前置:首行「# 甲\\n」共 6 字节");
         assert_eq!(
-            state.cursor.jump_to,
-            Some(state.editor.byte_to_char(line2_byte)),
-            "光标(字符偏移)落在第二行行首"
+            state.tabs.current().document.path.as_deref(),
+            Some(note.as_path())
         );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "# 甲\n你好 world\n第三行\n"
+        );
+        let line2_byte = state.tabs.current_mut().editor.line_to_byte(1);
+        assert_eq!(line2_byte, 6, "前置:首行「# 甲\\n」共 6 字节");
+        {
+            let tab = state.tabs.current();
+            assert_eq!(
+                tab.cursor.jump_to,
+                Some(tab.editor.byte_to_char(line2_byte)),
+                "光标(字符偏移)落在第二行行首"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1297,14 +1415,20 @@ mod tests {
 
         let mut state = State::default();
         state.apply(Message::SearchResultClicked(note.clone(), 1));
-        assert_eq!(state.cursor.jump_to, Some(0));
+        assert_eq!(state.tabs.current_mut().cursor.jump_to, Some(0));
         state.apply(Message::SearchResultClicked(note.clone(), 3));
-        assert_eq!(
-            state.cursor.jump_to,
-            Some(state.editor.byte_to_char(state.editor.line_to_byte(2))),
-            "同行内再次点击,光标前进到第三行"
+        {
+            let tab = state.tabs.current();
+            assert_eq!(
+                tab.cursor.jump_to,
+                Some(tab.editor.byte_to_char(tab.editor.line_to_byte(2))),
+                "同行内再次点击,光标前进到第三行"
+            );
+        }
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "未发生 IO 失败"
         );
-        assert!(state.document.notice.is_none(), "未发生 IO 失败");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1318,11 +1442,14 @@ mod tests {
 
         let mut state = State::default();
         state.apply(Message::SearchResultClicked(note.clone(), 999));
-        assert_eq!(
-            state.cursor.jump_to,
-            Some(state.editor.len_chars()),
-            "行号远超行数,钳制到文末"
-        );
+        {
+            let tab = state.tabs.current();
+            assert_eq!(
+                tab.cursor.jump_to,
+                Some(tab.editor.len_chars()),
+                "行号远超行数,钳制到文末"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1330,34 +1457,50 @@ mod tests {
     #[test]
     fn search_click_on_missing_file_notifies_without_jump() {
         let mut state = State::default();
-        let before = state.editor.text().to_owned();
+        let before = state.tabs.current_mut().editor.text().to_owned();
         state.apply(Message::SearchResultClicked(
             PathBuf::from("/latermd/no/such/hit.md"),
             1,
         ));
-        assert!(state.document.notice.is_some(), "读盘失败有提示");
-        assert_eq!(state.document.path, None, "文档身份未变");
-        assert_eq!(state.editor.text(), before, "缓冲未被触碰");
-        assert_eq!(state.cursor.jump_to, None, "不设跳转");
+        assert!(
+            state.tabs.current().document.notice.is_some(),
+            "读盘失败有提示"
+        );
+        assert_eq!(state.tabs.current().document.path, None, "文档身份未变");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            before,
+            "缓冲未被触碰"
+        );
+        assert_eq!(state.tabs.current_mut().cursor.jump_to, None, "不设跳转");
     }
 
-    /// dirty 保护与文件树同款:未保存时点击搜索结果被拦,不跳转。
+    /// 多标签:dirty 时点击搜索结果不再拦截,而是另开新标签跳转;
+    /// 原标签的草稿与身份原样保留(与文件树点击同语义)。
     #[test]
-    fn search_click_blocked_while_dirty() {
+    fn search_click_while_dirty_opens_new_tab() {
         let dir = temp_path("search-dirty");
         std::fs::create_dir_all(&dir).unwrap();
         let note = dir.join("note.md");
         std::fs::write(&note, "目标\n").unwrap();
 
         let mut state = State::default();
-        state.editor.insert_chars(0, "草稿");
-        assert!(state.editor.is_dirty());
+        state.tabs.current_mut().editor.insert_chars(0, "草稿");
+        assert!(state.tabs.current_mut().editor.is_dirty());
 
         state.apply(Message::SearchResultClicked(note.clone(), 1));
-        assert_eq!(state.document.path, None, "未换文档");
-        assert_eq!(state.cursor.jump_to, None, "未设跳转");
-        assert!(state.document.notice.is_some(), "拦截有提示");
-        assert!(state.editor.text().starts_with("草稿"));
+        assert_eq!(state.tabs.tabs.len(), 2, "另开新标签");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(note.as_path()),
+            "当前切到新标签"
+        );
+        assert!(state.tabs.current().cursor.jump_to.is_some(), "已设跳转");
+        assert_eq!(state.tabs.tabs[0].document.path, None, "原标签身份不动");
+        assert!(
+            state.tabs.tabs[0].editor.text().starts_with("草稿"),
+            "草稿保留"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1446,12 +1589,12 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::ZERO,
         ));
-        let base = state.editor.text().to_owned();
+        let base = state.tabs.current_mut().editor.text().to_owned();
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming(), "发起后流式标志置位");
         assert!(
-            state.editor.text().ends_with("\n\n"),
+            state.tabs.current_mut().editor.text().ends_with("\n\n"),
             "示例文档不以空行结尾,发起时补成空行"
         );
 
@@ -1476,11 +1619,14 @@ mod tests {
         assert!(done, "流在超时前自然收尾");
         assert!(!state.ai.is_streaming(), "AiDone 归约清流式标志");
 
-        let text = state.editor.text();
+        let text = state.tabs.current_mut().editor.text();
         assert!(text.starts_with(&base), "已有内容原样保留在头部");
         assert!(text.len() > base.len() + 2, "AI 文本已追加");
-        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
-        assert!(state.editor.revision() > 0);
+        assert!(
+            state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
+        assert!(state.tabs.current_mut().editor.revision() > 0);
 
         // 收尾后可再次发起(防重入不拦新流)
         state.apply(Message::AiStart);
@@ -1500,7 +1646,7 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::from_millis(20),
         ));
-        state.document.path = Some(path.clone()); // Save 直落盘,不弹对话框
+        state.tabs.current_mut().document.path = Some(path.clone()); // Save 直落盘,不弹对话框
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
@@ -1513,16 +1659,19 @@ mod tests {
                 .any(|m| matches!(m, Message::AiChunk { .. })),
             "前置:流在切文档前已产出正文块"
         );
-        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(
+            state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
 
         // 复刻评审路径:Save 清 dirty,放行 New 的 unsaved_guard
         state.apply(Message::FileCommand(FileCmd::Save));
         assert!(path.exists(), "已落盘");
-        assert!(!state.editor.is_dirty());
+        assert!(!state.tabs.current_mut().editor.is_dirty());
 
         state.apply(Message::FileCommand(FileCmd::New));
-        assert_eq!(state.document.path, None);
-        assert_eq!(state.editor.text(), "", "新文档为空");
+        assert_eq!(state.tabs.current().document.path, None);
+        assert_eq!(state.tabs.current_mut().editor.text(), "", "新文档为空");
         assert!(!state.ai.is_streaming(), "换文档取消在途流");
 
         // 给 worker 留出再发几块的时间:接收端已 drop,chunk 不得再进文档
@@ -1534,7 +1683,11 @@ mod tests {
                 .all(|m| !matches!(m, Message::AiChunk { .. })),
             "取消后 poll 不再产出正文块,实际 {messages:?}"
         );
-        assert_eq!(state.editor.text(), "", "新文档未被 AI 追加");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "",
+            "新文档未被 AI 追加"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1545,15 +1698,22 @@ mod tests {
         state.apply(Message::AiChunk {
             delta: "续写".into(),
         });
-        assert!(state.editor.text().ends_with("续写"));
-        assert!(state.editor.is_dirty());
+        assert!(state.tabs.current_mut().editor.text().ends_with("续写"));
+        assert!(state.tabs.current_mut().editor.is_dirty());
 
-        let (rev, len) = (state.editor.revision(), state.editor.len_chars());
+        let (rev, len) = (
+            state.tabs.current_mut().editor.revision(),
+            state.tabs.current_mut().editor.len_chars(),
+        );
         state.apply(Message::AiChunk {
             delta: String::new(),
         });
-        assert_eq!(state.editor.revision(), rev, "空 delta 不推进修订号");
-        assert_eq!(state.editor.len_chars(), len);
+        assert_eq!(
+            state.tabs.current_mut().editor.revision(),
+            rev,
+            "空 delta 不推进修订号"
+        );
+        assert_eq!(state.tabs.current_mut().editor.len_chars(), len);
     }
 
     /// 发起归约的空行补齐矩阵:空文档不动、单换行补一个、空行结尾不动、
@@ -1568,16 +1728,21 @@ mod tests {
         ];
         for (initial, expected_pad) in cases {
             let mut state = State::default();
-            state.editor.load(initial);
+            state.tabs.current_mut().editor.load(initial);
             state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
                 std::time::Duration::ZERO,
             ));
             state.start_ai_stream();
             let expected = format!("{initial}{}", "\n".repeat(expected_pad));
             assert!(
-                state.editor.text().starts_with(&expected),
+                state
+                    .tabs
+                    .current_mut()
+                    .editor
+                    .text()
+                    .starts_with(&expected),
                 "初始 {initial:?} 的补行结果应为 {expected:?},实际 {:?}",
-                &state.editor.text()[..expected.len()]
+                &state.tabs.current_mut().editor.text()[..expected.len()]
             );
             state.ai.finish();
         }
@@ -1589,12 +1754,19 @@ mod tests {
         let mut state = State::default();
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
-        let before = state.editor.text().to_owned();
+        let before = state.tabs.current_mut().editor.text().to_owned();
 
         state.apply(Message::AiFailed("额度用尽".into()));
         assert!(!state.ai.is_streaming(), "失败同样收尾");
-        assert_eq!(state.document.notice.as_deref(), Some("额度用尽"));
-        assert_eq!(state.editor.text(), before, "失败文本不写入文档");
+        assert_eq!(
+            state.tabs.current().document.notice.as_deref(),
+            Some("额度用尽")
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            before,
+            "失败文本不写入文档"
+        );
         // 失败不算完成:指令卡的状态键一并清空(卡片回「未执行」)
         assert_eq!(state.ai.last_prompt, None);
     }
@@ -1608,14 +1780,14 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::ZERO,
         ));
-        let base = state.editor.text().to_owned();
+        let base = state.tabs.current_mut().editor.text().to_owned();
 
         state.apply(Message::AiLinkClicked {
             prompt: Ok("续写一段 Markdown 介绍".into()),
         });
         assert!(state.ai.is_streaming(), "链接点击发起了流");
         assert!(
-            state.editor.text().ends_with("\n\n"),
+            state.tabs.current_mut().editor.text().ends_with("\n\n"),
             "发起时补成空行结尾,与 AiStart 同语义"
         );
 
@@ -1634,8 +1806,14 @@ mod tests {
         }
         assert!(done, "流在超时前自然收尾");
         assert!(!state.ai.is_streaming());
-        assert!(state.editor.text().len() > base.len() + 2, "AI 文本已追加");
-        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(
+            state.tabs.current_mut().editor.text().len() > base.len() + 2,
+            "AI 文本已追加"
+        );
+        assert!(
+            state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
         // 状态键:自然收尾保留最近 prompt,指令卡凭它显示「已完成」
         assert_eq!(
             state.ai.last_prompt.as_deref(),
@@ -1647,13 +1825,13 @@ mod tests {
             std::time::Duration::from_millis(50),
         ));
         state.apply(Message::AiStart);
-        let streaming_text = state.editor.text().to_owned();
+        let streaming_text = state.tabs.current_mut().editor.text().to_owned();
         state.apply(Message::AiLinkClicked {
             prompt: Ok("流式中再来一次".into()),
         });
         assert!(state.ai.is_streaming());
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             streaming_text,
             "流式中点击链接被忽略:文档一字未动"
         );
@@ -1666,7 +1844,7 @@ mod tests {
         });
         assert!(!idle.ai.is_streaming(), "解析失败不发起流");
         assert_eq!(
-            idle.document.notice.as_deref(),
+            idle.tabs.current().document.notice.as_deref(),
             Some("未实现的 AI 动作:summarize")
         );
     }
@@ -1765,21 +1943,35 @@ mod tests {
         let mut state = State::default();
         state.file_tree.root = Some(dir.clone());
         state.refresh_git();
-        state.editor.clear_dirty(); // 放行 open_from 的 unsaved_guard
+        state.tabs.current_mut().editor.clear_dirty(); // 放行 open_from 的 unsaved_guard
         state.apply(Message::FileSelected(file.clone()));
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "工作区乱改\n",
             "前置:编辑器持有工作区版"
         );
 
         state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
         state.apply(Message::GitCheckoutConfirmed);
-        assert_eq!(state.editor.text(), "HEAD 版本\n", "编辑器随磁盘回滚重载");
-        assert_eq!(state.preview.text, "HEAD 版本\n", "预览快照同帧联动");
-        assert!(!state.editor.is_dirty());
-        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
-        assert!(state.document.notice.is_none(), "干净重载无提示");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "HEAD 版本\n",
+            "编辑器随磁盘回滚重载"
+        );
+        assert_eq!(
+            state.tabs.current().preview.text,
+            "HEAD 版本\n",
+            "预览快照同帧联动"
+        );
+        assert!(!state.tabs.current_mut().editor.is_dirty());
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(file.as_path())
+        );
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "干净重载无提示"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1794,10 +1986,14 @@ mod tests {
         let mut state = State::default();
         state.file_tree.root = Some(dir.clone());
         state.refresh_git();
-        state.editor.clear_dirty();
+        state.tabs.current_mut().editor.clear_dirty();
         state.apply(Message::FileSelected(file.clone()));
-        state.editor.insert_chars(0, "未保存草稿\n"); // dirty
-        assert!(state.editor.is_dirty());
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "未保存草稿\n"); // dirty
+        assert!(state.tabs.current_mut().editor.is_dirty());
 
         state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
         state.apply(Message::GitCheckoutConfirmed);
@@ -1807,14 +2003,29 @@ mod tests {
             "磁盘已回滚"
         );
         assert!(
-            state.editor.text().starts_with("未保存草稿"),
+            state
+                .tabs
+                .current_mut()
+                .editor
+                .text()
+                .starts_with("未保存草稿"),
             "缓冲里的未保存稿保留"
         );
-        let notice = state.document.notice.as_deref().expect("有针对性提示");
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .expect("有针对性提示");
         assert!(notice.contains("写回"), "{notice}");
         // 预览快照未被重置:dirty 分支不走 load_document(重载是 clean 分支
         // 的行为);快照推进交给下一帧编辑器面板的修订号检查
-        assert_ne!(state.preview.text, "HEAD 版本\n", "未走重载路径");
+        assert_ne!(
+            state.tabs.current().preview.text,
+            "HEAD 版本\n",
+            "未走重载路径"
+        );
 
         // 回滚目标不是当前文档:编辑器与文档身份都不动
         std::fs::write(dir.join("b.md"), "HEAD 版本\n").unwrap();
@@ -1825,10 +2036,18 @@ mod tests {
         state.apply(Message::GitCheckoutRequested("b.md".to_owned()));
         state.apply(Message::GitCheckoutConfirmed);
         assert!(
-            state.editor.text().starts_with("未保存草稿"),
+            state
+                .tabs
+                .current_mut()
+                .editor
+                .text()
+                .starts_with("未保存草稿"),
             "非当前文档的回滚不触碰编辑器"
         );
-        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(file.as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1890,7 +2109,7 @@ mod tests {
         run_git(&dir, &["add", "."]);
 
         let mut state = State::default();
-        state.document.path = Some(dir.join("README.md"));
+        state.tabs.current_mut().document.path = Some(dir.join("README.md"));
 
         state.apply(Message::AiCommitRequested);
         let subject = state.ai_commit_suggestion.clone().expect("已生成建议");
@@ -1904,14 +2123,14 @@ mod tests {
         run_git(&dir, &["commit", "-q", "-m", "init"]);
         state.apply(Message::AiCommitRequested);
         assert_eq!(state.ai_commit_suggestion, None);
-        let notice = state.document.notice.as_deref().unwrap();
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("没有未提交的改动"), "{notice}");
 
         // 无文档且无文件树根:无法定位仓库目录
         let mut rootless = State::default();
         rootless.apply(Message::AiCommitRequested);
         assert_eq!(rootless.ai_commit_suggestion, None);
-        let notice = rootless.document.notice.as_deref().unwrap();
+        let notice = rootless.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("文件树"), "{notice}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1932,13 +2151,16 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::from_millis(50),
         ));
-        state.document.path = Some(dir.join("README.md"));
+        state.tabs.current_mut().document.path = Some(dir.join("README.md"));
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming(), "前置:流在途");
         state.apply(Message::AiCommitRequested);
         assert_eq!(state.ai_commit_suggestion, None, "流式中请求被忽略");
-        assert!(state.document.notice.is_none(), "忽略是静默的");
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "忽略是静默的"
+        );
         state.ai.finish();
 
         state.apply(Message::AiCommitRequested);
@@ -1976,40 +2198,51 @@ mod tests {
             std::time::Duration::ZERO,
         ));
         state
+            .tabs
+            .current_mut()
             .editor
             .load("# 设计\n\n正文段落。\n\n## AI 摘要\n\n> - 旧要点甲\n> - 旧要点乙\n");
 
         state.apply(Message::AiSummaryRequested);
         assert!(state.ai.is_streaming(), "发起后流式标志置位");
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "# 设计\n\n正文段落。\n\n## AI 摘要\n\n",
             "发起时旧节已移除,新标题与空行就位"
         );
 
         drain_ai_stream(&mut state);
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "# 设计\n\n正文段落。\n\n## AI 摘要\n\n> - 设计\n> - 正文段落。\n",
             "要点引用块长在标题下,旧要点不残留"
         );
-        let summary_headings = latermd_md::outline(state.editor.text())
+        let summary_headings = latermd_md::outline(state.tabs.current_mut().editor.text())
             .into_iter()
             .filter(|item| item.text == AI_SUMMARY_HEADING)
             .count();
         assert_eq!(summary_headings, 1, "摘要标题恰好一个,不堆积");
-        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(
+            state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
 
         // 再来一次:新节替换上一轮的节,仍然恰好一个
         state.apply(Message::AiSummaryRequested);
         drain_ai_stream(&mut state);
-        let summary_headings = latermd_md::outline(state.editor.text())
+        let summary_headings = latermd_md::outline(state.tabs.current_mut().editor.text())
             .into_iter()
             .filter(|item| item.text == AI_SUMMARY_HEADING)
             .count();
         assert_eq!(summary_headings, 1, "重复生成不堆积");
         assert_eq!(
-            state.editor.text().matches("## AI 摘要").count(),
+            state
+                .tabs
+                .current_mut()
+                .editor
+                .text()
+                .matches("## AI 摘要")
+                .count(),
             1,
             "标题文本也只出现一次"
         );
@@ -2022,23 +2255,32 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::ZERO,
         ));
-        state.editor.load("# 标题甲\n\n段落甲。\n");
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .load("# 标题甲\n\n段落甲。\n");
 
         state.apply(Message::AiSummaryRequested);
         assert!(state.ai.is_streaming());
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "# 标题甲\n\n段落甲。\n\n## AI 摘要\n\n",
             "无旧节可移除,标题直接接在补齐的空行后"
         );
 
         drain_ai_stream(&mut state);
         assert_eq!(
-            state.editor.text(),
+            state.tabs.current_mut().editor.text(),
             "# 标题甲\n\n段落甲。\n\n## AI 摘要\n\n> - 标题甲\n> - 段落甲。\n"
         );
         assert!(
-            state.editor.text().starts_with("# 标题甲\n\n段落甲。"),
+            state
+                .tabs
+                .current_mut()
+                .editor
+                .text()
+                .starts_with("# 标题甲\n\n段落甲。"),
             "正文原样"
         );
     }
@@ -2047,12 +2289,12 @@ mod tests {
     #[test]
     fn ai_summary_on_empty_document_notices_without_stream() {
         let mut state = State::default();
-        state.editor.load("");
+        state.tabs.current_mut().editor.load("");
         state.apply(Message::AiSummaryRequested);
         assert!(!state.ai.is_streaming(), "空文档不发起流");
-        assert_eq!(state.editor.text(), "", "文档未被触碰");
+        assert_eq!(state.tabs.current_mut().editor.text(), "", "文档未被触碰");
         assert_eq!(
-            state.document.notice.as_deref(),
+            state.tabs.current().document.notice.as_deref(),
             Some("文档为空,没有可摘要的内容")
         );
     }
@@ -2065,15 +2307,26 @@ mod tests {
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::from_millis(50),
         ));
-        state.editor.load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .load("# 甲\n\n## AI 摘要\n\n> - 旧要点\n");
 
         // 续写流在途 → 摘要请求忽略:文档一字未动(旧节还在)
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming(), "前置:续写流在途");
-        let before = state.editor.text().to_owned();
+        let before = state.tabs.current_mut().editor.text().to_owned();
         state.apply(Message::AiSummaryRequested);
-        assert_eq!(state.editor.text(), before, "流式中摘要请求不碰文档");
-        assert!(state.document.notice.is_none(), "忽略是静默的");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            before,
+            "流式中摘要请求不碰文档"
+        );
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "忽略是静默的"
+        );
         assert!(state.ai.is_streaming(), "原流继续在途");
         state.ai.finish();
 
@@ -2081,12 +2334,62 @@ mod tests {
         state.apply(Message::AiSummaryRequested);
         assert!(state.ai.is_streaming(), "摘要流已发起(旧节此刻已移除)");
         assert!(
-            !state.editor.text().contains("旧要点"),
+            !state.tabs.current_mut().editor.text().contains("旧要点"),
             "前置:旧节确实移除了"
         );
-        let before = state.editor.text().to_owned();
+        let before = state.tabs.current_mut().editor.text().to_owned();
         state.apply(Message::AiStart);
-        assert_eq!(state.editor.text(), before, "流式中续写命令不碰文档");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            before,
+            "流式中续写命令不碰文档"
+        );
         state.ai.finish();
+    }
+
+    /// 多标签关闭流程:脏标签 × → 确认模态 → 确认即移除;取消则保留。
+    #[test]
+    fn dirty_tab_close_requires_confirmation() {
+        let mut state = State::default();
+        let index = state.spawn_tab(None, "第二篇");
+        state.tabs.current_mut().editor.insert_chars(0, "草稿");
+        assert!(state.tabs.current_mut().editor.is_dirty());
+
+        state.apply(Message::TabCloseRequested(index));
+        assert_eq!(state.tabs.confirm_close, Some(index), "脏标签先弹确认");
+        assert_eq!(state.tabs.tabs.len(), 2, "未确认前不移除");
+
+        state.apply(Message::TabCloseCancelled);
+        assert_eq!(state.tabs.confirm_close, None);
+        assert_eq!(state.tabs.tabs.len(), 2, "取消后保留");
+
+        state.apply(Message::TabCloseRequested(index));
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 1, "确认后移除");
+        assert!(
+            state.tabs.tabs[0].editor.text().contains("LaterMD"),
+            "回到的是原来的标签(SAMPLE 文档)"
+        );
+    }
+
+    /// Ctrl+Tab 循环切换;切换作废在途流(chunk 只认当前缓冲)。
+    #[test]
+    fn tab_next_cycles_and_cancels_stream() {
+        let mut state = State::default();
+        state.spawn_tab(None, "第二篇");
+        state.spawn_tab(None, "第三篇");
+        assert_eq!(state.tabs.active, 2);
+
+        state.apply(Message::TabNext);
+        assert_eq!(state.tabs.active, 0, "循环回第一个");
+        state.apply(Message::TabNext);
+        assert_eq!(state.tabs.active, 1);
+
+        // 在途流在切换时作废
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::new());
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        state.apply(Message::TabNext);
+        assert!(!state.ai.is_streaming(), "切标签作废在途流");
     }
 }

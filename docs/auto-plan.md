@@ -29,7 +29,7 @@
 | 4 | p1-ai-links | `ai://` 链接协议 + AI 指令块（LinkHandler 五级扩展点落地），依赖 #3 | ✅完成 | feat(app): ai:// 链接协议——LinkHandler 样式区分与点击拦截触发 Mock 流式续写;feat(app): ```ai 指令卡——代码块级 block widget 渲染指令卡,执行走 ai:// 同通道 |
 | 5 | p1-ai-tools | AI commit message + AI 摘要大纲（基于 #3 的 provider，mock 可用） | ✅完成 | feat(app): AI 生成 commit message——diff 采集、prompt 模板、Mock 合成与建议浮窗;feat(app): AI 生成摘要——全文喂 provider、引用块流式插入文档末尾、旧摘要节自动清理 |
 | 6 | p2-git | latermd-git 只读集成：状态、历史、diff、blame、回滚 + 文件树 M/A/U/? 标记 | ✅完成 | feat(git): 新建 latermd-git——git2 只读封装(status/log/diff/blame)与确认式单文件回滚;feat(app): Git 面板与文件树状态角标——latermd-git 接入 UI(平铺改动列表/只读 diff/确认式回滚/历史折叠区) |
-| 7 | p2-creds | 凭据管理三平台封装（Credential Manager / Keychain / libsecret） | ✅完成 | `adbf43c` latermd-creds(keyring 4.2) + `41dc89c` AI key 闸门与设置区;经 PR #20 携带合入 main(2026-09-26 补记) |
+| 7 | p2-creds | 凭据管理三平台封装（Credential Manager / Keychain / libsecret） | ✅完成 | feat(creds): 新建 latermd-creds——keyring 4.2 三平台凭据存取,AI key 系统凭据优先于环境变量,错误文案不含凭据值(`adbf43c`);feat(app): 设置面板 AI Provider 区——API key 走 latermd-creds 存取,密码浮窗 + 三态状态行 + AI 命令 key 闸门(`41dc89c`);经 PR #20 携带合入 main(2026-09-26 补记) |
 | 11 | multi-tabs | 多标签页：同时打开多个文档（用户 2026-09-25 追加；**插队到 #8 之前执行**——编辑器状态大重构，必须先于 Live Preview 落地，否则 #9 的块级 caret 路由建立在单文档假设上要返工） | ⏳待开始 | — |
 | 8 | p2b-theme | 皮肤批次 B：三态切换（亮/暗/跟随系统）+ 自定义皮肤文件（RON 导出至 themes/）+ 视觉打磨 | ⏳待开始 | — |
 | 9 | p3-live-preview | Live Preview：块级 caret 路由 + 聚焦块裸源码；**共用同一 rope buffer 与 undo 栈**（roadmap 铁律） | ⏳待开始 | — |

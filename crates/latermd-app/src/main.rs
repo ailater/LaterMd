@@ -20,6 +20,7 @@ mod keymap;
 mod search;
 mod settings;
 mod state;
+mod tabs;
 mod theme;
 mod ui;
 

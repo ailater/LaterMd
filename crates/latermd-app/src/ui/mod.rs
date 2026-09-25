@@ -6,5 +6,6 @@ pub mod layout;
 pub mod menubar;
 pub mod preview;
 pub mod sidebar;
+pub mod tabs;
 pub mod tokens;
 pub mod toolbar;

@@ -84,7 +84,7 @@ impl LaterMdApp {
         }
 
         // 窗口标题只在变化时下发,避免每帧一次原生 set_title
-        let title = state.document.window_title();
+        let title = state.tabs.current().document.window_title();
         if *window_title != title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             *window_title = title;
@@ -116,10 +116,10 @@ impl LaterMdApp {
                     ui,
                     active_tab,
                     &self.state.file_tree,
-                    self.state.document.path.as_deref(),
+                    self.state.tabs.current().document.path.as_deref(),
                     crate::ui::sidebar::OutlineView {
-                        items: &self.state.preview.outline,
-                        cursor_byte: self.state.cursor.byte,
+                        items: &self.state.tabs.current().preview.outline,
+                        cursor_byte: self.state.tabs.current().cursor.byte,
                     },
                     &mut self.state.search,
                     &self.state.git,
@@ -137,14 +137,35 @@ impl LaterMdApp {
             .resizable(true)
             .default_size(500.0)
             .show(ui, |ui| {
-                crate::ui::toolbar::ui(ui, &state.document, &state.keymap, outbox);
-                crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
+                // 标签条(多标签 #11)在文件工具栏之上:先选文档,再对文档操作
+                crate::ui::tabs::ui(ui, &state.tabs, outbox);
+                crate::ui::toolbar::ui(ui, &state.tabs.current().document, &state.keymap, outbox);
+                let tab = state.tabs.current_mut();
+                let crate::tabs::TabState {
+                    editor,
+                    preview,
+                    cursor,
+                    id,
+                    ..
+                } = tab;
+                crate::ui::editor::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    crate::ui::editor::tab_editor_id(*id),
+                );
             });
 
         // ④ 必须最后:预览(outbox 供 ai:// 链接与 ```ai 指令卡的 LinkHandler 产消息;
         // ai 只读,供指令卡状态行取流式标志与最近 prompt)
         egui::CentralPanel::default().show(ui, |ui| {
-            crate::ui::preview::ui(ui, &self.state.preview, &self.state.ai, outbox);
+            crate::ui::preview::ui(
+                ui,
+                &self.state.tabs.current().preview,
+                &self.state.ai,
+                outbox,
+            );
         });
 
         // ⑤ 顶层浮层:commit message 建议(存在才显示)。panel 顺序铁律只
@@ -177,18 +198,39 @@ impl LaterMdApp {
         // 恰是编辑器当前文档时追加针对性警示(见 `checkout_extra_warning`),
         // checkout 只在「回滚」按钮点击之后的归约里执行。
         if let Some(path) = self.state.git.confirm_checkout.clone() {
-            let open_in_editor = self
-                .state
-                .git
-                .absolute_path(&path)
-                .is_some_and(|abs| self.state.document.path.as_deref() == Some(abs.as_path()));
-            let (confirm, cancel) =
-                checkout_dialog(ui, &path, open_in_editor, self.state.editor.is_dirty());
+            let open_in_editor = self.state.git.absolute_path(&path).is_some_and(|abs| {
+                self.state.tabs.current().document.path.as_deref() == Some(abs.as_path())
+            });
+            let (confirm, cancel) = checkout_dialog(
+                ui,
+                &path,
+                open_in_editor,
+                self.state.tabs.current().editor.is_dirty(),
+            );
             if confirm.clicked() {
-                self.outbox.push(Message::GitCheckoutConfirmed);
+                outbox.push(Message::GitCheckoutConfirmed);
             }
             if cancel.clicked() {
-                self.outbox.push(Message::GitCheckoutCancelled);
+                outbox.push(Message::GitCheckoutCancelled);
+            }
+        }
+
+        // ⑦.5 顶层浮层:脏标签关闭确认(标签条 × / Ctrl+W 触发,docs/auto-plan
+        // #11「关闭脏标签确认模态」)。文案与回滚确认同款不可逆警示。
+        if let Some(index) = self.state.tabs.confirm_close {
+            let name = self
+                .state
+                .tabs
+                .tabs
+                .get(index)
+                .map(|tab| tab.document.display_name())
+                .unwrap_or_default();
+            let (confirm, cancel) = tab_close_dialog(ui, &name);
+            if confirm.clicked() {
+                outbox.push(Message::TabCloseConfirmed);
+            }
+            if cancel.clicked() {
+                outbox.push(Message::TabCloseCancelled);
             }
         }
 
@@ -245,9 +287,9 @@ fn poll_capture(ctx: &egui::Context, state: &mut crate::state::State) {
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · 渲染后端 · AI · MCP。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
     ui.horizontal_wrapped(|ui| {
-        ui.weak(state.document.display_name());
-        let text = state.editor.text();
-        if let Some(byte) = state.cursor.byte {
+        ui.weak(state.tabs.current().document.display_name());
+        let text = state.tabs.current().editor.text();
+        if let Some(byte) = state.tabs.current().cursor.byte {
             let (line, col) = cursor_position(text, byte);
             ui.weak(format!("行 {line}:{col}"));
         }
@@ -307,6 +349,30 @@ fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Res
                     ctx.copy_text(subject.to_owned());
                 }
                 buttons = Some((copy, ui.button("关闭")));
+            });
+        });
+    buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 脏标签关闭确认浮窗;返回(确认关闭, 取消)按钮的响应,测试定位用
+/// (与 `checkout_dialog` 同款手法;真正的移除在归约)。
+fn tab_close_dialog(ui: &mut egui::Ui, name: &str) -> (egui::Response, egui::Response) {
+    let mut buttons = None;
+    egui::Window::new("关闭标签")
+        .default_pos([80.0, 120.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(format!("「{name}」有未保存的修改。"));
+            ui.label(
+                egui::RichText::new("关闭将丢弃这些修改,此操作不可撤销。")
+                    .strong()
+                    .color(crate::ui::tokens::DANGER),
+            );
+            ui.horizontal(|ui| {
+                let confirm = ui.button("关闭并丢弃");
+                let cancel = ui.button("取消");
+                buttons = Some((confirm, cancel));
             });
         });
     buttons.expect("浮窗必然绘制按钮")
@@ -432,7 +498,7 @@ mod tests {
         let mut app = LaterMdApp::default();
         assert_eq!(reduce(&mut app, Vec::new()), vec!["LaterMD — 未命名"]);
 
-        app.state.editor.insert_chars(0, "改动");
+        app.state.tabs.current_mut().editor.insert_chars(0, "改动");
         assert_eq!(reduce(&mut app, Vec::new()), vec!["LaterMD — 未命名*"]);
 
         // 空闲帧:标题未变,不再下发
@@ -445,16 +511,20 @@ mod tests {
     fn ctrl_s_saves_to_known_path() {
         let path = std::env::temp_dir().join(format!("latermd-layout-{}.md", std::process::id()));
         let mut app = LaterMdApp::default();
-        app.state.document.path = Some(path.clone());
-        app.state.editor.insert_chars(0, "# 落盘\r\n");
+        app.state.tabs.current_mut().document.path = Some(path.clone());
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "# 落盘\r\n");
 
         let titles = reduce(&mut app, vec![key_s(Modifiers::COMMAND)]);
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            app.state.editor.text().as_bytes(),
+            app.state.tabs.current_mut().editor.text().as_bytes(),
             "保存字节原样,含 CRLF"
         );
-        assert!(!app.state.editor.is_dirty());
+        assert!(!app.state.tabs.current_mut().editor.is_dirty());
         let expected = format!("LaterMD — {}", path.file_name().unwrap().to_string_lossy());
         assert_eq!(titles.last().map(String::as_str), Some(expected.as_str()));
         let _ = std::fs::remove_file(&path);
@@ -469,10 +539,10 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("latermd-layout-{}-focus.md", std::process::id()));
         let mut app = LaterMdApp::default();
-        app.state.document.path = Some(path.clone());
-        app.state.editor.insert_chars(0, "正文");
+        app.state.tabs.current_mut().document.path = Some(path.clone());
+        app.state.tabs.current_mut().editor.insert_chars(0, "正文");
         // 默认文档是 SAMPLE_MD 开头再插「正文」,基线取帧序列开始前的全文
-        let baseline = app.state.editor.text().to_owned();
+        let baseline = app.state.tabs.current_mut().editor.text().to_owned();
         let ctx = egui::Context::default();
 
         // 帧 1:渲染全部面板(菜单栏/侧边栏/编辑器/预览),无输入
@@ -482,7 +552,11 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         // 模拟用户点进编辑区:直接对编辑器 widget 请求焦点
-        ctx.memory_mut(|mem| mem.request_focus(crate::ui::editor::editor_id()));
+        ctx.memory_mut(|mem| {
+            mem.request_focus(crate::ui::editor::tab_editor_id(
+                app.state.tabs.current().id,
+            ))
+        });
 
         // 帧 2:聚焦状态下按 Ctrl+S —— logic 先消费,TextEdit 收不到该键
         let output = ctx.run_ui(
@@ -499,15 +573,17 @@ mod tests {
         assert!(path.exists(), "聚焦状态的 Ctrl+S 仍触发了保存命令");
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            app.state.editor.text().as_bytes()
+            app.state.tabs.current_mut().editor.text().as_bytes()
         );
         assert_eq!(
-            app.state.editor.text(),
+            app.state.tabs.current_mut().editor.text(),
             baseline,
             "命令键未被 TextEdit 当输入吞掉,也没有插入 's'"
         );
         assert!(
-            ctx.memory(|mem| mem.has_focus(crate::ui::editor::editor_id())),
+            ctx.memory(|mem| mem.has_focus(crate::ui::editor::tab_editor_id(
+                app.state.tabs.current().id
+            ))),
             "命令键不抢编辑器焦点"
         );
 
@@ -525,7 +601,7 @@ mod tests {
         output.drop_without_applying_deltas();
         // 新建 TextEdit 状态的默认光标在文末,普通字符追加到缓冲尾部
         assert_eq!(
-            app.state.editor.text(),
+            app.state.tabs.current_mut().editor.text(),
             format!("{baseline}s"),
             "普通字符输入未被劫持"
         );
@@ -640,10 +716,18 @@ mod tests {
         output.drop_without_applying_deltas();
 
         assert!(
-            app.state.editor.text().ends_with("第一块"),
+            app.state
+                .tabs
+                .current_mut()
+                .editor
+                .text()
+                .ends_with("第一块"),
             "chunk 已按序归约追加到文档末尾"
         );
-        assert!(app.state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(
+            app.state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
         assert!(!app.state.ai.is_streaming(), "AiDone 已归约收尾");
     }
 
@@ -979,12 +1063,14 @@ mod tests {
         );
         assert!(
             app.state
+                .tabs
+                .current()
                 .document
                 .notice
                 .as_deref()
                 .is_some_and(|n| n.contains("占用")),
             "提示指出被谁占用:{:?}",
-            app.state.document.notice
+            app.state.tabs.current().document.notice
         );
     }
 
