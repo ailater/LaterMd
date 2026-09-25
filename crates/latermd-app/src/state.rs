@@ -16,6 +16,8 @@
 //! undo 栈是 TextEdit 内建 undoer 的快照,看不到程序化插入:流式结束后的
 //! 第一次 Ctrl+Z 会整体回退到最近一次用户编辑的快照(表现为「一步撤销
 //! 整段 AI 续写」,redo 可恢复),用户在流式期间的手敲一并被归入同一步。
+//! 在途流随文档切换一并作废([`State::load_document`] 里收尾):chunk 只
+//! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
 
 use crate::ai::AiState;
 use crate::export;
@@ -540,7 +542,13 @@ impl State {
     }
 
     /// 换入整篇内容并复位文档身份(新建/打开共用)。
+    ///
+    /// 在途 AI 流随缓冲一起作废:chunk 归约无条件追加到「当前缓冲末尾」,
+    /// 缓冲一换,剩余块就会写进新文档(Save 清 dirty 放行的 New/Open 同样
+    /// 命中)。接收端 drop 后 worker 下一次 send 失败即退出(latermd-ai 的
+    /// 取消约定),重绘驱动随标志清零自然停;与搜索换根复位同款静默。
     fn load_document(&mut self, path: Option<PathBuf>, text: &str) {
+        self.ai.finish();
         self.editor.load(text);
         self.document.path = path;
         self.document.notice = None;
@@ -1094,6 +1102,55 @@ mod tests {
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
         state.ai.finish();
+    }
+
+    /// 评审回归:流式进行中切文档必须取消在途流。AI 写入置 dirty →
+    /// Ctrl+S 清 dirty → New 的 unsaved_guard 放行 → load_document 换入
+    /// 新缓冲;若不收尾,剩余 chunk 会经 poll_ai 追加进新文档。文件树点击
+    /// 与搜索跳转同走 load_document,一处收口。
+    #[test]
+    fn switching_document_cancels_inflight_ai_stream() {
+        let path = temp_path("ai-switch.md");
+        let mut state = State::default();
+        // 慢 provider:保证测试在流自然收尾前完成切文档(20ms × 30-50 块)
+        state.ai.provider =
+            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(20));
+        state.document.path = Some(path.clone()); // Save 直落盘,不弹对话框
+
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        // 前置:流确实在产块(对照取消后的空收流)
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            state
+                .poll_ai()
+                .iter()
+                .any(|m| matches!(m, Message::AiChunk { .. })),
+            "前置:流在切文档前已产出正文块"
+        );
+        assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+
+        // 复刻评审路径:Save 清 dirty,放行 New 的 unsaved_guard
+        state.apply(Message::FileCommand(FileCmd::Save));
+        assert!(path.exists(), "已落盘");
+        assert!(!state.editor.is_dirty());
+
+        state.apply(Message::FileCommand(FileCmd::New));
+        assert_eq!(state.document.path, None);
+        assert_eq!(state.editor.text(), "", "新文档为空");
+        assert!(!state.ai.is_streaming(), "换文档取消在途流");
+
+        // 给 worker 留出再发几块的时间:接收端已 drop,chunk 不得再进文档
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let messages = state.poll_ai();
+        assert!(
+            messages
+                .iter()
+                .all(|m| !matches!(m, Message::AiChunk { .. })),
+            "取消后 poll 不再产出正文块,实际 {messages:?}"
+        );
+        assert_eq!(state.editor.text(), "", "新文档未被 AI 追加");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// AiChunk 追加语义:精确接在文档末尾;空 delta 是无操作(不推进修订号)。
