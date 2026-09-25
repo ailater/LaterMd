@@ -4,6 +4,13 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #20 latermd-creds 的四岔路：keyring 维护线、get_secret 签名、env 回退测试注入、测试值口径（2026-09-25）
+
+- **岔路**：P2 凭据 crate 落地时任务留了四处自由度。①keyring crate 有两条版本线：3.6.3（hwchen 原维护线终版，无默认 features，需手工配平台组合，已随项目移交停更）与 4.2.0（open-source-cooperative 接管后的重构线，2026-08 仍更新，默认 feature `v1` 即三平台 store）；②任务签名写作 `get_secret(...) -> Option<String>`，但同批约束要求「所有后端调用优雅降级（Err 返回）」且单测要「断言错误文案不含 secret」——Option 装不下错误文案；③环境变量回退顺序的测试：临时改进程环境变量（并行测试竞态）还是注入；④红线「凭据值不进测试断言明文、测试只断言存在性/删除成功」与「内存后端全 CRUD」的关系——CRUD 的 R 不验证读回值就测不出后端正确性。
+- **自动选择**：①**keyring 4.2.0**：4.x 是唯一仍在维护的线；默认 feature 按 target 自动落 Windows Credential Manager / macOS Keychain / Linux Secret Service（zbus 纯 Rust 实现，不链 libsecret C 库；Cargo.lock 既有 zbus 条目复用）；keyring-core `Error` 的 `Display` 实测不携带凭据字节（`BadEncoding` 打固定文案）；②`get_secret` 返回 `Result<Option<String>, CredentialError>`（错误可见、文案可断言、不吞「后端坏了」），`has_secret -> bool` 与 `ai_api_key -> Option<String>` 保持任务签名——Err 折叠为 false/None 的降级语义自洽（便捷查询定位，用户重新保存时会看到 set 的真实错误）；③注入式：`Credentials::ai_api_key_from(env_value: Option<&str>)` 显式传环境变量取值（测试注入点），顶层 `ai_api_key()` 内部读真环境变量；④测试值全部是 `placeholder-*` 占位假值，断言只做相等性/存在性比较——验证的是后端读写一致性，不是把真实凭据写进断言。
+- **已知并接受的边界**：后端读失败时 `has_secret` 返回 false（「不可用」与「未配置」在便捷查询层不可区分）；keyring 4.x 的 v1 模块在 Linux 无 dbus 时首次 `Entry::new` 即快速失败并**缓存**初始化结果——优雅降级成立，但运行中途 Secret Service 才挂掉的场景不会重试（LaterMD 桌面应用的 keyring 在进程启动后基本常驻，可接受）。
+- **如何改**：要回 3.x 线，把 crate Cargo.toml 改 `keyring = "3.6.3"` + `features = ["apple-native", "windows-native", "sync-secret-service"]`（`NoEntry` 匹配同款，改动很小）；要 `get_secret` 恢复纯 Option 签名，删 `Result` 包装并把「错误文案不含 secret」断言收缩到 set/delete；要改用进程级环境变量测试，删 `ai_api_key_from` 注入点、测试里 `std::env::set_var`（须接受竞态或串行化）；要把「存在性-only」测试口径执行得更严，删 CRUD 测试里的相等性断言（代价：后端写坏值不再被测出，不建议）。
+
 ## #19 git status 的条数上限与超限文件的行为（2026-09-25）
 
 - **岔路**：独立评审指出 `latermd_git::status` 无条数上限（`recurse_untracked_dirs` 全量展开），叠加同步跑在 UI 线程的 3s 轮询与侧边栏每帧全量渲染，超大仓库会卡帧——log（50 条）与 diff（64KB）都有上限，唯独 status 没有。加多少、超限文件的行为（角标/选中/回滚）怎么定未指定。

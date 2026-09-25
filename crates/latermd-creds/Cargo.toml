@@ -1,0 +1,13 @@
+[package]
+name = "latermd-creds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform credential storage via keyring (Credential Manager / Keychain / Secret Service), no UI deps"
+
+[dependencies]
+# 三平台系统凭据统一封装(ADR-004 已登记 keyring 4.2.0,decisions-pending
+# #20 选的 4.x 维护线):默认 feature `v1` 按平台落到 Windows Credential
+# Manager / macOS Keychain / Linux Secret Service 的 zbus 实现,不拉
+# libsecret C 库;后端不可用时 Entry::new 快速失败,优雅降级为 Err。
+keyring = "4.2.0"
