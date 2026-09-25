@@ -14,7 +14,7 @@
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
 [~] M0 技术验证   自动化可测项已有结论「继续」;出口放行卡两条真机项(IME、Win/mac wgpu),挂账随 P0 载体补测,见 m0-report.md
-[~] P0 骨架       ← 当前(2026-09-25,模块批量落地中;剩打包分发与 M0 真机项)
+[~] P0 骨架       ← 当前(2026-09-25,模块批量落地中;打包配置已就绪 —— cargo-dist 五目标 + macOS universal2 dmg job + cask 模板,runbook 见 distribution.md;P0 剩余 = 首个 Release 发布 + 三平台真机验收)
 [ ] P1 差异化
 [ ] P2 版本层
 [ ] P2.5 界面打磨（皮肤系统批次 B，见「专题：界面美化与皮肤系统」）

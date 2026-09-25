@@ -26,10 +26,15 @@
 brew install --cask crazykun/ailater/latermd
 ```
 
-- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 直下 `.exe`。首次运行 SmartScreen 会警告,点「更多信息 → 仍要运行」即可。
-- **Linux**:`.AppImage` / `.deb` / `.rpm` 从 Releases 直下,或使用 Linuxbrew。
+- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 下 `latermd-x86_64-pc-windows-msvc.zip`(ARM64 机器取 `aarch64-pc-windows-msvc`),解压后运行 `latermd.exe`。无签名,SmartScreen 会警告,点「更多信息 → 仍要运行」。
+- **Linux**:下 `latermd-x86_64-unknown-linux-gnu.tar.xz`,解包后 `./latermd`,或自行放进 `~/.local/bin`。
+- **macOS**:universal2 单 dmg(`latermd-v{版本}-universal2-apple-darwin.dmg`),Intel / Apple Silicon 通用。推荐走 brew(postflight 自动去 quarantine);**从 Releases 直下 dmg** 的用户,拖入 `/Applications/` 后首次打开会被 Gatekeeper 拦(本项目无签名公证,提示「无法验证开发者」或「已损坏,无法打开」),执行一次下面的命令即可正常启动(brew 安装的用户不需要):
 
-> 未发布前此节为渠道预告,当前无可安装产物。
+  ```bash
+  sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app
+  ```
+
+> 未发布前此节为渠道预告,当前无可安装产物;发布链路(cargo-dist 五目标 + macOS dmg + cask)已就位,操作手册见 [docs/distribution.md](docs/distribution.md)。
 
 ## 技术栈
 
