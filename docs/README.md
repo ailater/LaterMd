@@ -14,7 +14,7 @@
 | [roadmap.md](roadmap.md) | 阶段划分、验收标准、crate 增量时机、风险登记册、当前位置 | 已接受（**排期唯一事实来源**） |
 | [vendor-upgrade-checklist.md](vendor-upgrade-checklist.md) | egui_markdown vendor 与升级操作清单 | **已执行**(2026-09-24 六项全绿) |
 | [m0-report.md](m0-report.md) | M0 技术验证结论（IME / 帧率 / 三 target 实测数据） | 已产出（Linux 项完成；IME 与 Win·mac wgpu 待真机） |
-| [p0-acceptance.md](p0-acceptance.md) | P0 验收清单（四条标准逐条状态与证据） | 进行中（打包待首跑、真机项待补） |
+| [p0-acceptance.md](p0-acceptance.md) | P0 四条验收标准的逐条状态、证据出处与出口待办 | 跟踪中（功能 10/11，剩打包首跑验证） |
 | [ui-design.md](ui-design.md) | 界面设计规范：需求表达词库 + 实测诊断 + Design Token + 组件规范 | 已接受（roadmap 专题批次 B 的视觉细化） |
 
 ## 决策总表（一句话版）
