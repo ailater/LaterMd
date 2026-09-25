@@ -55,6 +55,19 @@ impl LaterMdApp {
         if state.search.is_running() {
             ctx.request_repaint();
         }
+        // Git 状态轮询:有文件树根且尚未降级才轮询(无根无事可刷;非 git
+        // 目录零轮询——重探由换根/切 Git 页触发,egui 得以收敛到深度空闲,
+        // 这正是 search 去抖测试守护的不变量)。到点即刷(同步毫秒级,见
+        // `git_panel` 模块文档),并在到点前要一帧(空闲不来帧,轮询依赖
+        // 显式 repaint)。
+        if state.file_tree.root.is_some() && state.git.error.is_none() {
+            if state.git.due() {
+                state.refresh_git();
+            }
+            if state.git.error.is_none() {
+                ctx.request_repaint_after(state.git.until_refresh());
+            }
+        }
         // AI 流式的重绘驱动:chunk 到达即要在下一帧收流归约,预览才跟得上
         // 100ms/chunk 的节奏;AiDone 归约清标志后自然停。
         if state.ai.is_streaming() {
@@ -100,6 +113,7 @@ impl LaterMdApp {
                         cursor_byte: self.state.cursor.byte,
                     },
                     &mut self.state.search,
+                    &self.state.git,
                     &mut self.outbox,
                 );
             });
@@ -133,6 +147,26 @@ impl LaterMdApp {
                 self.outbox.push(Message::AiCommitDismissed);
             }
         }
+
+        // ⑥ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
+        // 即确认弹窗(与 commit 建议浮窗同模式);文案显式警示不可逆,目标
+        // 恰是编辑器当前文档时追加针对性警示(见 `checkout_extra_warning`),
+        // checkout 只在「回滚」按钮点击之后的归约里执行。
+        if let Some(path) = self.state.git.confirm_checkout.clone() {
+            let open_in_editor = self
+                .state
+                .git
+                .absolute_path(&path)
+                .is_some_and(|abs| self.state.document.path.as_deref() == Some(abs.as_path()));
+            let (confirm, cancel) =
+                checkout_dialog(ui, &path, open_in_editor, self.state.editor.is_dirty());
+            if confirm.clicked() {
+                self.outbox.push(Message::GitCheckoutConfirmed);
+            }
+            if cancel.clicked() {
+                self.outbox.push(Message::GitCheckoutCancelled);
+            }
+        }
     }
 }
 
@@ -163,6 +197,62 @@ fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Res
             });
         });
     buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 回滚确认浮窗;返回(回滚, 取消)按钮的响应,测试定位用(与
+/// `commit_dialog` 同款手法)。只展示与收集点击,checkout 在归约。
+/// `open_in_editor`/`dirty` 驱动当前文档的针对性警示
+/// ([`checkout_extra_warning`]),dirty 状态取自缓冲真源、每帧重估。
+fn checkout_dialog(
+    ui: &mut egui::Ui,
+    path: &str,
+    open_in_editor: bool,
+    dirty: bool,
+) -> (egui::Response, egui::Response) {
+    let mut buttons = None;
+    egui::Window::new("Git: 回滚文件")
+        .default_pos([80.0, 120.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(format!("把 {path} 恢复到 HEAD 版本。"));
+            ui.label(
+                egui::RichText::new("未提交的改动将被丢弃,此操作不可撤销。")
+                    .strong()
+                    .color(egui::Color32::from_rgb(235, 96, 96)),
+            );
+            if let Some(warning) = checkout_extra_warning(open_in_editor, dirty) {
+                let text = egui::RichText::new(warning);
+                // dirty 分支有真实损失(保存会反转回滚),黄色升级警示;
+                // 非 dirty 只是行为告知,走默认前景
+                let text = if dirty {
+                    text.color(egui::Color32::from_rgb(235, 180, 60))
+                } else {
+                    text
+                };
+                ui.label(text);
+            }
+            ui.horizontal(|ui| {
+                let confirm = ui.button("回滚");
+                let cancel = ui.button("取消");
+                buttons = Some((confirm, cancel));
+            });
+        });
+    buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 回滚目标恰是编辑器当前文档时的追加警示;`None` = 目标不在编辑器中,
+/// 只有常规不可逆警示。文案与归约侧行为(`State::after_git_checkout`)
+/// 一一对应:dirty 保留未保存稿、非 dirty 重载为 HEAD。
+fn checkout_extra_warning(open_in_editor: bool, dirty: bool) -> Option<&'static str> {
+    if !open_in_editor {
+        return None;
+    }
+    Some(if dirty {
+        "该文件正在编辑器中打开:编辑器里未保存的修改会保留,之后保存(Ctrl+S)会把它们写回。"
+    } else {
+        "该文件正在编辑器中打开:回滚后编辑器将重载为 HEAD 版本。"
+    })
 }
 
 impl eframe::App for LaterMdApp {
@@ -575,5 +665,159 @@ mod tests {
         let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
         output.drop_without_applying_deltas();
         assert_eq!(app.state.ai_commit_suggestion, None);
+    }
+
+    /// 在临时目录里装配一次性 git 仓库(一笔提交 + 一个工作区改动)。
+    fn dirty_repo(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-layout-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=LaterMD", "-c", "user.email=latermd@test"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} 失败");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.md"), "HEAD 版本\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("a.md"), "乱改\n").unwrap();
+        dir
+    }
+
+    /// Git 轮询在归约侧到点即刷:有根 + due 过期的一帧 reduce 后改动列表
+    /// 就位;无根时到点也不刷(不空转)。
+    #[test]
+    fn git_poll_refreshes_when_due_with_root() {
+        let dir = dirty_repo("git-poll");
+        let mut app = LaterMdApp::default();
+        app.state.file_tree.root = Some(dir.clone());
+        app.state.git.refresh_due = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.git.entries.len(), 1, "到点帧已刷新");
+        assert!(!app.state.git.due(), "刷新顺延了下一周期");
+
+        // 无根 + 到点:不刷(无根不轮询)
+        let mut rootless = LaterMdApp::default();
+        rootless.state.git.refresh_due =
+            std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let output = ctx.run_ui(RawInput::default(), |ui| rootless.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(rootless.state.git.entries.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚确认浮窗:「回滚」与「取消」按钮点击分别发 GitCheckoutConfirmed /
+    /// GitCheckoutCancelled 进 outbox,由下一帧归约执行(浮窗本身不做 git)。
+    #[test]
+    fn checkout_dialog_buttons_send_messages() {
+        let mut app = LaterMdApp::default();
+        app.state.git.confirm_checkout = Some("a.md".to_owned());
+        let ctx = egui::Context::default();
+        let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+
+        // 帧 1:渲染浮窗拿按钮位置(Area 按 id 记忆,draw 内位置一致)
+        ctx.run_ui(RawInput::default(), |ui| {
+            let (confirm, cancel) = checkout_dialog(ui, "a.md", false, false);
+            rects.set((confirm.rect, cancel.rect));
+        })
+        .drop_without_applying_deltas();
+
+        let (confirm_center, cancel_center) = {
+            let (confirm, cancel) = rects.get();
+            (confirm.center(), cancel.center())
+        };
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        // 帧 2-4:完整 draw 下点「取消」→ GitCheckoutCancelled(消息的
+        // 产出在 draw 的浮窗接线里,单独渲染浮窗不够)
+        for events in [
+            vec![Event::PointerMoved(cancel_center)],
+            vec![click(cancel_center, true)],
+            vec![click(cancel_center, false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            app.outbox
+                .iter()
+                .any(|m| matches!(m, Message::GitCheckoutCancelled)),
+            "{:?}",
+            app.outbox
+        );
+        app.outbox.clear();
+        // 帧 5-7:完整 draw 下点「回滚」→ GitCheckoutConfirmed(消息同样
+        // 产自 draw;真正的 checkout 在下一帧归约,state::tests 已覆盖)
+        for events in [
+            vec![Event::PointerMoved(confirm_center)],
+            vec![click(confirm_center, true)],
+            vec![click(confirm_center, false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            app.outbox
+                .iter()
+                .any(|m| matches!(m, Message::GitCheckoutConfirmed)),
+            "{:?}",
+            app.outbox
+        );
+    }
+
+    /// 针对性警示只看「目标是否当前文档」:不在编辑器中无追加;在则按
+    /// dirty 分流(保留稿子会写回 / 重载 HEAD),与归约侧行为一一对应。
+    #[test]
+    fn checkout_extra_warning_targets_current_document_only() {
+        assert_eq!(checkout_extra_warning(false, false), None);
+        assert_eq!(checkout_extra_warning(false, true), None);
+
+        let clean = checkout_extra_warning(true, false).unwrap();
+        assert!(clean.contains("重载"), "{clean}");
+        assert!(!clean.contains("写回"));
+
+        let dirty = checkout_extra_warning(true, true).unwrap();
+        assert!(dirty.contains("写回"), "{dirty}");
+        assert!(dirty.contains("未保存"), "{dirty}");
+    }
+
+    /// 三种警示形态的浮窗整体渲染都不 panic(按钮定位回归由上一个测试
+    /// 的 false/false 形态覆盖)。
+    #[test]
+    fn checkout_dialog_renders_all_warning_variants() {
+        let ctx = egui::Context::default();
+        for (open, dirty) in [(false, false), (true, false), (true, true)] {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                checkout_dialog(ui, "docs/a.md", open, dirty);
+            });
+            output.drop_without_applying_deltas();
+        }
     }
 }

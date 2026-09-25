@@ -23,6 +23,7 @@ use crate::ai::AiState;
 use crate::export;
 use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
+use crate::git_panel::GitPanelState;
 use crate::search::SearchState;
 use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
@@ -53,11 +54,13 @@ pub enum SidebarTab {
     Search,
     /// 文档大纲(P0 廉价版:点击跳编辑器光标)。
     Outline,
+    /// Git(P2:改动列表 + diff + 确认式回滚 + 历史)。
+    Git,
 }
 
 impl SidebarTab {
     /// 页签栏顺序。
-    pub const ALL: [SidebarTab; 3] = [Self::Files, Self::Search, Self::Outline];
+    pub const ALL: [SidebarTab; 4] = [Self::Files, Self::Search, Self::Outline, Self::Git];
 
     /// 页签栏显示名。
     pub fn label(self) -> &'static str {
@@ -65,6 +68,7 @@ impl SidebarTab {
             Self::Files => "文件",
             Self::Search => "搜索",
             Self::Outline => "大纲",
+            Self::Git => "Git",
         }
     }
 }
@@ -133,6 +137,9 @@ pub struct State {
     pub cursor: OutlineCursor,
     /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
     pub file_tree: FileTreeState,
+    /// Git 面板(Git 页签 + Files 页角标,P2):状态/历史/diff 快照与
+    /// 确认式回滚;刷新时机见 `git_panel` 模块文档。
+    pub git: GitPanelState,
     /// 全文搜索(Search 页签):输入去抖、后台服务与结果缓存。
     pub search: SearchState,
     /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
@@ -224,6 +231,7 @@ impl Default for State {
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
             file_tree: FileTreeState::default(),
+            git: GitPanelState::default(),
             search: SearchState::default(),
             ai: AiState::default(),
             ai_commit_suggestion: None,
@@ -306,13 +314,31 @@ pub enum Message {
     AiCommitSuggestion { subject: String },
     /// 关闭 commit message 建议浮窗。
     AiCommitDismissed,
+    /// 点击 Git 页改动列表里的文件,载荷为相对仓库根的路径:归约里选中
+    /// 并读它的 diff(列表外的过期路径被忽略)。
+    GitFileSelected(String),
+    /// 点击「回滚此文件」,载荷为相对仓库根的路径:归约里只置确认模态,
+    /// checkout 在用户显式确认之后。
+    GitCheckoutRequested(String),
+    /// 确认模态里确认回滚:执行 latermd-git 唯一的写操作并立即刷新状态;
+    /// 失败文案进提示行。
+    GitCheckoutConfirmed,
+    /// 确认模态取消,不触碰工作区。
+    GitCheckoutCancelled,
 }
 
 impl State {
     /// 消费一条消息,变更状态。只允许在 `App::logic` 调用。
     pub fn apply(&mut self, message: Message) {
         match message {
-            Message::SidebarTabChanged(tab) => self.sidebar.active_tab = tab,
+            Message::SidebarTabChanged(tab) => {
+                self.sidebar.active_tab = tab;
+                // 切到 Git 页立即刷新:页签可能停了很久,轮询周期外的快照
+                // 会误导回滚决策
+                if tab == SidebarTab::Git {
+                    self.refresh_git();
+                }
+            }
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.document.notice = None,
             Message::ExportHtml => self.run_export_html(),
@@ -346,6 +372,55 @@ impl State {
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
+            Message::GitFileSelected(path) => self.git.select(&path),
+            Message::GitCheckoutRequested(path) => self.git.request_checkout(path),
+            Message::GitCheckoutConfirmed => {
+                // 回滚目标与仓库根在 confirm_checkout 内被 take,先留档供
+                // 成功后的「当前文档一致性」判定
+                let target = self
+                    .git
+                    .confirm_checkout
+                    .clone()
+                    .zip(self.git.repo_root.clone());
+                match self.git.confirm_checkout(self.file_tree.root.as_deref()) {
+                    Some(error) => self.document.notice = Some(error),
+                    None => {
+                        if let Some((rel, root)) = target {
+                            self.after_git_checkout(&root.join(&rel));
+                        }
+                    }
+                }
+            }
+            Message::GitCheckoutCancelled => self.git.cancel_checkout(),
+        }
+    }
+
+    /// 立即刷新 Git 状态。触发点:切到 Git 页、文件树换根、回滚完成,以及
+    /// 归约侧的到点轮询(见 `ui::layout::reduce`)。
+    pub fn refresh_git(&mut self) {
+        let root = self.file_tree.root.clone();
+        self.git.refresh(root.as_deref());
+    }
+
+    /// 回滚成功后的编辑器一致性(`Message::GitCheckoutConfirmed` 的归约
+    /// 尾步):目标不是当前文档则无事;是则分两种情况——
+    ///
+    /// * 非 dirty:缓冲本与磁盘一致,磁盘已回 HEAD,重读换入(预览同帧
+    ///   联动),否则编辑器将显示已丢弃的工作区版本;
+    /// * dirty:磁盘回 HEAD 但**保留**编辑器里未保存的稿子(静默丢稿风险
+    ///   大于不一致风险,与 [`Self::unsaved_guard`] 同哲学),提示行告知
+    ///   「保存会写回」——否则一次 Ctrl+S 就静默反转回滚,用户毫不知情。
+    fn after_git_checkout(&mut self, file: &Path) {
+        if self.document.path.as_deref() != Some(file) {
+            return;
+        }
+        if self.editor.is_dirty() {
+            self.document.notice = Some(format!(
+                "已回滚 {}:编辑器里未保存的修改仍保留,保存(Ctrl+S)会把它们写回",
+                file.display()
+            ));
+        } else {
+            self.open_from(file);
         }
     }
 
@@ -650,10 +725,12 @@ impl State {
 
     /// 换根并持久化(对话框与最近列表两个入口共用);落盘失败只落提示行,
     /// 本次会话的文件树照常可用。搜索一并复位:旧根的结果在新根下相对
-    /// 路径失真,留着只会误导。
+    /// 路径失真,留着只会误导。Git 状态立即按新根刷新(角标与 Git 页
+    /// 不留旧仓库的快照)。
     fn change_file_tree_root(&mut self, dir: PathBuf) {
         self.file_tree.set_root(dir);
         self.search.reset();
+        self.refresh_git();
         if let Err(error) =
             FileTreeSettings::from(&self.file_tree).save_to(self.settings_dir.as_deref())
         {
@@ -1416,6 +1493,198 @@ mod tests {
             "git {args:?} 失败: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// 建带一笔提交 + 一个工作区改动的一次性仓库;返回其路径。
+    fn git_repo_with_dirty_file(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.md"), "HEAD 版本\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("a.md"), "工作区乱改\n").unwrap();
+        dir
+    }
+
+    /// Git 消息全链路归约:换根即刷新(角标就位)→ 选中读 diff → 回滚
+    /// 请求只置模态 → 取消不动文件 → 再请求 + 确认恢复 HEAD 并刷新
+    /// (干净列表、选中失效、模态关闭)。
+    #[test]
+    fn git_messages_drive_select_confirm_and_checkout() {
+        let dir = git_repo_with_dirty_file("git-flow");
+        let settings_dir = temp_path("git-flow-settings");
+        let mut state = State {
+            settings_dir: Some(settings_dir.clone()),
+            ..State::default()
+        };
+
+        // 换根触发刷新:改动列表与绝对路径角标就位
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        assert_eq!(state.git.error, None);
+        assert_eq!(state.git.entries.len(), 1);
+        assert_eq!(state.git.entries[0].path, "a.md");
+        assert_eq!(
+            state.git.badge_for(&dir.join("a.md")),
+            Some(latermd_git::StatusKind::Modified)
+        );
+
+        // 选中:diff 就位
+        state.apply(Message::GitFileSelected("a.md".to_owned()));
+        assert_eq!(state.git.selected.as_deref(), Some("a.md"));
+        assert!(state.git.diff.contains("+工作区乱改"), "{}", state.git.diff);
+
+        // 过期路径:不顶掉选中
+        state.apply(Message::GitFileSelected("stale.md".to_owned()));
+        assert_eq!(state.git.selected.as_deref(), Some("a.md"));
+
+        // 回滚请求只置模态;取消不动文件
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        assert_eq!(state.git.confirm_checkout.as_deref(), Some("a.md"));
+        state.apply(Message::GitCheckoutCancelled);
+        assert_eq!(state.git.confirm_checkout, None);
+        assert!(std::fs::read_to_string(dir.join("a.md"))
+            .unwrap()
+            .contains("乱改"));
+
+        // 确认:恢复 HEAD、刷新后列表干净、选中失效、模态关闭
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.md")).unwrap(),
+            "HEAD 版本\n",
+            "确认后文件恢复 HEAD"
+        );
+        assert_eq!(state.git.confirm_checkout, None);
+        assert!(state.git.entries.is_empty(), "回滚后工作区干净");
+        assert_eq!(state.git.selected, None, "选中随 clean 失效");
+        assert!(state.git.badges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&settings_dir);
+    }
+
+    /// 回滚目标正是编辑器当前文档(非 dirty):确认后编辑器重读磁盘的
+    /// HEAD 版本、预览同帧联动——不重载则编辑器仍显示已丢弃的工作区版本。
+    #[test]
+    fn git_checkout_of_current_document_reloads_editor() {
+        let dir = git_repo_with_dirty_file("git-reload");
+        let file = dir.join("a.md");
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.refresh_git();
+        state.editor.clear_dirty(); // 放行 open_from 的 unsaved_guard
+        state.apply(Message::FileSelected(file.clone()));
+        assert_eq!(
+            state.editor.text(),
+            "工作区乱改\n",
+            "前置:编辑器持有工作区版"
+        );
+
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert_eq!(state.editor.text(), "HEAD 版本\n", "编辑器随磁盘回滚重载");
+        assert_eq!(state.preview.text, "HEAD 版本\n", "预览快照同帧联动");
+        assert!(!state.editor.is_dirty());
+        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
+        assert!(state.document.notice.is_none(), "干净重载无提示");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚目标正是当前文档且编辑器 dirty:未保存的稿子保留(绝不静默
+    /// 丢稿),磁盘已回 HEAD,提示行说明「保存会写回」;非当前文档的回滚
+    /// 则完全不触碰编辑器。
+    #[test]
+    fn git_checkout_keeps_dirty_buffer_and_skips_unrelated_editor() {
+        let dir = git_repo_with_dirty_file("git-dirty");
+        let file = dir.join("a.md");
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.refresh_git();
+        state.editor.clear_dirty();
+        state.apply(Message::FileSelected(file.clone()));
+        state.editor.insert_chars(0, "未保存草稿\n"); // dirty
+        assert!(state.editor.is_dirty());
+
+        state.apply(Message::GitCheckoutRequested("a.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "HEAD 版本\n",
+            "磁盘已回滚"
+        );
+        assert!(
+            state.editor.text().starts_with("未保存草稿"),
+            "缓冲里的未保存稿保留"
+        );
+        let notice = state.document.notice.as_deref().expect("有针对性提示");
+        assert!(notice.contains("写回"), "{notice}");
+        // 预览快照未被重置:dirty 分支不走 load_document(重载是 clean 分支
+        // 的行为);快照推进交给下一帧编辑器面板的修订号检查
+        assert_ne!(state.preview.text, "HEAD 版本\n", "未走重载路径");
+
+        // 回滚目标不是当前文档:编辑器与文档身份都不动
+        std::fs::write(dir.join("b.md"), "HEAD 版本\n").unwrap();
+        run_git(&dir, &["add", "b.md"]);
+        run_git(&dir, &["commit", "-q", "-m", "b"]);
+        std::fs::write(dir.join("b.md"), "乱改\n").unwrap();
+        state.refresh_git();
+        state.apply(Message::GitCheckoutRequested("b.md".to_owned()));
+        state.apply(Message::GitCheckoutConfirmed);
+        assert!(
+            state.editor.text().starts_with("未保存草稿"),
+            "非当前文档的回滚不触碰编辑器"
+        );
+        assert_eq!(state.document.path.as_deref(), Some(file.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切到 Git 页立即刷新:停了很久的快照不用于回滚决策。
+    #[test]
+    fn switching_to_git_tab_refreshes_state() {
+        let dir = git_repo_with_dirty_file("git-tab");
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        assert!(state.git.entries.is_empty(), "前置:尚未刷过");
+
+        state.apply(Message::SidebarTabChanged(SidebarTab::Git));
+        assert_eq!(state.git.entries.len(), 1, "切页签即刷新");
+        state.apply(Message::SidebarTabChanged(SidebarTab::Files));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非 git 目录换根:Git 状态降级为提示文案,角标清空(文件树无角标);
+    /// 从有状态仓库切到普通目录,旧角标不残留。
+    #[test]
+    fn non_git_root_degrades_git_state() {
+        let repo = git_repo_with_dirty_file("git-degrade-repo");
+        let plain = temp_path("git-degrade-plain");
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let settings_dir = temp_path("git-degrade-settings");
+        let mut state = State {
+            settings_dir: Some(settings_dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(repo.clone()));
+        assert!(
+            state.git.badge_for(&repo.join("a.md")).is_some(),
+            "前置:仓库根有角标"
+        );
+
+        state.apply(Message::FileTreeRootSelected(plain.clone()));
+        let error = state.git.error.as_deref().expect("降级文案");
+        assert!(error.contains("不是"), "{error}");
+        assert!(state.git.badges.is_empty(), "旧角标不残留");
+        assert_eq!(state.git.selected, None);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&settings_dir);
     }
 
     /// commit message 全链路:已保存文档 + 暂存改动 → 建议(单行、conventional

@@ -4,6 +4,31 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #19 git status 的条数上限与超限文件的行为（2026-09-25）
+
+- **岔路**：独立评审指出 `latermd_git::status` 无条数上限（`recurse_untracked_dirs` 全量展开），叠加同步跑在 UI 线程的 3s 轮询与侧边栏每帧全量渲染，超大仓库会卡帧——log（50 条）与 diff（64KB）都有上限，唯独 status 没有。加多少、超限文件的行为（角标/选中/回滚）怎么定未指定。
+- **自动选择**：上限 **500**（`latermd_git::DEFAULT_STATUS_LIMIT`），与文件树 `MAX_CHILDREN`、搜索 `MAX_HITS` 两个既有先例同量级；`status(root, limit)` 返回 `StatusSnapshot { entries, truncated }`，**先按路径排序再截断**（保留字典序最小的前 500 条，保证确定性）；Git 页改动列表尾部渲染「…还有 N 项未显示」（与文件树同款提示行）。超限文件的降级：无文件树角标、不可选中/回滚（select/request_checkout 的「列表外路径忽略」防御天然覆盖）——与文件树截断、搜索 MAX_HITS 同语义。注意：libgit2 的 statuses 遍历本身无法提前截断（StatusOptions 无 limit），本上限消除的是「Vec 无界 + 每帧全量渲染」两项；遍历成本仍属 #17 已登记的「掉帧再挪线程」取舍。
+- **如何改**：嫌 500 太小改 `DEFAULT_STATUS_LIMIT` 一个常量（调用方 `git_panel.rs` 自动跟随）；要「显示全部」，给 Git 页加展开交互并让 `status` 支持分页或提高上限；要消除遍历成本，把 `recurse_untracked_dirs` 关掉（未跟踪目录只报目录一条，快得多，但文件树逐文件打标失效）或按 #17 的「如何改」挪后台线程。
+
+## #18 回滚目标恰是编辑器当前文档时，dirty 缓冲的处置（2026-09-25）
+
+- **岔路**：独立评审指出回滚（checkout 单文件）若目标正是编辑器当前打开的文档，归约后编辑器不重载、无提示——dirty 场景一次 Ctrl+S 就把被丢弃的改动静默写回（反转回滚）；非 dirty 场景编辑器显示与磁盘不一致。修法有两派：①回滚后无条件重载编辑器（强一致，但 dirty 时静默丢掉未保存稿）；②分 dirty 分流。
+- **自动选择**：**②分 dirty 分流**（`State::after_git_checkout`）：目标非当前文档不触碰编辑器；是当前文档且非 dirty → 重读磁盘换入缓冲（预览同帧联动，编辑器与磁盘重新一致）；是当前文档且 dirty → **保留未保存稿**（静默丢稿的代价大于不一致，与 `unsaved_guard` 的既有哲学一致），提示行明示「已回滚 X：编辑器里未保存的修改仍保留，保存(Ctrl+S)会把它们写回」。确认模态同步加针对性警示（`checkout_dialog` 的 `checkout_extra_warning`）：目标在编辑器中打开时按 dirty 显式告知上述行为，不再只有通用不可逆警示。
+- **如何改**：要①的强一致语义，把 `after_git_checkout` 的 dirty 分支改成同样调 `open_from(file)`（并在 `checkout_extra_warning` 的 dirty 文案里说明将丢弃编辑器修改）；要更保守的「dirty 时拒绝回滚」（像 unsaved_guard 那样拦下），在 `request_checkout` 前置检查并落提示行。
+
+## #17 Git UI 接驳的刷新机制、仓库根定位与确认模态形态（2026-09-25）
+
+- **岔路**：把 latermd-git 接进侧边栏时任务留了三处自由度。①「每 N 秒或触发时刷新」的 N 未定，且同步归约执行还是后台线程未定（`git status` 大仓库冷缓存可能上百毫秒，卡帧风险真实存在）；②#16 ③ 已定 latermd-git API 层用 `Repository::open` 严格仓库根，但 UI 的文件树根常是**仓库子目录**（比如选了 `docs/` 当根），以哪个目录调 status/diff/log 没定；③「确认模态」在 egui 0.36 没有内建阻塞模态层，用什么形态承载。
+- **自动选择**：①**N=3 秒，同步在归约里执行**（`crates/latermd-app/src/git_panel.rs::REFRESH_INTERVAL`）：与 `git_diff.rs` 的既有口径一致（本地 git 读是毫秒级，不上后台线程），到点由 `ui::layout::reduce` 触发并 `request_repaint_after` 要帧；触发式刷新 = 换根 / 切到 Git 页 / 回滚完成；**降级（非 git 目录）即停轮询**，重探由换根/切页签触发——保证 egui 空闲收敛（search 去抖测试守护的不变量），零成本挂着的失败探测没有价值。②新增 `latermd_git::discover`（`Repository::discover` 向上探测，裸仓库显式 Err）：crate 其余 API 的「严格仓库根」口径不动，UI 接驳层先 discover 把文件树根换算成仓库根；状态条目仍记「相对仓库根」路径，角标拼成绝对路径与文件树条目匹配。③确认模态用**非阻塞 `egui::Window` 浮窗 + 红色警示文案「未提交的改动将被丢弃，此操作不可撤销」**（与 AI commit 建议浮窗同模式）：checkout 只在「回滚」按钮点击后的消息归约里执行，浮窗本身零 git 调用。
+- **如何改**：嫌 3s 太钝/太勤，改 `REFRESH_INTERVAL` 一个常量；大仓库实测掉帧，把 `GitPanelState::refresh` 的两次 git 读挪后台线程（对 UI 的接口不变，参照 search 的代际号取消模式）；要收紧回「文件树根必须是仓库根」，删 `latermd_git::discover` 并让 `GitPanelState::refresh` 直接以文件树根调 status（非根目录会走降级提示）；要真阻塞式模态，等 egui 内建 modal 层（0.36 无）或自绘全屏遮罩 Area。
+
+## #16 latermd-git 的三个落地口径：U 的语义、git2 features、仓库根定位（2026-09-25）
+
+- **岔路**：P2 首个 Git crate 落地时任务留了三处歧义。①状态码集合写作 `M|A|U|D|?`，U 是 unmerged（git CLI short format 语义）还是 untracked（VS Code 装饰字母语义）——若 U=untracked 则 `?` 无含义。②ADR-004 登记 git2 0.21.0 的组合是 `vendored-libgit2 + vendored-openssl`，但 vendored-openssl 会拉 openssl-src 全量编译（三平台 CI 各多数分钟），而它的唯一用途是 https 传输。③API 以仓库路径为参数：`Repository::open`（严格根）还是 `Repository::discover`（向上层搜 `.git`）。
+- **自动选择**：①**U=unmerged（合并冲突），?=untracked**，按 git CLI `--short` 语义（`crates/latermd-git/src/lib.rs::StatusKind`），与 roadmap「文件树 Git 标记 M/A/U/?」并排五码自洽；②git2 取 **`default-features = false, features = ["vendored-libgit2"]`**（版本 0.21 与 ADR-004 一致）：P2 明确只读、无 fetch/push/pull，ssh/https 传输层整层用不上，关掉后零 openssl 面（不依赖系统包、不编译 openssl-src）；若将来做 remote 再加 `vendored-openssl` 即可；③**`Repository::open` 严格仓库根**，不向上搜——与 #14 app 侧「不向上搜 `.git`」的既有口径一致，非 git 目录一律 `Err` 交给 UI 降级成提示。
+- **已知并接受的边界**：status 里非 UTF-8 文件名不出现（libgit2 的 `entry.path()` 返回 `Option<&str>`，非 UTF-8 时为 None，极罕见）；blame 基于 HEAD 提交内容，工作区未提交的行不参与行级归属（libgit2 限制，doc 已注明）；`checkout_file` 的 path 走 git pathspec 语义（与 `git checkout -- <path>` 一致，含 glob 元字符的文件名理论上可被通配匹配）。
+- **如何改**：要改 U=untracked，改 `lib.rs::status_kind` 的优先级映射一处（untracked 同时映射 U 与 `?` 的需求不存在，五码本来就单字母）；要恢复 ADR 原样的 openssl 组合，把 crate Cargo.toml 的 features 改回 `["vendored-libgit2", "vendored-openssl"]`（须同时去掉 `default-features = false`，否则 https feature 仍关着）；要支持从子目录自动定位仓库根，把 `open_repo` 的 `Repository::open` 换成 `Repository::discover`，但 status/diff 的相对路径语义需随之在 UI 侧重排。
+
 ## #15 AI 摘要的插入形态、引用块前缀来源与 Mock 请求识别（2026-09-25）
 
 - **岔路**：任务把展示形态留成二选一——「以引用块形式插入文档末尾」或「展示给用户可选插入」。另外 prompt 输出要求固定为「每条一行中文，以 '- ' 开头」，而最终插入形态是引用块（`> - …` 行），`> ` 前缀由谁加上、Mock provider 在共用 `stream_complete` 通道里如何区分摘要请求与续写请求，都需要定口径。
