@@ -132,6 +132,10 @@ pub struct State {
     pub search: SearchState,
     /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
     pub ai: AiState,
+    /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
+    /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
+    /// 时替换/清除。
+    pub ai_commit_suggestion: Option<String>,
     /// 当前文档的落盘身份。
     pub document: DocumentState,
     /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
@@ -217,6 +221,7 @@ impl Default for State {
             file_tree: FileTreeState::default(),
             search: SearchState::default(),
             ai: AiState::default(),
+            ai_commit_suggestion: None,
             editor,
             document: DocumentState {
                 path: None,
@@ -284,6 +289,14 @@ pub enum Message {
     /// 后的提示词,归约走与 [`Message::AiStart`] 同一条流式启动路径(防重入
     /// 同样生效);`Err` 为未实现动作 / 解析失败的提示语,落状态栏不执行。
     AiLinkClicked { prompt: Result<String, String> },
+    /// 请求生成 commit message(命令层入口):staged diff 优先、无 staged
+    /// 用 working tree diff,喂 provider 合成单行 subject。流式进行中在
+    /// 归约里被忽略(防重入,与 [`Message::AiStart`] 同一道闸)。
+    AiCommitRequested,
+    /// commit message 建议就绪,载荷为单行 subject;置入 state 供浮窗展示。
+    AiCommitSuggestion { subject: String },
+    /// 关闭 commit message 建议浮窗。
+    AiCommitDismissed,
 }
 
 impl State {
@@ -320,7 +333,53 @@ impl State {
                 Ok(prompt) => self.start_ai_stream_with_prompt(&prompt),
                 Err(reason) => self.document.notice = Some(reason),
             },
+            Message::AiCommitRequested => self.request_commit_message(),
+            Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
+            Message::AiCommitDismissed => self.ai_commit_suggestion = None,
         }
+    }
+
+    /// 生成 commit message(`Message::AiCommitRequested` 的归约):定位仓库
+    /// 目录 → 采 diff → 拼 prompt → 取建议。结果经
+    /// [`Message::AiCommitSuggestion`] 再归约一次落 state,与其它 AI 结果
+    /// 同走消息通道。
+    ///
+    /// 仓库定位:当前文档所在目录优先,退文件树根(`git diff` 在仓库子目录
+    /// 里跑也返回全仓改动);两者皆无 → 提示行。演示期同步完成(Mock 的
+    /// 关键词合成,流式通道是续写文本不适用);流式进行中忽略(防重入)。
+    fn request_commit_message(&mut self) {
+        if self.ai.is_streaming() {
+            return;
+        }
+        let Some(dir) = self
+            .document
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| self.file_tree.root.clone())
+        else {
+            self.document.notice =
+                Some("生成 commit message 需要先保存文档或设置文件树根目录".to_owned());
+            return;
+        };
+        let diff = match crate::git_diff::uncommitted_diff(&dir) {
+            Ok(diff) if !diff.trim().is_empty() => diff,
+            Ok(_) => {
+                self.document.notice = Some("没有未提交的改动,无需生成 commit message".to_owned());
+                return;
+            }
+            Err(error) => {
+                self.document.notice = Some(error);
+                return;
+            }
+        };
+        let prompt = latermd_ai::commit_message_prompt(&diff);
+        // TODO(真实 key,decisions-pending #3):换 OpenAiProvider 低温度补全
+        // 并取首行;演示期用 Mock 的关键词同步合成。
+        let subject = self.ai.provider.mock_commit_subject(&prompt);
+        self.apply(Message::AiCommitSuggestion { subject });
     }
 
     /// 发起 AI Mock 流式续写(`Message::AiStart` 的归约)。流式进行中
@@ -1302,5 +1361,87 @@ mod tests {
             idle.document.notice.as_deref(),
             Some("未实现的 AI 动作:summarize")
         );
+    }
+
+    /// 在临时目录里跑 git(测试数据装配);失败即 panic。
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=LaterMD", "-c", "user.email=latermd@test"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// commit message 全链路:已保存文档 + 暂存改动 → 建议(单行、conventional
+    /// 前缀、含文件名)→ 关闭清空;干净仓库与无法定位目录分别落提示行。
+    #[test]
+    fn ai_commit_message_flow_notices_and_dismissal() {
+        let dir = temp_path("ai-commit-repo");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "# 后加的说明\n").unwrap();
+        run_git(&dir, &["add", "."]);
+
+        let mut state = State::default();
+        state.document.path = Some(dir.join("README.md"));
+
+        state.apply(Message::AiCommitRequested);
+        let subject = state.ai_commit_suggestion.clone().expect("已生成建议");
+        assert_eq!(subject, "docs: 新增README.md");
+        assert!(!subject.contains('\n'), "单行 subject");
+
+        state.apply(Message::AiCommitDismissed);
+        assert_eq!(state.ai_commit_suggestion, None, "关闭清空建议");
+
+        // 干净仓库(全部提交):无未提交改动 → 提示,不出建议
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+        state.apply(Message::AiCommitRequested);
+        assert_eq!(state.ai_commit_suggestion, None);
+        let notice = state.document.notice.as_deref().unwrap();
+        assert!(notice.contains("没有未提交的改动"), "{notice}");
+
+        // 无文档且无文件树根:无法定位仓库目录
+        let mut rootless = State::default();
+        rootless.apply(Message::AiCommitRequested);
+        assert_eq!(rootless.ai_commit_suggestion, None);
+        let notice = rootless.document.notice.as_deref().unwrap();
+        assert!(notice.contains("文件树"), "{notice}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 防重入:续写流在途时请求生成 commit message 被静默忽略(无建议、无
+    /// 提示);收尾后同一请求照常出建议。
+    #[test]
+    fn ai_commit_request_ignored_while_streaming() {
+        let dir = temp_path("ai-commit-reentry");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "# 说明\n").unwrap();
+        run_git(&dir, &["add", "."]);
+
+        let mut state = State::default();
+        // 慢 provider:保证测试在流自然收尾前完成断言
+        state.ai.provider =
+            latermd_ai::MockProvider::with_interval(std::time::Duration::from_millis(50));
+        state.document.path = Some(dir.join("README.md"));
+
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming(), "前置:流在途");
+        state.apply(Message::AiCommitRequested);
+        assert_eq!(state.ai_commit_suggestion, None, "流式中请求被忽略");
+        assert!(state.document.notice.is_none(), "忽略是静默的");
+        state.ai.finish();
+
+        state.apply(Message::AiCommitRequested);
+        assert!(state.ai_commit_suggestion.is_some(), "收尾后同一请求生效");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

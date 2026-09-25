@@ -26,6 +26,7 @@ pub fn ui(bar: &mut egui::Ui, outbox: &mut Vec<Message>) {
         });
         ui.menu_button("AI", |ui| {
             item(ui, Command::AiMockStream, outbox);
+            item(ui, Command::AiCommitMessage, outbox);
         });
     });
 }

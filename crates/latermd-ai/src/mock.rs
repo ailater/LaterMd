@@ -129,6 +129,69 @@ impl MockProvider {
     pub fn with_interval(interval: Duration) -> Self {
         Self { interval }
     }
+
+    /// commit message 场景的同步生成(菜单「AI: 生成 commit message」)。
+    ///
+    /// 不走 [`AiProvider::stream_complete`]:流式脚本拼起来是续写正文,
+    /// 对 commit 场景不适用。真实 key 接入后由网络 provider 的低温度补全
+    /// 取代(调方收口,见 app 侧 `request_commit_message` 的 TODO),本方法
+    /// 保留作演示与测试。输入是 [`crate::commit_message_prompt`] 的产物,
+    /// 按 diff 关键词合成单行 conventional 中文 subject。
+    pub fn mock_commit_subject(&self, prompt: &str) -> String {
+        commit_subject_for(prompt)
+    }
+}
+
+/// 按 diff 关键词选 conventional 前缀。关键词全部取自 diff 的文件路径与
+/// 元数据行,不会撞上 prompt 的指令文本(见 commit.rs INSTRUCTIONS 的措辞
+/// 约束);`new file mode` 排在路径规则之后——新增 README 应是 docs 而非 feat。
+fn commit_prefix(prompt: &str) -> &'static str {
+    if prompt.contains("README") || prompt.contains(".md") || prompt.contains("docs/") {
+        "docs"
+    } else if prompt.contains("Cargo.toml") || prompt.contains("Cargo.lock") {
+        "chore"
+    } else if prompt.contains("new file mode") {
+        "feat"
+    } else {
+        "chore"
+    }
+}
+
+/// 按 diff 元数据行选动作:新增 / 清理 / 更新。
+fn commit_action(prompt: &str) -> &'static str {
+    if prompt.contains("new file mode") {
+        "新增"
+    } else if prompt.contains("deleted file mode") {
+        "清理"
+    } else {
+        "更新"
+    }
+}
+
+/// 取 diff 第一处改动的文件名(`+++ b/<path>` 行的 basename);删除侧的
+/// `+++ /dev/null` 天然不匹配该前缀,取不到时回退到通用描述。
+fn changed_file(prompt: &str) -> Option<&str> {
+    let line = prompt.lines().find(|line| line.starts_with("+++ b/"))?;
+    let path = &line["+++ b/".len()..];
+    let name = path.rsplit('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// 前缀 + 动作 + (文件名 | 通用描述),拼成单行 subject。
+fn commit_subject_for(prompt: &str) -> String {
+    match changed_file(prompt) {
+        Some(file) => format!(
+            "{}: {}{}",
+            commit_prefix(prompt),
+            commit_action(prompt),
+            file
+        ),
+        None => format!(
+            "{}: {}项目文件",
+            commit_prefix(prompt),
+            commit_action(prompt)
+        ),
+    }
 }
 
 impl AiProvider for MockProvider {
@@ -232,6 +295,65 @@ mod tests {
                     assert!((MIN_CHUNK..=MAX_CHUNK).contains(&len), "块长 {len} 越界");
                 }
             }
+        }
+    }
+
+    /// commit 场景:用真实 prompt 模板喂 mock(顺带验证指令措辞不与关键词
+    /// 规则撞车),按 diff 形态产出对应前缀/动作/文件名的单行 subject。
+    #[test]
+    fn mock_commit_subject_follows_diff_keywords() {
+        let subject_for = |diff: &str| {
+            MockProvider::new().mock_commit_subject(&crate::commit::commit_message_prompt(diff))
+        };
+
+        // 新增 README:路径规则优先于 new file → docs + 新增 + 文件名
+        let new_readme = "diff --git a/README.md b/README.md\nnew file mode 100644\n\
+                          --- /dev/null\n+++ b/README.md\n@@ -0,0 +1 @@\n+# 说明\n";
+        assert_eq!(subject_for(new_readme), "docs: 新增README.md");
+
+        // 新增源码文件:feat
+        let new_src = "diff --git a/src/editor.rs b/src/editor.rs\nnew file mode 100644\n\
+                       --- /dev/null\n+++ b/src/editor.rs\n@@ -0,0 +1 @@\n+fn main() {}\n";
+        assert_eq!(subject_for(new_src), "feat: 新增editor.rs");
+
+        // 修改既有源码:chore + 更新
+        let edit = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n\
+                    +++ b/src/main.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
+        assert_eq!(subject_for(edit), "chore: 更新main.rs");
+
+        // 构建清单:路径规则命中 chore(与默认同前缀,但显式覆盖「非代码非文档」类)
+        let cargo = "diff --git a/Cargo.toml b/Cargo.toml\n--- a/Cargo.toml\n\
+                     +++ b/Cargo.toml\n@@ -1 +1 @@\n-ropey = \"1.6\"\n+ropey = \"1.7\"\n";
+        assert_eq!(subject_for(cargo), "chore: 更新Cargo.toml");
+
+        // 删除文件:+++ 侧是 /dev/null,取不到文件名 → 通用描述
+        let deleted = "diff --git a/src/old.rs b/src/old.rs\ndeleted file mode 100644\n\
+                       --- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-fn gone() {}\n";
+        assert_eq!(subject_for(deleted), "chore: 清理项目文件");
+
+        // 空 diff(防御):通用兜底
+        assert_eq!(subject_for(""), "chore: 更新项目文件");
+    }
+
+    /// 产出形态约束:单行、无反引号、前缀在约定集合内(所有分支都过一遍)。
+    #[test]
+    fn mock_commit_subject_is_single_line_with_conventional_prefix() {
+        let diffs = [
+            "new file mode 100644\n+++ b/README.md\n",
+            "+++ b/src/a.rs\n",
+            "deleted file mode 100644\n+++ /dev/null\n",
+            "",
+        ];
+        for diff in diffs {
+            let subject = MockProvider::new().mock_commit_subject(diff);
+            assert!(!subject.contains('\n'), "{subject}");
+            assert!(!subject.contains('`'), "{subject}");
+            assert!(
+                ["feat: ", "fix: ", "docs: ", "chore: "]
+                    .iter()
+                    .any(|prefix| subject.starts_with(prefix)),
+                "{subject}"
+            );
         }
     }
 }

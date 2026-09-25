@@ -10,9 +10,11 @@
 
 #![forbid(unsafe_code)]
 
+mod commit;
 mod mock;
 mod openai;
 
+pub use commit::{commit_message_prompt, truncate_diff};
 pub use mock::MockProvider;
 pub use openai::{parse_openai_sse, AiError, OpenAiProvider, API_KEY_ENV};
 

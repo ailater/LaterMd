@@ -33,6 +33,10 @@ pub enum Command {
     /// AI:Mock 流式续写(P1 联调入口,decisions-pending #3)。流式进行中
     /// 再次触发在归约侧被忽略;不绑快捷键,避免与现有键位冲突。
     AiMockStream,
+    /// AI:生成 commit message(P1):读仓库未提交改动(staged 优先),
+    /// 合成 conventional 中文 subject 并弹建议对话框。流式进行中触发
+    /// 同样被忽略(与 AiMockStream 共用防重入)。
+    AiCommitMessage,
 }
 
 impl Command {
@@ -50,13 +54,14 @@ impl Command {
             Self::ToggleTheme => "切换主题",
             Self::ToggleSidebar => "切换侧边栏",
             Self::AiMockStream => "AI: Mock 流式续写",
+            Self::AiCommitMessage => "AI: 生成 commit message",
         }
     }
 
     /// 绑定的快捷键;`None` = 不绑定(菜单里只显示名字)。
     ///
-    /// 全部文件/视图命令都有绑定,菜单栏负责展示以保证可发现性;AI 命令是
-    /// 唯一的 `None`:联调入口不抢键位,等 provider 选型定案再定。
+    /// 全部文件/视图命令都有绑定,菜单栏负责展示以保证可发现性;AI 命令
+    /// 一律 `None`:联调入口不抢键位,等 provider 选型定案再定。
     ///
     /// ToggleSidebar 取 Ctrl/Cmd+\\ 而非更常见的 Ctrl+B:Markdown 工作台的
     /// Ctrl+B 要留给将来的加粗(与主流 Markdown 编辑器一致)。
@@ -76,7 +81,7 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
             // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
-            Self::AiMockStream => return None,
+            Self::AiMockStream | Self::AiCommitMessage => return None,
         };
         Some(shortcut)
     }
@@ -92,6 +97,7 @@ impl Command {
             Self::ToggleTheme => Message::ToggleTheme,
             Self::ToggleSidebar => Message::SidebarToggled,
             Self::AiMockStream => Message::AiStart,
+            Self::AiCommitMessage => Message::AiCommitRequested,
         }
     }
 }
@@ -241,11 +247,15 @@ mod tests {
         assert_eq!(Command::ToggleTheme.message(), Message::ToggleTheme);
         assert_eq!(Command::ToggleSidebar.message(), Message::SidebarToggled);
         assert_eq!(Command::AiMockStream.message(), Message::AiStart);
+        assert_eq!(
+            Command::AiCommitMessage.message(),
+            Message::AiCommitRequested
+        );
     }
 
     /// AI 命令不绑快捷键(ask 约束:避免与现有键位冲突),其余命令全部有绑定。
     #[test]
-    fn only_ai_command_lacks_shortcut() {
+    fn only_ai_commands_lack_shortcut() {
         for cmd in [
             Command::New,
             Command::Open,
@@ -258,5 +268,6 @@ mod tests {
             assert!(cmd.shortcut().is_some(), "{cmd:?} 应有快捷键");
         }
         assert_eq!(Command::AiMockStream.shortcut(), None);
+        assert_eq!(Command::AiCommitMessage.shortcut(), None);
     }
 }

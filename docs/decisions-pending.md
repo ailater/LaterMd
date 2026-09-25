@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #14 AI commit message 的仓库定位与浮窗/复制口径（2026-09-25）
+
+- **岔路**：菜单「AI: 生成 commit message」要读「当前仓库」的未提交改动，但 LaterMD 没有「当前仓库」的概念——文档可以不在任何 git 仓库里，文件树根也可以是任意目录，还可以向上搜 `.git` 找仓库根。另外 ask 把展示（状态栏 vs 对话框）与复制（按钮 vs 自动写剪贴板）留成二选一。
+- **自动选择**：仓库定位取**当前文档所在目录，退文件树根目录**，两者皆无则提示「先保存文档或设置文件树根目录」；不在仓库/无 git 时 `git diff` 的 stderr 直接落提示行（`crates/latermd-app/src/state.rs::request_commit_message`）。不向上搜 `.git` 找根：`git diff` 在仓库子目录里跑也返回全仓改动，先找根纯属多余。展示用**浮窗对话框**（subject 要整行可读，状态栏 notice 行是错误专用、红色语义不符）；复制用**显式「复制」按钮**（`Context::copy_text`），不自动写剪贴板——未经用户动作覆盖系统剪贴板会冲掉用户正在搬运的内容。生成路径演示期为 `MockProvider::mock_commit_subject` 同步合成（流式脚本对 commit 场景不适用），真实 key 接入后改走 `OpenAiProvider` 低温度补全取首行（同函数内的 TODO）。
+- **如何改**：要支持显式指定仓库（如设置面板里选仓库根），改 `request_commit_message` 的目录解析一处即可；要改自动复制，在 `Message::AiCommitSuggestion` 归约里补 `Context::copy_text(subject)`（消息已带 subject，归约侧拿得到 ctx）；要让建议随换文档消失，在 `State::load_document` 里顺手清 `ai_commit_suggestion`（本轮刻意不清：建议是仓库级派生物，不是文档的）。
+
 ## #13 ```ai 指令卡状态行的键控口径（2026-09-25）
 
 - **岔路**：指令卡状态行要求「未执行 / 进行中 / 已完成」三态，需要回答「哪张卡算进行中/已完成」。可选：①按卡片指令文本与最近一次发起的 prompt 匹配（`AiState::last_prompt`）；②按块在文档中的序号维护每卡状态表。
