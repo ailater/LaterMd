@@ -260,11 +260,11 @@ mod tests {
     /// 造一个指定流式/最近 prompt 的 AI 状态(卡片状态的三个输入)。
     fn ai_state(streaming: bool, last_prompt: Option<&str>) -> AiState {
         AiState {
-            provider: latermd_ai::MockProvider::new(),
+            runtime: crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::new()),
             rx: None,
             streaming,
             last_prompt: last_prompt.map(str::to_owned),
-            provider_requires_key: false,
+            config: crate::ai_config::AiConfig::default(),
         }
     }
 

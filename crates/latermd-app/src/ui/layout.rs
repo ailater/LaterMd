@@ -23,11 +23,20 @@ impl LaterMdApp {
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
-        // 命令快捷键(统一清单见 `crate::command`)。eframe 在 begin_pass 之后
-        // 调 logic,本帧按键事件此刻可见;消费即从输入流移除,TextEdit 即使
-        // 聚焦也收不到;无 COMMAND 修饰的普通字符不匹配任何绑定,原样放行。
-        for cmd in crate::command::poll_shortcuts(ctx) {
-            state.apply(cmd.message());
+        // 命令快捷键(键位来自 `keymap`,用户可改;统一清单见 `crate::command`)。
+        // eframe 在 begin_pass 之后调 logic,本帧按键事件此刻可见;消费即从
+        // 输入流移除,TextEdit 即使聚焦也收不到;无 COMMAND 修饰的普通字符
+        // 不匹配任何绑定,原样放行。
+        //
+        // 设置页正在捕获键位时**不**派发命令:此刻的按键是「新键位」而不是
+        // 命令触发,否则会把 Ctrl+S 同时当成「保存」和「保存的新键位」。
+        if state.settings.capture.is_some() {
+            poll_capture(ctx, state);
+        } else {
+            let commands = crate::command::poll_shortcuts(ctx, &state.keymap);
+            for cmd in commands {
+                state.apply(cmd.message());
+            }
         }
         // 主题投影到 context:egui 主题(外壳)+ MarkdownStyle(正文,含代码
         // 高亮自动随 dark/light)。带 staleness 检查,空闲帧近零开销;首帧前
@@ -87,7 +96,7 @@ impl LaterMdApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         // ① 最外层:顶部菜单栏(全部命令的可发现性入口)
         egui::Panel::top("menubar").show(ui, |ui| {
-            crate::ui::menubar::ui(ui, &mut self.outbox);
+            crate::ui::menubar::ui(ui, &self.state.keymap, &mut self.outbox);
         });
 
         // ② 次外层:侧边栏(可折叠)。show_collapsible 原地持有 `&mut visible`,
@@ -128,13 +137,7 @@ impl LaterMdApp {
             .resizable(true)
             .default_size(500.0)
             .show(ui, |ui| {
-                crate::ui::toolbar::ui(
-                    ui,
-                    &state.document,
-                    state.theme.mode,
-                    &mut state.ai_key,
-                    outbox,
-                );
+                crate::ui::toolbar::ui(ui, &state.document, &state.keymap, outbox);
                 crate::ui::editor::ui(ui, &mut state.editor, &mut state.preview, &mut state.cursor);
             });
 
@@ -150,15 +153,23 @@ impl LaterMdApp {
         if let Some(subject) = self.state.ai_commit_suggestion.clone() {
             let (_, close) = commit_dialog(ui, &subject);
             if close.clicked() {
-                self.outbox.push(Message::AiCommitDismissed);
+                outbox.push(Message::AiCommitDismissed);
             }
         }
 
-        // ⑥ 顶层浮层:AI Provider 凭据设置(设置菜单「AI Provider…」翻开,
-        // 关闭由浮窗 X 原地翻转)。凭据读写只在归约(Message),浮窗只持草稿
-        // 与展示状态。
-        if self.state.ai_key.dialog_open {
-            crate::ai_key::ai_key_dialog(ui, &mut self.state.ai_key, &mut self.outbox);
+        // ⑥ 顶层浮层:设置对话框(外观 / 快捷键 / AI / MCP)。凭据读写只在
+        // 归约(Message),对话框只持草稿与展示状态;关闭按钮原地翻转开关。
+        if self.state.settings.open {
+            let state = &mut self.state;
+            let settings = &mut state.settings;
+            let ai_key = &mut state.ai_key;
+            let ai = &state.ai;
+            let keymap = &state.keymap;
+            let mode = state.theme.mode;
+            let close = crate::settings::dialog(ui, settings, mode, keymap, ai, ai_key, outbox);
+            if close.is_some_and(|close| close.clicked()) {
+                settings.open = false;
+            }
         }
 
         // ⑦ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
@@ -180,7 +191,96 @@ impl LaterMdApp {
                 self.outbox.push(Message::GitCheckoutCancelled);
             }
         }
+
+        // ⑧ 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
+        // (docs/ui-polish.md §4),工具栏得以只留动作。
+        egui::Panel::bottom("statusbar").show(ui, |ui| {
+            status_bar(ui, &self.state);
+        });
     }
+}
+
+/// 快捷键捕获(设置页「改键」):本帧的按键就是新键位。
+///
+/// 在归约侧消费而非 UI 侧:消费即把事件从输入流移除,编辑器收不到这个
+/// 键,也不会被 [`crate::command::poll_shortcuts`] 当成命令触发。
+/// Esc = 取消,Backspace/Delete(无修饰)= 清除绑定,其余按键走
+/// [`Message::KeymapAssign`] 归约(撞键与不可绑定的拒绝都在那里)。
+fn poll_capture(ctx: &egui::Context, state: &mut crate::state::State) {
+    let Some(cmd) = state.settings.capture else {
+        return;
+    };
+    let pressed = ctx.input_mut(|input| {
+        let mut captured = None;
+        input.events.retain(|event| match event {
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } => {
+                captured = Some((*key, *modifiers));
+                false // 消费:不让编辑器与命令层再见到它
+            }
+            _ => true,
+        });
+        captured
+    });
+    let Some((key, modifiers)) = pressed else {
+        return;
+    };
+    state.settings.capture = None;
+    match key {
+        egui::Key::Escape => {}
+        egui::Key::Backspace | egui::Key::Delete if modifiers.is_none() => {
+            state.apply(Message::KeymapCleared(cmd));
+        }
+        _ => state.apply(Message::KeymapAssign {
+            cmd,
+            shortcut: crate::keymap::Shortcut { modifiers, key },
+        }),
+    }
+}
+
+/// 底部状态栏:路径 · 行列 · 字数 · 主题 · 渲染后端 · AI · MCP。
+fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(state.document.display_name());
+        let text = state.editor.text();
+        if let Some(byte) = state.cursor.byte {
+            let (line, col) = cursor_position(text, byte);
+            ui.weak(format!("行 {line}:{col}"));
+        }
+        ui.weak(format!("{} 字", text.chars().count()));
+        separator(ui);
+        ui.weak(state.theme.mode.label());
+        ui.weak(crate::renderer_label(
+            std::env::var("LATERMD_RENDERER").ok().as_deref(),
+        ));
+        separator(ui);
+        let ai = if state.ai.is_streaming() {
+            format!("{} · 生成中", state.ai.provider_label())
+        } else {
+            state.ai.provider_label().to_owned()
+        };
+        ui.weak(ai);
+        separator(ui);
+        ui.weak("MCP: 规划中");
+    });
+}
+
+fn separator(ui: &mut egui::Ui) {
+    ui.weak("·");
+}
+
+/// 光标行列(1 起):行按换行数,列按该行字符数(中文按字计,与编辑器
+/// 的视觉列一致)。
+fn cursor_position(text: &str, byte: usize) -> (usize, usize) {
+    let byte = byte.min(text.len());
+    let before = &text[..byte];
+    let line = before.matches('\n').count() + 1;
+    let col = before.chars().rev().take_while(|ch| *ch != '\n').count() + 1;
+    (line, col)
 }
 
 /// commit message 建议浮窗;返回(复制, 关闭)按钮的响应,测试定位用
@@ -232,7 +332,7 @@ fn checkout_dialog(
             ui.label(
                 egui::RichText::new("未提交的改动将被丢弃,此操作不可撤销。")
                     .strong()
-                    .color(egui::Color32::from_rgb(235, 96, 96)),
+                    .color(crate::ui::tokens::DANGER),
             );
             if let Some(warning) = checkout_extra_warning(open_in_editor, dirty) {
                 let text = egui::RichText::new(warning);
@@ -805,21 +905,87 @@ mod tests {
         );
     }
 
-    /// AI Provider 设置浮窗的接线:`dialog_open` 时完整 `draw` 渲染浮窗不
-    /// panic,关闭后浮窗不再进入绘制路径(渲染全程不触碰凭据后端——读写
-    /// 只在归约)。
+    /// 设置对话框的接线:`settings.open` 时完整 `draw` 渲染不 panic,四个
+    /// 分页各渲一帧;关闭后不再进入绘制路径(渲染全程不触碰凭据后端——
+    /// 读写只在归约)。
     #[test]
-    fn draw_renders_ai_key_dialog_without_panic() {
+    fn draw_renders_settings_dialog_on_every_tab() {
         let mut app = LaterMdApp::default();
-        app.state.ai_key.dialog_open = true;
+        app.state.settings.open = true;
         let ctx = egui::Context::default();
-        let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
-        output.drop_without_applying_deltas();
-        assert!(app.state.ai_key.dialog_open, "渲染不翻转开关");
+        for tab in crate::settings::SettingsTab::ALL {
+            app.state.settings.tab = tab;
+            let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+            output.drop_without_applying_deltas();
+        }
+        assert!(app.state.settings.open, "渲染不翻转开关");
 
-        app.state.ai_key.dialog_open = false;
+        app.state.settings.open = false;
         let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
         output.drop_without_applying_deltas();
+    }
+
+    /// 快捷键捕获:设置页点「改键」后,本帧按键成为新键位并落 keymap;
+    /// 捕获期间该键**不**触发命令(否则 Ctrl+K 会顺手触发一次别的命令)。
+    #[test]
+    fn capture_assigns_shortcut_without_firing_command() {
+        let mut app = LaterMdApp::default();
+        app.state.settings.capture = Some(crate::command::Command::Save);
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.settings.capture, None, "捕获即结束");
+        let bound = app.state.keymap.get(crate::command::Command::Save).unwrap();
+        assert_eq!(bound.key, Key::K);
+        assert_eq!(bound.modifiers, Modifiers::COMMAND);
+    }
+
+    /// 撞键被拒:把「保存」改成与「打开」相同的键位,绑定不变并落提示。
+    #[test]
+    fn capture_rejects_conflicting_shortcut() {
+        let mut app = LaterMdApp::default();
+        app.state.settings.capture = Some(crate::command::Command::Save);
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::O,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            app.state.keymap.get(crate::command::Command::Save),
+            crate::keymap::Keymap::builtin().get(crate::command::Command::Save),
+            "撞键被拒:保存仍是原键位"
+        );
+        assert!(
+            app.state
+                .document
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("占用")),
+            "提示指出被谁占用:{:?}",
+            app.state.document.notice
+        );
     }
 
     /// 针对性警示只看「目标是否当前文档」:不在编辑器中无追加;在则按

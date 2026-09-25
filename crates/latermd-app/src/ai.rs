@@ -1,4 +1,4 @@
-//! AI 流式写作的应用侧接线(P1「AI 流式写作」第一棒,MockProvider 联调)。
+//! AI 流式写作的应用侧接线(P1「AI 流式写作」)。
 //!
 //! 后台线程由 `latermd-ai` 的 provider 自带(`AiProvider::stream_complete`
 //! 返回线程句柄),本模块只持有接收端:每帧 [`AiState::poll`] 非阻塞收空
@@ -8,23 +8,74 @@
 //!
 //! 不引入 tokio:100ms/chunk 的节奏下 `std::sync::mpsc` + 每帧
 //! `request_repaint` 足够(roadmap 阶段 1 附加验证 6 的既定结论)。
+//!
+//! **provider 可切换**(docs/ui-polish.md §6):[`AiRuntime`] 在 Mock 与
+//! OpenAI 兼容端点之间二选一,由 [`AiConfig`] + API key 现场装配,保存配置
+//! 即时生效、无需重启。
 
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use latermd_ai::{AiProvider, Chunk, MockProvider};
+use latermd_ai::{AiProvider, Chunk, MockProvider, OpenAiProvider, OpenAiSettings};
 
+use crate::ai_config::AiConfig;
 use crate::state::Message;
 
-/// AI 流式状态:provider + 当前流的接收端 + 进行中标志。
+/// 生效的 provider 运行时。
+///
+/// 枚举而非 trait 对象:只有两种实现,编译期穷尽匹配比动态分发更省事,
+/// 也让「Mock 的同步合成」这类独有方法不必塞进公共 trait。
+pub enum AiRuntime {
+    /// 内置演示 provider:不联网。
+    Mock(MockProvider),
+    /// OpenAI 兼容端点(参数见 [`OpenAiSettings`])。
+    OpenAi(OpenAiProvider),
+}
+
+impl AiRuntime {
+    /// 状态栏 / 设置页显示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Mock(_) => "Mock",
+            Self::OpenAi(_) => "OpenAI 兼容",
+        }
+    }
+
+    fn stream_complete(&self, prompt: &str, tx: Sender<Chunk>) -> JoinHandle<()> {
+        match self {
+            Self::Mock(provider) => provider.stream_complete(prompt, tx),
+            Self::OpenAi(provider) => provider.stream_complete(prompt, tx),
+        }
+    }
+
+    /// 同步生成 commit subject(commit 建议是「一行结果」,流式对它无意义)。
+    ///
+    /// Mock 走关键词合成;真实端点走一次非流式请求并取首行(模型偶尔会
+    /// 带解释性前缀行,首行即 subject 的约定在 prompt 里已写明)。
+    pub fn commit_subject(&self, prompt: &str) -> Result<String, String> {
+        match self {
+            Self::Mock(provider) => Ok(provider.mock_commit_subject(prompt)),
+            Self::OpenAi(provider) => provider
+                .complete_sync(prompt)
+                .map(|text| first_line(&text).to_owned())
+                .map_err(|error| format!("AI 请求失败:{error}")),
+        }
+    }
+}
+
+/// 正文首行(去空白;空正文给空串)。
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
+/// AI 流式状态:运行时 + 当前流的接收端 + 进行中标志。
 ///
 /// `streaming` 是普通 bool 而非 AtomicBool:发起与收尾都只发生在 UI 线程
 /// 的归约里(单线程访问),原子性无从谈起;它存在的意义是防重入 —— 流式
 /// 进行中再次触发命令在 [`AiState::start`] 入口被忽略。
 pub struct AiState {
-    /// 演示期固定 MockProvider;接真实端点后换成 trait 对象(decisions-pending #3)。
-    /// `pub(crate)` 仅为测试注入零间隔 provider。
-    pub(crate) provider: MockProvider,
+    /// 生效的 provider;`pub(crate)` 仅为测试注入零间隔 provider。
+    pub(crate) runtime: AiRuntime,
     /// 当前流的接收端;`finish` 时 drop,发送端下一次 send 失败静默收尾。
     pub(crate) rx: Option<Receiver<Chunk>>,
     /// 是否有流在途(防重入标志,见类型文档)。
@@ -35,28 +86,63 @@ pub struct AiState {
     /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与换文档
     /// ([`crate::state::State::load_document`] 里清),卡片是文档的派生物。
     pub(crate) last_prompt: Option<String>,
-    /// 当前 provider 是否需要 API key 才能发起命令:Mock 恒 `false`(无
-    /// key 也能跑);置 `true` 时所有 AI 命令入口先过
-    /// [`crate::state::State::ai_key_gate`](latermd-creds →
-    /// `LATERMD_AI_API_KEY` 都无则拦在状态栏)。主模型启用
-    /// (decisions-pending #3)的预留接线,换真实 provider 时随 provider
-    /// 一起置位。
-    pub(crate) provider_requires_key: bool,
+    /// 当前生效的 AI 配置(端点/模型/采样参数……)。与 `runtime` 同源:
+    /// 保存配置即重新装配 runtime,两者不会各说各话。
+    pub(crate) config: AiConfig,
 }
 
 impl Default for AiState {
     fn default() -> Self {
         Self {
-            provider: MockProvider::new(),
+            runtime: AiRuntime::Mock(MockProvider::new()),
             rx: None,
             streaming: false,
             last_prompt: None,
-            provider_requires_key: false,
+            config: AiConfig::default(),
         }
     }
 }
 
 impl AiState {
+    /// 按配置 + key 装配运行时。无 key 的 OpenAI 兼容端点照样装配(请求会
+    /// 失败并由命令闸门拦在前面 —— `requires_key` 为真而凭据为空时,四条
+    /// AI 命令入口先落「未配置 key」提示,见 `State::ai_key_gate`)。
+    pub fn set_provider(&mut self, config: AiConfig, api_key: Option<&str>) {
+        self.runtime = if config.provider.requires_key() {
+            let settings = OpenAiSettings {
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                temperature: Some(config.temperature),
+                top_p: Some(config.top_p),
+                max_tokens: Some(config.max_tokens),
+                system_prompt: config.system_prompt.clone(),
+                stream: config.stream,
+                timeout_secs: config.timeout_secs,
+            };
+            AiRuntime::OpenAi(OpenAiProvider::with_settings(
+                api_key.unwrap_or_default(),
+                settings,
+            ))
+        } else {
+            AiRuntime::Mock(MockProvider::new())
+        };
+        self.config = config;
+    }
+
+    /// 当前 provider 是否需要 key 才能发起命令。
+    ///
+    /// 取自**配置**而非运行时:网关判定与「实际用哪个 provider 发请求」
+    /// 是两件事 —— 配置说要 key 就是「这条命令必须带 key」,即使测试把
+    /// 运行时换成 Mock 也仍按配置拦截(不发出真实请求就能测闸门)。
+    pub fn requires_key(&self) -> bool {
+        self.config.provider.requires_key()
+    }
+
+    /// 状态栏显示名(Mock / OpenAI 兼容)。
+    pub fn provider_label(&self) -> &'static str {
+        self.runtime.label()
+    }
+
     /// 发起一次流式续写。已在流式中则忽略(防重入),返回是否真的发起了。
     ///
     /// provider 在自己的后台线程里按节奏发块,本方法同步返回;channel 无界,
@@ -66,7 +152,7 @@ impl AiState {
             return false;
         }
         let (tx, rx) = mpsc::channel();
-        let worker: JoinHandle<()> = self.provider.stream_complete(prompt, tx);
+        let worker: JoinHandle<()> = self.runtime.stream_complete(prompt, tx);
         // 不 join:接收端在 `finish` 时 drop,worker 下一次 send 失败即退出
         // (latermd-ai 的取消约定);与搜索服务同款,不滞留句柄。
         drop(worker);
@@ -137,6 +223,7 @@ impl AiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_config::ProviderKind;
     use std::time::Duration;
 
     /// 把消息序列里的正文块拼起来,便于断言。
@@ -156,7 +243,7 @@ mod tests {
     #[test]
     fn start_poll_yields_chunks_then_done() {
         let mut ai = AiState {
-            provider: MockProvider::with_interval(Duration::ZERO),
+            runtime: AiRuntime::Mock(MockProvider::with_interval(Duration::ZERO)),
             ..AiState::default()
         };
         assert!(ai.start("帮我续写这段设计文档"));
@@ -203,11 +290,11 @@ mod tests {
     #[test]
     fn failure_chunk_maps_to_ai_failed() {
         let mut ai = AiState {
-            provider: MockProvider::new(),
+            runtime: AiRuntime::Mock(MockProvider::new()),
             rx: None,
             streaming: true,
             last_prompt: None,
-            provider_requires_key: false,
+            config: AiConfig::default(),
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {
@@ -225,11 +312,11 @@ mod tests {
     #[test]
     fn disconnected_channel_without_done_becomes_ai_failed() {
         let mut ai = AiState {
-            provider: MockProvider::new(),
+            runtime: AiRuntime::Mock(MockProvider::new()),
             rx: None,
             streaming: true,
             last_prompt: None,
-            provider_requires_key: false,
+            config: AiConfig::default(),
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {
@@ -271,5 +358,40 @@ mod tests {
         ai.finish();
         assert!(!ai.is_streaming());
         assert!(ai.poll().is_empty(), "finish 丢弃接收端,不再产出消息");
+    }
+
+    /// 运行时切换:Mock 不需要 key;OpenAI 兼容需要 key,且配置被记进
+    /// `config`(闸门与状态栏显示名随之变化)。
+    #[test]
+    fn set_provider_switches_runtime_and_key_requirement() {
+        let mut ai = AiState::default();
+        assert!(!ai.requires_key());
+        assert_eq!(ai.provider_label(), "Mock");
+
+        let config = AiConfig {
+            provider: ProviderKind::OpenAiCompatible,
+            model: "deepseek-chat".to_owned(),
+            base_url: "https://api.deepseek.com/v1".to_owned(),
+            ..AiConfig::default()
+        };
+        ai.set_provider(config.clone(), Some("placeholder-key"));
+        assert!(ai.requires_key());
+        assert_eq!(ai.provider_label(), "OpenAI 兼容");
+        assert_eq!(ai.config, config, "配置跟着运行时一起换");
+
+        // 切回 Mock:闸门随之打开
+        ai.set_provider(AiConfig::default(), None);
+        assert!(!ai.requires_key());
+    }
+
+    /// 首行提取:commit subject 只取第一行(模型常带解释性后续行)。
+    #[test]
+    fn first_line_takes_only_the_subject() {
+        assert_eq!(
+            first_line("docs: 新增 README\n\n说明……"),
+            "docs: 新增 README"
+        );
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("  \n x"), "");
     }
 }

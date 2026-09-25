@@ -17,9 +17,6 @@ use eframe::egui;
 /// `State::settings_dir` 同款口径;后端可用性(`backend_ok`)由启动探测与
 /// 保存/清除结果维护,状态行凭它三态分流。
 pub struct AiKeyState {
-    /// 设置浮窗是否可见(设置菜单「AI Provider…」打开、浮窗 X 关闭,均为
-    /// UI 关注点原地翻转,同 `SidebarState::visible` 的口径)。
-    pub dialog_open: bool,
     /// 密码框草稿。仅 UI 粘合用:保存成功即清空,生命周期不超出本结构,
     /// 绝不进 settings.json 等任何落盘物。
     pub draft: String,
@@ -34,7 +31,6 @@ pub struct AiKeyState {
 impl Default for AiKeyState {
     fn default() -> Self {
         Self {
-            dialog_open: false,
             draft: String::new(),
             configured: false,
             // 乐观默认:真实可用性由启动探测(`AiKeyState::probe`)修正,
@@ -96,71 +92,49 @@ impl AiKeyState {
     }
 }
 
-/// 设置菜单里的「AI Provider…」入口:点击翻开设置浮窗(原地翻转,不发
-/// 消息——开关是纯 UI 关注点,同侧边栏把手口径)。独立成函数便于点击测试。
-pub(crate) fn ai_provider_entry(ui: &mut egui::Ui, key: &mut AiKeyState) -> egui::Response {
-    let response = ui.button("AI Provider…");
-    if response.clicked() {
-        key.dialog_open = true;
-    }
-    response
-}
-
-/// 设置浮窗(顶层 Window,由 `ui::layout` 在浮层区按 `dialog_open` 调用):
-/// 密码框 + 保存/清除 + 状态行。点击只发消息,凭据读写在归约;返回
-/// (保存, 清除)按钮响应供测试定位,窗口未绘制(已关闭)时为 `None`。
-pub(crate) fn ai_key_dialog(
+/// API key 编辑区(嵌入设置对话框的 AI 页,docs/ui-polish.md §6)。
+///
+/// 原形态是工具栏「设置」菜单里的独立浮窗;AI 配置页有 8 个字段,浮窗
+/// 装不下,故改为可被设置页嵌入的一块内容(本身不再开窗口)。返回
+/// (保存, 清除)按钮响应供测试定位。
+pub(crate) fn key_editor(
     ui: &mut egui::Ui,
     key: &mut AiKeyState,
     outbox: &mut Vec<Message>,
-) -> Option<(egui::Response, egui::Response)> {
-    let mut buttons = None;
-    // open 标志先拷出再写回:`.open(&mut …)` 与闭包体对 key 的可变借用
-    // 不能同时成立,X 的翻转经局部变量中转
-    let mut open = key.dialog_open;
-    egui::Window::new("设置 · AI Provider")
-        .default_pos([80.0, 120.0])
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ui.ctx(), |ui| {
-            ui.label(
-                "API key 保存到系统凭据(Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service),不写入任何文件。",
-            );
-            ui.weak("未配置或后端不可用时,AI 命令回退环境变量 LATERMD_AI_API_KEY。");
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut key.draft)
-                    .password(true)
-                    .hint_text("API key"),
-            );
-            ui.horizontal(|ui| {
-                // 空白草稿/未配置时目标状态已达成,禁用防误触;归约侧仍有
-                // 同款防线(BlankSecret 拒绝、删除幂等)
-                let save = ui.add_enabled(!key.draft.trim().is_empty(), egui::Button::new("保存"));
-                if save.clicked() {
-                    outbox.push(Message::AiKeySaved);
-                }
-                let clear = ui.add_enabled(key.configured, egui::Button::new("清除"));
-                if clear.clicked() {
-                    outbox.push(Message::AiKeyCleared);
-                }
-                buttons = Some((save, clear));
-            });
-            let text = egui::RichText::new(key.status_text());
-            let text = if !key.backend_ok {
-                // 与回滚 dirty 警示同档黄:可行动的降级告知
-                text.color(egui::Color32::from_rgb(235, 180, 60))
-            } else if key.configured {
-                text.strong()
-                    .color(egui::Color32::from_rgb(96, 200, 120))
-            } else {
-                text.weak()
-            };
-            ui.label(text);
-        });
-    key.dialog_open = open;
-    buttons
+) -> (egui::Response, egui::Response) {
+    ui.label(
+        "API key 保存到系统凭据(Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service),不写入任何文件。",
+    );
+    ui.weak("未配置或后端不可用时,AI 命令回退环境变量 LATERMD_AI_API_KEY。");
+    ui.add(
+        egui::TextEdit::singleline(&mut key.draft)
+            .password(true)
+            .hint_text("API key"),
+    );
+    let buttons = ui.horizontal(|ui| {
+        // 空白草稿/未配置时目标状态已达成,禁用防误触;归约侧仍有同款
+        // 防线(BlankSecret 拒绝、删除幂等)
+        let save = ui.add_enabled(!key.draft.trim().is_empty(), egui::Button::new("保存"));
+        if save.clicked() {
+            outbox.push(Message::AiKeySaved);
+        }
+        let clear = ui.add_enabled(key.configured, egui::Button::new("清除"));
+        if clear.clicked() {
+            outbox.push(Message::AiKeyCleared);
+        }
+        (save, clear)
+    });
+    let text = egui::RichText::new(key.status_text());
+    let text = if !key.backend_ok {
+        // 与回滚 dirty 警示同档黄:可行动的降级告知
+        text.color(crate::ui::tokens::WARN)
+    } else if key.configured {
+        text.strong().color(crate::ui::tokens::OK)
+    } else {
+        text.weak()
+    };
+    ui.label(text);
+    buttons.inner
 }
 
 #[cfg(test)]
@@ -369,7 +343,7 @@ mod tests {
     fn ai_stream_blocked_without_key_when_provider_requires_it() {
         std::env::remove_var(latermd_creds::API_KEY_ENV);
         let mut state = state_in_memory();
-        state.ai.provider_requires_key = true;
+        state.ai.config.provider = crate::ai_config::ProviderKind::OpenAiCompatible;
 
         state.apply(Message::AiStart);
         assert!(!state.ai.is_streaming(), "无 key 不发起流");
@@ -410,7 +384,9 @@ mod tests {
             .creds
             .set_ai_api_key("placeholder-gated")
             .unwrap();
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming(), "有 key 照常发起");
         state.ai.finish();
@@ -421,8 +397,10 @@ mod tests {
     fn mock_provider_runs_without_key() {
         std::env::remove_var(latermd_creds::API_KEY_ENV);
         let mut state = state_in_memory();
-        assert!(!state.ai.provider_requires_key, "前置:Mock 不需要 key");
-        state.ai.provider = latermd_ai::MockProvider::with_interval(std::time::Duration::ZERO);
+        assert!(!state.ai.requires_key(), "前置:Mock 不需要 key");
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
@@ -430,48 +408,14 @@ mod tests {
         state.ai.finish();
     }
 
-    /// 设置菜单入口:点击翻开浮窗(原地翻转,仅渲染不翻转)。
+    /// 编辑区交互:空草稿时「保存」禁用(点击不产消息);填入草稿并置已
+    /// 配置后,「保存」「清除」点击分别产 AiKeySaved / AiKeyCleared。
+    /// 按钮点击归属要求指针先停在目标上(实测),三帧节奏与 layout.rs 的
+    /// 浮窗测试一致。
     #[test]
-    fn ai_provider_entry_click_opens_dialog() {
-        let ctx = egui::Context::default();
-        let mut key = AiKeyState::default();
-        let rect = Cell::new(Rect::NOTHING);
-
-        ctx.run_ui(RawInput::default(), |ui| {
-            rect.set(ai_provider_entry(ui, &mut key).rect);
-        })
-        .drop_without_applying_deltas();
-        assert!(!key.dialog_open, "仅渲染不打开");
-
-        let center = rect.get().center();
-        let click = |pressed| Event::PointerButton {
-            pos: center,
-            button: PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        ctx.run_ui(
-            RawInput {
-                events: vec![Event::PointerMoved(center), click(true), click(false)],
-                ..Default::default()
-            },
-            |ui| {
-                ai_provider_entry(ui, &mut key);
-            },
-        )
-        .drop_without_applying_deltas();
-        assert!(key.dialog_open, "点击翻开浮窗");
-    }
-
-    /// 浮窗交互:空草稿时「保存」禁用(点击不产消息);填入草稿并置已配置
-    /// 后,「保存」「清除」点击分别产 AiKeySaved / AiKeyCleared;X 关闭原地
-    /// 收起浮窗。Window 层按钮的点击归属要求指针先停在目标上(实测),
-    /// 三帧节奏与 layout.rs 的浮窗测试一致。
-    #[test]
-    fn dialog_buttons_send_messages_and_close_button_dismisses() {
+    fn key_editor_buttons_send_messages() {
         let ctx = egui::Context::default();
         let mut key = AiKeyState {
-            dialog_open: true,
             creds: Credentials::in_memory(),
             ..AiKeyState::default()
         };
@@ -479,7 +423,7 @@ mod tests {
         let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
 
         ctx.run_ui(RawInput::default(), |ui| {
-            let (save, clear) = ai_key_dialog(ui, &mut key, &mut outbox).expect("已开必然绘制");
+            let (save, clear) = key_editor(ui, &mut key, &mut outbox);
             rects.set((save.rect, clear.rect));
         })
         .drop_without_applying_deltas();
@@ -510,14 +454,14 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    ai_key_dialog(ui, &mut key, &mut outbox);
+                    key_editor(ui, &mut key, &mut outbox);
                 },
             )
             .drop_without_applying_deltas();
         }
         assert!(outbox.is_empty(), "禁用按钮不产消息:{outbox:?}");
 
-        // 填草稿:保存按钮产 AiKeySaved;置已配置后清除按钮产 AiKeyCleared
+        // 填草稿 + 已配置:保存/清除各自产消息
         key.draft = "placeholder-ui".into();
         key.configured = true;
         for events in [
@@ -531,7 +475,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    ai_key_dialog(ui, &mut key, &mut outbox);
+                    key_editor(ui, &mut key, &mut outbox);
                 },
             )
             .drop_without_applying_deltas();
@@ -539,23 +483,34 @@ mod tests {
         assert_eq!(outbox, vec![Message::AiKeySaved]);
         outbox.clear();
 
-        // 状态行三态各渲一帧不 panic(文案断言已在 status_text 纯函数覆盖);
-        // 渲染不触碰 dialog_open(翻转只属于入口点击与 X 关闭)
-        for configured in [false, true] {
+        for events in [
+            vec![Event::PointerMoved(clear_center)],
+            vec![click(clear_center, true)],
+            vec![click(clear_center, false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    key_editor(ui, &mut key, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::AiKeyCleared]);
+        outbox.clear();
+
+        // 三态状态行各渲一帧不 panic(文案断言已在 status_text 覆盖)
+        for (configured, backend_ok) in [(false, true), (true, true), (false, false)] {
             key.configured = configured;
-            key.backend_ok = true;
+            key.backend_ok = backend_ok;
             ctx.run_ui(RawInput::default(), |ui| {
-                ai_key_dialog(ui, &mut key, &mut outbox);
+                key_editor(ui, &mut key, &mut outbox);
             })
             .drop_without_applying_deltas();
-            assert!(key.dialog_open, "渲染本身不收起浮窗");
             assert!(outbox.is_empty());
         }
-        key.backend_ok = false;
-        ctx.run_ui(RawInput::default(), |ui| {
-            ai_key_dialog(ui, &mut key, &mut outbox);
-        })
-        .drop_without_applying_deltas();
-        assert!(outbox.is_empty());
     }
 }
