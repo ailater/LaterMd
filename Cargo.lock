@@ -2248,6 +2248,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "latermd-ai"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "latermd-app"
 version = "0.1.0"
 dependencies = [

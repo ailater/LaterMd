@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #9 流式失败信号与 OpenAI adapter 默认值（2026-09-25）
+
+- **岔路**：`latermd-ai` 的 `Chunk` 按 ask 固定为 `{ delta, done }` 两字段，但流式请求失败（HTTP 非 2xx / 连接中断 / 读超时）没有天然的信号位；另外 OpenAI adapter 的默认端点、模型名与是否引入额外环境变量，ask 未规定。
+- **自动选择**：约定「`done == true` 且 `delta` 非空 = 流失败，`delta` 是面向用户的错误描述（不写入文档）；`done == true` 且 `delta` 为空 = 成功结束」，见 `crates/latermd-ai/src/lib.rs` 的 `Chunk` 文档。默认端点 `https://api.openai.com/v1`、默认模型 `gpt-4o-mini`，可分别用 `LATERMD_AI_BASE_URL`、`LATERMD_AI_MODEL` 覆盖（key 仍只有 `LATERMD_AI_API_KEY`，decisions-pending #3 不变）。
+- **如何改**：若希望失败信号更显式（如 `Chunk` 加 `error` 字段或改 enum），改动点集中在 `latermd-ai` 的 `Chunk` 定义与 `openai.rs::run`，消费方尚只有 mock 联调链路，无迁移负担；默认模型/端点改 `OpenAiProvider` 两个 `DEFAULT_*` 常量即可。
+
 ## #8 搜索去抖到点发起从 `ui::sidebar` 挪进归约侧（2026-09-25）
 
 - **岔路**：修复「清空搜索输入 / 输入后切走页签后 `debounce_due` 残留过期时刻，`layout.rs` 每帧 `request_repaint_after(ZERO)` 满帧空转」时，评审给了两个薄修：①去掉 `ui::sidebar` 到点判断里的非空输入条件；②`layout.rs` 对已过期的 due 不再要帧。①只修「清空输入」主路径，「输入后切到 Files/Outline 页签」路径 `search_panel` 不渲染、无人清计时，依旧空转；②会打断接力最后一环——到点帧 reduce 先于 ui 执行，reduce 见 remaining==0 不要帧后，同帧 `ui::sidebar` 发出的 `SearchRequested` 滞留 outbox，无下一帧 apply，表现为「输入完不动鼠标搜索永不发起」。
