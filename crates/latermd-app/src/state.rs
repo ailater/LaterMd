@@ -312,6 +312,8 @@ impl State {
             Message::AiDone => self.ai.finish(),
             Message::AiFailed(error) => {
                 self.ai.finish();
+                // 失败不算完成:指令卡状态随 last_prompt 清空回到未执行
+                self.ai.forget_last_prompt();
                 self.document.notice = Some(error);
             }
             Message::AiLinkClicked { prompt } => match prompt {
@@ -568,6 +570,8 @@ impl State {
     /// 取消约定),重绘驱动随标志清零自然停;与搜索换根复位同款静默。
     fn load_document(&mut self, path: Option<PathBuf>, text: &str) {
         self.ai.finish();
+        // 指令卡是文档的派生物:新文档的 ```ai 块与新流无关,状态一并复位
+        self.ai.forget_last_prompt();
         self.editor.load(text);
         self.document.path = path;
         self.document.notice = None;
@@ -1227,6 +1231,8 @@ mod tests {
         assert!(!state.ai.is_streaming(), "失败同样收尾");
         assert_eq!(state.document.notice.as_deref(), Some("额度用尽"));
         assert_eq!(state.editor.text(), before, "失败文本不写入文档");
+        // 失败不算完成:指令卡的状态键一并清空(卡片回「未执行」)
+        assert_eq!(state.ai.last_prompt, None);
     }
 
     /// ai:// 链接点击归约:Ok(prompt) 复用流式启动路径(补空行 + 发起),
@@ -1264,6 +1270,11 @@ mod tests {
         assert!(!state.ai.is_streaming());
         assert!(state.editor.text().len() > base.len() + 2, "AI 文本已追加");
         assert!(state.editor.is_dirty(), "AI 写入置 dirty");
+        // 状态键:自然收尾保留最近 prompt,指令卡凭它显示「已完成」
+        assert_eq!(
+            state.ai.last_prompt.as_deref(),
+            Some("续写一段 Markdown 介绍")
+        );
 
         // 防重入:慢 provider 发起后再点链接,忽略且不补空行
         state.ai.provider =

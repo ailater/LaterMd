@@ -29,6 +29,12 @@ pub struct AiState {
     pub(crate) rx: Option<Receiver<Chunk>>,
     /// 是否有流在途(防重入标志,见类型文档)。
     pub(crate) streaming: bool,
+    /// 最近一次真实发起的 prompt 原文(AI 指令卡的状态匹配键):
+    /// 指令文本与它相等 → 流式中「进行中」/结束「已完成」,否则「未执行」。
+    /// 只增不清是刻意的:`finish` 后保留才能显示「已完成」,失效时机只有
+    /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与换文档
+    /// ([`crate::state::State::load_document`] 里清),卡片是文档的派生物。
+    pub(crate) last_prompt: Option<String>,
 }
 
 impl Default for AiState {
@@ -37,6 +43,7 @@ impl Default for AiState {
             provider: MockProvider::new(),
             rx: None,
             streaming: false,
+            last_prompt: None,
         }
     }
 }
@@ -57,6 +64,7 @@ impl AiState {
         drop(worker);
         self.rx = Some(rx);
         self.streaming = true;
+        self.last_prompt = Some(prompt.to_owned());
         true
     }
 
@@ -108,6 +116,13 @@ impl AiState {
     /// 是否有流在途(驱动流式期间持续重绘)。
     pub fn is_streaming(&self) -> bool {
         self.streaming
+    }
+
+    /// 清掉「最近一次发起的 prompt」(指令卡状态随之回到未执行)。只在两个
+    /// 失效时机调用:流失败归约、换文档(`State::load_document`);`finish`
+    /// 本身不清,否则流刚结束「已完成」就不可见。
+    pub(crate) fn forget_last_prompt(&mut self) {
+        self.last_prompt = None;
     }
 }
 
@@ -183,6 +198,7 @@ mod tests {
             provider: MockProvider::new(),
             rx: None,
             streaming: true,
+            last_prompt: None,
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {
@@ -203,6 +219,7 @@ mod tests {
             provider: MockProvider::new(),
             rx: None,
             streaming: true,
+            last_prompt: None,
         };
         let (tx, rx) = mpsc::channel();
         tx.send(Chunk {

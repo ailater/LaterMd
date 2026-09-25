@@ -4,6 +4,19 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #13 ```ai 指令卡状态行的键控口径（2026-09-25）
+
+- **岔路**：指令卡状态行要求「未执行 / 进行中 / 已完成」三态，需要回答「哪张卡算进行中/已完成」。可选：①按卡片指令文本与最近一次发起的 prompt 匹配（`AiState::last_prompt`）；②按块在文档中的序号维护每卡状态表。
+- **自动选择**：①（`crates/latermd-app/src/ui/preview.rs::AiLinkHandler::card_status`）。理由：防重入保证同时至多一个流，「哪张卡发起」由 prompt 文本即足以判定；序号表在用户增删块时会整体错位，还要处理失效清理；文本匹配零新增结构。已知并接受的简化：**两卡片指令文本完全相同则状态同亮**；指令文本被编辑后状态回「未执行」（文本变了=另一条指令，语义自洽）。菜单入口（`AiStart`）的 prompt 是文档尾部拼装文本，不会与任何指令文本相等，菜单流不点亮卡片。
+- **失效时机**：`last_prompt` 只在两处清空——流失败（`Message::AiFailed` 归约，失败不算完成）与换文档（`State::load_document`，卡片是文档的派生物）；`AiDone` 后保留，让「已完成」可见。
+- **如何改**：要按序号键控（同文卡片状态独立），在 `PreviewState` 加 `card_status: HashMap<usize, AiCardStatus>` 并把 `block_code_widget` 的 `index` 传进消息，即可替换匹配逻辑；消息归约与 vendored 扩展点无需动。
+
+## #12 ```ai 指令块走最小 vendor 改动（代码块级 block widget 扩展点）（2026-09-25）
+
+- **岔路**：任务优先「只用 app 侧扩展点，不动 vendor」。实测 vendored `LinkHandler::is_block_widget`/`block_widget`（`vendor/egui_markdown/src/link.rs`）只作用于 **`Token::Link` 的 href**（判定点 `layout.rs` `append_link_to_job`/`needs_segmentation`/`build_layout`），**够不到围栏代码块**——roadmap 阶段 3 写的「`.is_block_widget()` → `.block_widget()`」对 ```ai 围栏不成立。app 侧唯一代码块扩展点是 `code_block_buttons` 头部 overlay 回调（回调签名 `(ui, text, lang)`，无块序号/span），画不出「卡片 + 状态行」，也拿不到稳定块身份（AGENTS §6.7 的 id 稳定性无从谈起）。
+- **自动选择**：给 vendored `LinkHandler` 加**代码块级 block widget** 两方法（`is_block_code_widget(language)` / `block_code_widget(ui, text, language)`，按 info string 判定），与链接 block widget 同构：命中即 segment break，在 `render_token_range` 独立渲染；`needs_segmentation` / `build_layout` / `render_token_range` 三处按上游既有「必须同步」约定同步改。类别 **①上游可合**（通用能力、带 tests/block_code_widget.rs，可 cherry-pick 提上游 PR），登记见 `vendor/README.md` 提交级登记表与 `vendor/egui_markdown/README.md` 差异表 #7。
+- **如何改**：若不认可动 vendor，revert 该 ① 类 commit 并把 app 侧退到 `code_block_buttons` overlay 形态（功能降级：状态行并入代码块头、卡片视觉消失、多卡身份按内容 hash 近似）——代价已实测如上，不建议。
+
 ## #11 `ai://` 链接协议语义与 prompt 编解码口径（2026-09-25）
 
 - **岔路**：roadmap 阶段 3 对「ai:// 链接协议」只写了「`.link_style()` + `.click()` 拦截」的实现方式，协议本体没有定稿——已实现动作是哪个、未实现动作点了怎么办、prompt 怎么编码、`+` 算不算空格，都得有个说法才能写测试。另实测发现 vendored 的 `LinkStyle.underline` 字段（`vendor/egui_markdown/src/link.rs:86`）当前**没有任何读取点**。

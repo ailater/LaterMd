@@ -12,6 +12,7 @@
 | 4 | 删除本目录 `rust-toolchain.toml` | 根目录已钉 1.98.0,子目录文件会遮蔽根配置 |
 | 5 | **新增 `Markdown::spans` 平行数组**(parser.rs / types.rs) | 顶层 token 的源码 byte range,连续无洞(`spans.len() == tokens.len()`)。大纲导航与 Live Preview 的 prerequisite,LaterMD 定制 |
 | 6 | pulldown-cmark 钉 0.13.4 | 上游写 `0.13.0`,锁定补丁版本 |
+| 7 | **`LinkHandler` 新增 `is_block_code_widget` / `block_code_widget`**(link.rs / layout.rs / label.rs / tests/block_code_widget.rs) | 围栏代码块级 block widget 扩展点:按 info string 判定(`is_block_widget` 按 href,只覆盖链接,够不到 ```ai 围栏),命中后与链接 block widget 同款走 segment break 独立渲染;`needs_segmentation` / `build_layout` / `render_token_range` 三处与既有约定保持同步。上游可合的通用能力(①类),AI 指令卡是首个消费方 |
 
 `bash check.sh` 六项门禁在本目录运行时作用于整个 LaterMD workspace。
 
