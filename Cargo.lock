@@ -2265,6 +2265,7 @@ dependencies = [
  "egui_markdown_style",
  "grep-searcher",
  "ignore",
+ "latermd-ai",
  "latermd-editor",
  "latermd-export",
  "latermd-md",

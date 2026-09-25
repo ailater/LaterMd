@@ -17,6 +17,9 @@ impl LaterMdApp {
             outbox,
             window_title,
         } = self;
+        // AI 后台流式收流:channel 里的 chunk 翻成 Message 并入本帧归约
+        // (文本回编辑器只走 Message,后台线程不触碰 UI 状态)
+        outbox.extend(state.poll_ai());
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
@@ -50,6 +53,11 @@ impl LaterMdApp {
             ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
         }
         if state.search.is_running() {
+            ctx.request_repaint();
+        }
+        // AI 流式的重绘驱动:chunk 到达即要在下一帧收流归约,预览才跟得上
+        // 100ms/chunk 的节奏;AiDone 归约清标志后自然停。
+        if state.ai.is_streaming() {
             ctx.request_repaint();
         }
 
@@ -358,6 +366,38 @@ mod tests {
             "到点清空后不再安排任何重绘(过期 due 曾致满帧空转)"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AI 流式收流接线:reduce 每帧从 AI channel 取 chunk 翻成 Message 归约,
+    /// 正文追加进编辑器、结束块清流式标志(后台线程 → mpsc → Message →
+    /// apply 的完整链路;不经 provider 线程,零时序依赖)。
+    #[test]
+    fn reduce_drains_ai_chunks_into_editor() {
+        let mut app = LaterMdApp::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(latermd_ai::Chunk {
+            delta: "第一块".into(),
+            done: false,
+        })
+        .unwrap();
+        tx.send(latermd_ai::Chunk {
+            delta: String::new(),
+            done: true,
+        })
+        .unwrap();
+        app.state.ai.rx = Some(rx);
+        app.state.ai.streaming = true;
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+
+        assert!(
+            app.state.editor.text().ends_with("第一块"),
+            "chunk 已按序归约追加到文档末尾"
+        );
+        assert!(app.state.editor.is_dirty(), "AI 写入置 dirty");
+        assert!(!app.state.ai.is_streaming(), "AiDone 已归约收尾");
     }
 
     /// 主题切换消息走完整归约链:同帧内 egui 主题已翻转(设置菜单点击的下一

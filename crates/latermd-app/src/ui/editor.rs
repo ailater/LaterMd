@@ -322,6 +322,95 @@ mod tests {
         assert_eq!(preview.text, "一二");
     }
 
+    /// AI 流式追加(程序化 insert_chars)后的 undo 语义,实测钉住:
+    /// TextEdit 内建 undoer 只在绘制时喂状态,看不到程序化插入 —— 流式
+    /// 结束后第一次 Ctrl+Z 整体回退到最近一次用户编辑的快照(即「一步
+    /// 撤销整段 AI 续写」),再按 Ctrl+Shift+Z 重做可恢复 AI 文本。
+    #[test]
+    fn undo_after_ai_append_reverts_whole_stream() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(
+            &ctx,
+            vec![Event::Text("一".into())],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        // 空转让「一」成为已提交的撤销点(undoer 按 stable_time 切组)
+        frame(
+            &ctx,
+            Vec::new(),
+            1.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        // AI 流式追加(与 Message::AiChunk 归约同路径:程序化 insert_chars)
+        editor.insert_chars(editor.len_chars(), "AI续写内容");
+        frame(
+            &ctx,
+            Vec::new(),
+            1.6,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(editor.text(), "一AI续写内容");
+
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame(
+            &ctx,
+            vec![undo],
+            1.7,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            editor.text(),
+            "一",
+            "一步撤销整段 AI 续写(回到最近用户编辑快照)"
+        );
+
+        let redo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        };
+        frame(
+            &ctx,
+            vec![redo],
+            1.8,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(editor.text(), "一AI续写内容", "redo 恢复 AI 文本");
+    }
+
     /// 大纲跳转:消费 jump_to 后,TextEdit 持久光标被覆写到目标字符偏移,
     /// 焦点回到编辑器;下一帧输入从新位置继续。
     #[test]
