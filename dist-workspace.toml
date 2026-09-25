@@ -1,0 +1,35 @@
+# cargo-dist 发布配置(docs/roadmap.md「打包」条目;AGENTS.md §5 三平台矩阵)
+# release.yml 由 `dist generate` 生成并维护,禁止手改(dist 会把手改视为 error);
+# macOS universal2 dmg 走自建 custom job,不经本文件的 installer 通道。
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# CI 内安装的 dist 版本钉死(生成的 release.yml 里 dist installer URL 由此读取)
+cargo-dist-version = "0.33.0"
+# CI 后端与发布渠道:GitHub Release(AGENTS.md §5 分发策略)
+ci = "github"
+hosting = "github"
+# 不产 shell/powershell/homebrew installer:GUI 桌面应用用不上脚本安装器;
+# macOS 走自建 cask(crazykun/homebrew-ailater,universal2 dmg + postflight 去 quarantine),
+# dist 自带的 homebrew installer 产 formula(引 tar.xz)而非 cask,故关闭。
+installers = []
+# 三平台五目标矩阵(AGENTS.md §5):Linux x64 / macOS 双架构(由 merge-tasks 合并
+# 到 macos-14 单 job,见下)/ Windows x64 + ARM64(xwin 容器交叉编)
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+# macOS 双架构合并到 macos-14(ARM runner)单 job 交叉编 x86_64:
+# ①universal2 dmg 的 lipo 前置(同一 job 内产出两架构二进制);
+# ②摆脱 macos-15-intel runner 退场风险(roadmap 风险登记册)。
+# dist 0.33 无 universal2-apple-darwin target(上游 config/v1/mod.rs 标 FIXME),
+# dmg 合成由后续模块的自建 custom job 完成。
+merge-tasks = true
+
+[dist.github-custom-runners.x86_64-apple-darwin]
+runner = "macos-14"

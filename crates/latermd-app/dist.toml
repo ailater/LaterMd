@@ -1,0 +1,6 @@
+# dist 资产名 shadow:crate 名保持 latermd-app(目录/-p 引用零改动),
+# 发布资产与二进制统一叫 latermd —— 资产命名 = latermd-{target-triple}.{ext},
+# 不含版本号,GitHub releases/latest/download/ 热链可用,cask URL 模板依赖此格式
+# (roadmap 风险登记册 #7:命名不随版本变)。
+[package]
+name = "latermd"

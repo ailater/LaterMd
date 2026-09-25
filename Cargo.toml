@@ -17,3 +17,8 @@ repository = "https://github.com/ailater/LaterMd"
 
 [profile.release]
 # 默认即可;后续按 M0 帧率数据再调 opt-level/lto
+
+# cargo-dist 构建专用 profile(dist 默认;资产用 thin LTO 减体积)
+[profile.dist]
+inherits = "release"
+lto = "thin"
