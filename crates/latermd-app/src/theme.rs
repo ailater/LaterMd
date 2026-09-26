@@ -357,9 +357,11 @@ fn apply_shell_to(style: &mut egui::Style) {
     v.extreme_bg_color = c.code_bg;
     v.faint_bg_color = c.faint;
     v.hyperlink_color = c.accent;
-    // 选区:浅蓝底、无线(egui 默认蓝底蓝框太重)
+    // 选区:浅蓝底、正文色文字。egui 0.36 里 `selection.stroke` 兼任
+    // **选中文字的颜色**(TextEdit 把选中字形重涂成它,选中态 label 的
+    // 前景也取它),设成 NONE 会让选中文字全透明——蓝底上看不见字。
     v.selection.bg_fill = c.selected_bg;
-    v.selection.stroke = egui::Stroke::NONE;
+    v.selection.stroke = egui::Stroke::new(1.0, c.text);
     // 圆角:控件 6(WorkBuddy 的圆润感)。0.36 的窗口/菜单圆角字段已不在
     // Visuals/Spacing 的公开面,浮窗圆角走 egui 出厂值,不做覆盖
     // 滚动条:出厂 12px 偏粗,WorkBuddy 是细浅条
@@ -828,5 +830,24 @@ mod tests {
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
         let restored = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
         assert_eq!(restored, standard, "来回切换不累积缩放");
+    }
+
+    /// 选区文字可见性回归:egui 0.36 的 `selection.stroke.color` 同时是
+    /// **选中文字的颜色**(TextEdit 把选中字形重涂成它,选中态 label 的
+    /// 前景也取它)。曾设成 `Stroke::NONE`,选中文字全透明,蓝底上看不见
+    /// 字;两套主题的选中文字都必须不透明、且与选区底色不同。
+    #[test]
+    fn selection_text_stays_visible_in_both_themes() {
+        let ctx = egui::Context::default();
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let visuals = ctx.style_of(theme).visuals.clone();
+            let text = visuals.selection.stroke.color;
+            assert_eq!(text.a(), 255, "{theme:?}: 选中文字颜色不透明");
+            assert_ne!(
+                text, visuals.selection.bg_fill,
+                "{theme:?}: 选中文字与选区底色不同"
+            );
+        }
     }
 }

@@ -5,6 +5,11 @@
 //! App trait 采用 egui 0.36 的 `logic` / `ui` 二分,三栏布局见 `ui::layout`
 //! (docs/adr-005)。
 
+// Windows 发布版按 GUI 子系统链接,双击 exe 不再弹控制台黑框;debug 构建
+// 保留控制台,stdout/stderr 可见。MCP stdio 通道不受影响:客户端以管道
+// 方式拉起子进程,GUI 子系统下重定向的 stdio 句柄照常可读写。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ai;
 mod ai_config;
 mod ai_key;
