@@ -20,6 +20,7 @@
 [x] P2.5 界面打磨   2026-09-26 全部落地:批次 B-light(图标/工具栏/状态栏/设置对话框/快捷键可改绑/AI 配置页)+ 批次 B 本体(三态主题含跟随系统 + themes/*.ron 皮肤文件 + 标准/紧凑密度),设计规格见 docs/ui-polish.md
 [x] MCP 附加项   2026-09-26 落地(原登记为「P3 之后」):latermd-search 下沉 + latermd-mcp 五只读工具 + stdio/HTTP 双通道 + 设置页 MCP 页与状态栏;默认关闭,只绑 127.0.0.1。详见 [mcp-plan.md](mcp-plan.md)
 [x] P3 深水区    Live Preview v1 + [[wikilink]] + 大纲预览跳转 均已于 2026-09-26 落地;剩余增强 = Live Preview v2(内联半隐藏)、Live Preview 选区扩展、反向链接面板
+多标签已落地(2026-09-26,用户追加需求)
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
