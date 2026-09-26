@@ -137,7 +137,9 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![0..text.len()]
+            // 不用 `vec![0..len]`:clippy 的 single_range_in_vec_init 会把
+            // 它读成「长度为 1 的 Range 序列」的误写;这里确实只要一个区间
+            std::iter::once(0..text.len()).collect()
         };
     }
     // ② 连续化:每块**吃到下一块的内容起点**(块间空行归前一块),最后一块
