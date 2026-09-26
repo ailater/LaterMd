@@ -21,6 +21,17 @@ use serde::{Deserialize, Serialize};
 /// 持久化文件名,与 `settings.json` 同目录。
 const SETTINGS_FILE: &str = "layout.json";
 
+/// 进入禅定前的面板快照 `(left, right)`;退出时逐项还原(§7)。
+///
+/// 规格 §7 写的是三元组 `(left, right, editor_hidden)`,这里是二元组:
+/// `editor_hidden` 在禅定下恒 `true`(**藏编辑器就是禅定的定义 itself**),
+/// 把常量写进存档会在每次读它时都骗人一次。将来若真出现「禅定但仍露源码」
+/// 的变体,扩成三元组比现在留一个假字段便宜。
+///
+/// **只快照左右两栏而不是整个 `LayoutSettings`**:多记一个字段就多一条
+/// 「进/出漏抄某一项」的路,而禅定只改这两项。
+pub type PreZen = Option<(bool, bool)>;
+
 /// 持久化的外壳布局。字段各自直接喂给 UI,不额外镜像。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,10 +40,23 @@ pub struct LayoutSettings {
     pub left: bool,
     /// 右栏(预览)是否展开。
     pub right: bool,
-    /// 禅定模式(M4 实装;本棒只存档,不参与绘制)。
+    /// 禅定模式(§7):三栏让位、预览占满内容区。
+    ///
+    /// **`skip`(读写两端都跳过)而不是 `default`**:它是**当前会话的临时
+    /// 沉浸态**,不是像 left/right 那样的长期布局偏好。跨会话保留会让下次
+    /// 启动的窗口在用户没要求的情况下直接进入禅定,而配套的 `pre_zen` 快照
+    /// 按同一口径不落盘 —— 那次会话里退出禅定只剩「一律全开」这一条兜底,
+    /// 用户被静默改了布局还回不到原样。
+    ///
+    /// 落到字段上而不是在 `save_to` 里事后改写,`save_to` 因此回到「所见即
+    /// 所写」—— 少一处「 save 与 struct 定义不同步」的可能。
+    #[serde(skip)]
     pub zen: bool,
     /// 左栏上次停留的视图。
     pub left_view: SidebarTab,
+    /// 进入禅定前的面板快照(§7)。同上口径:`skip`,不落盘。
+    #[serde(skip)]
+    pub pre_zen: PreZen,
 }
 
 /// 出厂布局:三栏全开(旧行为),停文件树。
@@ -43,6 +67,7 @@ impl Default for LayoutSettings {
             right: true,
             zen: false,
             left_view: SidebarTab::Files,
+            pre_zen: None,
         }
     }
 }
@@ -65,6 +90,12 @@ impl LayoutSettings {
 
     /// 落盘到 `<dir>/layout.json`;`dir` 为 `None` 时用平台默认目录。
     /// 目录不存在则创建。失败带路径,提示行可直接展示。
+    ///
+    /// `zen` 与 `pre_zen` 都是 `#[serde(skip)]`(理由见各自字段注释),而禅定
+    /// 期间 `left/right` 已被改成 `false/false` —— 那是**状态被临时借用**,
+    /// 不是用户改了偏好。此刻若有别的原因触发保存(切左栏视图等),照直写
+    /// 会把「三栏全关」钉进磁盘:下次启动既没有侧栏也没有菜单栏入口
+    /// (禅定下两者都在),用户面对一个近乎空的窗口。故这里按快照还原后再写。
     pub fn save_to(&self, dir: Option<&Path>) -> StdResult<(), SaveError> {
         let Some(dir) = dir.map(Path::to_path_buf).or_else(theme::config_dir) else {
             return Err(SaveError {
@@ -72,7 +103,12 @@ impl LayoutSettings {
                 source: "找不到平台配置目录(HOME/APPDATA 均未设置)".into(),
             });
         };
-        let json = serde_json::to_string_pretty(self).map_err(|source| SaveError {
+        let mut saved = self.clone();
+        if let Some((left, right)) = saved.pre_zen {
+            saved.left = left;
+            saved.right = right;
+        }
+        let json = serde_json::to_string_pretty(&saved).map_err(|source| SaveError {
             path: dir.join(SETTINGS_FILE),
             source: Box::new(source),
         })?;
@@ -95,6 +131,41 @@ impl LayoutSettings {
         })?;
         serde_json::from_slice(&bytes)
             .map_err(|source| LoadError::Corrupt(format!("{}: {}", path.display(), source)))
+    }
+
+    /// 进禅定:存快照 → 关两栏 → 置标志(§7)。
+    ///
+    /// **已经在禅定里再调一次是 no-op**:`pre_zen` 已 `Some` 就不再覆写,
+    /// 否则第二册快照会把第一册的布局吞掉,退出时还原到「进禅定之后」的样子
+    /// (三关),等于永久丢掉了用户的原始布局。
+    pub fn enter_zen(&mut self) {
+        if self.pre_zen.is_some() {
+            return;
+        }
+        self.pre_zen = Some((self.left, self.right));
+        self.left = false;
+        self.right = false;
+        self.zen = true;
+    }
+
+    /// 退出禅定:按快照逐项还原(§7)。**必须还原到进入前的状态**,不能一律
+    /// 全开 —— 用户原本关着左侧写,退出禅定却蹦出侧栏是意外行为
+    /// (decisions-pending #29「宁可多一次操作,不静默改变用户状态」同款)。
+    ///
+    /// 没有快照(脏启动 / `zen` 从存档读出来而快照被丢)时**退化为三栏全开**
+    /// 而不是什么都不做:后者会把用户永久困在禅定里。
+    pub fn exit_zen(&mut self) {
+        match self.pre_zen.take() {
+            Some((left, right)) => {
+                self.left = left;
+                self.right = right;
+            }
+            None => {
+                self.left = true;
+                self.right = true;
+            }
+        }
+        self.zen = false;
     }
 }
 
@@ -138,18 +209,121 @@ mod tests {
     }
 
     /// 往返无损:改过的三态 + 视图都回来。
+    ///
+    /// `zen` 取 false:`Zen` 不落盘(见下一个用例),带着 `zen: true` 进往返
+    /// 必然不相等 —— 那是设计如此,不是 bug。
     #[test]
     fn roundtrip_preserves_every_field() {
         let dir = dir("roundtrip");
         let settings = LayoutSettings {
             left: false,
             right: true,
-            zen: true,
+            zen: false,
             left_view: SidebarTab::Outline,
+            ..Default::default()
         };
         settings.save_to(Some(&dir)).unwrap();
         assert_eq!(LayoutSettings::load_from(&dir).unwrap(), settings);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **禅定不跨会话**:`zen` 是本次会话的临时沉浸态,不像 left/right 那样
+    /// 是长期布局偏好。一旦写进 `layout.json`,下次启动的窗口会在用户没要求
+    /// 的情况下直接进入禅定。且那时候 `pre_zen` 已被 `skip`(更不会被写出),
+    /// 退出禅定只剩「一律全开」这一条兜底 —— 用户被静默改了布局还找不回来。
+    #[test]
+    fn zen_and_snapshot_are_never_persisted() {
+        let dir = dir("zen-ephemeral");
+        let mut settings = LayoutSettings::default();
+        settings.enter_zen();
+        assert!(settings.zen && settings.pre_zen.is_some());
+
+        settings.save_to(Some(&dir)).unwrap();
+        let raw = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(!raw.contains("zen"), "写出的 JSON 里不该有 zen 字段:{raw}");
+        assert!(!raw.contains("pre_zen"), "快照同口径不落盘:{raw}");
+
+        let loaded = LayoutSettings::load_from(&dir).unwrap();
+        assert!(!loaded.zen, "读回来的窗口不是禅定的");
+        assert_eq!(loaded.pre_zen, None, "读回来没有脏快照");
+        assert!(loaded.left && loaded.right, "三栏按快照还原着写,不写三关");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 禅定期间触发保存(例如期间切了左栏视图):写出去的是**快照里的布局**
+    /// 而不是当下那个被借用的 `false/false`。这是 `save_to` 特意多看一眼
+    /// `pre_zen` 的唯一原因 —— 漏了它,用户会发现下次启动既没有侧栏也没有
+    /// 菜单栏入口(禅定下两者都在),面对一个近乎空的窗口。
+    #[test]
+    fn saving_during_zen_writes_the_snapshot_columns() {
+        let dir = dir("zen-save");
+        let mut settings = LayoutSettings {
+            left: false,
+            ..Default::default()
+        };
+        settings.enter_zen();
+        assert!(!settings.left && !settings.right, "禅定期间两栏都被关了");
+
+        settings.save_to(Some(&dir)).unwrap();
+        let loaded = LayoutSettings::load_from(&dir).unwrap();
+        assert_eq!(
+            (loaded.left, loaded.right),
+            (false, true),
+            "照快照写:(right 本来就开着)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 进出禅定:退出一律**还原到进入前的组合**,不一律全开 —— 用户原本
+    /// 关着左栏写,退出禅定却蹦出侧栏是意外行为(decisions-pending #29 同款)。
+    #[test]
+    fn exit_zen_restores_the_pre_zen_combination() {
+        for (left, right) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut settings = LayoutSettings {
+                left,
+                right,
+                ..Default::default()
+            };
+            settings.enter_zen();
+            assert!(!settings.left && !settings.right && settings.zen);
+            settings.exit_zen();
+            assert_eq!(
+                (settings.left, settings.right, settings.zen),
+                (left, right, false),
+                "组合 {left}/{right} 逐项还原"
+            );
+            assert_eq!(settings.pre_zen, None, "退出后快照清掉");
+        }
+    }
+
+    /// 重复进入是 no-op:第二册快照不能吞掉第一册的原始布局,否则退出时
+    /// 还原到「进禅定之后」的三关状态 = 永久丢掉用户的布局。
+    #[test]
+    fn entering_zen_twice_keeps_the_original_snapshot() {
+        let mut settings = LayoutSettings {
+            left: false,
+            ..Default::default()
+        };
+        settings.enter_zen();
+        settings.enter_zen();
+        assert_eq!(settings.pre_zen, Some((false, true)));
+        settings.exit_zen();
+        assert_eq!((settings.left, settings.right), (false, true));
+    }
+
+    /// 没有快照(例如这份 `zen` 是手改出来的)时退出退化为三栏全开,而不是
+    /// 什么都不做 —— 后者会把用户永久困在禅定里。
+    #[test]
+    fn exit_zen_without_snapshot_falls_back_to_all_columns() {
+        let mut settings = LayoutSettings {
+            zen: true,
+            left: false,
+            right: false,
+            ..Default::default()
+        };
+        settings.exit_zen();
+        assert!(!settings.zen);
+        assert!(settings.left && settings.right, "退路是三栏全开");
     }
 
     /// 出厂布局三栏全开、停文件树 —— 与旧行为一致,升级用户不会被直接

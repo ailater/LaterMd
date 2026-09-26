@@ -9,6 +9,7 @@
 //! 单测钉住;`ui` 的交互区用 `Ui::allocate_rect`(绝对摆放)直接消费
 //! 同一批纯函数,测试与绘制零偏差。
 
+use crate::command::Command;
 use crate::state::{Message, State};
 use crate::ui::icons::Icon;
 use crate::ui::tokens::{DANGER, ICON, ICON_SM, RADIUS_SM, SPACE_SM};
@@ -27,7 +28,6 @@ pub enum TitleButton {
     PanelLeft,
     /// 关闭/打开右栏(消息由三分栏重排棒消费)。
     PanelRight,
-    /// 禅定模式(本棒占位禁用,M4 实装)。
     Zen,
     /// 最小化。
     Minimize,
@@ -205,10 +205,8 @@ pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
     }
 
     let rects = button_rects(bar);
-    let toggle_shortcut = state
-        .keymap
-        .get(crate::command::Command::ToggleSidebar)
-        .map(|shortcut| ctx.format_shortcut(&shortcut.keyboard()));
+    let toggle_shortcut = shortcut_of(state, &ctx, Command::ToggleSidebar);
+    let zen_shortcut = shortcut_of(state, &ctx, Command::ToggleZen);
     for (button, rect) in TITLE_BUTTONS.into_iter().zip(rects) {
         window_button(
             ui,
@@ -217,15 +215,27 @@ pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
             rect,
             maximized,
             state.layout.left,
+            state.layout.zen,
             toggle_shortcut.as_deref(),
+            zen_shortcut.as_deref(),
             outbox,
         );
     }
 }
 
+/// 某条命令当前绑的键位(用户可改,与 settings 快捷键页同源)。
+fn shortcut_of(state: &State, ctx: &egui::Context, cmd: Command) -> Option<String> {
+    state
+        .keymap
+        .get(cmd)
+        .map(|shortcut| ctx.format_shortcut(&shortcut.keyboard()))
+}
+
 /// 单个窗口按钮:命中区整块 `WINDOW_BTN`,hover 浅底,关闭键 hover 用
-/// 警示色;禅定键本棒占位禁用(无底色、点击不触发)。动作只发视口命令
-/// 与 [`Message`],不在 UI 侧改状态。
+/// 警示色。动作只发视口命令与 [`Message`],不在 UI 侧改状态。
+///
+/// `zen_open` 只影响禅定键的**著色**:它是个纯 toggle,没有禁用态, 仅靠
+/// 图标著色区分「当前是否在禅定里」(accent = 在)。
 #[allow(clippy::too_many_arguments)]
 fn window_button(
     ui: &mut egui::Ui,
@@ -234,23 +244,17 @@ fn window_button(
     rect: Rect,
     maximized: bool,
     sidebar_open: bool,
+    zen_open: bool,
     toggle_shortcut: Option<&str>,
+    zen_shortcut: Option<&str>,
     outbox: &mut Vec<Message>,
 ) {
-    let enabled = button != TitleButton::Zen;
-    let response = ui.allocate_rect(
-        rect,
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
+    let response = ui.allocate_rect(rect, Sense::click());
     let hovered = response.hovered();
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if enabled && hovered {
+        if hovered {
             let fill = if button == TitleButton::Close {
                 DANGER
             } else {
@@ -258,10 +262,12 @@ fn window_button(
             };
             painter.rect_filled(rect, RADIUS_SM, fill);
         }
-        let color = if !enabled {
-            ui.visuals().weak_text_color()
-        } else if button == TitleButton::Close && hovered {
+        let color = if button == TitleButton::Close && hovered {
             Color32::WHITE
+        } else if button == TitleButton::Zen && zen_open {
+            // 禅定键是唯一带「当前模式」语义的窗口按钮:进入后用强调色,让
+            // 「我在哪儿 / 怎么回去」在这一颗图标上自解释。
+            crate::ui::tokens::accent(ui)
         } else {
             ui.visuals().text_color()
         };
@@ -282,7 +288,18 @@ fn window_button(
             })
         }
         TitleButton::PanelRight => response.on_hover_text("关闭右侧预览"),
-        TitleButton::Zen => response.on_hover_text("禅定模式(即将推出)"),
+        // 与 `PanelLeft` 同款:键位文案取自 keymap(用户可改),不硬编码 F11。
+        TitleButton::Zen => {
+            let action = if zen_open {
+                "退出禅定"
+            } else {
+                "禅定模式"
+            };
+            response.on_hover_text(match zen_shortcut {
+                Some(shortcut) => format!("{action}({shortcut})"),
+                None => action.to_owned(),
+            })
+        }
         TitleButton::Minimize => response.on_hover_text("最小化"),
         TitleButton::Maximize => {
             response.on_hover_text(if maximized { "还原" } else { "最大化" })
@@ -292,6 +309,7 @@ fn window_button(
     match button {
         TitleButton::PanelLeft if response.clicked() => outbox.push(Message::SidebarToggled),
         TitleButton::PanelRight if response.clicked() => outbox.push(Message::RightPanelToggled),
+        TitleButton::Zen if response.clicked() => outbox.push(Message::ZenToggled),
         TitleButton::Minimize if response.clicked() => {
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
@@ -553,10 +571,18 @@ mod tests {
             outbox,
             vec![Message::SidebarToggled, Message::RightPanelToggled]
         );
-        let commands = press(2, &state, &mut outbox); // 禅定:禁用占位
-        assert!(
-            outbox.len() == 2 && commands.is_empty(),
-            "禁用按钮不产消息/命令"
+        // 禅定键(M4 实装):与左右两栏那两颗同为「布局入口」——产消息而非
+        // 视口命令。区别在于进/出的快照怎么存怎么还原由 `LayoutSettings`
+        // 自己裁决,本模块连左右两栏当前是什么状态都不必知道。
+        let commands = press(2, &state, &mut outbox);
+        assert!(commands.is_empty(), "禅定键不发视口命令");
+        assert_eq!(
+            outbox,
+            vec![
+                Message::SidebarToggled,
+                Message::RightPanelToggled,
+                Message::ZenToggled
+            ]
         );
         assert!(press(3, &state, &mut outbox).contains(&ViewportCommand::Minimized(true)));
         assert!(press(4, &state, &mut outbox).contains(&ViewportCommand::Maximized(true)));

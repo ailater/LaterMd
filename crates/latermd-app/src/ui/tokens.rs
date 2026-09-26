@@ -46,6 +46,20 @@ pub const NAV_ROW_H: f32 = 26.0;
 pub const NAV_BOTTOM_H: f32 = 28.0;
 /// 导航选中行的左侧竖条宽度(整行选中态的另一半)。
 pub const NAV_BAR_W: f32 = 2.0;
+/// 禅定模式的正文限宽(docs/ui-shell-redesign.md §11;源出 ui-design.md
+/// §1.2 的「沉浸」参数)。720 约合中文 40 字/行:再宽一行要横向扫读,
+/// 再窄代码块与表格就得横向滚动了。
+pub const ZEN_TEXT_W: f32 = 720.0;
+/// 禅定模式下「退出禅定」浮层到内容区右上角的留白。贴死边缘会与「收起
+/// 到边」的视觉直觉打架,也压住滚动条。
+pub const ZEN_EXIT_MARGIN: f32 = 10.0;
+/// 禅定模式内容区的四周留白(docs/ui-shell-redesign.md §7)。窗口够宽时
+/// 正文在剩下的空间里居中;窗口窄于 `ZEN_TEXT_W + 2×gutter` 时由 720 限宽
+/// 自己收缩,不至于逼出横向滚动。
+///
+/// **必须是整数**:`Frame::inner_margin` 最终落成 `Margin`(i8),`f32` 转过去
+/// 会被 `round()` 静默吃掉小数。
+pub const ZEN_GUTTER: f32 = 24.0;
 
 // —— 圆角 ——
 
