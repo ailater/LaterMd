@@ -25,7 +25,8 @@ PR 合入 main(版本号已 bump)
 │ plan → build-local(4 job,5 目标)             │
 │   macos-14:双 darwin target 单 job(merge-tasks)│
 │   ubuntu-22.04:linux x64                     │
-│   ubuntu-22.04 + cargo-xwin 容器:win ARM64   │
+│   windows-11-arm 原生:win ARM64(ring 汇编,   │
+│   xwin 容器编不过,见 dist-workspace.toml 注) │
 │   windows-2022:win x64                       │
 │ → host:gh release create + 上传全部资产        │
 │   (正文 = CHANGELOG.md 对应版本小节)          │
@@ -122,7 +123,7 @@ bot 直推 main 改版本号会被分支保护拦截。版本号不变地合入 
 合入后无需任何手动操作:main 上 rust.yml 门禁跑绿 → auto-tag.yml 自动打
 `v{version}` 并 dispatch release.yml → 五目标构建 + 建 Release(正文取自
 CHANGELOG.md)→ host job dispatch macos-dmg.yml 合成 dmg 回传。
-全程约 20–40 分钟(Windows xwin 交叉编最慢),在 Actions 页盯
+全程约 20–40 分钟(Windows 目标最慢),在 Actions 页盯
 `Auto Tag` → `Release` → `macOS dmg` 三个 workflow 依次变绿即可。
 
 应急通道(自动链路故障时,人工等价物):
@@ -146,9 +147,11 @@ git tag v0.0.1 && git push origin v0.0.1   # 人工 tag push 直接触发 releas
 - [ ] Release 未被误标 prerelease(除非 tag 带预发布后缀)。
 
 首个 Release 还要额外验证(只此一次,之后信任链路):
-- Windows xwin 交叉编能否通过(egui/wgpu 栈未经 xwin 实测;若失败,改用
-  `github-custom-runners` 把 `aarch64-pc-windows-msvc` 指到 `windows-11-arm`
-  原生 runner 后重新 generate);
+- ~~Windows xwin 交叉编能否通过~~ **已实测编不过**:ring 0.17 的 ARM64 汇编
+  在 cargo-xwin 容器内失败(容器 clang 不认 cc-rs 的 `/imsvc` 参数,
+  2026-09-26 v0.0.1 首发踩中),已改 `github-custom-runners` 把
+  `aarch64-pc-windows-msvc` 指到 `windows-11-arm` 原生 runner;
+  **windows-11-arm 首编能否通过是下一个待验项**;
 - dmg 内 .app 在真机可启动(本机无 macOS,lipo/hdiutil/codesign 均未自测)。
 
 ### 3.4 cask 落地(动 tap 仓库 crazykun/homebrew-ailater)
