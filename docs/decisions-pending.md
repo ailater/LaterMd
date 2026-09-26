@@ -4,6 +4,13 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #24 皮肤批次 B 的四处口径：System 解析、皮肤存储、密度基准、文件名（2026-09-26）
+
+- **岔路**：roadmap「专题：界面美化与皮肤系统」批次 B 只写了「三态切换 + 自定义皮肤文件 + 视觉打磨」，落地时有四处自由度。①`跟随系统` 是个**非确定值**：检测结果缓存在哪、多久刷一次、检测不到怎么办；②皮肤文件用什么格式、存哪、内容要不要再存一份进 `settings.json`；③密度 token 怎么算（以出厂值为基准还是基于当前值缩放、动不动字号）；④皮肤名来自用户输入却要拼进路径。
+- **自动选择**：①`ThemeMode::System` 只在 `resolve(detected, fallback)` 处落到确定值 —— 结果缓存在 `State::system_theme`，**仅跟随系统模式才轮询**（1 秒节流；非跟随模式返回 `None`，让 egui 收敛到深度空闲），检测失败与 `Unspecified` 一律回落上一次的手动值并在设置页明示「本机读不到系统主题设置」，不猜；②皮肤文件是**唯一事实源**：`themes/*.ron` 存 `MarkdownStyle`，`settings.json` 只存皮肤名，启动扫描目录把内容载入 `ThemeSettings::skin_style`（`#[serde(skip)]`）—— 避免同一份样式两处存放、改一处另一处不跟着变；用目录扫描而非配置清单，用户把别人给的 ron 丢进目录即生效；③密度以 `egui::Style::default()` 的出厂值为**基准**缩放（间距/控件尺寸 0.7、圆角 0.8、滚动条同比例收窄），不基于「当前值」再乘（否则标准↔紧凑来回切会逐次累积）；**不动字号** —— 中文在小字号下的可读性损失远大于多出来的几行；④皮肤名经 `skin_file_name` 清洗（`/ \ : * ? " < > | .` 全换 `_`，空名给默认名），挡住 `..` 拼进路径。
+- **已知并接受的边界**：跟随系统的首次值来自启动那次探测，系统切主题后最迟 1 秒跟上；Linux 上 `dark-light` 走 freedesktop portal，Deepin/KDE 等环境可能恒返回 `Unspecified`（本机实测结果待人工补记）；皮肤只覆盖**正文与代码高亮**（`MarkdownStyle`），外壳配色仍由 egui 自带的 light/dark visuals 决定 —— 要让外壳一起换色需另加 shell token 表，属批次 C（明确不做）。
+- **如何改**：要更快的系统主题响应，调小 `SYSTEM_THEME_POLL`（代价：更频繁查 dbus/注册表）；要让外壳也随皮肤换色，在 `ThemeSettings` 加 shell token 表并在 `apply_density` 同处投影；要让皮肤内容也进 `settings.json`（自包含），去掉 `skin_style` 的 `#[serde(skip)]` 并在 `select_skin` 里同步写回 `overrides`（代价：两份真源，改皮肤文件后界面不变）。
+
 ## #22 MCP server 落地的六处口径（2026-09-26）
 
 - **岔路**：mcp-plan.md 给了形态与工具集，落地时仍有六处自由度。①HTTP 与 stdio 谁是主通道（GUI 进程内的 stdin 不是管道，stdio 在常驻进程里没有客户端）；②`tools/call` 缺 `name` 该怎么报错；③关掉的工具是「调了才拒」还是「对客户端不存在」；④文件树换根后服务要不要重启；⑤`--mcp-stdio` 子进程模式要不要受 `mcp.json` 的 `enabled` 约束；⑥`list_files` 的 glob 用什么实现（引 `glob` / `globset` 还是复用 `ignore`）。
