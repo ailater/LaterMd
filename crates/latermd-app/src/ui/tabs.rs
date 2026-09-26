@@ -26,12 +26,19 @@ pub fn ui(panel: &mut egui::Ui, tabs: &TabsState, outbox: &mut Vec<Message>) -> 
     if hide {
         return false;
     }
-    // wrapped:标签多到放不下时换行而不是溢出
-    panel.horizontal_wrapped(|ui| {
-        for index in 0..tabs.tabs.len() {
-            chip(ui, tabs, index, outbox);
-        }
-    });
+    // 标签放不下时水平滚动而非换行(同 vendored 表格的横向滚动手法):
+    // 换行会让标签条高度随标签数成倍增长,把编辑区顶得上下跳;单行 +
+    // 滚动(垂直滚轮在仅水平可滚的 ScrollArea 里自动转为水平)高度恒定。
+    egui::ScrollArea::horizontal()
+        .id_salt("tabs-bar")
+        .auto_shrink([false, true])
+        .show(panel, |ui| {
+            ui.horizontal(|ui| {
+                for index in 0..tabs.tabs.len() {
+                    chip(ui, tabs, index, outbox);
+                }
+            });
+        });
     true
 }
 
@@ -145,6 +152,36 @@ mod tests {
             assert!(super::ui(ui, &tabs, &mut outbox));
         });
         output.drop_without_applying_deltas();
+    }
+
+    /// 标签多到放不下时保持单行水平滚动,不换行:同一组标签在窄/宽容器里
+    /// 条高一致(换行实现的高度随标签数成倍增长,编辑区会被顶得上下跳)。
+    #[test]
+    fn bar_keeps_single_line_when_chips_overflow() {
+        let ctx = egui::Context::default();
+        let mut tabs = TabsState::new("");
+        for i in 0..6 {
+            tabs.open_tab(
+                Some(std::path::PathBuf::from(format!(
+                    "一个很长很长的文档标题第{i}篇.md"
+                ))),
+                "",
+            );
+        }
+        let mut outbox = Vec::new();
+        let heights = [220.0, 2000.0].map(|width| {
+            let mut height = None;
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                ui.set_max_width(width);
+                assert!(super::ui(ui, &tabs, &mut outbox), "多标签必画条");
+                height = Some(ui.min_rect().height());
+            });
+            output.drop_without_applying_deltas();
+            height.unwrap()
+        });
+        assert_eq!(heights[0], heights[1], "窄容器不换行,条高恒定");
+        // 单行高度与 chip 高度同量级(留行距与滚动条余量),远小于 6 行
+        assert!(heights[1] < 2.0 * CHIP_H, "条高 {}", heights[1]);
     }
 
     /// chip 交互:点名字区发 TabActivate,点 × 区发 TabCloseRequested。

@@ -2465,16 +2465,16 @@ dependencies = [
  "eframe",
  "egui_markdown",
  "egui_markdown_style",
- "grep-searcher",
  "ignore",
  "latermd-ai",
  "latermd-creds",
  "latermd-editor",
  "latermd-export",
  "latermd-git",
+ "latermd-mcp",
  "latermd-md",
+ "latermd-search",
  "percent-encoding",
- "regex",
  "rfd",
  "serde",
  "serde_json",
@@ -2509,11 +2509,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "latermd-mcp"
+version = "0.1.0"
+dependencies = [
+ "latermd-git",
+ "latermd-md",
+ "latermd-search",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "latermd-md"
 version = "0.1.0"
 dependencies = [
  "egui_markdown",
  "pulldown-cmark",
+]
+
+[[package]]
+name = "latermd-search"
+version = "0.1.0"
+dependencies = [
+ "grep-searcher",
+ "ignore",
+ "regex",
 ]
 
 [[package]]

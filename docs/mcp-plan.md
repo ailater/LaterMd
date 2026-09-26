@@ -1,8 +1,12 @@
-# MCP Server 规划（让外部 AI 调用 LaterMD 的文档检索能力）
+# MCP Server（让外部 AI 调用 LaterMD 的文档检索能力）
 
-日期：2026-09-25
-状态：规划中（**本轮不实现代码**，设置页显示「规划中」禁用态）
+日期：2026-09-25（规划）／2026-09-26（实现落地）
+状态：**已实现**（阶段 ①–④ 全部完成；设置页开关可用，默认关闭）
 关联：[AGENTS.md](../AGENTS.md) §7 范围边界、[roadmap.md](roadmap.md) P3、[ui-polish.md](ui-polish.md) §7、[adr-001](adr-001-gui-and-architecture.md) §3
+
+> **实现状态（2026-09-26）**：`latermd-search`（检索核心下沉）+ `latermd-mcp`
+> （协议 / 五工具 / stdio / HTTP）已落地并接线到设置页与状态栏。两条通道均有
+> 实测证据，见 §6「落地阶段与验收」。本节以下的规划原文保留，仅在有偏离处补注。
 
 ---
 
@@ -93,15 +97,26 @@ crates/latermd-mcp/          # 新 crate,P3 时机(roadmap crate 增量表)
 
 ## 6. 落地阶段与验收
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| ① | 抽 `latermd-search`（方案 A）+ 新建 `latermd-mcp` 协议与 Tool trait | app 侧边栏搜索行为不变（既有测试全绿）；`latermd-mcp` 单测覆盖参数校验与错误码 |
-| ② | stdio server + 进程内装配 + 五个工具 | 用 `claude mcp add` / 一个手写 JSON-RPC 客户端跑通 `tools/list` 与一次 `search_docs`；路径越界被拒 |
-| ③ | 设置页开关/端口/工具开关/调用计数 | 开关起停不阻塞 UI 帧；计数随调用增长；关闭后再调用即拒 |
-| ④ | HTTP 通道 | 仅本地回环可连；非 loopback 来源拒绝 |
+| 阶段 | 内容 | 验收 | 状态 / 证据 |
+|---|---|---|---|
+| ① | 抽 `latermd-search`（方案 A）+ 新建 `latermd-mcp` 协议与工具 | app 侧边栏搜索行为不变（既有测试全绿）；`latermd-mcp` 单测覆盖参数校验与错误码 | ✅ `cargo test -p latermd-search` 14 项、`-p latermd-mcp` 33 项全绿；app 侧 189 项（含原 175 项）全绿 |
+| ② | stdio server + 进程装配 + 五个工具 | 跑通 `tools/list` 与一次 `search_docs`；路径越界被拒 | ✅ 真进程冒烟：`printf … \| LATERMD_MCP_ROOT=<dir> latermd --mcp-stdio` 返回 `initialize` / `tools/list` / 一次真实检索（8 条命中，行号与路径正确）；越界、`..`、绝对路径均被拒（`tools.rs::path_escape_is_rejected`） |
+| ③ | 设置页开关/端口/工具开关/调用计数 | 开关起停不阻塞 UI 帧；计数随调用增长；关闭后再调用即拒 | ✅ 设置页 MCP 页四个分区齐备；`state::tests::mcp_config_saved_starts_server_and_answers_over_http` 从「保存配置」走到「真实 TCP 应答」 |
+| ④ | HTTP 通道 | 仅本地回环可连；非 loopback 来源拒绝 | ✅ bind `127.0.0.1` + accept 后 `is_loopback` 双保险；`transport::http` 单测覆盖 200 / SSE 协商 / 405 / 404 |
+
+**用法**：
+
+- GUI 常驻：设置 → MCP → 勾选启用 → 保存，状态行显示「监听 127.0.0.1:<port>」，
+  客户端填 `http://127.0.0.1:<port>/mcp`（页面上有复制按钮）。
+- 子进程式：`claude mcp add latermd -- latermd --mcp-stdio`，文档库根用
+  `LATERMD_MCP_ROOT` 指定（headless 没有文件树 UI 可交互）。
+- 换文档库：文件树换根即生效（共享句柄，服务不重启）。
 
 **门禁**：vendor 未动时只跑六项（fmt / 三轮 clippy / test / doc）；新增 crate 需同步
 登记 [adr-004](adr-004-technical-stack.md) 技术栈表（decisions-pending #4 的口径）。
+2026-09-26 六项全绿；`latermd-search` / `latermd-mcp` 是 workspace 内部 crate，不进
+ADR-004 的外部依赖清单（与 `latermd-ai` / `latermd-git` 同口径），已在
+[adr-001](adr-001-gui-and-architecture.md) §3 的目录结构补两行。
 
 ---
 

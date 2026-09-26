@@ -1,0 +1,16 @@
+[package]
+name = "latermd-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Markdown vault retrieval: gitignore-aware walk and regex line search (sync + streaming, no UI deps)"
+
+[dependencies]
+# 目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)。list_files 的 glob
+# 过滤用同 crate 的 overrides(gitignore 语法),不另引 glob 系依赖。
+ignore = "0.4.33"
+# 行迭代(ADR-004 清单):与 ripgrep 同一套行语义(产出行含终止符、尾行可
+# 不带换行)。不走 Searcher 系 API——那要求 Matcher 实参,见 lib.rs 模块注释。
+grep-searcher = "0.1.17"
+# 正则(ADR-004 清单);bytes 变体匹配 LineIter 的 &[u8] 产出
+regex = "1.13.1"

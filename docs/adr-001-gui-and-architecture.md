@@ -91,6 +91,8 @@ LaterMD/
 │   ├── latermd-editor/            # ropey 文本缓冲 + caret/选区 + IME
 │   ├── latermd-git/               # git2 封装（P2）
 │   ├── latermd-ai/                # provider trait、流式、tool calling（P1）
+│   ├── latermd-search/            # .gitignore 感知遍历 + 逐行正则（侧边栏与 MCP 共用）
+│   ├── latermd-mcp/               # 本地 MCP server：五个只读工具（stdio / 127.0.0.1 HTTP）
 │   ├── latermd-export/            # PDF/HTML/DOCX 导出
 │   └── latermd-app/               # eframe binary，唯一的 GUI crate
 ├── docs/

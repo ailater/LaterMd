@@ -4,6 +4,19 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #22 MCP server 落地的六处口径（2026-09-26）
+
+- **岔路**：mcp-plan.md 给了形态与工具集，落地时仍有六处自由度。①HTTP 与 stdio 谁是主通道（GUI 进程内的 stdin 不是管道，stdio 在常驻进程里没有客户端）；②`tools/call` 缺 `name` 该怎么报错；③关掉的工具是「调了才拒」还是「对客户端不存在」；④文件树换根后服务要不要重启；⑤`--mcp-stdio` 子进程模式要不要受 `mcp.json` 的 `enabled` 约束；⑥`list_files` 的 glob 用什么实现（引 `glob` / `globset` 还是复用 `ignore`）。
+- **自动选择**：①**HTTP 是 GUI 进程内的主通道**（应用开着就能被调 —— 坤哥的诉求原话），stdio 作为 `--mcp-stdio` 子进程模式给 `claude mcp add` 这类客户端，两者共用同一个 `Server`，只是传输不同；②缺 `name` 走**协议层 `InvalidParams`**（-32602），工具执行失败才走 `isError` 内容块 —— 前者是请求格式问题、后者是工具结果，混在一起客户端不好分支；③关掉的工具**不出现在 `tools/list`**（最小权限要真的生效，而不是「列出来让你调、调了才拒」），真被点名时仍回「工具已在设置里关闭」；④换根走 **`SharedRoot` 共享句柄**（`Arc<Mutex<Option<PathBuf>>>`），服务不重启；⑤headless 模式**不看 `enabled`** —— 用户显式用参数启动就是一次授权，而 `enabled` 管的是「GUI 进程内是否自动监听端口」这件不同的事；根取环境变量 `LATERMD_MCP_ROOT`；⑥glob 走 **`ignore` 的 override 匹配查询**（`Override::matched(path, is_dir)`）而非 `builder.overrides()` —— 实测后者只筛文件、目录条目照旧产出（`*.txt` 会带出 `notes` 目录），而列目录的语义是「条目本身要不要出现」，目录必须过同一把筛子；零新增依赖。
+- **已知并接受的边界**：HTTP 侧**单连接串行**（工具是毫秒级检索，排队即可，也避开「两个 AI 并发改同一个编辑器缓冲」）；不实现 MCP 的 `resources` / `prompts` / `sampling` 与 SSE 长连接流（客户端要 SSE 时按单帧 `data:` 回，语义与 JSON 一致）；`outline` 的行号按标题 span 换算，而 span 会吸收上一块尾部的换行（latermd-md 的已知行为），换算时跳过前导换行。
+- **如何改**：要 stdio 当主通道，把 GUI 启动的 `http::serve` 换成 `stdio::serve`（代价：常驻 GUI 的 stdin 无处接客户端，等于放弃「应用开着就能被调」）；要让关掉的工具仍出现在列表里，去掉 `tool_list` 的 `filter`、保留 `tool_call` 的拒绝分支；要并发 HTTP，把 `serve_with` 的 accept 循环改成每连接一个线程（需同步处理工具对同一库的并发读）。
+
+## #23 多标签归约迁移的三处消息口径:TabOpen 不引入、确认关闭不带载荷、孤立 chunk 丢弃(2026-09-26)
+
+- **岔路**:multi-tabs 棒的任务规格写「Message 新增 `TabOpen { path }`、`TabCloseConfirmed { index }`」,而 main 上已落地的多标签骨架(`crates/latermd-app/src/tabs.rs` + state.rs 归约)用了不同的等价结构;另有一个规格没覆盖的防御分支(在途流的发起标签已不存在时,迟到的 `AiChunk` 写到哪)需要定口径。
+- **自动选择**:①**不引入 `TabOpen`**——「打开」的三个入口(菜单「打开」对话框 / 文件树点击 / 搜索跳转)都在归约内部完成「路径去重 → 命中激活 / 未命中开新标签」(`State::open_path`),UI 层没有任何场景需要直接产出 `TabOpen`,引入无人产出的消息只增表面积;②**`TabCloseConfirmed` 不带 `{ index }` 载荷**——确认目标存在 `TabsState::confirm_close`(请求时刻的快照),确认的必是弹窗所问的那个标签,比消息载荷更防错(载荷在模态期间标签增删后会指错对象);③**孤立 chunk 丢弃并作废流**(`State::append_ai_delta` 的 `ai_stream_tab_index() == None` 分支)——发起标签被关闭时 `remove_tab` 已先行作废流,真实链路走不到该分支;万一未来重构弄丢绑定,fail-safe 是「丢块可见(续写中断)」而非「静默写进 active(写错文档)」。
+- **如何改**:要让 UI 能直接开标签(比如将来的拖拽打开),加 `Message::TabOpen { path: Option<PathBuf> }` 并在归约里转 `open_path`/`spawn_tab` 即可;要确认关闭改带载荷,给 `TabCloseConfirmed` 加 `usize` 并在 `layout.rs` 的 `tab_close_dialog` 处带上 `confirm_close` 的值;要孤立 chunk 落到当前标签,把 `append_ai_delta` 的 `else` 分支改成 `self.tabs.current_mut()`(须接受写错标签的风险,不建议)。
+
 ## #22 界面打磨批次的四个口径:图标自绘、撞键拒绝、未实现项禁用、MCP 只出规划(2026-09-25)
 
 - **岔路**:用户指令「图标、快捷键设置、AI 配置页、MCP 规划」留了四处自由度。①egui 无图标集,用 emoji/Unicode 字符(✎ 🗋)还是自绘?②改键撞到别的命令的键位时,抢占还是拒绝?③AI 配置页的「接口方式」里 Anthropic/Ollama adapter 还没写,下拉里给不给选?④MCP 做到什么深度?

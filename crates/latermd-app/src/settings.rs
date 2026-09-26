@@ -16,10 +16,12 @@ use crate::ai_config::{AiConfig, ApiStyle, ProviderKind};
 use crate::ai_key::{self, AiKeyState};
 use crate::command::Command;
 use crate::keymap::Keymap;
+use crate::mcp::McpState;
 use crate::state::Message;
 use crate::theme::ThemeMode;
 use crate::ui::icons;
 use eframe::egui;
+use latermd_mcp::{McpConfig, ToolKind};
 
 /// 设置页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,6 +75,8 @@ pub struct SettingsState {
     pub notice: Option<String>,
     /// AI 页的草稿:编辑原地发生,「保存」才发消息落盘。
     pub ai_draft: AiConfig,
+    /// MCP 页的草稿:同理,「保存」才落盘并起停服务。
+    pub mcp_draft: McpConfig,
 }
 
 impl Default for SettingsState {
@@ -83,6 +87,7 @@ impl Default for SettingsState {
             capture: None,
             notice: None,
             ai_draft: AiConfig::default(),
+            mcp_draft: McpConfig::default(),
         }
     }
 }
@@ -99,6 +104,7 @@ pub fn dialog(
     keymap: &Keymap,
     ai: &AiState,
     ai_key: &mut AiKeyState,
+    mcp: &McpState,
     outbox: &mut Vec<Message>,
 ) -> Option<egui::Response> {
     let mut open = settings.open;
@@ -137,7 +143,7 @@ pub fn dialog(
                         SettingsTab::Appearance => appearance(ui, theme_mode, outbox),
                         SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
                         SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
-                        SettingsTab::Mcp => mcp_page(ui),
+                        SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
                     });
             });
             ui.separator();
@@ -331,45 +337,113 @@ fn ai_page(
     ai_key::key_editor(ui, ai_key, outbox);
 }
 
-/// MCP 页:**规划态**,只呈现计划与状态,不伪造运行中。
-fn mcp_page(ui: &mut egui::Ui) {
+/// MCP 页:开关 + 端口 + 工具权限 + 状态行 + 调用计数。
+///
+/// 与 AI 页同款「草稿 + 保存」分工:开关勾选不立刻生效,要点「保存」才落
+/// `mcp.json` 并起停后台服务 —— 端口与工具权限都是「改了要重启监听」的
+/// 动作,让用户显式确认比静默生效可预期。
+fn mcp_page(
+    ui: &mut egui::Ui,
+    settings: &mut SettingsState,
+    mcp: &McpState,
+    outbox: &mut Vec<Message>,
+) {
     ui.heading("MCP");
-    ui.colored_label(
-        crate::ui::tokens::WARN,
-        "规划中:server 尚未实现,以下开关不可用。",
+    ui.weak(
+        "应用开着就能被本机其他 AI(Claude Code / Cursor 等)调用,检索这个文档库。\
+         全部工具只读,写入仍只能由你在界面里操作。",
     );
     ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.label(
-        "目标:LaterMD 启动后开一个本地 MCP server,让外部 AI(Claude Code / Cursor 等)\
-         调用它的文档检索能力,而不是各自 grep。",
-    );
-    ui.add_enabled_ui(false, |ui| {
-        let mut enabled = false;
-        ui.checkbox(&mut enabled, "启用本地 MCP 服务(默认关闭)");
+
+    let draft = &mut settings.mcp_draft;
+    ui.checkbox(&mut draft.enabled, "启用本地 MCP 服务(默认关闭)");
+    ui.add_enabled_ui(draft.enabled, |ui| {
         ui.horizontal(|ui| {
             ui.label("HTTP 端口");
-            let mut port = 8731_u16;
-            ui.add(egui::DragValue::new(&mut port).range(1024..=65535));
+            ui.add(egui::DragValue::new(&mut draft.http_port).range(McpConfig::PORT_RANGE));
+            ui.weak("只监听 127.0.0.1,外部机器连不上");
         });
     });
+
     ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.strong("计划提供的工具(全部只读):");
-    for (name, desc) in [
-        ("search_docs", "全文检索:路径 + 行号 + 摘要"),
-        ("read_document", "读取文档原文(支持分片)"),
-        ("outline", "文档大纲(标题层级)"),
-        ("list_files", "列目录,尊重 .gitignore"),
-        ("git_status", "当前改动列表(只读)"),
-    ] {
-        ui.horizontal(|ui| {
-            ui.monospace(name);
-            ui.weak(desc);
-        });
+    ui.strong("工具权限(关掉的工具对客户端就不存在):");
+    for kind in ToolKind::ALL {
+        let mut on = draft.tool_enabled(kind);
+        let label = format!("{} — {}", kind.name(), kind.description());
+        if ui.checkbox(&mut on, label).changed() {
+            draft.tools.insert(kind.name().to_owned(), on);
+        }
     }
+
     ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.weak(
-        "完整设计:docs/mcp-plan.md(安全边界:只服务 127.0.0.1、路径不得越出文件树根、无写工具)。",
-    );
+    ui.separator();
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    ui.horizontal(|ui| {
+        ui.strong("状态");
+        // 失败态用警示色:端口被占用是最常见的失败,不能混在普通文字里
+        let label = mcp.status.label();
+        if matches!(mcp.status, crate::mcp::McpStatus::Failed(_)) {
+            ui.colored_label(crate::ui::tokens::WARN, label);
+        } else {
+            ui.label(label);
+        }
+    });
+    match mcp.root() {
+        Some(root) => {
+            ui.weak(format!("检索范围:{}", root.display()));
+        }
+        None => {
+            ui.colored_label(
+                crate::ui::tokens::WARN,
+                "未设置文件树根目录:先选一个目录,否则所有工具都会拒绝执行。",
+            );
+        }
+    }
+
+    if !mcp.counts.is_empty() {
+        ui.add_space(crate::ui::tokens::SPACE_SM);
+        ui.strong("本次运行调用次数:");
+        for kind in ToolKind::ALL {
+            if let Some(count) = mcp.counts.get(kind.name()) {
+                ui.horizontal(|ui| {
+                    ui.monospace(kind.name());
+                    ui.weak(count.to_string());
+                });
+            }
+        }
+    }
+
+    // 客户端接线示例:用户照抄即可,省去查文档
+    if mcp.config.enabled {
+        ui.add_space(crate::ui::tokens::SPACE_SM);
+        ui.strong("客户端配置:");
+        let url = format!("http://127.0.0.1:{}/mcp", mcp.config.http_port);
+        ui.horizontal(|ui| {
+            ui.monospace(&url);
+            if ui.small_button("复制").clicked() {
+                ui.ctx().copy_text(url.clone());
+            }
+        });
+        ui.weak("stdio 方式(客户端自己拉起进程): latermd --mcp-stdio");
+    }
+
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    ui.horizontal(|ui| {
+        let dirty = *draft != mcp.config;
+        let save = ui.add_enabled(dirty, egui::Button::new("保存"));
+        if save.clicked() {
+            outbox.push(Message::McpConfigSaved(draft.clone()));
+        }
+        let revert = ui.add_enabled(dirty, egui::Button::new("放弃修改"));
+        if revert.clicked() {
+            *draft = mcp.config.clone();
+        }
+        if dirty {
+            ui.weak("保存后服务按新配置重启");
+        }
+    });
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    ui.weak("完整设计:docs/mcp-plan.md(路径不得越出文件树根、无写工具)。");
 }
 
 #[cfg(test)]
@@ -386,13 +460,23 @@ mod tests {
             settings,
             ai_key,
             ai,
+            mcp,
             keymap,
             theme,
             ..
         } = state;
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            dialog(ui, settings, theme.mode, keymap, ai, ai_key, &mut outbox);
+            dialog(
+                ui,
+                settings,
+                theme.mode,
+                keymap,
+                ai,
+                ai_key,
+                mcp,
+                &mut outbox,
+            );
         });
         output.drop_without_applying_deltas();
     }
@@ -435,6 +519,36 @@ mod tests {
         assert!(!settings.ai_draft.provider.requires_key());
         settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
         assert!(settings.ai_draft.provider.requires_key());
+    }
+
+    /// MCP 页草稿:默认与 `McpConfig::default` 一致(关闭 + 默认端口 + 五
+    /// 工具全开);关掉一个工具后 draft 立即反映(保存才生效到服务)。
+    #[test]
+    fn mcp_draft_defaults_and_tool_toggle() {
+        let mut settings = SettingsState::default();
+        assert_eq!(settings.mcp_draft, McpConfig::default());
+        assert!(!settings.mcp_draft.enabled);
+        settings
+            .mcp_draft
+            .tools
+            .insert(ToolKind::GitStatus.name().to_owned(), false);
+        assert!(!settings.mcp_draft.tool_enabled(ToolKind::GitStatus));
+        assert!(settings.mcp_draft.tool_enabled(ToolKind::SearchDocs));
+    }
+
+    /// MCP 页在「未设根」的初始态下渲染不 panic,并给出警示文案(该页
+    /// 是唯一会把「根缺失」摆到台面上的地方)。
+    #[test]
+    fn mcp_page_renders_without_root() {
+        let ctx = egui::Context::default();
+        let mut settings = SettingsState::default();
+        let mcp = McpState::default();
+        let mut outbox = Vec::new();
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            mcp_page(ui, &mut settings, &mcp, &mut outbox);
+        });
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "渲染不产出消息");
     }
 
     /// 快捷键页的捕获状态是纯 UI 关注点:点一次进入捕获,再点一次退出。

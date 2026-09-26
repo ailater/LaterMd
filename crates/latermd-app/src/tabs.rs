@@ -6,12 +6,14 @@
 //! id),不随标签增删错位。
 //!
 //! 语义约定(auto-plan 规格 + 既有哲学的延伸):
-//! * 打开文件**永远开新标签**,已在某标签打开则直接激活它 —— 多标签下
-//!   「新建/打开」不再覆盖当前缓冲,`unsaved_guard` 的拦截对象消失了;
+//! * 打开文件**永远开新标签**,已在某标签打开(`find_by_path` 路径去重)
+//!   则直接激活它 —— 多标签下「新建/打开」不再覆盖当前缓冲,
+//!   `unsaved_guard` 的拦截对象消失了;
 //! * 关闭**脏**标签必须显式确认(模态文案同回滚确认的不可逆警示),
 //!   静默丢稿的代价大于多一次点击;
-//! * 在途 AI 流随「当前标签」走,换标签/关标签即作废(与 `load_document`
-//!   既有口径一致:chunk 只认当前缓冲末尾,缓冲一换剩余块会写错文档)。
+//! * 在途 AI 流**绑定发起标签的 id**(`State::ai_active_tab`):换标签/
+//!   开新标签不改写入目标也不中断;只有发起标签被关闭才作废(剩余块
+//!   无处可写,写进任何别的标签都是写错文档)。
 
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
@@ -101,11 +103,17 @@ impl TabsState {
         &mut self.tabs[active]
     }
 
-    /// 某路径已在哪个标签打开(按规范化的落盘身份逐字节比较)。
+    /// 某路径已在哪个标签打开(按落盘身份逐字节比较)。
     pub fn find_by_path(&self, path: &Path) -> Option<usize> {
         self.tabs
             .iter()
             .position(|tab| tab.document.path.as_deref() == Some(path))
+    }
+
+    /// 稳定 id 对应的标签索引;id 不在(标签已移除)返回 `None`。在途 AI 流
+    /// 的写入目标按 id 而非索引定位 —— 索引随标签增删漂移,id 不会。
+    pub fn index_by_id(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
     }
 
     /// 开新标签(换入 `text`)并激活,返回新标签索引。打开文件**永远走
