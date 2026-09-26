@@ -22,7 +22,7 @@ hosting = "github"
 # dist 自带的 homebrew installer 产 formula(引 tar.xz)而非 cask,故关闭。
 installers = []
 # 三平台五目标矩阵(AGENTS.md §5):Linux x64 / macOS 双架构(由 merge-tasks 合并
-# 到 macos-14 单 job,见下)/ Windows x64 + ARM64(xwin 容器交叉编)
+# 到 macos-14 单 job,见下)/ Windows x64 + ARM64(ARM64 走原生 runner,见下)
 targets = [
   "aarch64-apple-darwin",
   "aarch64-pc-windows-msvc",
@@ -36,6 +36,13 @@ targets = [
 # dist 0.33 无 universal2-apple-darwin target(上游 config/v1/mod.rs 标 FIXME),
 # dmg 合成由后续模块的自建 custom job 完成。
 merge-tasks = true
+
+# Win ARM64:dist 默认走 ubuntu + cargo-xwin 容器交叉编,但 ring 0.17 的
+# ARM64 汇编在容器内编不过(容器 clang 不认 cc-rs 的 /imsvc 参数形式,
+# 2026-09-26 v0.0.1 首发实测踩中)。改指 GitHub 公共仓库免费的
+# windows-11-arm 原生 runner,MSVC 工具链直编,不经 xwin。
+[dist.github-custom-runners.aarch64-pc-windows-msvc]
+runner = "windows-11-arm"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
 runner = "macos-14"
