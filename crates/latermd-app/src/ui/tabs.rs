@@ -69,14 +69,19 @@ fn chip(ui: &mut egui::Ui, tabs: &TabsState, index: usize, outbox: &mut Vec<Mess
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        // WorkBuddy 风活动页签:浅蓝底 + 蓝字 + 底部 2px 蓝条;未选中悬停浅灰
+        let accent = crate::ui::tokens::accent(ui);
+        let selected_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).selected_bg;
+        let hover_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).hover;
         let bg = if selected {
-            ui.visuals().widgets.inactive.bg_fill
+            selected_bg
         } else if response.hovered() {
-            ui.visuals().widgets.hovered.bg_fill
+            hover_bg
         } else {
             egui::Color32::TRANSPARENT
         };
         painter.rect_filled(rect, RADIUS_SM, bg);
+        let text_color = if selected { accent } else { text_color };
         painter.text(
             egui::pos2(rect.left() + SPACE_SM, rect.center().y),
             Align2::LEFT_CENTER,
@@ -84,6 +89,14 @@ fn chip(ui: &mut egui::Ui, tabs: &TabsState, index: usize, outbox: &mut Vec<Mess
             font,
             text_color,
         );
+        if selected {
+            // 底部 2px 强调条:WorkBuddy 标签的视觉锚点
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + SPACE_SM, rect.bottom() - 2.0),
+                egui::pos2(rect.right() - SPACE_SM, rect.bottom()),
+            );
+            painter.rect_filled(bar, 1.0, accent);
+        }
         // 关闭 ×:悬停该 chip 时才上色(常驻会显得噪)
         let cross = if response.hovered() {
             ui.visuals().text_color()

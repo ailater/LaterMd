@@ -4,6 +4,14 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #28 WorkBuddy 风外壳：强调色从紫罗兰改蓝、面板靠底色分区（2026-09-26）
+
+- **岔路**：坤哥看过 WorkBuddy 截图后要求「UI 要这种风格」。冲突点：①既有强调色是紫罗兰（与 `ai://` 链接同源，decisions-pending #11/#24），WorkBuddy 是飞书系蓝；②egui 出厂的 light/dark visuals 是"灰底 + 硬边框"的桌面风，WorkBuddy 是「侧栏灰 #F2F2F2 / 内容白 / **无硬边框**，靠底色分区」；③皮肤系统（#24）只管正文，外壳配色按批次 C 约定"随皮肤换色"是不做的。
+- **自动选择**：①强调色改**飞书系蓝**（浅 #3370FF / 暗 #6C9FFF），AI 专属元素（ai:// 链接、指令卡）**保留紫罗兰** —— 强调色中立化后，AI 反而是全界面唯一的紫，更醒目；②新增 `theme::shell_tokens(dark)` + `apply_shell()`：把侧栏 #F2F3F5、内容 #FFFFFF、文字 #1F2329、悬停、浅蓝选区、控件圆角 6 等投影进 egui 的**两套 style**（只投影一次，`style_mut_of` 会推进 style 版本作废布局缓存）；面板分区用底色不用线 —— `noninteractive.bg_stroke` 压到 border 色一档；③外壳是**内置观感**不是皮肤（皮肤仍只管正文），批次 C 的约定不变。
+- **实现里踩的 egui 0.36 坑**：①`Visuals` 已无 `window_rounding`/`menu_rounding` 字段，`Spacing` 也没有，浮窗圆角只能走出厂值；②TextEdit 底 = `extreme_bg_color`，而 vendored 代码块底 = `code_bg_color` —— **两者必须分开**（都给灰的话编辑器整片是灰的，"灰侧栏 + 白内容"就没了）：extreme 给内容白、code_bg 给 #F5F6F7；③`Panel`/`CentralPanel` 无 `.fill()`，预览区用 `CentralPanel::frame(Frame::default().inner_margin(8).fill(content))`。
+- **实测验证**（llvmpipe + import 截图 + 像素采样）：侧栏 #F0F3F5、菜单栏灰、编辑器 TextEdit 区白、全图 918 个像素命中 #3370FF（页签蓝条/侧栏选中/链接）；暗色一套同构投影。
+- **如何改**：嫌蓝不对就改 `theme.rs::shell_tokens` 与 `ui/tokens.rs::accent` 两处（前后者管页签/选中，前者管面板底色）；AI 元素的紫罗兰在 `ui/preview.rs::ai_link_color`，要跟着改蓝就在那。
+
 ## #27 大纲预览跳转：为什么动了 vendor、以及滚动目标的归属（2026-09-26）
 
 - **岔路**：roadmap 写「大纲预览跳转（复用 `section_to_token` 映射）」，但 vendored `MarkdownLabel` 把内容画进单个 galley，`section_to_token` 与布局 y 坐标都不对外暴露 —— app 侧无论怎么算都拿不到「这一节在第几像素」。可选：①动 vendor 暴露锚点；②app 侧按字节比例估算 y；③不做跳转。

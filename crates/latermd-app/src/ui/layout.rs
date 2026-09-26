@@ -168,14 +168,22 @@ impl LaterMdApp {
 
         // ④ 必须最后:预览(outbox 供 ai:// 链接与 ```ai 指令卡的 LinkHandler 产消息;
         // ai 只读,供指令卡状态行取流式标志与最近 prompt)
-        egui::CentralPanel::default().show(ui, |ui| {
-            crate::ui::preview::ui(
-                ui,
-                &mut self.state.tabs.current_mut().preview,
-                &self.state.ai,
-                outbox,
-            );
-        });
+        // 预览区白(WorkBuddy 风):菜单栏/侧栏/编辑器工具条吃 panel_fill 灰,
+        // 内容区显式白 —— 靠底色分区而非硬边框
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::same(8))
+                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+            )
+            .show(ui, |ui| {
+                crate::ui::preview::ui(
+                    ui,
+                    &mut self.state.tabs.current_mut().preview,
+                    &self.state.ai,
+                    outbox,
+                );
+            });
 
         // ⑤ 顶层浮层:commit message 建议(存在才显示)。panel 顺序铁律只
         // 约束 panel(浮窗是独立 Area 层,不参与嵌套),画在最后取语义上的
