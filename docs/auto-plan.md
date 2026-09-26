@@ -35,12 +35,19 @@
 | 12 | mcp-server | 本地 MCP server：五只读工具 + stdio/HTTP 双通道 + 设置页(用户 2026-09-26 追加) | ✅完成 | feat(mcp): latermd-mcp + latermd-search 下沉,PR #23 合入;docs: mcp-plan 阶段 ①-④ 全完成;口径见 decisions-pending #22 |
 | 9 | p3-live-preview | Live Preview：块级 caret 路由 + 聚焦块裸源码；**共用同一 rope buffer 与 undo 栈**（roadmap 铁律） | ✅完成(v1) | feat(md): blocks() 块划分(区间连续覆盖全文);feat(app): live.rs 活动块编辑代理 + RenderMode 分派 + Cmd+/ 命令;选区扩展与内联半隐藏留 v2 |
 | 10 | p3-nav | 大纲预览跳转（复用 section_to_token 映射）+ `[[wikilink]]` 双向链接（LinkHandler） | ✅完成 | `[[wikilink]]` 已落地；大纲预览跳转已落地（vendored ①类 `section_anchors()` + app 侧滚动消费） |
-| 13 | shell-redesign | 外壳重构：自绘标题栏（关左/关右/禅定）+ 左导航三段式 + 源码栏格式工具条 + 只读右预览 | ⏳**待拍板** | 规格见 [ui-shell-redesign.md](ui-shell-redesign.md)；**D1–D5 五个决策点需坤哥拍板**（默认：自绘标题栏 / 保留菜单栏 / 单栏三段 / 禅定保留标题栏 / 可视化编辑只预留）。拍板后按 M1→M5 五个里程碑推进（8.5 工作日） |
+| 13a | shell-m1 | 外壳重构 M1：自绘无边框标题栏（六按钮/拖窗/边缘 resize）+ 三栏重排（nav/preview/central）+ layout.json 持久化 | ⏳待开始 | 规格见 [ui-shell-redesign.md](ui-shell-redesign.md) M1；D1–D5 已按默认拍板（decisions-pending #30，依据用户 2026-09-26「加入流水线」指令） |
+| 13b | shell-m2 | 外壳重构 M2：左栏三段式（顶动作/视图导航/ScrollArea 中段/底设置行），依赖 13a | ⏳待开始 | 规格 M2 |
+| 13c | shell-m3 | 外壳重构 M3：Markdown 格式工具条（compose.rs 纯函数 12 组语义 + format_bar.rs + 12 Command + selection 回填链路） | ⏳待开始 | 规格 M3；依赖 13a（不依赖 13b，但按序执行防布局漂移） |
+| 13d | shell-m4 | 外壳重构 M4：禅定模式（pre_zen 快照/限宽 720 居中/三退出入口），依赖 13a | ⏳待开始 | 规格 M4 |
+| 13e | shell-m5 | 外壳重构 M5：收口（六项门禁+明暗像素采样验收+文档回写：ui-polish TOOLBAR_H 订正/adr-005 §3.2/acceptance-checklist 无边框三项），依赖 13a-d | ⏳待开始 | 规格 M5 |
+| 14 | lp-v2 | Live Preview v2：内联标记半隐藏（块内分段，`**` 等标记聚焦时半透明而非整块裸源码）+ 选区扩展，依赖 #9(v1 已完成) | ⏳待开始 | roadmap「P3 深水区」剩余增强；铁律：共用同一 rope buffer 与 undo 栈 |
+| 15 | backlinks | 反向链接面板：全仓扫描 `[[wikilink]]` 引用，侧栏面板列出「谁链接了当前文档」+ 点击跳转，依赖 #10(wikilink 已完成) | ⏳待开始 | roadmap「P3 深水区」剩余增强；扫描复用 latermd-search 遍历骨架 |
 
 状态图例：⏳待开始 → 🔄进行中 → ✅完成 / ❌挂起（3 次失败）/ ⛔受阻（依赖挂起）。
 
-> **#13 不在自动循环里自动起步**：D1 要把窗口改成无边框、引入三平台 resize 风险（R1），
-> 属「决定的成本高于执行的成本」的类型 —— 等坤哥拍板后再起 workflow。
+> **#13 已放行**（2026-09-26 坤哥指令「看还有什么未完成的，加入流水线」）：D1–D5 按规格默认值
+> 拍板入档（decisions-pending #30，`LATERMD_NATIVE_DECORATIONS=1` 逃生口保留），拆 13a–13e 五棒顺序推进；
+> 无边框三平台 resize 风险由 M5 像素验收 + acceptance-checklist 无边框三项兜底，Win/mac 真机仍走人工清单。
 
 ## 各条目规格（写脚本时取用）
 
@@ -71,7 +78,7 @@
 
 **#10 p3-nav**：大纲点击滚动预览到对应 section（section_to_token 映射 + scroll_to_rect）；`[[wikilink]]` 解析（latermd-md 层加语法或预处理）+ LinkHandler 点击打开文件树中同名 md。
 
-**#13 shell-redesign**（坤哥 2026-09-26 指定形态，**待 D1–D5 拍板**）：规格全文在 `docs/ui-shell-redesign.md`，这里只列 ordered milestones。
+**#13 shell-redesign**（坤哥 2026-09-26 指定形态；D1–D5 已按默认拍板见 decisions-pending #30）：规格全文在 `docs/ui-shell-redesign.md`，这里只列 ordered milestones（对应队列表 13a–13e 五棒，写脚本时按棒取对应 M 段规格）。
 - **M1 标题栏 + 三栏重排（1.5d）**：新 `ui/titlebar.rs` —— `main.rs` 加 `with_decorations(false)`；自绘 36px 条（文档名 + dirty 星号 / 右端 关闭左 · 关闭右 · 禅定 · 最小化 · 最大化 · 关闭 六按钮）；拖窗走 `ViewportCommand::StartDrag`，双击标题区走 `Maximized(!info.maximized)`；无边框丢 resize 手柄，四边各留 6px 命中区发 `BeginResize(八方向)`。新 `layout.rs` 存 `LayoutSettings{left,right,zen,left_view}` 落 `layout.json`。`ui::layout::draw` 的 panel 顺序改为 top(titlebar) → top(menubar) → left("nav") → right("preview") → `CentralPanel`(编辑器) → bottom(statusbar)；左右两个都用 `show_collapsible` 吃 `&mut bool`。
 - **M2 左栏三段式（1.5d）**：重写 `ui/sidebar.rs` —— 顶段五个文件动作图标、次段四行视图导航（整行选中：`selected_bg` 底 + 左侧 2px `accent` 竖条）、中段 `ScrollArea` 包现有四页内容（`max_height = available - NAV_BOTTOM_H` 吃掉剩余）、底段齿轮设置行。左栏下限 160→180。
 - **M3 格式工具条（3d）**：新 `compose.rs`（**纯函数**，不依赖 egui）：`apply(FormatAction, text, sel: Range<char>) -> (String, Range<char>)`，12 组语义按规格 §6.2 表实现（含 toggle off、跨行前缀替换、任务三态、CJK 多字节）+ 单测。新 `ui/format_bar.rs`；新增 12 个 `Command` + 键位（见规格 §6.3）；`EditorBuffer` 加 `replace_range(char_range, text)`；`TabState` 加 `selection` / `pending_selection` 走「UI 每帧回填 → 归约 → 下帧写回」链路（copy 既有 `OutlineCursor` 手法）。
@@ -80,9 +87,9 @@
 
 ## 人工待办（自动循环不做）
 
-- **#13 的 D1–D5 决策**（本轮新增）：自绘标题栏涉及三平台无边框行为，等坤哥拍板后自动循环才起步
+- ~~#13 的 D1–D5 决策~~（2026-09-26 已拍板：按规格默认值，见 decisions-pending #30）
 - IME 真机实测（Win11 微软拼音 / macOS 简体拼音）——M0 挂账项
-- Win/mac wgpu 真机启动验证
+- Win/mac wgpu 真机启动验证（13a 无边框化后需一并复测）
 - 三平台打包真机验收：`feature/p0-packaging` 分支（cargo-dist + universal2 dmg + cask 模板已就绪）等待人工验收合并，**自动循环不碰该分支**（见 decisions-pending #1）
 - AI provider 真实 API key 配置
-- 视觉终审与发布（打 tag 触发 Release）
+- ~~视觉终审与发布（打 tag 触发 Release）~~ v0.0.1 已发布（2026-09-26 tag + GitHub Release 产物就位）；剩余 = 发布产物真机验收（下述三项）与发布后收尾清单（acceptance-checklist）
