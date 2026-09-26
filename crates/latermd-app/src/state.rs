@@ -29,6 +29,7 @@ use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
 use crate::git_panel::GitPanelState;
 use crate::keymap::{Keymap, Shortcut};
+use crate::live::RenderMode;
 use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
@@ -180,6 +181,9 @@ pub struct State {
     pub mcp: McpState,
     /// 快捷键绑定表(用户可改,`keymap.json`;命令层从它读实际键位)。
     pub keymap: Keymap,
+    /// 编辑器渲染模式(P3 Live Preview 的那个标志;源码 ↔ Live 共用同一
+    /// rope buffer,切换无恢复逻辑)。
+    pub render_mode: RenderMode,
     /// 设置对话框(外观 / 快捷键 / AI / MCP 四页)。
     pub settings: SettingsState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
@@ -281,6 +285,7 @@ impl Default for State {
             ai: AiState::default(),
             ai_key: AiKeyState::default(),
             mcp: McpState::default(),
+            render_mode: RenderMode::default(),
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
             ai_commit_suggestion: None,
@@ -384,6 +389,8 @@ pub enum Message {
     KeymapReset(Command),
     /// 全部键位恢复出厂。
     KeymapResetAll,
+    /// 源码模式 ↔ Live Preview 互换(P3):只翻标志,不碰缓冲与光标。
+    ToggleLivePreview,
     /// 打开设置对话框并切到指定分页(工具栏齿轮 / 菜单「设置…」入口)。
     SettingsOpened(crate::settings::SettingsTab),
     /// 激活某标签(标签条点击 / 文件树与搜索跳转的已开路径)。
@@ -495,6 +502,7 @@ impl State {
                 self.theme.density = density;
                 self.persist_theme();
             }
+            Message::ToggleLivePreview => self.toggle_live_preview(),
             Message::KeymapAssign { cmd, shortcut } => self.assign_shortcut(cmd, shortcut),
             Message::KeymapCleared(cmd) => {
                 self.keymap.set(cmd, None);
@@ -891,6 +899,17 @@ impl State {
         }
         self.keymap.set(cmd, Some(shortcut));
         self.persist_keymap();
+    }
+
+    /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
+    /// 就有可编辑的块,而不是「点一下才出现」)。
+    fn toggle_live_preview(&mut self) {
+        self.render_mode = self.render_mode.opposite();
+        if self.render_mode == RenderMode::Live {
+            let tab = self.tabs.current_mut();
+            let byte = tab.cursor.byte;
+            tab.live.sync(&tab.editor, byte);
+        }
     }
 
     /// 主题落盘;失败只落提示行(切换已在内存生效,不回滚)。
@@ -1602,6 +1621,25 @@ mod tests {
         let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
         assert_eq!(reloaded_theme.density, Density::Compact);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切 Live Preview 只翻标志:文本、修订号、dirty 都不动(共用同一 rope
+    /// buffer 的可观测证据 —— 切模式没有任何「搬运」)。
+    #[test]
+    fn toggling_live_preview_only_flips_the_flag() {
+        let mut state = State::default();
+        let before = state.tabs.current().editor.text().to_owned();
+        let rev = state.tabs.current().editor.revision();
+
+        state.apply(Message::ToggleLivePreview);
+        assert_eq!(state.render_mode, RenderMode::Live);
+        assert_eq!(state.tabs.current().editor.text(), before);
+        assert_eq!(state.tabs.current().editor.revision(), rev);
+        assert!(!state.tabs.current().editor.is_dirty());
+        assert!(state.tabs.current().live.blocks.len() > 1, "块表已建");
+
+        state.apply(Message::ToggleLivePreview);
+        assert_eq!(state.render_mode, RenderMode::Source);
     }
 
     /// 系统主题只在「跟随系统」模式轮询:其余模式返回 None(egui 得以收敛

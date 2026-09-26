@@ -151,6 +151,7 @@ impl LaterMdApp {
                     editor,
                     preview,
                     cursor,
+                    live,
                     id,
                     ..
                 } = tab;
@@ -159,6 +160,8 @@ impl LaterMdApp {
                     editor,
                     preview,
                     cursor,
+                    live,
+                    state.render_mode,
                     crate::ui::editor::tab_editor_id(*id),
                 );
             });
@@ -312,6 +315,7 @@ fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
         ui.weak(format!("{} 字", text.chars().count()));
         separator(ui);
         ui.weak(state.theme.mode.label());
+        ui.weak(state.render_mode.label());
         ui.weak(crate::renderer_label(
             std::env::var("LATERMD_RENDERER").ok().as_deref(),
         ));
