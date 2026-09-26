@@ -3,7 +3,7 @@
 //! 顺序铁律:panel 添加顺序决定嵌套,先加的最外层;`CentralPanel` 必须最后加。
 //! `App::logic` 只归约状态,`App::ui` 只绘制,两者严格分离(铁律)。
 
-use crate::state::{Message, SidebarState};
+use crate::state::Message;
 use crate::LaterMdApp;
 use eframe::egui;
 
@@ -16,6 +16,7 @@ impl LaterMdApp {
             state,
             outbox,
             window_title,
+            ..
         } = self;
         // AI 后台流式收流:channel 里的 chunk 翻成 Message 并入本帧归约
         // (文本回编辑器只走 Message,后台线程不触碰 UI 状态)
@@ -100,24 +101,41 @@ impl LaterMdApp {
     /// `App::ui` 的面板主体。独立成函数是为了测试能在同一 run_ui 帧里按
     /// eframe 顺序(先 `reduce` 后绘制)跑完整帧。
     fn draw(&mut self, ui: &mut egui::Ui) {
-        // ① 最外层:顶部菜单栏(全部命令的可发现性入口)
+        // ⓪ 自绘窗口骨架之一:36px 自绘标题栏(仅无边框模式;
+        // LATERMD_NATIVE_DECORATIONS=1 的原生装饰路径不画,行为与旧版
+        // 完全一致)。
+        if self.frameless {
+            egui::Panel::top("titlebar")
+                .exact_size(crate::ui::tokens::TITLEBAR_H)
+                .frame(
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::ZERO)
+                        .fill(ui.visuals().panel_fill),
+                )
+                .show(ui, |ui| {
+                    crate::ui::titlebar::ui(ui, &self.state, &mut self.outbox);
+                });
+        }
+
+        // ① 次外层:顶部菜单栏(全部命令的可发现性入口)
         egui::Panel::top("menubar").show(ui, |ui| {
             crate::ui::menubar::ui(ui, &self.state.keymap, &mut self.outbox);
         });
 
-        // ② 次外层:侧边栏(可折叠)。show_collapsible 原地持有 `&mut visible`,
-        // 因此先把 sidebar 解构成 `visible` 与其余字段,闭包只捕获后者。
-        // 大纲数据、文件树与当前文档路径只读借用 `preview`/`file_tree`/
-        // `document`(与 `visible` 不相交);树的交互全部经由消息归约。
-        let SidebarState {
-            visible,
-            active_tab,
-        } = &mut self.state.sidebar;
-        egui::Panel::left("sidebar")
+        // ② 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
+        // 原地持有 `&mut bool`,因此先解构再把闭包要用的其余状态分头借用
+        // (都与这两个 bool 不相交)。
+        //
+        // 宽度下限走 `SIDEBAR_MIN_W`(180,M2 三段式起够用):160 是二分栏
+        // 时代的数字(docs/ui-shell-redesign.md §11 R4)。
+        let layout = &mut self.state.layout;
+        let left = &mut layout.left;
+        let active_tab = &mut layout.left_view;
+        egui::Panel::left("nav")
             .resizable(true)
             .default_size(240.0)
-            .size_range(160.0..=400.0)
-            .show_collapsible(ui, visible, |ui| {
+            .size_range(crate::ui::tokens::SIDEBAR_MIN_W..=400.0)
+            .show_collapsible(ui, left, |ui| {
                 crate::ui::sidebar::ui(
                     ui,
                     active_tab,
@@ -133,10 +151,34 @@ impl LaterMdApp {
                 );
             });
 
-        // ③ 次外层:编辑器(顶部文件工具栏 + 源码)。TextEdit 是立即模式控件,
-        // 必须原地持有 `&mut` 缓冲,因此 editor、preview 快照与大纲光标的
-        // 借用下放到本面板闭包内(归约/绘制二分对这对"控件附属状态"的
-        // 例外见 state.rs)。
+        // ③ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
+        // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
+        // 都只是让中间伸缩,不会挤掉谁。
+        let right = &mut self.state.layout.right;
+        egui::Panel::right("preview")
+            .resizable(true)
+            .default_size(crate::ui::tokens::PREVIEW_DEFAULT_W)
+            .size_range(crate::ui::tokens::PREVIEW_MIN_W..=880.0)
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::same(8))
+                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+            )
+            .show_collapsible(ui, right, |ui| {
+                crate::ui::preview::ui(
+                    ui,
+                    &mut self.state.tabs.current_mut().preview,
+                    &self.state.ai,
+                    &mut self.outbox,
+                );
+            });
+
+        // ④ 编辑器:源文本这份唯一真源住在中间,标签条与文件工具栏在其上。
+        // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
+        //
+        // TextEdit 是立即模式控件,必须原地持有 `&mut` 缓冲,故 editor /
+        // preview 快照 / 大纲光标的借用下放到本闭包内(归约/绘制二分对这对
+        // 「控件附属状态」的例外见 state.rs)。
         let state = &mut self.state;
         let outbox = &mut self.outbox;
         egui::Panel::left("editor")
@@ -163,25 +205,6 @@ impl LaterMdApp {
                     live,
                     state.render_mode,
                     crate::ui::editor::tab_editor_id(*id),
-                );
-            });
-
-        // ④ 必须最后:预览(outbox 供 ai:// 链接与 ```ai 指令卡的 LinkHandler 产消息;
-        // ai 只读,供指令卡状态行取流式标志与最近 prompt)
-        // 预览区白(WorkBuddy 风):菜单栏/侧栏/编辑器工具条吃 panel_fill 灰,
-        // 内容区显式白 —— 靠底色分区而非硬边框
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::same(8))
-                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
-            )
-            .show(ui, |ui| {
-                crate::ui::preview::ui(
-                    ui,
-                    &mut self.state.tabs.current_mut().preview,
-                    &self.state.ai,
-                    outbox,
                 );
             });
 
@@ -266,6 +289,14 @@ impl LaterMdApp {
         egui::Panel::bottom("statusbar").show(ui, |ui| {
             status_bar(ui, &self.state);
         });
+
+        // ⑨ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
+        // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
+        // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
+        // 所有面板之后,不影响任何 panel 的布局。
+        if self.frameless {
+            crate::ui::titlebar::edge_resize_zones(ui);
+        }
     }
 }
 
@@ -662,7 +693,7 @@ mod tests {
 
         let mut app = LaterMdApp::default();
         app.state.file_tree.root = Some(root.clone());
-        app.state.sidebar.active_tab = state::SidebarTab::Files;
+        app.state.layout.left_view = state::SidebarTab::Files;
         app.state.search.query = "latermd".into();
         app.state.search.debounce_due =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -1146,5 +1177,150 @@ mod tests {
             });
             output.drop_without_applying_deltas();
         }
+    }
+
+    /// 无边框模式(`frameless`)的完整 draw:自绘标题栏 + 边缘缩放命令区
+    /// 与其余面板共存渲染不 panic;点标题栏「关闭左栏」经完整面板路径发
+    /// `SidebarToggled`,下一帧归约翻转侧栏可见性。默认(原生装饰)路径
+    /// 不受影响——不画标题栏,`frameless=false` 即旧行为。
+    #[test]
+    fn frameless_draw_renders_and_toggles_sidebar_via_titlebar() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        let visible_before = app.state.layout.left;
+
+        // 渲染一帧定位左栏按钮(标题栏在屏幕顶部,按钮矩形由
+        // titlebar::button_rects 按**标题栏矩形**给出,与绘制同源)
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        )
+        .drop_without_applying_deltas();
+
+        let bar = egui::Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        let center = crate::ui::titlebar::button_rects(bar)[0].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // 面板层首两遍为 sizing/未交互遍,先热身两帧再合成点击
+        for _ in 0..2 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(app.outbox, vec![Message::SidebarToggled]);
+
+        // 下一帧归约:消息生效,面板可见性翻转
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.layout.left, !visible_before);
+        assert!(app.outbox.is_empty());
+    }
+
+    /// 自绘标题栏的「关闭右侧」按钮在**完整三栏 draw** 路径下真的能点到,
+    /// 且翻转的是右栏而非左栏(M1 验收点)。
+    ///
+    /// 走 `LaterMdApp::draw`(而非单独渲 `titlebar::ui`)是有意的:三栏重排后
+    /// 新加的 `Panel::right("preview")` 与边缘缩放命令区挤在同一命中层里,
+    /// 只测孤立标题栏会漏掉「谁抢走了这次点击」这类回归。
+    #[test]
+    fn titlebar_right_button_toggles_only_the_right_panel() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        assert!(
+            app.state.layout.left && app.state.layout.right,
+            "出厂三栏全开"
+        );
+
+        let bar = egui::Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        // 六个按钮从左至右:`TITLE_BUTTONS` 顺序,右栏是第 2 个(下标 1)
+        let center = crate::ui::titlebar::button_rects(bar)[1].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // 面板层前几遍为 sizing pass,widget 尚不参与命中测试
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(app.outbox, vec![Message::RightPanelToggled]);
+
+        // 归约在下一帧:只翻右栏,左栏纹丝不动
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            app.state.layout.left && !app.state.layout.right,
+            "只收右栏,左栏保持:left={} right={}",
+            app.state.layout.left,
+            app.state.layout.right
+        );
     }
 }

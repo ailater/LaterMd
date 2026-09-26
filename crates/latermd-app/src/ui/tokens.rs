@@ -26,6 +26,17 @@ pub const ICON: f32 = 16.0;
 pub const ICON_SM: f32 = 13.0;
 /// 工具栏按钮高度。
 pub const TOOLBAR_H: f32 = 28.0;
+/// 自绘标题栏高度(docs/ui-shell-redesign.md §11,无边框模式才有)。
+pub const TITLEBAR_H: f32 = 36.0;
+/// 标题栏右侧窗口按钮命中区(Win 风整块,mac/Linux 同款统一)。
+pub const WINDOW_BTN: egui::Vec2 = egui::Vec2::new(32.0, 24.0);
+/// 左栏(导航)宽度下限(docs/ui-shell-redesign.md §11,R4):三栏旧下限
+/// 160 是二分栏时代的数字,塞进四行视图导航后不够。
+pub const SIDEBAR_MIN_W: f32 = 180.0;
+/// 右栏(只读预览)初始宽度。
+pub const PREVIEW_DEFAULT_W: f32 = 420.0;
+/// 右栏宽度下限:再窄代码块与表格就只剩横向滚动了。
+pub const PREVIEW_MIN_W: f32 = 260.0;
 
 // —— 圆角 ——
 

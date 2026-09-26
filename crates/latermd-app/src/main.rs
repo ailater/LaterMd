@@ -22,6 +22,7 @@ mod fonts;
 mod git_diff;
 mod git_panel;
 mod keymap;
+mod layout;
 mod live;
 mod mcp;
 mod search;
@@ -76,10 +77,16 @@ fn main() -> eframe::Result<()> {
         Ok("glow") => eframe::Renderer::Glow,
         _ => eframe::Renderer::Wgpu,
     };
+    // 原生装饰逃生口(docs/ui-shell-redesign.md §2 D1):变量精确为 1 时走
+    // 系统标题栏,其余(含未设)去装饰、由 `ui::titlebar` 自绘接管。
+    let native_chrome =
+        native_decorations(std::env::var("LATERMD_NATIVE_DECORATIONS").ok().as_deref());
     let opts = eframe::NativeOptions {
         renderer,
         // 三栏的最小可用宽度:侧边栏下限 160 + 编辑器 500 + 预览余量(docs/adr-005)
-        viewport: egui::ViewportBuilder::default().with_min_inner_size([900.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_min_inner_size([900.0, 600.0])
+            .with_decorations(native_chrome),
         ..Default::default()
     };
     eframe::run_native(
@@ -103,7 +110,10 @@ fn main() -> eframe::Result<()> {
             );
             // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
             let file_tree = filetree::FileTreeSettings::load();
-            let mut app = LaterMdApp::new(theme, file_tree);
+            // 外壳布局(左右两栏开着与否 + 左栏停在哪个视图)同上,M1 起持久化
+            let layout = layout::LayoutSettings::load();
+            let mut app = LaterMdApp::new(theme, file_tree, layout);
+            app.frameless = !native_chrome;
             app.state.system_theme = system;
             app.state.system_theme_ok = system.is_some();
             Ok(Box::new(app))
@@ -122,6 +132,12 @@ pub(crate) fn renderer_label(env: Option<&str>) -> &'static str {
     }
 }
 
+/// 原生装饰逃生口的判定(与 `main` 的启动选择同源):变量**精确**为 `1`
+/// 才回落系统标题栏,未设/其余值一律自绘。`env` 由调用方传入以便无头测试。
+fn native_decorations(env: Option<&str>) -> bool {
+    env == Some("1")
+}
+
 /// 应用根:状态 + 待归约消息队列。归约在 [`eframe::App::logic`],绘制在
 /// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
 #[derive(Default)]
@@ -130,15 +146,23 @@ struct LaterMdApp {
     outbox: Vec<state::Message>,
     /// 最近一次下发给原生窗口的标题缓存;仅用于跳过重复的 set_title。
     window_title: String,
+    /// 无边框模式(自绘标题栏 + 边缘缩放命令区);`main` 启动时按
+    /// `LATERMD_NATIVE_DECORATIONS` 读一次,原生装饰路径不画任何自绘 chrome。
+    frameless: bool,
 }
 
 impl LaterMdApp {
     /// 以启动时装载的主题与文件树设置建应用(重启保持)。`Default` 恒为
     /// 深色且不走磁盘,仅供测试。
-    fn new(theme: theme::ThemeSettings, file_tree: filetree::FileTreeSettings) -> Self {
+    fn new(
+        theme: theme::ThemeSettings,
+        file_tree: filetree::FileTreeSettings,
+        layout: layout::LayoutSettings,
+    ) -> Self {
         let mut app = Self::default();
         app.state.theme = theme;
         app.state.file_tree = file_tree.into();
+        app.state.layout = layout;
         // 凭据状态启动即探测:设置浮窗状态行首见即真(后端不可用的
         // Linux 环境直接给回退提示,而不是「未配置」的误报)
         // 先探测凭据后端,再装载 AI 配置 —— 装配 provider 运行时要读 key
@@ -150,7 +174,7 @@ impl LaterMdApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{renderer_label, MCP_STDIO_ARG};
+    use super::{native_decorations, renderer_label, MCP_STDIO_ARG};
 
     /// 判定与 `main` 的启动选择同规则:认不认 `glow` 取决于 glow feature
     /// (两条产线都会跑到对应分支);值精确匹配小写,大小写变体不认。
@@ -163,6 +187,16 @@ mod tests {
         assert_eq!(renderer_label(Some("wgpu")), "wgpu");
         assert_eq!(renderer_label(Some("GLOW")), "wgpu");
         assert_eq!(renderer_label(None), "wgpu");
+    }
+
+    /// 原生装饰逃生口与变量精确匹配:仅 `1` 回落系统标题栏,未设、`0`、
+    /// 大小写变体都走自绘(与 `LATERMD_RENDERER` 同款口径)。
+    #[test]
+    fn native_decorations_requires_exact_env_value() {
+        assert!(native_decorations(Some("1")));
+        assert!(!native_decorations(Some("0")));
+        assert!(!native_decorations(Some("true")));
+        assert!(!native_decorations(None));
     }
 
     /// `--mcp-stdio` 只在精确匹配时生效(其它参数照常进 GUI);参数常量与
