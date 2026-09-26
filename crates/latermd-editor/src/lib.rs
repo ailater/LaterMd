@@ -109,6 +109,22 @@ impl EditorBuffer {
         self.touch();
     }
 
+    /// 替换字符区间为给定文本(定点编辑)。
+    ///
+    /// 供 `compose` 这类「算出局部改动」的场景用:比 [`Self::replace_all`]
+    /// 走的 delta 更小,rope 内部结构保留得多,`TextEdit` 内建 undoer 的
+    /// 快照也不至于被整篇重建打碎。区间按字符给;空区间即纯插入。
+    pub fn replace_range(&mut self, char_range: Range<usize>, text: &str) {
+        let len = self.rope.len_chars();
+        let start = char_range.start.min(len);
+        let end = char_range.end.min(len).max(start);
+        if start == end && text.is_empty() {
+            return;
+        }
+        self.remove_chars(start..end);
+        self.insert_chars(start, text);
+    }
+
     /// 整体替换。只有内容真的不同才生效(egui 内建 undo/redo 经
     /// `TextBuffer::replace_with` 走到这里,undo 栈不会推入相同快照,
     /// 但防御性短路仍保留,免得无谓推进修订号触发预览重建)。
@@ -256,6 +272,37 @@ mod tests {
     fn snapshot_matches_text() {
         let buf = EditorBuffer::new(CJK);
         assert_eq!(buf.snapshot(), CJK);
+    }
+
+    /// 定点替换:镜像与 rope 同步,CJK 按字符偏移算;空区间是纯插入。
+    #[test]
+    fn replace_range_keeps_mirror_in_sync() {
+        let mut buf = EditorBuffer::new("你好世界");
+        buf.replace_range(1..3, "AB");
+        assert_eq!(buf.text(), "你AB界");
+        assert_invariants(&buf);
+
+        buf.replace_range(1..3, "");
+        assert_eq!(buf.text(), "你界");
+        assert_invariants(&buf);
+
+        buf.replace_range(1..1, "甲乙");
+        assert_eq!(buf.text(), "你甲乙界", "空区间 = 纯插入");
+        assert_invariants(&buf);
+
+        // 换进更长文本同样成立(mirror 的 replace_range 与 rope 一致)
+        buf.replace_range(0..buf.len_chars(), "替换整个文档");
+        assert_eq!(buf.text(), "替换整个文档");
+        assert_invariants(&buf);
+    }
+
+    /// 无操作组合不推进修订号(preview 依赖「修订号前进才重建」这一条)。
+    #[test]
+    fn replace_range_noop_keeps_revision() {
+        let mut buf = EditorBuffer::new("abc");
+        let before = buf.revision();
+        buf.replace_range(1..1, "");
+        assert_eq!(buf.revision(), before, "空区间 + 空文本什么都不做");
     }
 
     /// 行号 → 行首字节:0-based、末行之后钳制到文末、CRLF 的 `\r` 属于
