@@ -48,6 +48,8 @@ ignore = "0.4.33"
 # ai:// 链接协议的 prompt 百分号解码(ADR-004 清单,decisions-pending #11):
 # 只用严格 %XX 解码,+ 不当空格
 percent-encoding = "2.3.2"
+dark-light = "3.0.0"
+ron = "0.12.2"
 
 [dev-dependencies]
 # M0 主验证 2「长文档性能」的自建基准(headless 单帧渲染耗时)。

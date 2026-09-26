@@ -86,11 +86,21 @@ fn main() -> eframe::Result<()> {
             }
             let theme = theme::ThemeSettings::load();
             // 首帧前装好主题,避免开场按默认深色闪一帧;此后每次切换由
-            // `App::logic` 的投影维持
-            theme.apply(&cc.egui_ctx);
+            // `App::logic` 的投影维持。「跟随系统」在这里先探测一次,首帧
+            // 就不是靠 fallback 猜的。
+            let system = theme::detect_system_mode();
+            theme.apply(
+                &cc.egui_ctx,
+                theme
+                    .mode
+                    .resolve(system, system.unwrap_or(theme::ThemeMode::Dark)),
+            );
             // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
             let file_tree = filetree::FileTreeSettings::load();
-            Ok(Box::new(LaterMdApp::new(theme, file_tree)))
+            let mut app = LaterMdApp::new(theme, file_tree);
+            app.state.system_theme = system;
+            app.state.system_theme_ok = system.is_some();
+            Ok(Box::new(app))
         }),
     )
 }

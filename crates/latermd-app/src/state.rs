@@ -33,7 +33,7 @@ use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
 use crate::tabs::TabsState;
-use crate::theme::{ThemeMode, ThemeSettings};
+use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
@@ -43,6 +43,12 @@ use std::time::Duration;
 
 /// 搜索输入去抖间隔(roadmap 阶段 3 的既定值)。
 const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// 「跟随系统」模式下探测系统主题的间隔。
+///
+/// 1 秒:切系统主题后最迟 1 秒跟上,又不至于每帧查一次 dbus/注册表
+/// (Linux 无统一规范,查询走 freedesktop portal,roadmap 风险 #8)。
+const SYSTEM_THEME_POLL: Duration = Duration::from_secs(1);
 
 /// 组装 AI 续写 prompt 时的文档尾部上限(字符):MockProvider 只按关键词
 /// 选脚本,真实 provider 的上下文窗口截断是 app 层的职责(latermd-ai
@@ -183,6 +189,16 @@ pub struct State {
     /// 主题(外壳 visuals 与 MarkdownStyle 的唯一事实源);每帧由 `logic`
     /// 投影到 context,切换即时生效。
     pub theme: ThemeSettings,
+    /// 皮肤目录的内容(`themes/*.ron`);选皮肤时从它取内容。
+    pub skins: SkinCatalog,
+    /// 「跟随系统」的最近一次检测结果;`None` = 尚未检测或检测失败。
+    /// 主题检测要查系统设置(Linux 走 dbus),故结果缓存在这里、由
+    /// [`State::poll_system_theme`] 节流刷新,不每帧探测。
+    pub system_theme: Option<ThemeMode>,
+    /// 系统主题探测是否可用(设置页据此提示「检测不可用,已回落手动」)。
+    pub system_theme_ok: bool,
+    /// 下一次探测系统主题的时刻;`None` = 未启用跟随系统(零轮询)。
+    pub system_theme_due: Option<std::time::Instant>,
     /// 主题落盘目录;`None` = 平台默认。仅为测试注入临时目录而存在,
     /// 生产恒为 `None`。
     pub(crate) settings_dir: Option<PathBuf>,
@@ -269,6 +285,10 @@ impl Default for State {
             settings: SettingsState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
+            skins: SkinCatalog::default(),
+            system_theme: None,
+            system_theme_ok: false,
+            system_theme_due: None,
             settings_dir: None,
         }
     }
@@ -392,6 +412,12 @@ pub enum Message {
     /// 保存 MCP 配置(设置页 MCP 页「保存」):归一化 → 落 `mcp.json` → 按
     /// 开关起停后台服务(**默认关闭**,开了才监听回环端口)。
     McpConfigSaved(McpConfig),
+    /// 选择皮肤(设置页外观页下拉);`None` = 出厂默认正文样式。
+    ThemeSkinSelected(Option<String>),
+    /// 把当前正文样式导出成皮肤文件(`themes/<name>.ron`)并选中它。
+    ThemeSkinExported { name: String },
+    /// 切换界面密度(标准 / 紧凑)。
+    ThemeDensityChanged(Density),
 }
 
 impl State {
@@ -463,6 +489,12 @@ impl State {
             Message::AiKeyBackendUnavailable => self.ai_key.backend_ok = false,
             Message::AiConfigSaved(config) => self.apply_ai_config(config),
             Message::McpConfigSaved(config) => self.apply_mcp_config(config),
+            Message::ThemeSkinSelected(name) => self.apply_skin(name),
+            Message::ThemeSkinExported { name } => self.export_skin(&name),
+            Message::ThemeDensityChanged(density) => {
+                self.theme.density = density;
+                self.persist_theme();
+            }
             Message::KeymapAssign { cmd, shortcut } => self.assign_shortcut(cmd, shortcut),
             Message::KeymapCleared(cmd) => {
                 self.keymap.set(cmd, None);
@@ -763,6 +795,38 @@ impl State {
         self.ai.poll()
     }
 
+    /// 当前应渲染的明暗:`System` 已在 [`ThemeMode::resolve`] 里落到确定值,
+    /// 绘制前一律用它,不直接读 `theme.mode`。
+    pub fn resolved_theme(&self) -> ThemeMode {
+        self.theme.mode.resolve(
+            self.system_theme,
+            self.system_theme.unwrap_or(ThemeMode::Dark),
+        )
+    }
+
+    /// 立即探测一次系统主题(启动与刚切到「跟随系统」时用)。
+    pub fn refresh_system_theme(&mut self) {
+        self.system_theme = crate::theme::detect_system_mode();
+        self.system_theme_ok = self.system_theme.is_some();
+    }
+
+    /// 节流刷新系统主题:只有「跟随系统」模式才轮询,其余模式零开销
+    /// (探测要查系统设置,不该在没用到它的时候白跑)。
+    ///
+    /// 返回下一次探测时刻(供 `ui::layout::reduce` 要帧);非跟随系统返回
+    /// `None`,让 egui 收敛到深度空闲。
+    pub fn poll_system_theme(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if self.theme.mode != ThemeMode::System {
+            self.system_theme_due = None;
+            return None;
+        }
+        if self.system_theme_due.is_none_or(|due| due <= now) {
+            self.refresh_system_theme();
+            self.system_theme_due = Some(now + SYSTEM_THEME_POLL);
+        }
+        self.system_theme_due
+    }
+
     /// 启动装载:`ai.json`(AI provider 参数)、`keymap.json`(键位)与
     /// `mcp.json`(MCP 开关/端口/工具权限),并据此装配 provider 运行时与
     /// MCP 服务。与主题/文件树设置同处调用(见 `main`)。无配置目录(极简
@@ -778,6 +842,15 @@ impl State {
         let key = self.ai_key.creds.ai_api_key();
         self.ai.set_provider(config, key.as_deref());
         self.keymap = Keymap::load_from(&dir);
+        // 皮肤目录(`themes/*.rom`)与选中的皮肤内容:皮肤文件是唯一事实源,
+        // 内存里只留载入后的样式
+        self.skins = SkinCatalog::load_from(&dir);
+        let skin = self.theme.skin.clone();
+        self.theme.select_skin(skin.as_deref(), &self.skins);
+        // 跟随系统:启动即探测一次,否则首帧只能靠 fallback
+        if self.theme.mode == ThemeMode::System {
+            self.refresh_system_theme();
+        }
         let mcp = McpConfig::load_from(&dir);
         self.mcp.set_root(self.file_tree.root.clone());
         self.mcp.apply_config(mcp);
@@ -820,6 +893,46 @@ impl State {
         self.persist_keymap();
     }
 
+    /// 主题落盘;失败只落提示行(切换已在内存生效,不回滚)。
+    fn persist_theme(&mut self) {
+        if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
+            self.tabs.current_mut().document.notice = Some(error.to_string());
+        }
+    }
+
+    /// 选皮肤:内容从目录里取(名字不在目录中则回落默认),随后落盘。
+    fn apply_skin(&mut self, name: Option<String>) {
+        let catalog = self.skins.clone();
+        self.theme.select_skin(name.as_deref(), &catalog);
+        self.persist_theme();
+    }
+
+    /// 导出当前正文样式为皮肤文件 → 重扫目录 → 选中它(所见即所得:导出的
+    /// 就是此刻看到的样式)。
+    fn export_skin(&mut self, name: &str) {
+        let Some(dir) = self.config_dir() else {
+            self.tabs.current_mut().document.notice =
+                Some("找不到配置目录,无法导出皮肤".to_owned());
+            return;
+        };
+        let style = self.theme.markdown_style();
+        match crate::theme::export_skin(&dir, name, &style) {
+            Ok(path) => {
+                self.skins = SkinCatalog::load_from(&dir);
+                let stem = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.apply_skin(Some(stem));
+                self.tabs.current_mut().document.notice =
+                    Some(format!("已导出皮肤:{}", path.display()));
+            }
+            Err(error) => {
+                self.tabs.current_mut().document.notice = Some(error);
+            }
+        }
+    }
+
     /// 保存 MCP 配置(设置页「保存」):归一化 → 落 `mcp.json` → 按开关起停
     /// 后台服务。**默认关闭**,开启才监听回环端口(docs/mcp-plan.md §5)。
     ///
@@ -859,6 +972,11 @@ impl State {
     /// 照常生效 —— 持久化失败不该牺牲本次会话的可用性。
     fn change_theme(&mut self, mode: ThemeMode) {
         self.theme.mode = mode;
+        // 切到「跟随系统」立即探测一次:否则要等下一个轮询点才生效
+        if mode == ThemeMode::System {
+            self.refresh_system_theme();
+            self.system_theme_due = None;
+        }
         if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
             self.tabs.current_mut().document.notice = Some(error.to_string());
         }
@@ -1406,6 +1524,103 @@ mod tests {
         state.apply(Message::FileTreeRootSelected(dir.clone()));
         assert_eq!(state.mcp.root(), Some(dir.clone()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换皮肤:目录里的 `.ron` 内容进内存并落 `settings.json`(皮肤文件是
+    /// 唯一事实源,配置只存名字)。
+    #[test]
+    fn theme_skin_selected_loads_style_and_persists() {
+        let dir = temp_path("skin-select");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        let style = egui_markdown_style::MarkdownStyle {
+            block_spacing: 21.0,
+            ..egui_markdown_style::MarkdownStyle::default()
+        };
+        crate::theme::export_skin(&dir, "暗夜", &style).unwrap();
+        state.skins = SkinCatalog::load_from(&dir);
+        assert_eq!(state.skins.skins.len(), 1);
+
+        state.apply(Message::ThemeSkinSelected(Some("暗夜".to_owned())));
+        assert_eq!(state.theme.markdown_style().block_spacing, 21.0);
+        assert_eq!(state.theme.skin.as_deref(), Some("暗夜"));
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(json.contains("暗夜"), "{json}");
+
+        // 选回出厂默认:内存样式与配置里的名字一起清空
+        state.apply(Message::ThemeSkinSelected(None));
+        assert_eq!(state.theme.skin, None);
+        assert_eq!(
+            state.theme.markdown_style(),
+            egui_markdown_style::MarkdownStyle::default()
+        );
+
+        // 选一个目录里没有的皮肤:回落默认而不是留在「选了不存在的」
+        state.apply(Message::ThemeSkinSelected(Some("不存在".to_owned())));
+        assert_eq!(state.theme.skin, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出皮肤:写文件 → 重扫目录 → 自动选中(所见即所得)。
+    #[test]
+    fn theme_skin_export_writes_file_and_selects_it() {
+        let dir = temp_path("skin-export");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::ThemeSkinExported {
+            name: "我的".to_owned(),
+        });
+        assert_eq!(state.theme.skin.as_deref(), Some("我的"));
+        assert!(dir.join("themes").join("我的.ron").exists());
+        assert!(state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("已导出皮肤")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 密度切换落盘;重启(`load_preferences`)后仍是紧凑。
+    #[test]
+    fn theme_density_persists_across_reload() {
+        let dir = temp_path("density");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::ThemeDensityChanged(Density::Compact));
+        assert_eq!(state.theme.density, Density::Compact);
+
+        // 重启路径:主题由 `main` 的 `ThemeSettings::load` 装载(不经过
+        // `load_preferences`),这里按同源的 load_from 复现
+        let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(reloaded_theme.density, Density::Compact);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 系统主题只在「跟随系统」模式轮询:其余模式返回 None(egui 得以收敛
+    /// 到深度空闲),跟随模式返回下一次探测时刻。
+    #[test]
+    fn system_theme_polls_only_when_following_system() {
+        let mut state = State::default();
+        assert_eq!(
+            state.poll_system_theme(std::time::Instant::now()),
+            None,
+            "默认深色不轮询"
+        );
+        state.apply(Message::ThemeChanged(ThemeMode::System));
+        let now = std::time::Instant::now();
+        let due = state.poll_system_theme(now);
+        assert!(due.is_some(), "跟随系统模式给出下一次探测时刻");
+        assert!(due.unwrap_or(now) > now);
+        // 未到点不重复探测(同一 due 原样返回)
+        assert_eq!(state.poll_system_theme(now), due);
     }
 
     /// 落盘失败(目录路径被同名文件占据):切换照常生效,失败带路径进提示行。

@@ -38,10 +38,16 @@ impl LaterMdApp {
                 state.apply(cmd.message());
             }
         }
-        // 主题投影到 context:egui 主题(外壳)+ MarkdownStyle(正文,含代码
-        // 高亮自动随 dark/light)。带 staleness 检查,空闲帧近零开销;首帧前
-        // main 已装载一次,这里覆盖此后每次切换。
-        state.theme.apply(ctx);
+        // 系统主题节流刷新:只有「跟随系统」模式才轮询(返回下一次探测时刻),
+        // 其余模式返回 None,egui 得以收敛到深度空闲。
+        if let Some(due) = state.poll_system_theme(std::time::Instant::now()) {
+            ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
+        }
+        // 主题投影到 context:egui 主题(外壳)+ 密度 token + MarkdownStyle
+        // (正文,含代码高亮自动随 dark/light)。带 staleness 检查,空闲帧近零
+        // 开销;首帧前 main 已装载一次,这里覆盖此后每次切换。`System` 已在
+        // `resolved_theme` 里落到确定的明暗。
+        state.theme.apply(ctx, state.resolved_theme());
         state.end_of_logic();
 
         // 搜索去抖到点:在归约侧发起,不放 `ui::sidebar`——归约每帧必跑、
@@ -187,9 +193,21 @@ impl LaterMdApp {
             let ai = &state.ai;
             let mcp = &state.mcp;
             let keymap = &state.keymap;
-            let mode = state.theme.mode;
-            let close =
-                crate::settings::dialog(ui, settings, mode, keymap, ai, ai_key, mcp, outbox);
+            let theme = &state.theme;
+            let skins = &state.skins;
+            let system_theme_ok = state.system_theme_ok;
+            let close = crate::settings::dialog(
+                ui,
+                settings,
+                theme,
+                skins,
+                system_theme_ok,
+                keymap,
+                ai,
+                ai_key,
+                mcp,
+                outbox,
+            );
             if close.is_some_and(|close| close.clicked()) {
                 settings.open = false;
             }
