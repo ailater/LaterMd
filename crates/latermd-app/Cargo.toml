@@ -35,15 +35,13 @@ latermd-creds = { path = "../latermd-creds" }
 latermd-export = { path = "../latermd-export" }
 # Git 只读集成(P2 版本层):状态角标、Git 面板与确认式单文件回滚
 latermd-git = { path = "../latermd-git" }
+# 文档库检索核心(P1 搜索已下沉至此,docs/mcp-plan.md §3 方案 A):侧边栏
+# 只留状态机,MCP 的 search_docs/list_files 复用同一实现
+latermd-search = { path = "../latermd-search" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
 # 文件树目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)
 ignore = "0.4.33"
-# 仓库搜索的行迭代(ADR-004 清单,P1 侧边栏搜索):只用其 LineIter,
-# 不用 Searcher 系 API——那需要 Matcher 实参,见 src/search.rs 模块注释
-grep-searcher = "0.1.17"
-# 搜索正则(ADR-004 清单):大小写开关经 RegexBuilder 承接
-regex = "1.13.1"
 # ai:// 链接协议的 prompt 百分号解码(ADR-004 清单,decisions-pending #11):
 # 只用严格 %XX 解码,+ 不当空格
 percent-encoding = "2.3.2"

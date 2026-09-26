@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 对话框过滤器接受的 Markdown 扩展名(同步给 rfd,不带点)。
-pub const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
+///
+/// 唯一事实源在 `latermd-search`:文件树、搜索与 MCP 共用同一张清单
+/// (docs/mcp-plan.md §3 方案 A —— 两份清单必然漂移)。
+pub use latermd_search::MARKDOWN_EXTENSIONS;
 
 /// 未落盘文档在另存为对话框里的预填文件名。
 pub const UNTITLED_FILE_NAME: &str = "未命名.md";

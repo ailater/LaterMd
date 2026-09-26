@@ -10,6 +10,8 @@ members = [
   "crates/latermd-export",
   "crates/latermd-git",
   "crates/latermd-md",
+  "crates/latermd-mcp",
+  "crates/latermd-search",
 ]
 
 [workspace.package]
