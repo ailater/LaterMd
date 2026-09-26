@@ -18,7 +18,7 @@ use crate::command::Command;
 use crate::keymap::Keymap;
 use crate::mcp::McpState;
 use crate::state::Message;
-use crate::theme::ThemeMode;
+use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
 use crate::ui::icons;
 use eframe::egui;
 use latermd_mcp::{McpConfig, ToolKind};
@@ -77,6 +77,8 @@ pub struct SettingsState {
     pub ai_draft: AiConfig,
     /// MCP 页的草稿:同理,「保存」才落盘并起停服务。
     pub mcp_draft: McpConfig,
+    /// 外观页「导出皮肤」的名字输入框(纯 UI 关注点,导出动作走消息)。
+    pub skin_export_name: String,
 }
 
 impl Default for SettingsState {
@@ -88,6 +90,7 @@ impl Default for SettingsState {
             notice: None,
             ai_draft: AiConfig::default(),
             mcp_draft: McpConfig::default(),
+            skin_export_name: String::new(),
         }
     }
 }
@@ -100,7 +103,9 @@ impl Default for SettingsState {
 pub fn dialog(
     ui: &mut egui::Ui,
     settings: &mut SettingsState,
-    theme_mode: ThemeMode,
+    theme: &ThemeSettings,
+    skins: &SkinCatalog,
+    system_theme_ok: bool,
     keymap: &Keymap,
     ai: &AiState,
     ai_key: &mut AiKeyState,
@@ -140,7 +145,9 @@ pub fn dialog(
                     .id_salt("settings-body")
                     .auto_shrink([false, false])
                     .show(ui, |ui| match settings.tab {
-                        SettingsTab::Appearance => appearance(ui, theme_mode, outbox),
+                        SettingsTab::Appearance => {
+                            appearance(ui, settings, theme, skins, system_theme_ok, outbox)
+                        }
                         SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
                         SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
                         SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
@@ -153,19 +160,83 @@ pub fn dialog(
     close
 }
 
-/// 外观页:主题定向选择 + 渲染后端只读。
-fn appearance(ui: &mut egui::Ui, theme_mode: ThemeMode, outbox: &mut Vec<Message>) {
+/// 外观页:主题三态 + 皮肤 + 密度 + 渲染后端只读。
+fn appearance(
+    ui: &mut egui::Ui,
+    settings: &mut SettingsState,
+    theme: &ThemeSettings,
+    skins: &SkinCatalog,
+    system_theme_ok: bool,
+    outbox: &mut Vec<Message>,
+) {
     ui.heading("外观");
     ui.add_space(crate::ui::tokens::SPACE_SM);
     ui.label("主题(外壳与正文、代码块同帧联动):");
     for mode in ThemeMode::ALL {
         if ui
-            .selectable_label(theme_mode == mode, mode.label())
+            .selectable_label(theme.mode == mode, mode.label())
             .clicked()
         {
             outbox.push(Message::ThemeChanged(mode));
         }
     }
+    if theme.mode == ThemeMode::System && !system_theme_ok {
+        // 检测不到就直说:Linux 无统一规范(roadmap 风险 #8),此时回落的
+        // 是上一次的手动选择,不该让用户以为「跟随系统」正在生效
+        ui.colored_label(
+            crate::ui::tokens::WARN,
+            "本机读不到系统主题设置,已回落到手动值",
+        );
+    }
+
+    ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.label("皮肤(正文与代码高亮样式):");
+    let current = theme.skin.as_deref();
+    egui::ComboBox::from_label("皮肤")
+        .selected_text(current.unwrap_or("出厂默认"))
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(current.is_none(), "出厂默认").clicked() && current.is_some()
+            {
+                outbox.push(Message::ThemeSkinSelected(None));
+            }
+            for skin in &skins.skins {
+                if ui
+                    .selectable_label(current == Some(skin.name.as_str()), &skin.name)
+                    .clicked()
+                {
+                    outbox.push(Message::ThemeSkinSelected(Some(skin.name.clone())));
+                }
+            }
+        });
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut settings.skin_export_name)
+                .hint_text("皮肤名")
+                .desired_width(140.0),
+        );
+        let name = settings.skin_export_name.trim();
+        if ui
+            .add_enabled(!name.is_empty(), egui::Button::new("导出当前样式"))
+            .clicked()
+        {
+            outbox.push(Message::ThemeSkinExported {
+                name: name.to_owned(),
+            });
+        }
+    });
+    ui.weak("导出到配置目录 themes/ 下,改名或删文件即增删皮肤。");
+
+    ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.label("界面密度(间距与控件尺寸):");
+    for density in Density::ALL {
+        if ui
+            .selectable_label(theme.density == density, density.label())
+            .clicked()
+        {
+            outbox.push(Message::ThemeDensityChanged(density));
+        }
+    }
+
     ui.add_space(crate::ui::tokens::SPACE_MD);
     // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
     // 决策,这里只显示不切换
@@ -173,7 +244,6 @@ fn appearance(ui: &mut egui::Ui, theme_mode: ThemeMode, outbox: &mut Vec<Message
         "渲染后端: {}",
         crate::renderer_label(std::env::var("LATERMD_RENDERER").ok().as_deref())
     ));
-    ui.weak("跟随系统主题与自定义皮肤文件属 P2.5(见 docs/roadmap.md),届时在此增加选项。");
 }
 
 /// 快捷键页:命令 + 键位 + 改键/清除/重置,含撞键提示。
@@ -463,14 +533,18 @@ mod tests {
             mcp,
             keymap,
             theme,
+            skins,
             ..
         } = state;
         let mut outbox = Vec::new();
+        let system_theme_ok = state.system_theme_ok;
         let output = ctx.run_ui(RawInput::default(), |ui| {
             dialog(
                 ui,
                 settings,
-                theme.mode,
+                theme,
+                skins,
+                system_theme_ok,
                 keymap,
                 ai,
                 ai_key,

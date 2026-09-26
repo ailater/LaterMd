@@ -17,7 +17,7 @@
 [~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包配置已就绪(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板,发布 runbook 见 [distribution.md](distribution.md));收尾修补(跨平台字体候选/ADR 登记/后端显示)已于 2026-09-25 完成;P0 剩余 = 首个 Release 发布(tag 触发 CI 全链路跑通)+ 三平台真机验收
 [~] P1 差异化     全文搜索已落地(2026-09-25),latermd-ai 基础(Mock 流式)已落地(2026-09-25),ai:// 链接与 AI 指令块已落地(2026-09-25),AI commit message 与摘要大纲已落地(2026-09-25);阶段内模块全部落地,P1 剩余仅真实 key 的凭据存取,按 auto-plan 队列归 #7(P2) 实施
 [x] P2 版本层     Git 只读集成已落地(2026-09-25);凭据管理已落地(2026-09-25);P2 全部完成(latermd-creds + AI key 闸门/设置区经 PR #20 携带合入)
-[~] P2.5 界面打磨   批次 B-light 已提前落地(2026-09-25):自绘图标体系/工具栏分组/底部状态栏/设置对话框(外观·快捷键可改绑·AI 配置页)/MCP 规划,设计规格见 docs/ui-polish.md;剩余 = 三态跟随系统 + 自定义皮肤 RON(批次 B 本体)
+[x] P2.5 界面打磨   2026-09-26 全部落地:批次 B-light(图标/工具栏/状态栏/设置对话框/快捷键可改绑/AI 配置页)+ 批次 B 本体(三态主题含跟随系统 + themes/*.ron 皮肤文件 + 标准/紧凑密度),设计规格见 docs/ui-polish.md
 [x] MCP 附加项   2026-09-26 落地(原登记为「P3 之后」):latermd-search 下沉 + latermd-mcp 五只读工具 + stdio/HTTP 双通道 + 设置页 MCP 页与状态栏;默认关闭,只绑 127.0.0.1。详见 [mcp-plan.md](mcp-plan.md)
 [ ] P3 深水区
 ```
