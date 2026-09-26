@@ -35,7 +35,7 @@
 | 12 | mcp-server | 本地 MCP server：五只读工具 + stdio/HTTP 双通道 + 设置页(用户 2026-09-26 追加) | ✅完成 | feat(mcp): latermd-mcp + latermd-search 下沉,PR #23 合入;docs: mcp-plan 阶段 ①-④ 全完成;口径见 decisions-pending #22 |
 | 9 | p3-live-preview | Live Preview：块级 caret 路由 + 聚焦块裸源码；**共用同一 rope buffer 与 undo 栈**（roadmap 铁律） | ✅完成(v1) | feat(md): blocks() 块划分(区间连续覆盖全文);feat(app): live.rs 活动块编辑代理 + RenderMode 分派 + Cmd+/ 命令;选区扩展与内联半隐藏留 v2 |
 | 10 | p3-nav | 大纲预览跳转（复用 section_to_token 映射）+ `[[wikilink]]` 双向链接（LinkHandler） | ✅完成 | `[[wikilink]]` 已落地；大纲预览跳转已落地（vendored ①类 `section_anchors()` + app 侧滚动消费） |
-| 13a | shell-m1 | 外壳重构 M1：自绘无边框标题栏（六按钮/拖窗/边缘 resize）+ 三栏重排（nav/preview/central）+ layout.json 持久化 | ⏳待开始 | 规格见 [ui-shell-redesign.md](ui-shell-redesign.md) M1；D1–D5 已按默认拍板（decisions-pending #30，依据用户 2026-09-26「加入流水线」指令） |
+| 13a | shell-m1 | 外壳重构 M1：自绘无边框标题栏（六按钮/拖窗/边缘 resize）+ 三栏重排（nav/preview/central）+ layout.json 持久化 | ✅完成 | `ui/titlebar.rs`（36px 六按钮 + StartDrag + 双击最大化 + 八向 BeginResize 命中区）；`Panel::left("nav")` / `Panel::right("preview")` / 编辑器进 `Panel::left("editor")`，左右均 `show_collapsible`；新 `layout.rs` 的 `LayoutSettings` 落 `layout.json`（写盘点统一收在 `State::end_of_logic` 比对写，覆盖不产消息的面板把手路径）；左栏下限 180 (`SIDEBAR_MIN_W`)。466 测试全绿，六项门禁通过 |
 | 13b | shell-m2 | 外壳重构 M2：左栏三段式（顶动作/视图导航/ScrollArea 中段/底设置行），依赖 13a | ⏳待开始 | 规格 M2 |
 | 13c | shell-m3 | 外壳重构 M3：Markdown 格式工具条（compose.rs 纯函数 12 组语义 + format_bar.rs + 12 Command + selection 回填链路） | ⏳待开始 | 规格 M3；依赖 13a（不依赖 13b，但按序执行防布局漂移） |
 | 13d | shell-m4 | 外壳重构 M4：禅定模式（pre_zen 快照/限宽 720 居中/三退出入口），依赖 13a | ⏳待开始 | 规格 M4 |

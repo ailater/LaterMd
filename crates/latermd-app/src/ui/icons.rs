@@ -43,6 +43,18 @@ pub enum Icon {
     Settings,
     /// 重置:回环箭头。
     Reset,
+    /// 关右栏:外框 + 右侧实心条(左栏用既有 `Sidebar` 镜像)。
+    PanelRight,
+    /// 禅定:同心圆。
+    Zen,
+    /// 最小化:一条横线。
+    Minimize,
+    /// 最大化:方框。
+    Maximize,
+    /// 还原:前后错位的两个方框(后框只画上、右两边)。
+    Restore,
+    /// 关闭:叉。
+    Close,
 }
 
 impl Icon {
@@ -197,6 +209,29 @@ impl Icon {
                 );
                 seg(end, (end.0 + 0.02, end.1 + 0.20));
                 seg(end, (end.0 + 0.20, end.1 - 0.04));
+            }
+            Self::PanelRight => {
+                frame((-0.44, -0.36), (0.44, 0.36));
+                fill((0.24, -0.36), (0.44, 0.36));
+            }
+            Self::Zen => {
+                ring((0.0, 0.0), 0.30);
+                dot((0.0, 0.0), 0.09);
+            }
+            Self::Minimize => {
+                seg((-0.30, 0.0), (0.30, 0.0));
+            }
+            Self::Maximize => {
+                frame((-0.28, -0.28), (0.28, 0.28));
+            }
+            Self::Restore => {
+                // 后框被前框遮住的左、下两边不画,保持「还原」辨识度
+                path(&[(-0.06, -0.34), (0.34, -0.34), (0.34, 0.06)]);
+                frame((-0.34, -0.06), (0.06, 0.34));
+            }
+            Self::Close => {
+                seg((-0.28, -0.28), (0.28, 0.28));
+                seg((-0.28, 0.28), (0.28, -0.28));
             }
         }
     }
@@ -404,6 +439,12 @@ mod tests {
             Icon::Git,
             Icon::Settings,
             Icon::Reset,
+            Icon::PanelRight,
+            Icon::Zen,
+            Icon::Minimize,
+            Icon::Maximize,
+            Icon::Restore,
+            Icon::Close,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {

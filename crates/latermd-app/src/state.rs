@@ -29,6 +29,7 @@ use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
 use crate::git_panel::GitPanelState;
 use crate::keymap::{Keymap, Shortcut};
+use crate::layout::LayoutSettings;
 use crate::live::RenderMode;
 use crate::mcp::McpState;
 use crate::search::SearchState;
@@ -38,6 +39,7 @@ use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,7 +67,11 @@ const AI_SUMMARY_HEADING: &str = "AI 摘要";
 const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
 
 /// 侧边栏功能页签。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize/Deserialize`:外壳布局要记住「上次停在哪个视图」
+/// (`layout.json`,docs/ui-shell-redesign.md §10),变体名即存档值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SidebarTab {
     /// 文件树(P0 基础版)。
     Files,
@@ -101,16 +107,6 @@ impl SidebarTab {
             Self::Git => Icon::Git,
         }
     }
-}
-
-/// 侧边栏状态。`visible` 直接喂给 `Panel::show_collapsible` 的 `&mut bool`:
-/// 面板把手在 `ui` 里原地翻转;命令层(菜单/快捷键)的切换走
-/// [`Message::SidebarToggled`] 在 `logic` 归约。
-pub struct SidebarState {
-    /// 是否展开。
-    pub visible: bool,
-    /// 当前页签。
-    pub active_tab: SidebarTab,
 }
 
 /// 文档派生视图快照:预览文本 + 大纲,与编辑器修订号绑定。
@@ -173,8 +169,14 @@ pub struct OutlineCursor {
 
 /// 应用根状态。
 pub struct State {
-    /// 侧边栏。
-    pub sidebar: SidebarState,
+    /// 外壳布局(左右两栏展开与否 + 左栏视图 + `layout.json` 存档,
+    /// docs/ui-shell-redesign.md §10)。`left` / `right` 直接喂给各自
+    /// `Panel::show_collapsible` 的 `&mut bool`:面板把手在 `ui` 里原地翻转,
+    /// 命令层与自绘标题栏的切换走消息在 `logic` 归约。
+    pub layout: LayoutSettings,
+    /// 外壳布局的**上次写盘快照**:与 `layout` 比对决定是否真的落盘,避免
+    /// 每帧 serialize + fs::write。写盘失败时不更新(下次比对仍不等,自动重试)。
+    layout_written: LayoutSettings,
     /// 多标签(每个标签持有自己的缓冲/预览/大纲光标/落盘身份,#11)。
     pub tabs: TabsState,
     /// 在途 AI 流的发起标签 id;`None` = 无流。发起时锁定,收尾
@@ -289,10 +291,8 @@ fn main() {
 impl Default for State {
     fn default() -> Self {
         Self {
-            sidebar: SidebarState {
-                visible: true,
-                active_tab: SidebarTab::Files,
-            },
+            layout: LayoutSettings::default(),
+            layout_written: LayoutSettings::default(),
             tabs: TabsState::new(SAMPLE_MD),
             ai_active_tab: None,
             file_tree: FileTreeState::default(),
@@ -336,8 +336,12 @@ pub enum Message {
     /// 明暗主题互换(命令层「切换主题」的快捷键/菜单入口;定向选择走
     /// [`Message::ThemeChanged`])。
     ToggleTheme,
-    /// 切换侧边栏展开/折叠(命令层入口;面板把手翻转不走消息)。
+    /// 切换左侧导航栏展开/折叠(命令层 `Ctrl/Cmd+\` 与自绘标题栏「关闭
+    /// 左侧」两个入口;面板把手自行翻转不走消息)。
     SidebarToggled,
+    /// 切换右侧只读预览栏(自绘标题栏「关闭右侧」入口,
+    /// docs/ui-shell-redesign.md §3.1;M1 起接 `LayoutSettings::right`)。
+    RightPanelToggled,
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -451,7 +455,7 @@ impl State {
     pub fn apply(&mut self, message: Message) {
         match message {
             Message::SidebarTabChanged(tab) => {
-                self.sidebar.active_tab = tab;
+                self.layout.left_view = tab;
                 // 切到 Git 页立即刷新:页签可能停了很久,轮询周期外的快照
                 // 会误导回滚决策
                 if tab == SidebarTab::Git {
@@ -463,7 +467,8 @@ impl State {
             Message::ExportHtml => self.run_export_html(),
             Message::ThemeChanged(mode) => self.change_theme(mode),
             Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
-            Message::SidebarToggled => self.sidebar.visible = !self.sidebar.visible,
+            Message::SidebarToggled => self.toggle_left_panel(),
+            Message::RightPanelToggled => self.toggle_right_panel(),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
@@ -926,6 +931,17 @@ impl State {
         self.persist_keymap();
     }
 
+    /// 翻转左栏(导航)可见性。写盘不在这里 —— 帧末的比对写统一负责
+    /// (见 `end_of_logic`),既是面板把手那条不产消息的路径也要被写到。
+    fn toggle_left_panel(&mut self) {
+        self.layout.left = !self.layout.left;
+    }
+
+    /// 翻转右栏(只读预览)可见性;写盘同上由帧末统一负责。
+    fn toggle_right_panel(&mut self) {
+        self.layout.right = !self.layout.right;
+    }
+
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
     /// 就有可编辑的块,而不是「点一下才出现」)。
     fn toggle_live_preview(&mut self) {
@@ -1074,6 +1090,18 @@ impl State {
         self.search.poll_hits();
         // MCP:收绑定结果与调用计数(两者都是非阻塞的轻量检查)
         self.mcp.poll();
+        // 外壳布局落盘的唯一写入点:与上次写下的一份比对,变了才写。
+        //
+        // **为什么是这里而不是各条消息**:左右两栏的面板把手在 `ui` 里原地
+        // 翻转 `&mut bool`(egui 内建的收起/拖回动画都在那条路径上),
+        // 根本不产消息 —— 只在归约侧写盘会把拖把手这个最常用的入口漏掉。
+        // 比对写排除了闲置帧的重复 IO(每帧 serialize + write 不可接受)。
+        if self.layout != self.layout_written {
+            let snapshot = self.layout.clone();
+            if self.layout.save_to(self.settings_dir.as_deref()).is_ok() {
+                self.layout_written = snapshot;
+            }
+        }
     }
 
     fn run_file_cmd(&mut self, cmd: FileCmd) {
@@ -1341,7 +1369,7 @@ mod tests {
             settings_dir: Some(dir.clone()),
             ..State::default()
         };
-        let visible_before = state.sidebar.visible;
+        let visible_before = state.layout.left;
 
         state.apply(Message::ToggleTheme);
         assert_eq!(state.theme.mode, ThemeMode::Light, "默认深色 → 浅色");
@@ -1350,7 +1378,98 @@ mod tests {
         assert_eq!(state.theme.mode, ThemeMode::Dark, "再切回深色");
 
         state.apply(Message::SidebarToggled);
-        assert_eq!(state.sidebar.visible, !visible_before);
+        assert_eq!(state.layout.left, !visible_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个「关闭栏」按钮各自只翻自己那一个 bool,互不牵连(M1 验收点:
+    /// 同时关左右 → 只剩编辑器)。
+    #[test]
+    fn panel_toggles_are_independent() {
+        let mut state = State::default();
+        assert!(state.layout.left && state.layout.right, "出厂三栏全开");
+
+        state.apply(Message::SidebarToggled);
+        assert!(!state.layout.left && state.layout.right, "只收左栏");
+
+        state.apply(Message::RightPanelToggled);
+        assert!(!state.layout.left && !state.layout.right, "左右都收");
+
+        state.apply(Message::SidebarToggled);
+        assert!(state.layout.left && !state.layout.right, "只开左栏");
+    }
+
+    /// 面板开合落到 `layout.json`,重启(`load_from`)后逐项一致。写盘在帧末
+    /// 统一发生,故这里必须显式跑一次 `end_of_logic`。
+    #[test]
+    fn layout_panel_state_persists_across_reload() {
+        let dir = temp_path("layout-dir");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::SidebarToggled);
+        state.apply(Message::SidebarTabChanged(SidebarTab::Outline));
+        state.end_of_logic();
+
+        let restored = LayoutSettings::load_from(&dir).unwrap();
+        assert!(!restored.left, "左栏收起被记住");
+        assert_eq!(
+            restored.left_view,
+            SidebarTab::Outline,
+            "停在哪个视图也记住"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **面板把手那条路径也要写盘**:拖把手 / 点收缩箭头是 egui 在 `ui` 里
+    /// 原地翻转 `&mut bool`,不产任何消息 —— 写盘若挂在消息归约上,最常用
+    /// 的入口会被漏掉。这里直接改 bool 模拟它。
+    #[test]
+    fn handle_flip_without_message_still_persists() {
+        let dir = temp_path("layout-handle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        // 不经过任何 Message,模拟 ui 侧 show_collapsible 的原地翻转
+        state.layout.right = false;
+        state.end_of_logic();
+
+        assert!(
+            !LayoutSettings::load_from(&dir).unwrap().right,
+            "把手翻转同样落到 layout.json"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 闲置帧不写盘(`end_of_logic` 每帧都跑,无脑写就是每帧 serialize +
+    /// fs::write —— 一个字没敲的空闲frame也不停砸磁盘)。以文件 mtime 佐证。
+    #[test]
+    fn idle_frames_do_not_rewrite_layout_json() {
+        let dir = temp_path("layout-idle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        // 首次变更催生写盘(未变过则连文件都不建 —— 全新安装不该凭空多出
+        // 一个 json,那是下一次真正改动的事)
+        assert!(!dir.join("layout.json").exists(), "出厂态不写盘");
+        state.apply(Message::SidebarToggled);
+        state.end_of_logic();
+
+        let path = dir.join("layout.json");
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // 后续若干帧状态一字未变
+        for _ in 0..5 {
+            state.end_of_logic();
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            first,
+            "状态未变则不再写盘"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
