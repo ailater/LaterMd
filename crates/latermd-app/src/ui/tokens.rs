@@ -34,13 +34,16 @@ pub const RADIUS_SM: f32 = 4.0;
 
 // —— 语义色 ——
 
-/// 强调色:主按钮、AI 相关、选中态。与 `ai://` 链接色同源
-/// (decisions-pending #11 已定紫罗兰两档),避免 AI 两处不同色。
+/// 强调色:页签选中、选中态下划线、主按钮。WorkBuddy 风(2026-09-26 定):
+/// 飞书系蓝,浅色 #3370FF、暗色 #6C9FFF。
+///
+/// AI 专属元素(ai:// 链接、指令卡)仍用紫罗兰 —— 见 `ui::preview` 的
+/// `ai_link_color`:强调色中立化之后,AI 是"唯一用紫罗兰的东西",反而更醒目。
 pub fn accent(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0xA7, 0x8B, 0xFA)
+        Color32::from_rgb(0x6C, 0x9F, 0xFF)
     } else {
-        Color32::from_rgb(0x8B, 0x7C, 0xF6)
+        Color32::from_rgb(0x33, 0x70, 0xFF)
     }
 }
 

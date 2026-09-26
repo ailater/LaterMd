@@ -27,6 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use eframe::egui::Color32;
 use egui_markdown_style::MarkdownStyle;
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +188,7 @@ impl ThemeSettings {
         if ctx.theme() != theme {
             ctx.set_theme(theme);
         }
+        apply_shell(ctx);
         apply_density(ctx, self.density);
         let wanted = self.markdown_style();
         if *egui_markdown_style::global_style(ctx) != wanted {
@@ -260,6 +262,126 @@ impl ThemeSettings {
         serde_json::from_slice(&bytes)
             .map_err(|source| LoadError::Corrupt(format!("{}: {}", path.display(), source)))
     }
+}
+
+/// WorkBuddy 风外壳 token(2026-09-26 坤哥指定方向;浅色取自截图采样:
+/// 侧栏/顶栏 #F2F2F2、内容纯白、**无硬边框**,靠底色分区)。
+///
+/// 这是对 egui 内置 light/dark visuals 的**投影**(不再是"出厂默认"),
+/// 亮暗各一套;皮肤文件仍只管正文(批次 C 的"外壳随皮肤"依旧不做 ——
+/// 这里是内置观感,不是皮肤系统)。
+pub struct ShellTokens {
+    /// 侧边栏 / 顶栏 / 菜单栏的底。
+    pub sidebar: Color32,
+    /// 编辑器与预览的内容区底。
+    pub content: Color32,
+    /// 主文字。
+    pub text: Color32,
+    /// 次要文字(提示行、占位)。
+    pub secondary: Color32,
+    /// 悬停底(白底上)。
+    pub hover: Color32,
+    /// 选中底(浅蓝,列表/页签选中)。
+    pub selected_bg: Color32,
+    /// 强调(链接、选中文字、活动页签)。
+    pub accent: Color32,
+    /// 分隔线与描边(弱,尽量少用)。
+    pub border: Color32,
+    /// 代码块 / 行内代码底。
+    pub code_bg: Color32,
+    /// 更弱一档的底(斑马纹、禁用区)。
+    pub faint: Color32,
+}
+
+/// 取当前明暗的 shell token。
+pub fn shell_tokens(dark: bool) -> ShellTokens {
+    if dark {
+        ShellTokens {
+            sidebar: Color32::from_rgb(0x20, 0x21, 0x24),
+            content: Color32::from_rgb(0x29, 0x2A, 0x2D),
+            text: Color32::from_rgb(0xE8, 0xEA, 0xED),
+            secondary: Color32::from_rgb(0x9A, 0xA0, 0xA6),
+            hover: Color32::from_rgb(0x35, 0x37, 0x3A),
+            selected_bg: Color32::from_rgb(0x2B, 0x3F, 0x5E),
+            accent: Color32::from_rgb(0x6C, 0x9F, 0xFF),
+            border: Color32::from_rgb(0x3C, 0x40, 0x43),
+            code_bg: Color32::from_rgb(0x23, 0x24, 0x27),
+            faint: Color32::from_rgb(0x2A, 0x2B, 0x2E),
+        }
+    } else {
+        ShellTokens {
+            sidebar: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+            content: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            text: Color32::from_rgb(0x1F, 0x23, 0x29),
+            secondary: Color32::from_rgb(0x64, 0x6A, 0x73),
+            hover: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+            selected_bg: Color32::from_rgb(0xE1, 0xEF, 0xFF),
+            accent: Color32::from_rgb(0x33, 0x70, 0xFF),
+            border: Color32::from_rgb(0xE5, 0xE6, 0xEB),
+            code_bg: Color32::from_rgb(0xF5, 0xF6, 0xF7),
+            faint: Color32::from_rgb(0xFA, 0xFB, 0xFC),
+        }
+    }
+}
+
+/// 内容区的底(编辑器与预览面板显式 `.fill`;侧栏吃 `panel_fill`)。
+pub fn content_fill(dark: bool) -> Color32 {
+    shell_tokens(dark).content
+}
+
+/// 把 WorkBuddy 外壳 token 投影进 egui 的两套 style(亮暗各一)。
+///
+/// 只投影一次(`ui.data` 记标志):`style_mut_of` 即使值相同也会推进 style
+/// 版本、作废布局缓存,每帧调用不可接受。
+fn apply_shell(ctx: &egui::Context) {
+    let id = egui::Id::new("latermd-shell");
+    let changed = ctx.data_mut(|data| {
+        let done = data.get_temp::<bool>(id).unwrap_or(false);
+        data.insert_temp(id, true);
+        !done
+    });
+    if !changed {
+        return;
+    }
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.style_mut_of(theme, apply_shell_to);
+    }
+}
+
+fn apply_shell_to(style: &mut egui::Style) {
+    let c = shell_tokens(style.visuals.dark_mode);
+    let v = &mut style.visuals;
+    v.panel_fill = c.sidebar;
+    v.window_fill = c.content;
+
+    v.extreme_bg_color = c.code_bg;
+    v.faint_bg_color = c.faint;
+    v.hyperlink_color = c.accent;
+    // 选区:浅蓝底、无线(egui 默认蓝底蓝框太重)
+    v.selection.bg_fill = c.selected_bg;
+    v.selection.stroke = egui::Stroke::NONE;
+    // 圆角:控件 6(WorkBuddy 的圆润感)。0.36 的窗口/菜单圆角字段已不在
+    // Visuals/Spacing 的公开面,浮窗圆角走 egui 出厂值,不做覆盖
+    // 分隔线弱化:panel 之间靠底色分区,线只在必要时出现
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+    let widgets = [
+        (&mut v.widgets.inactive, c.text, Color32::TRANSPARENT),
+        (&mut v.widgets.hovered, c.text, c.hover),
+        (&mut v.widgets.active, c.accent, c.selected_bg),
+        (&mut v.widgets.open, c.text, c.hover),
+    ];
+    for (widget, fg, bg) in widgets {
+        widget.fg_stroke = egui::Stroke::new(1.0, fg);
+        widget.bg_fill = bg;
+        widget.weak_bg_fill = bg;
+        widget.corner_radius = egui::CornerRadius::same(6);
+        widget.bg_stroke = egui::Stroke::NONE;
+    }
+    // 输入框/按钮内的弱文字(占位符)用次要色
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    let _ = c.secondary; // 占位符色由 egui 的 weak_fg 承接,这里保持默认层级
 }
 
 /// 密度 → egui style token。
