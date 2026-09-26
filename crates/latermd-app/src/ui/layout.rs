@@ -710,6 +710,9 @@ mod tests {
         .unwrap();
         app.state.ai.rx = Some(rx);
         app.state.ai.streaming = true;
+        // 手工搭流式状态须同步发起标签绑定(`AiState::start` 在真实链路里
+        // 负责):chunk 的写入目标由它决定
+        app.state.ai_active_tab = Some(app.state.tabs.current().id);
 
         let ctx = egui::Context::default();
         let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));

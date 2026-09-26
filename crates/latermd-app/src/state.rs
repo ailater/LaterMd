@@ -16,9 +16,9 @@
 //! undo 栈是 TextEdit 内建 undoer 的快照,看不到程序化插入:流式结束后的
 //! 第一次 Ctrl+Z 会整体回退到最近一次用户编辑的快照(表现为「一步撤销
 //! 整段 AI 续写」,redo 可恢复),用户在流式期间的手敲一并被归入同一步。
-//! 在途流随当前标签切换一并作废([`State::switch_active`] /
-//! [`State::spawn_tab`] 里收尾):chunk 只
-//! 认「当前缓冲末尾」,缓冲一换剩余块就会写错文件。
+//! 在途流**绑定发起它的标签**([`State::ai_active_tab`]):切标签/开新标签
+//! 不改写入目标也不中断 —— 多标签下用户理应能边等流式边编辑别的文档;
+//! 只有发起标签被关闭时才作废(chunk 无处可写,见 [`State::remove_tab`])。
 
 use crate::ai::AiState;
 use crate::ai_config::AiConfig;
@@ -152,6 +152,10 @@ pub struct State {
     pub sidebar: SidebarState,
     /// 多标签(每个标签持有自己的缓冲/预览/大纲光标/落盘身份,#11)。
     pub tabs: TabsState,
+    /// 在途 AI 流的发起标签 id;`None` = 无流。发起时锁定,收尾
+    /// (成功/失败/作废)清除 —— [`Message::AiChunk`] / [`Message::AiDone`]
+    /// 的写入目标由它决定,与 `tabs.active` 无关:切标签不中断也不改道。
+    pub ai_active_tab: Option<u64>,
     /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
     pub file_tree: FileTreeState,
     /// Git 面板(Git 页签 + Files 页角标,P2):状态/历史/diff 快照与
@@ -250,6 +254,7 @@ impl Default for State {
                 active_tab: SidebarTab::Files,
             },
             tabs: TabsState::new(SAMPLE_MD),
+            ai_active_tab: None,
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
             search: SearchState::default(),
@@ -402,7 +407,7 @@ impl State {
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
-            Message::FileSelected(path) => self.open_from_file_tree(&path),
+            Message::FileSelected(path) => self.open_path(&path),
             Message::SearchQueryChanged => self.search.input_changed(DEBOUNCE),
             Message::SearchRequested => self.start_search(),
             Message::SearchResultClicked(path, line_no) => {
@@ -411,12 +416,18 @@ impl State {
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
             Message::AiStart => self.start_ai_stream(),
             Message::AiChunk { delta } => self.append_ai_delta(&delta),
-            Message::AiDone => self.ai.finish(),
+            Message::AiDone => {
+                self.ai.finish();
+                self.ai_active_tab = None;
+            }
             Message::AiFailed(error) => {
                 self.ai.finish();
+                // 失败信息属于发起流的标签(绑定清除前定位),不属于此刻的
+                // active
+                self.ai_origin_tab_mut().document.notice = Some(error);
+                self.ai_active_tab = None;
                 // 失败不算完成:指令卡状态随 last_prompt 清空回到未执行
                 self.ai.forget_last_prompt();
-                self.tabs.current_mut().document.notice = Some(error);
             }
             Message::AiLinkClicked { prompt } => match prompt {
                 Ok(prompt) => {
@@ -664,13 +675,17 @@ impl State {
     /// 流式启动的共用入口,两个来源:菜单命令(带文档尾部的 prompt)与
     /// ai:// 链接点击(链接里的提示词,原样透传)。防重入在此把关,流式
     /// 进行中连「补空行」都不发生;key 闸门在两处入口的归约最前面
-    /// (见 [`Self::ai_key_gate`]),走到这里必然已过闸。
+    /// (见 [`Self::ai_key_gate`]),走到这里必然已过闸。发起成功即把流
+    /// 锁定到当前标签([`State::ai_active_tab`]),此后 chunk 的写入目标
+    /// 不随 `tabs.active` 漂移。
     fn start_ai_stream_with_prompt(&mut self, prompt: &str) {
         if self.ai.is_streaming() {
             return;
         }
         self.ensure_trailing_blank_line();
-        self.ai.start(prompt);
+        if self.ai.start(prompt) {
+            self.ai_active_tab = Some(self.tabs.current().id);
+        }
     }
 
     /// 文档非空且不以空行结尾时,补成恰好一个空行(空文档/已空行结尾不动)。
@@ -690,12 +705,39 @@ impl State {
         }
     }
 
-    /// 追加 AI 增量块到文档末尾(`Message::AiChunk` 的归约)。走
-    /// `insert_chars` 的增量 splice 双写,dirty 与修订号照常推进 —— AI 写
-    /// 进来的是真实内容,保存前与手敲同责;undo 语义见模块文档。
+    /// 追加 AI 增量块到**发起标签**文档末尾(`Message::AiChunk` 的归约)。
+    /// 写入目标按 [`State::ai_active_tab`] 定位而非当前标签 —— 流式期间
+    /// 切标签,块仍长在发起它的文档上(关键回归测试
+    /// `ai_stream_writes_to_origin_tab_not_active`)。发起标签已不存在时
+    /// (理论上 `remove_tab` 已先行作废流)丢弃块并作废,绝不落到别的
+    /// 标签。走 `insert_chars` 的增量 splice 双写,dirty 与修订号照常推进
+    /// —— AI 写进来的是真实内容,保存前与手敲同责;undo 语义见模块文档。
     fn append_ai_delta(&mut self, delta: &str) {
-        let tab = self.tabs.current_mut();
+        let Some(index) = self.ai_stream_tab_index() else {
+            self.abort_ai_stream();
+            return;
+        };
+        let tab = &mut self.tabs.tabs[index];
         tab.editor.insert_chars(tab.editor.len_chars(), delta);
+    }
+
+    /// 在途流发起标签的索引;id 失效(标签已被移除)返回 `None`。
+    fn ai_stream_tab_index(&self) -> Option<usize> {
+        self.ai_active_tab.and_then(|id| self.tabs.index_by_id(id))
+    }
+
+    /// 在途流的发起标签(可变);id 失效时退回当前标签(防御性兜底,
+    /// 正常流程 `remove_tab` 已把流作废,收尾消息不会晚于标签移除到达)。
+    fn ai_origin_tab_mut(&mut self) -> &mut crate::tabs::TabState {
+        let index = self.ai_stream_tab_index().unwrap_or(self.tabs.active);
+        &mut self.tabs.tabs[index]
+    }
+
+    /// 作废在途流(收尾标志 + 指令卡状态键 + 发起标签绑定一并清)。
+    fn abort_ai_stream(&mut self) {
+        self.ai.finish();
+        self.ai.forget_last_prompt();
+        self.ai_active_tab = None;
     }
 
     /// 收流(每帧归约调用一次):把 AI channel 里积压的 chunk 翻成消息,
@@ -816,7 +858,7 @@ impl State {
             FileCmd::Open => {
                 let start = file::start_dir(self.tabs.current().document.path.as_deref());
                 if let Some(path) = file::open_dialog(&start) {
-                    self.open_in_tab(&path);
+                    self.open_path(&path);
                 }
             }
             FileCmd::Save => {
@@ -861,8 +903,10 @@ impl State {
         }
     }
 
-    /// 文件树点击文件:已开则激活该标签,否则开新标签。
-    fn open_from_file_tree(&mut self, path: &Path) {
+    /// 按路径打开文档的统一入口(菜单「打开」/ 文件树点击 / 搜索跳转):
+    /// 该路径已在某标签打开则**激活它**(路径去重,同一路径至多一个标签),
+    /// 否则读盘开新标签。
+    fn open_path(&mut self, path: &Path) {
         if let Some(index) = self.tabs.find_by_path(path) {
             self.switch_active(index);
         } else {
@@ -870,21 +914,15 @@ impl State {
         }
     }
 
-    /// 开新标签的统一入口:作废在途 AI 流后再换入 —— 新标签随即成为
-    /// 「当前缓冲」,旧流的剩余块会写进新文档,与换文档作废是同一条风险。
+    /// 开新标签的统一入口。不动在途 AI 流:流绑定发起标签
+    /// ([`State::ai_active_tab`]),新标签不是它的写入目标。
     fn spawn_tab(&mut self, path: Option<PathBuf>, text: &str) -> usize {
-        self.ai.finish();
-        self.ai.forget_last_prompt();
         self.tabs.open_tab(path, text)
     }
 
-    /// 激活某标签;切换会作废在途 AI 流(chunk 只认当前缓冲末尾,缓冲一换
-    /// 剩余块会写进别的文档)。
+    /// 激活某标签。不动在途 AI 流:chunk 的写入目标由发起标签 id 决定,
+    /// 与当前标签无关(多标签 #11 的核心不变量)。
     fn switch_active(&mut self, index: usize) {
-        if self.tabs.active != index {
-            self.ai.finish();
-            self.ai.forget_last_prompt();
-        }
         self.tabs.activate(index);
     }
 
@@ -900,13 +938,13 @@ impl State {
         }
     }
 
-    /// 真正移除(确认后或干净标签)。关的是当前标签则作废在途流。
+    /// 真正移除(确认后或干净标签)。关掉的是在途流的发起标签则作废流
+    /// —— 剩余 chunk 无处可写,落到任何别的标签都是写错文档。
     fn remove_tab(&mut self, index: usize) {
-        let closing_active = index == self.tabs.active;
+        let closing_stream_origin = self.ai_stream_tab_index() == Some(index);
         self.tabs.remove(index);
-        if closing_active {
-            self.ai.finish();
-            self.ai.forget_last_prompt();
+        if closing_stream_origin {
+            self.abort_ai_stream();
         }
     }
 
@@ -1634,67 +1672,70 @@ mod tests {
         state.ai.finish();
     }
 
-    /// 评审回归:流式进行中切文档必须取消在途流。AI 写入置 dirty →
-    /// Ctrl+S 清 dirty → New 的 unsaved_guard 放行 → load_document 换入
-    /// 新缓冲;若不收尾,剩余 chunk 会经 poll_ai 追加进新文档。文件树点击
-    /// 与搜索跳转同走 load_document,一处收口。
+    /// 关键回归(#11 核心不变量):在途 AI 流**绑定发起标签** —— 流式期间
+    /// 开新标签,chunk 仍长在发起标签的文档末尾,新标签零污染;收尾清除
+    /// 绑定。单标签时代的「换文档作废流」语义随多标签废弃:用户理应能
+    /// 边等流式边在别的标签干活。
     #[test]
-    fn switching_document_cancels_inflight_ai_stream() {
-        let path = temp_path("ai-switch.md");
+    fn ai_stream_writes_to_origin_tab_not_active() {
         let mut state = State::default();
-        // 慢 provider:保证测试在流自然收尾前完成切文档(20ms × 30-50 块)
+        // 慢 provider:保证测试在流自然收尾前完成开新标签(20ms × 30-50 块)
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
             std::time::Duration::from_millis(20),
         ));
-        state.tabs.current_mut().document.path = Some(path.clone()); // Save 直落盘,不弹对话框
 
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
-        // 前置:流确实在产块(对照取消后的空收流)
+        let origin_id = state.ai_active_tab.expect("发起时锁定标签 id");
+        assert_eq!(origin_id, state.tabs.current().id, "发起标签即当前标签");
+        let origin_base = state.tabs.current_mut().editor.text().to_owned();
+
+        // 前置:流确实在产块(此时的块经归约落进发起标签)
         std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
             state
                 .poll_ai()
                 .iter()
                 .any(|m| matches!(m, Message::AiChunk { .. })),
-            "前置:流在切文档前已产出正文块"
-        );
-        assert!(
-            state.tabs.current_mut().editor.is_dirty(),
-            "AI 写入置 dirty"
+            "前置:开新标签前已产出正文块"
         );
 
-        // 复刻评审路径:Save 清 dirty,放行 New 的 unsaved_guard
-        state.apply(Message::FileCommand(FileCmd::Save));
-        assert!(path.exists(), "已落盘");
-        assert!(!state.tabs.current_mut().editor.is_dirty());
-
+        // 开新标签:当前缓冲换走,流不中断、写入目标不改道
         state.apply(Message::FileCommand(FileCmd::New));
-        assert_eq!(state.tabs.current().document.path, None);
-        assert_eq!(state.tabs.current_mut().editor.text(), "", "新文档为空");
-        assert!(!state.ai.is_streaming(), "换文档取消在途流");
+        assert_eq!(state.tabs.tabs.len(), 2);
+        assert!(state.ai.is_streaming(), "开新标签不作废在途流");
+        assert_eq!(state.ai_active_tab, Some(origin_id), "写入目标仍是发起标签");
 
-        // 给 worker 留出再发几块的时间:接收端已 drop,chunk 不得再进文档
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let messages = state.poll_ai();
+        // 收流到自然结束:全部 chunk 落发起标签,新标签保持空白
+        drain_ai_stream(&mut state);
+        assert!(!state.ai.is_streaming());
+        assert_eq!(state.ai_active_tab, None, "收尾清除发起标签绑定");
         assert!(
-            messages
-                .iter()
-                .all(|m| !matches!(m, Message::AiChunk { .. })),
-            "取消后 poll 不再产出正文块,实际 {messages:?}"
+            state.tabs.tabs[0].editor.text().len() > origin_base.len(),
+            "发起标签吃到全部续写"
+        );
+        assert!(
+            state.tabs.tabs[0].editor.is_dirty(),
+            "AI 写入置发起标签 dirty"
         );
         assert_eq!(
-            state.tabs.current_mut().editor.text(),
+            state.tabs.tabs[1].editor.text(),
             "",
-            "新文档未被 AI 追加"
+            "新标签零污染(这正是旧语义要防的「chunk 写错文档」)"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// AiChunk 追加语义:精确接在文档末尾;空 delta 是无操作(不推进修订号)。
+    /// 真实链路里 chunk 只来自在途流(`poll_ai`),故先发起建立标签绑定。
     #[test]
     fn ai_chunk_appends_at_end_and_empty_delta_is_noop() {
         let mut state = State::default();
+        state.apply(Message::AiStart);
+        assert_eq!(
+            state.ai_active_tab,
+            Some(state.tabs.current().id),
+            "前置:发起已锁定写入目标"
+        );
         state.apply(Message::AiChunk {
             delta: "续写".into(),
         });
@@ -1769,6 +1810,24 @@ mod tests {
         );
         // 失败不算完成:指令卡的状态键一并清空(卡片回「未执行」)
         assert_eq!(state.ai.last_prompt, None);
+        assert_eq!(state.ai_active_tab, None, "失败清除发起标签绑定");
+
+        // 多标签回归:失败提示属于发起流的标签,不属于此刻的 active
+        state.spawn_tab(None, "第二篇");
+        state.apply(Message::TabActivate(0));
+        state.apply(Message::AiStart);
+        assert_eq!(state.ai_active_tab, Some(state.tabs.tabs[0].id));
+        state.apply(Message::TabActivate(1));
+        state.apply(Message::AiFailed("跨标签失败".into()));
+        assert_eq!(
+            state.tabs.tabs[0].document.notice.as_deref(),
+            Some("跨标签失败"),
+            "提示落在发起标签"
+        );
+        assert!(
+            state.tabs.tabs[1].document.notice.is_none(),
+            "此刻的 active 标签不被打扰"
+        );
     }
 
     /// ai:// 链接点击归约:Ok(prompt) 复用流式启动路径(补空行 + 发起),
@@ -2372,9 +2431,10 @@ mod tests {
         );
     }
 
-    /// Ctrl+Tab 循环切换;切换作废在途流(chunk 只认当前缓冲)。
+    /// Ctrl+Tab 循环切换;切换不作废在途流(流绑定发起标签,见
+    /// `ai_stream_writes_to_origin_tab_not_active`)。
     #[test]
-    fn tab_next_cycles_and_cancels_stream() {
+    fn tab_next_cycles_and_stream_keeps_running() {
         let mut state = State::default();
         state.spawn_tab(None, "第二篇");
         state.spawn_tab(None, "第三篇");
@@ -2385,11 +2445,120 @@ mod tests {
         state.apply(Message::TabNext);
         assert_eq!(state.tabs.active, 1);
 
-        // 在途流在切换时作废
+        // 在途流随切换继续:写入目标仍是发起标签
         state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::new());
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
+        let origin = state.ai_active_tab;
         state.apply(Message::TabNext);
-        assert!(!state.ai.is_streaming(), "切标签作废在途流");
+        assert!(state.ai.is_streaming(), "切标签不作废在途流");
+        assert_eq!(state.ai_active_tab, origin, "写入目标不改道");
+        state.apply(Message::AiDone);
+    }
+
+    /// 关闭在途流的发起标签:流作废 —— 剩余 chunk 无处可写,落到任何
+    /// 别的标签都是写错文档;兜底空标签保持空白。
+    #[test]
+    fn closing_stream_origin_tab_aborts_stream() {
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(20),
+        ));
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            state
+                .poll_ai()
+                .iter()
+                .any(|m| matches!(m, Message::AiChunk { .. })),
+            "前置:流在产块"
+        );
+
+        // AI 写入已置 dirty → 关闭走确认模态
+        state.apply(Message::TabCloseRequested(0));
+        assert_eq!(state.tabs.confirm_close, Some(0), "发起标签已脏,先弹确认");
+        state.apply(Message::TabCloseConfirmed);
+        assert!(!state.ai.is_streaming(), "发起标签被关,流作废");
+        assert_eq!(state.ai_active_tab, None, "绑定一并清除");
+        assert_eq!(state.tabs.tabs.len(), 1, "回到唯一的兜底空标签");
+
+        // 给 worker 留出再发几块的时间:接收端已 drop,不得再有正文块
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let messages = state.poll_ai();
+        assert!(
+            messages
+                .iter()
+                .all(|m| !matches!(m, Message::AiChunk { .. })),
+            "作废后 poll 不再产出正文块,实际 {messages:?}"
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "",
+            "兜底空标签未被 AI 追加"
+        );
+    }
+
+    /// 路径去重:同一路径无论从哪个入口打开(打开归约 / 文件树点击 /
+    /// 搜索跳转),至多占一个标签;再次打开是激活而非新建。
+    #[test]
+    fn opening_same_path_twice_yields_single_tab() {
+        let dir = temp_path("dedup-open");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "# 去重\n").unwrap();
+
+        let mut state = State::default();
+        state.open_path(&note);
+        assert_eq!(state.tabs.tabs.len(), 2, "首次打开开新标签");
+
+        // 文件树点击同路径:激活已有标签,不再新建
+        state.spawn_tab(None, "第三篇");
+        assert_eq!(state.tabs.tabs.len(), 3);
+        state.apply(Message::FileSelected(note.clone()));
+        assert_eq!(state.tabs.tabs.len(), 3, "同路径不新建标签");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(note.as_path()),
+            "已切到该路径的标签"
+        );
+
+        // 搜索跳转同语义
+        state.apply(Message::SearchResultClicked(note.clone(), 1));
+        assert_eq!(state.tabs.tabs.len(), 3, "搜索点击同路径仍不新建");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切标签后的编辑只落 active 标签:另一标签的文本、dirty 镜像与预览
+    /// 快照都不动(每标签一套缓冲/快照/光标,换标签零拷贝)。
+    #[test]
+    fn editing_after_switch_only_touches_active_tab() {
+        let mut state = State::default();
+        let origin_text = state.tabs.current_mut().editor.text().to_owned();
+        let origin_rev = state.tabs.current().preview.synced_rev;
+        state.spawn_tab(None, "第二篇");
+        assert_eq!(state.tabs.active, 1);
+
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "只属于第二篇");
+        state.end_of_logic();
+        assert!(
+            state.tabs.tabs[1].editor.text().starts_with("只属于第二篇"),
+            "active 标签吃到编辑"
+        );
+        assert!(state.tabs.tabs[1].document.dirty, "dirty 镜像只落 active");
+        assert_eq!(
+            state.tabs.tabs[0].editor.text(),
+            origin_text,
+            "另一标签文本不动"
+        );
+        assert!(!state.tabs.tabs[0].document.dirty);
+        assert_eq!(
+            state.tabs.tabs[0].preview.synced_rev, origin_rev,
+            "另一标签的预览快照不动"
+        );
     }
 }

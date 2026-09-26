@@ -83,8 +83,10 @@ pub struct AiState {
     /// 最近一次真实发起的 prompt 原文(AI 指令卡的状态匹配键):
     /// 指令文本与它相等 → 流式中「进行中」/结束「已完成」,否则「未执行」。
     /// 只增不清是刻意的:`finish` 后保留才能显示「已完成」,失效时机只有
-    /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与换文档
-    /// (`State::switch_active` / `State::spawn_tab` 里清),卡片是文档的派生物。
+    /// 两个——流失败([`crate::state::Message::AiFailed`] 归约里清)与发起
+    /// 标签被关闭(`State::remove_tab` 作废流时清)。流绑定发起标签
+    /// (`State::ai_active_tab`),切标签不作废:别的标签里文本不匹配的
+    /// 指令卡自然显示「未执行」,切回发起标签仍能正确显示状态。
     pub(crate) last_prompt: Option<String>,
     /// 当前生效的 AI 配置(端点/模型/采样参数……)。与 `runtime` 同源:
     /// 保存配置即重新装配 runtime,两者不会各说各话。

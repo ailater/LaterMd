@@ -4,6 +4,12 @@
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > 编号 #6 为当前阻塞项，需用户裁决。
 
+## #23 多标签归约迁移的三处消息口径:TabOpen 不引入、确认关闭不带载荷、孤立 chunk 丢弃(2026-09-26)
+
+- **岔路**:multi-tabs 棒的任务规格写「Message 新增 `TabOpen { path }`、`TabCloseConfirmed { index }`」,而 main 上已落地的多标签骨架(`crates/latermd-app/src/tabs.rs` + state.rs 归约)用了不同的等价结构;另有一个规格没覆盖的防御分支(在途流的发起标签已不存在时,迟到的 `AiChunk` 写到哪)需要定口径。
+- **自动选择**:①**不引入 `TabOpen`**——「打开」的三个入口(菜单「打开」对话框 / 文件树点击 / 搜索跳转)都在归约内部完成「路径去重 → 命中激活 / 未命中开新标签」(`State::open_path`),UI 层没有任何场景需要直接产出 `TabOpen`,引入无人产出的消息只增表面积;②**`TabCloseConfirmed` 不带 `{ index }` 载荷**——确认目标存在 `TabsState::confirm_close`(请求时刻的快照),确认的必是弹窗所问的那个标签,比消息载荷更防错(载荷在模态期间标签增删后会指错对象);③**孤立 chunk 丢弃并作废流**(`State::append_ai_delta` 的 `ai_stream_tab_index() == None` 分支)——发起标签被关闭时 `remove_tab` 已先行作废流,真实链路走不到该分支;万一未来重构弄丢绑定,fail-safe 是「丢块可见(续写中断)」而非「静默写进 active(写错文档)」。
+- **如何改**:要让 UI 能直接开标签(比如将来的拖拽打开),加 `Message::TabOpen { path: Option<PathBuf> }` 并在归约里转 `open_path`/`spawn_tab` 即可;要确认关闭改带载荷,给 `TabCloseConfirmed` 加 `usize` 并在 `layout.rs` 的 `tab_close_dialog` 处带上 `confirm_close` 的值;要孤立 chunk 落到当前标签,把 `append_ai_delta` 的 `else` 分支改成 `self.tabs.current_mut()`(须接受写错标签的风险,不建议)。
+
 ## #22 界面打磨批次的四个口径:图标自绘、撞键拒绝、未实现项禁用、MCP 只出规划(2026-09-25)
 
 - **岔路**:用户指令「图标、快捷键设置、AI 配置页、MCP 规划」留了四处自由度。①egui 无图标集,用 emoji/Unicode 字符(✎ 🗋)还是自绘?②改键撞到别的命令的键位时,抢占还是拒绝?③AI 配置页的「接口方式」里 Anthropic/Ollama adapter 还没写,下拉里给不给选?④MCP 做到什么深度?
