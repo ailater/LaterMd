@@ -257,7 +257,12 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
 }
 
 /// 绘制预览面板。
-pub fn ui(panel: &mut egui::Ui, preview: &PreviewState, ai: &AiState, outbox: &mut Vec<Message>) {
+pub fn ui(
+    panel: &mut egui::Ui,
+    preview: &mut PreviewState,
+    ai: &AiState,
+    outbox: &mut Vec<Message>,
+) {
     egui::ScrollArea::vertical()
         .id_salt("preview-scroll")
         // 不收缩宽度,让 wrap 以面板宽为界
@@ -285,6 +290,28 @@ pub fn ui(panel: &mut egui::Ui, preview: &PreviewState, ai: &AiState, outbox: &m
                 .show(ui);
             handler.drain_into(outbox);
         });
+
+    // 大纲跳转的预览侧:把字节偏移换算成 y 再滚过去。锚点是上一行渲染时
+    // vendored 层记录下的(section → y),这里只做查表 + 请求滚动。
+    if let Some(target) = preview.scroll_target.take() {
+        if let Some(anchors) = egui_markdown::section_anchors(panel, egui::Id::new("preview-md")) {
+            // 取「起点不超过目标」的最后一个锚点:标题所在节的顶部
+            let anchor = anchors
+                .iter()
+                .rev()
+                .find(|anchor| anchor.byte_start <= target)
+                .or_else(|| anchors.first());
+            if let Some(anchor) = anchor {
+                panel.scroll_to_rect(
+                    egui::Rect::from_min_size(
+                        egui::pos2(panel.min_rect().left(), anchor.y),
+                        egui::vec2(panel.available_width().max(1.0), 1.0),
+                    ),
+                    Some(egui::Align::TOP),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,13 +450,14 @@ mod tests {
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |panel| {
             let text = doc.to_owned();
-            let preview = PreviewState {
+            let mut preview = PreviewState {
                 rendered: latermd_md::expand_wikilinks(&text),
                 text,
                 synced_rev: 0,
                 outline: Vec::new(),
+                scroll_target: None,
             };
-            ui(panel, &preview, &AiState::default(), &mut outbox);
+            ui(panel, &mut preview, &AiState::default(), &mut outbox);
         });
         let painted = painted_text(&output);
         output.drop_without_applying_deltas();
@@ -488,6 +516,28 @@ mod tests {
                 target: "架构决策".into()
             }]
         );
+    }
+
+    /// 预览消费滚动目标一次:不消费会导致每帧都把预览拽回目标位置,用户
+    /// 再也滚不动(锚点缺失时也不 panic)。
+    #[test]
+    fn preview_consumes_scroll_target_once() {
+        let ctx = egui::Context::default();
+        let doc = "# 一\n\n正文\n\n## 二\n\n正文二\n";
+        let mut preview = PreviewState {
+            rendered: doc.to_owned(),
+            text: doc.to_owned(),
+            synced_rev: 0,
+            outline: Vec::new(),
+            scroll_target: Some(0),
+        };
+        let mut outbox = Vec::new();
+        let output = ctx.run_ui(RawInput::default(), |panel| {
+            ui(panel, &mut preview, &AiState::default(), &mut outbox);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(preview.scroll_target, None, "滚动目标只消费一次");
+        assert!(outbox.is_empty(), "滚动不产消息");
     }
 
     /// 卡片 widget id 的稳定性(AGENTS.md §6.7 的证据):id 由「块在文档中的

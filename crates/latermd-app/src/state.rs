@@ -132,6 +132,9 @@ pub struct PreviewState {
     /// 喂给预览的**渲染文本**:`[[wikilink]]` 已展开成 `wiki://` 链接
     /// (P3 双向链接)。源码 `text` 一字不改 —— 展开只影响渲染。
     pub rendered: String,
+    /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
+    /// 属 UI 关注点(同侧边栏把手与键位捕获),不进归约:滚动位置不是文档状态。
+    pub scroll_target: Option<usize>,
 }
 
 impl PreviewState {
@@ -145,6 +148,7 @@ impl PreviewState {
             outline: latermd_md::outline(&text),
             text,
             synced_rev: editor.revision(),
+            scroll_target: None,
         }
     }
 
@@ -469,7 +473,12 @@ impl State {
             Message::SearchResultClicked(path, line_no) => {
                 self.open_search_hit(&path, line_no);
             }
-            Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
+            Message::OutlineItemClicked(span) => {
+                // 编辑器跳光标 + 预览滚到该标题(P3「大纲预览跳转」):同一个
+                // span 两处消费,预览侧在绘制时换算成 y
+                self.tabs.current_mut().preview.scroll_target = Some(span.start);
+                self.jump_cursor_to_heading(span);
+            }
             Message::WikilinkClicked { target } => self.open_wikilink(&target),
             Message::AiStart => self.start_ai_stream(),
             Message::AiChunk { delta } => self.append_ai_delta(&delta),
@@ -1657,6 +1666,18 @@ mod tests {
         let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
         assert_eq!(reloaded_theme.density, Density::Compact);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大纲点击同时驱动两处:编辑器跳光标(既有)+ 预览滚到该标题(P3)。
+    #[test]
+    fn outline_click_sets_cursor_jump_and_preview_scroll() {
+        let mut state = State::default();
+        state.apply(Message::OutlineItemClicked(10..19));
+        assert_eq!(state.tabs.current().preview.scroll_target, Some(10));
+        assert!(
+            state.tabs.current().cursor.jump_to.is_some(),
+            "编辑器侧照旧跳光标"
+        );
     }
 
     /// `[[wikilink]]`:命中即打开同名文档(与文件树点击同一条路径),找不到
