@@ -15,9 +15,12 @@
 //! (刷新时机在归约侧),本层零 git 调用;回滚按钮只发消息,checkout
 //! 在确认模态之后(见 `ui::layout`)。
 
+use crate::command::Command;
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
 use crate::git_panel::GitPanelState;
+use crate::keymap::Keymap;
 use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
+use crate::settings::SettingsTab;
 use crate::state::{Message, SidebarTab};
 use latermd_git::{CommitInfo, FileStatus, StatusKind};
 use latermd_md::OutlineItem;
@@ -38,10 +41,16 @@ pub struct OutlineView<'a> {
     pub cursor_byte: Option<usize>,
 }
 
-/// 绘制侧边栏内容。
+/// 绘制左栏(**三段式**,docs/ui-shell-redesign.md §5,D3 已拍板):
+/// 顶段高频文件动作 → 次段四行视图导航 → 中段视图内容(吃掉剩余高度)
+/// → 底段设置。
+///
+/// 中段「吃掉剩余」用手算 `max_height = available - NAV_BOTTOM_H`,不上
+/// 嵌套 `Panel`(会造成 widget id 与 z-order 意外),也不用 `bottom_up`
+/// (左右 snap 会让各段的阅读顺序与代码顺序相反)。
 ///
 /// `active_tab`、`search` 与 `outbox` 是从 `App` 上解构出的不相交借用,使本
-/// 函数可以与 `show_collapsible` 原地持有的 `&mut visible` 并存(见
+/// 函数可以与 `show_collapsible` 原地持有的 `&mut bool` 并存(见
 /// `layout.rs`)。`file_tree`、`git`、`outline` 与 `current_file` 只读:交互
 /// 全部经由消息归约;`search` 的输入文本/开关由本层原地改写(TextEdit/
 /// checkbox 控件的 `&mut` 要求,同编辑器缓冲的例外),取消与发起都在归约。
@@ -57,25 +66,215 @@ pub fn ui(
     search: &mut SearchState,
     git: &GitPanelState,
     outbox: &mut Vec<Message>,
-) {
-    tab_bar(panel, active_tab, outbox);
-    panel.add_space(4.0);
-    match *active_tab {
-        SidebarTab::Files => files_panel(panel, file_tree, current_file, git, outbox),
-        SidebarTab::Search => search_panel(panel, search, file_tree.root.as_deref(), outbox),
-        SidebarTab::Outline => outline_panel(panel, outline, outbox),
-        SidebarTab::Git => git_panel(panel, git, outbox),
+) -> SidebarBands {
+    let left = panel.max_rect().left();
+    let right = panel.max_rect().right();
+    let band = |top: f32, bottom: f32| {
+        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+    };
+
+    let y0 = panel.cursor().top();
+    top_actions(panel, outbox);
+    let y1 = panel.cursor().top();
+    view_nav(panel, *active_tab, outbox);
+    let y2 = panel.cursor().top();
+    panel.separator();
+    // 底段高度从 available 里预扣:设置行高 + 它上面那条 `item_spacing`
+    // (不扣的话借助 stats 看不出,实测会溢出 3px 把底段挤到可视区外)
+    let reserved = crate::ui::tokens::NAV_BOTTOM_H + panel.spacing().item_spacing.y;
+    let body_height = (panel.available_height() - reserved).max(0.0);
+    let y3 = panel.cursor().top();
+    egui::ScrollArea::vertical()
+        .id_salt("nav-body")
+        .auto_shrink([false, false])
+        .max_height(body_height)
+        .show(panel, |ui| match *active_tab {
+            SidebarTab::Files => files_panel(ui, file_tree, current_file, git, outbox),
+            SidebarTab::Search => search_panel(ui, search, file_tree.root.as_deref(), outbox),
+            SidebarTab::Outline => outline_panel(ui, outline, outbox),
+            SidebarTab::Git => git_panel(ui, git, outbox),
+        });
+    let y4 = panel.cursor().top();
+    settings_row(panel, outbox);
+    let y5 = panel.cursor().top();
+
+    SidebarBands {
+        top: band(y0, y1),
+        nav: band(y1, y2),
+        body: band(y3, y4),
+        bottom: band(y4, y5),
     }
 }
 
-/// 页签栏(图标 + 文字,docs/ui-polish.md §4)。点击只发消息,归约在下一帧
-/// `App::logic` 完成;wrapped:侧边栏拖窄时换行而不是压缩。
-fn tab_bar(panel: &mut egui::Ui, active_tab: &mut SidebarTab, outbox: &mut Vec<Message>) {
+/// 左栏三段各自的竖直区间,自上而下互不重叠。
+///
+/// 由 [`ui`] 顺手测出来返回:`nav_row` 是手绘 widget(无可读名字),要算
+/// 「第 N 行的 y」只能靠 [`SidebarTab::ALL`] 的顺序 + `NAV_ROW_H` 自己推。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidebarBands {
+    /// 顶段:高频文件动作。
+    pub top: egui::Rect,
+    /// 次段:四行视图导航(每行 `NAV_ROW_H` 高)。
+    pub nav: egui::Rect,
+    /// 中段:当前视图内容,吃掉剩余高度。
+    pub body: egui::Rect,
+    /// 底段:设置行。
+    pub bottom: egui::Rect,
+}
+
+/// 单条视图导航行的**竖直中心 y**(相对传进来的 `panel`)。
+///
+/// 给无头测试定位用:行本身是 `allocate_exact_size` 的手绘 widget,没有可
+/// 从外部读的名字;而顺序是 `SidebarTab::ALL`、行高是 `NAV_ROW_H`,与绘制
+/// 同源地算出来即可,不必把矩形一路传出去。
+// 只有无头测试用;生产路径靠 `SidebarBands` 定位。
+#[cfg(test)]
+pub(crate) fn nav_row_center_y(top: f32, tab: SidebarTab) -> f32 {
+    let index = SidebarTab::ALL
+        .iter()
+        .position(|candidate| *candidate == tab)
+        .expect("tab 必在 ALL 里");
+    top + crate::ui::tokens::NAV_ROW_H * (index as f32 + 0.5)
+}
+
+/// 左栏高频文件动作(docs/ui-shell-redesign.md §5 顶段)。
+///
+/// 这五个在顶部菜单栏里都有,这里是**第二入口**而非迁移 —— 规格的
+/// 「可发现性守恒」要求菜单栏一个不删(ui-polish §1.2「工具栏是高频投影,
+/// 菜单栏负责全部」的同款分工)。`horizontal_wrapped`:左栏拖到 180px 下限
+/// 时换行而不是溢出裁切(R4)。
+fn top_actions(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
     panel.horizontal_wrapped(|ui| {
-        for tab in SidebarTab::ALL {
-            if crate::ui::icons::icon_tab(ui, tab.icon(), tab.label(), *active_tab == tab).clicked()
-            {
-                outbox.push(Message::SidebarTabChanged(tab));
+        for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
+            let response =
+                crate::ui::icons::icon_button(ui, cmd.icon(), &tooltip_of(cmd, &Keymap::builtin()));
+            if response.clicked() {
+                outbox.push(cmd.message());
+            }
+        }
+    });
+}
+
+/// 按钮悬浮提示:命令名 + 出厂键位(与顶部工具栏 `toolbar::button` 同款
+/// 口径;键位可改,这里取的是出厂默认,够指路就够)。
+fn tooltip_of(cmd: Command, keymap: &Keymap) -> String {
+    match keymap.get(cmd) {
+        Some(shortcut) => format!("{}({})", cmd.label(), shortcut.platform_text()),
+        None => cmd.label().to_owned(),
+    }
+}
+
+/// 左栏次段的视图导航:四行竖排,**整行选中态** —— 浅色底 + 左侧 2px
+/// 强调色竖条(照抄 ui-polish 的页签选中态,不用重boBox 再辨证)。
+///
+/// 点击只发 [`Message::SidebarTabChanged`],切换本身在归约。
+fn view_nav(panel: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Message>) {
+    for tab in SidebarTab::ALL {
+        let response = nav_row(panel, tab, tab == active);
+        if response.clicked() {
+            outbox.push(Message::SidebarTabChanged(tab));
+        }
+    }
+}
+
+/// 单条导航行:图标 + 文字占满整行宽。返回响应以便点击测试定位。
+fn nav_row(ui: &mut egui::Ui, tab: SidebarTab, selected: bool) -> egui::Response {
+    icon_label_row(
+        ui,
+        tab.icon(),
+        tab.label(),
+        selected,
+        crate::ui::tokens::NAV_ROW_H,
+    )
+}
+
+/// 图标 + 文字的整行按钮,高度可调(左栏次段导航与底段设置共用)。
+///
+/// 手绘而非 `Button` 是为了「整行选中态」:浅色底打满可用宽 + 左侧 2px
+/// 强调色竖条(ui-polish 页签选中态的同款口径)。`Sense::click` 打在
+/// `allocate_exact_size` 上而非某个子控件,因此整行任意位置都能点 —— 这
+/// 也是它比起 `horizontal` 容器响应的差别:后者只有不可交互的 `label`,
+/// 压根收不到点击。
+fn icon_label_row(
+    ui: &mut egui::Ui,
+    icon: crate::ui::icons::Icon,
+    label: &str,
+    selected: bool,
+    height: f32,
+) -> egui::Response {
+    let size = egui::vec2(ui.available_width().max(0.0), height);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let visuals = ui.visuals();
+        // 整行选中态:底 + 左侧 2px 竖条;hover 用内建 hover 底
+        if selected {
+            let accent = crate::ui::tokens::accent(ui);
+            painter.rect_filled(rect, 0.0, visuals.widgets.hovered.bg_fill);
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    rect.left_top(),
+                    egui::vec2(crate::ui::tokens::NAV_BAR_W, height),
+                ),
+                0.0,
+                accent,
+            );
+        } else if response.hovered() {
+            painter.rect_filled(rect, 0.0, visuals.widgets.hovered.bg_fill);
+        }
+        let color = if selected {
+            crate::ui::tokens::accent(ui)
+        } else {
+            visuals.text_color()
+        };
+        let text_pos = egui::pos2(
+            rect.left()
+                + crate::ui::tokens::SPACE_SM
+                + crate::ui::tokens::ICON_SM
+                + crate::ui::tokens::SPACE_XS,
+            rect.center().y,
+        );
+        icon.draw(
+            painter,
+            egui::pos2(
+                rect.left() + crate::ui::tokens::SPACE_SM + crate::ui::tokens::ICON_SM / 2.0,
+                rect.center().y,
+            ),
+            crate::ui::tokens::ICON_SM,
+            color,
+        );
+        painter.text(
+            text_pos,
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Button.resolve(ui.style()),
+            color,
+        );
+    }
+    response
+}
+
+/// 左栏底段的设置行:左键打开设置对话框默认页,右键弹出四项直达。
+///
+/// 四项直达是「少点一次」的快捷方式,不改变任何状态 —— 与顶部菜单同源的
+/// [`Message::SettingsOpened`]。
+fn settings_row(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
+    let response = icon_label_row(
+        panel,
+        crate::ui::icons::Icon::Settings,
+        "设置",
+        false,
+        crate::ui::tokens::NAV_BOTTOM_H,
+    );
+    if response.clicked() {
+        outbox.push(Message::SettingsOpened(SettingsTab::Appearance));
+    }
+    response.context_menu(|ui| {
+        for tab in SettingsTab::ALL {
+            if ui.button(tab.label()).clicked() {
+                outbox.push(Message::SettingsOpened(tab));
+                // egui 0.36 的 popup 默认 `CloseOnClick`:点完菜单项自己就关,
+                // 没有(也不需要)`ui.close_menu()` 这类手动关闭调用。
             }
         }
     });
@@ -832,5 +1031,247 @@ mod tests {
         let cut = snippet(&long);
         assert!(cut.ends_with('…'));
         assert_eq!(cut.chars().count(), SNIPPET_MAX_CHARS + 1);
+    }
+
+    // —— M2 三段式(docs/ui-shell-redesign.md §5)——
+
+    /// 四段顺序 helper:一行一 `NAV_ROW_H`,自上而下不重叠。
+    #[test]
+    fn nav_row_center_y_follows_tab_order() {
+        let row = crate::ui::tokens::NAV_ROW_H;
+        assert_eq!(
+            nav_row_center_y(100.0, SidebarTab::Files),
+            100.0 + row * 0.5
+        );
+        assert_eq!(
+            nav_row_center_y(100.0, SidebarTab::Git),
+            100.0 + row * 3.5,
+            "Git 是第四行"
+        );
+        let ys = SidebarTab::ALL.map(|tab| nav_row_center_y(0.0, tab));
+        assert!(
+            ys.windows(2).all(|pair| pair[1] > pair[0]),
+            "四行自上而下:{ys:?}"
+        );
+    }
+
+    /// 三段式骨架:四段自上而下排满左栏、互不重叠,中段吃掉除底段以外的
+    /// 全部剩余高度(M2 验收点)。宽度下限 180px 时同样成立 —— 顶段在窄栏
+    /// 里会换行变高,中段让出的高度随之变少。
+    #[test]
+    fn three_bands_fill_the_panel_top_down() {
+        let ctx = egui::Context::default();
+        let (tree, _root) = sample_tree();
+        let mut bands = None;
+        let whole_slack = Cell::new(0.0f32);
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let slack = ui.spacing().item_spacing.y + 1.0;
+                let whole = ui_whole(ui, SidebarTab::Files, &tree, &GitPanelState::default());
+                whole_slack.set(slack);
+                bands = Some(whole);
+            },
+        )
+        .drop_without_applying_deltas();
+        let bands = bands.unwrap();
+        let slack = whole_slack.get();
+
+        assert!(bands.top.top() < bands.nav.top(), "顶段在次段之上");
+        assert!(
+            bands.bottom.height() <= crate::ui::tokens::NAV_BOTTOM_H + slack,
+            "底段不超过预留高度(放行一个 item_spacing):{}",
+            bands.bottom.height()
+        );
+    }
+
+    /// 点「搜索」行的手写命中区:走完整 `sidebar::ui` 三帧请求,只发一条
+    /// `SidebarTabChanged`。
+    ///
+    /// 直接驱 `sidebar::ui`(而非孤立 `nav_row`)是有意的:顶段的五个文件
+    /// 动作按钮紧贴次段,只测孤立行会漏掉「谁抢走了这次点击」—— 三栏重排
+    /// 时已经在标题栏上踩过一次。
+    #[test]
+    fn clicking_nav_row_switches_view() {
+        let (tree, _root) = sample_tree();
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let mut active = SidebarTab::Files;
+        let mut search = SearchState::default();
+        let git = GitPanelState::default();
+        let nav_top = Cell::new(0.0f32);
+
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                nav_top.set(ui_whole(ui, SidebarTab::Files, &tree, &git).nav.top());
+            },
+        )
+        .drop_without_applying_deltas();
+
+        let target = egui::pos2(
+            crate::ui::tokens::SIDEBAR_MIN_W / 2.0,
+            nav_row_center_y(nav_top.get(), SidebarTab::Search),
+        );
+        let click = |pressed| Event::PointerButton {
+            pos: target,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // 前两遍是 sizing / 未交互遍,widget 尚不参与命中测试
+        for events in [
+            Vec::new(),
+            Vec::new(),
+            vec![Event::PointerMoved(target)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui_whole_with(ui, &mut active, &mut search, &tree, &git, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            outbox,
+            vec![Message::SidebarTabChanged(SidebarTab::Search)],
+            "导航行点击只发一条切换消息"
+        );
+    }
+
+    /// 底段设置行:左键发 `SettingsOpened(Appearance)`,即设置对话框的
+    /// 默认落地页(与顶部菜单「设置」入口同源)。
+    #[test]
+    fn clicking_settings_row_opens_default_tab() {
+        let (tree, _root) = sample_tree();
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let bottom = Cell::new(Rect::NOTHING);
+
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                bottom
+                    .set(ui_whole(ui, SidebarTab::Files, &tree, &GitPanelState::default()).bottom);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        let mut active = SidebarTab::Files;
+        let mut search = SearchState::default();
+        let git = GitPanelState::default();
+        let target = egui::pos2(
+            crate::ui::tokens::SIDEBAR_MIN_W / 2.0,
+            bottom.get().center().y,
+        );
+        let click = |pressed| Event::PointerButton {
+            pos: target,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            Vec::new(),
+            Vec::new(),
+            vec![Event::PointerMoved(target)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui_whole_with(ui, &mut active, &mut search, &tree, &git, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            outbox,
+            vec![Message::SettingsOpened(SettingsTab::Appearance)]
+        );
+    }
+
+    /// 只读一版的整栏渲染:无 piercing、无 outbox,专供量取三段矩形。
+    fn ui_whole(
+        ui: &mut egui::Ui,
+        tab: SidebarTab,
+        tree: &FileTreeState,
+        git: &GitPanelState,
+    ) -> SidebarBands {
+        let mut tab = tab;
+        let mut search = SearchState::default();
+        let mut outbox = Vec::new();
+        super::ui(
+            ui,
+            &mut tab,
+            tree,
+            None,
+            OutlineView {
+                items: &[],
+                cursor_byte: None,
+            },
+            &mut search,
+            git,
+            &mut outbox,
+        )
+    }
+
+    /// 带状态与 outbox 的整栏渲染(点击测试走这条)。
+    fn ui_whole_with(
+        ui: &mut egui::Ui,
+        active: &mut SidebarTab,
+        search: &mut SearchState,
+        tree: &FileTreeState,
+        git: &GitPanelState,
+        outbox: &mut Vec<Message>,
+    ) {
+        super::ui(
+            ui,
+            active,
+            tree,
+            None,
+            OutlineView {
+                items: &[],
+                cursor_byte: None,
+            },
+            search,
+            git,
+            outbox,
+        );
     }
 }
