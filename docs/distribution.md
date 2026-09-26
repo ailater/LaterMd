@@ -2,17 +2,24 @@
 
 > 本文是发布操作的**唯一事实来源**。配置侧的事实源分别是:
 > [dist-workspace.toml](../dist-workspace.toml)(dist 目标矩阵)、
-> [.github/workflows/release.yml](../.github/workflows/release.yml)(dist 生成,**禁止手改**)、
+> [.github/workflows/release.yml](../.github/workflows/release.yml)(dist 生成 + 三处 LOCAL PATCH,见 §1)、
+> [.github/workflows/auto-tag.yml](../.github/workflows/auto-tag.yml)(自动打 tag,2026-09-26 接入)、
 > [.github/workflows/macos-dmg.yml](../.github/workflows/macos-dmg.yml)(自建 dmg job)、
 > [packaging/latermd.rb](../packaging/latermd.rb)(cask 模板)。
 > 与本文冲突时,以配置文件为准并回改本文。
 
-## 1. 发布链路总览
+## 1. 发布链路总览(2026-09-26 起全自动)
+
+发版动作 = PR 里 bump `Cargo.toml` 的 `workspace.package.version`(建议同 PR 带
+CHANGELOG.md 小节)→ 合入 main。此后无人值守:
 
 ```
-git tag v0.1.0 && git push origin v0.1.0
+PR 合入 main(版本号已 bump)
         │
-        ▼  on: push: tags: '**[0-9]+.[0-9]+.[0-9]+*'   (release.yml:45)
+        ▼  rust.yml 门禁跑绿
+        │  auto-tag.yml(workflow_run 监听 Rust conclusion=success)
+        │  读 Cargo.toml 版本 → 无对应 tag 则打 v{version} → dispatch
+        ▼  gh workflow run release.yml --ref <tag>   ← workflow_dispatch
 ┌─────────────────────────────────────────────┐
 │ release.yml(cargo-dist 0.33.0 生成)          │
 │ plan → build-local(4 job,5 目标)             │
@@ -21,16 +28,36 @@ git tag v0.1.0 && git push origin v0.1.0
 │   ubuntu-22.04 + cargo-xwin 容器:win ARM64   │
 │   windows-2022:win x64                       │
 │ → host:gh release create + 上传全部资产        │
+│   (正文 = CHANGELOG.md 对应版本小节)          │
 └─────────────────────────────────────────────┘
-        │  Release 状态变 published
-        ▼  on: release: types: [published]        (macos-dmg.yml:19)
+        │  host job 尾部 dispatch(非 on: release 事件)
+        ▼  gh workflow run macos-dmg.yml -f tag=<tag>
 ┌─────────────────────────────────────────────┐
 │ macos-dmg.yml(自建 job,macos-14)             │
-│ 下载双架构 tar.xz → lipo 合一 → 组装 .app      │
+│ checkout(取 packaging/macos/Info.plist)      │
+│ → 下载双架构 tar.xz → lipo 合一 → 组装 .app    │
 │ → hdiutil 合 dmg → sha256 写 step summary     │
 │ → gh release upload 回传同一 Release           │
 └─────────────────────────────────────────────┘
 ```
+
+**为什么链路必须显式 dispatch(GitHub 防递归规则)**:workflow 用 GITHUB_TOKEN
+推的 tag、建的 Release,产生的事件**不会触发新的 workflow run**(防无限递归),
+唯一例外是 `workflow_dispatch` / `repository_dispatch`。因此 auto-tag 推完 tag
+必须 `gh workflow run release.yml`;release.yml host job 建完 Release 必须
+`gh workflow run macos-dmg.yml`(macos-dmg 的 `on: release` 保留给人工/PAT 场景)。
+`release: published` 事件在自动链路中**永远不会到达** —— 不要把链路改回事件驱动。
+
+**release.yml 的三处 LOCAL PATCH**(dist 模板之外的增量,`dist generate`
+重新生成时会被覆盖,必须重新打上):
+1. `on:` 增加 `workflow_dispatch`(auto-tag 的 dispatch 入口);
+2. `permissions` 增加 `"actions": "write"`(host job 要 dispatch macos-dmg);
+3. host job 尾部「Dispatch macOS dmg build」步骤。
+
+**版本策略**:tag 号永远取自 Cargo.toml(workspace.package.version),
+auto-tag 不自行递增 —— dist 强制 tag 与包版本一致,自动改号必失配;
+bot 直推 main 改版本号会被分支保护拦截。版本号不变地合入 main 不发版
+(tag 已存在,auto-tag 秒跳过)。
 
 - **tag 格式**:`v0.1.0` / `latermd/0.1.0` / `releases/v1.0.0` 均可触发(模式
   `**[0-9]+.[0-9]+.[0-9]+*`);带 `-beta.1` 等预发布后缀时 GitHub Release 自动标记
@@ -64,14 +91,14 @@ git tag v0.1.0 && git push origin v0.1.0
   (dist 官方设计,支持 latest 热链),后者带版本号(Homebrew cask 惯例,url 与
   version 绑定以便 sha256 校验)。这是两套命名共存的原因,不是疏漏。
 
-## 3. 首个 Release 步骤(v0.1.0)
+## 3. 首个 Release 步骤(v0.0.1)
 
 ### 3.1 前置检查
 
-1. 打包 PR 已合入 `main`(分支保护要求 PR;release.yml 在 tag push 时从 tag
-   指向的 commit 构建)。
+1. 发版 PR 已合入 `main`:PR 内含 `workspace.package.version` 的版本 bump
+   与 CHANGELOG.md 对应小节(分支保护要求 PR;发布从 tag 指向的 commit 构建)。
 2. 本地六项门禁全绿(AGENTS.md §8;vendor 改动另跑 check.sh)。
-3. 配置核对(改过则先验证再打 tag):
+3. 配置核对(改过 dist-workspace.toml 才需要):
 
    ```bash
    dist manifest --output-format=json \
@@ -84,16 +111,20 @@ git tag v0.1.0 && git push origin v0.1.0
 4. `Cargo.toml` 的 `workspace.package.version` 已是待发版本(dist 要求 tag 版本
    与 workspace 版本一致,否则报版本不匹配)。
 
-### 3.2 发布
+### 3.2 发布(全自动)
+
+合入后无需任何手动操作:main 上 rust.yml 门禁跑绿 → auto-tag.yml 自动打
+`v{version}` 并 dispatch release.yml → 五目标构建 + 建 Release(正文取自
+CHANGELOG.md)→ host job dispatch macos-dmg.yml 合成 dmg 回传。
+全程约 20–40 分钟(Windows xwin 交叉编最慢),在 Actions 页盯
+`Auto Tag` → `Release` → `macOS dmg` 三个 workflow 依次变绿即可。
+
+应急通道(自动链路故障时,人工等价物):
 
 ```bash
 git checkout main && git pull --rebase origin main
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.0.1 && git push origin v0.0.1   # 人工 tag push 直接触发 release.yml
 ```
-
-之后不需要也不应该手动跑任何 workflow:release.yml 建好 Release 并上传
-5 个 dist 资产后,macos-dmg.yml 自动被 `release: published` 事件触发,合成
-universal2 dmg 回传。全程约 20–40 分钟(Windows xwin 交叉编最慢)。
 
 ### 3.3 资产核对清单(Release 页面逐项勾)
 
@@ -128,8 +159,8 @@ quarantine、`depends_on macos: :sonoma`、zap)。**复刻对象是
 2. **tap README**:Formula/Cask 表加 `latermd` 一行,安装命令区补
    `brew install --cask crazykun/ailater/latermd`。
 3. **验证**:`brew install --cask crazykun/ailater/latermd` 在真机跑通;随后
-   主仓 README「当前还没发过版」段(README.md「安装(发布后)」尾注)删除并
-   回填实测过的命令。
+   核对主仓 README「安装」节三条路径与实测一致(2026-09-26 起 README 已按
+   已发布状态撰写,如命令有变以实测回改)。
 
 **auto-bump 空档(重要)**:tap 的 auto-bump 流水线(cron 每小时 :23,
 `bump_formula.py` 做 version/url/sha256 三点重写)**只遍历 `Formula/`**,
@@ -142,20 +173,20 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
 
 ### 3.5 首发后回填
 
-- 主仓 README 安装节:删「当前还没发过版」免责,确认三条路径命令可执行。
+- 主仓 README 安装节:确认三条路径命令可执行(2026-09-26 已按发布状态重写)。
 - docs/roadmap.md「当前位置」:P0 打包条目状态更新。
 - m0-report.md 真机项:Win11 / macOS 冒烟结果(IME、字体 face index 核对)。
 
-## 4. 后续版本发布(v0.1.1+)
+## 4. 后续版本发布(v0.0.2+)
 
-1. 改 `workspace.package.version`(workspace 内 dist-able crate 版本必须一致,
-   lockstep)。
-2. 常规 PR 合入 main,打 tag `v0.1.1` push —— 链路同 §3.2。
+1. PR 里把 `workspace.package.version` 提到新版本号(workspace 内 dist-able
+   crate 版本必须一致,lockstep),CHANGELOG.md 顶部加对应小节,合入 main。
+2. 链路全自动(§3.2),无需打 tag。
 3. **发版后必做**:更新 tap 的 `Casks/latermd.rb`(version + sha256,取新
    Release 的 dmg step summary 值;见 §3.4 的 auto-bump 空档)。
 4. dist 配置(dist-workspace.toml)改动后本地必须重跑 §3.1 第 3 步的
-   manifest 校验,再 `dist generate` 重新生成 release.yml(手改 release.yml
-   会被 dist 视为 error 并在下次 generate 时覆盖)。
+   manifest 校验,再 `dist generate` 重新生成 release.yml —— 重新生成会
+   **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上。
 
 ## 5. 无签名路线的用户侧影响(README「安装」节的依据)
 

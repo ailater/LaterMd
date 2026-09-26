@@ -1,9 +1,68 @@
 # LaterMD
 
+[![Rust](https://github.com/ailater/LaterMd/actions/workflows/rust.yml/badge.svg)](https://github.com/ailater/LaterMd/actions/workflows/rust.yml)
+
 **跨平台、版本化、可对话、可演化的 Markdown 知识工作台** —— Markdown 是内容层,AI 是智能层,Git 是时间层。
 
-> **当前状态:Vendor 适配已完成,M0 技术验证进行中,P0 骨架在建。** 全部技术决策见 [docs/](docs/README.md),演进路线与验收标准见 [docs/roadmap.md](docs/roadmap.md),M0 实测数据见 [docs/m0-report.md](docs/m0-report.md)。
-> 仓库已可编译运行(骨架窗口),但**尚无对外发布的安装包** —— 想跑就本地编译,见「构建与运行」。
+纯 Rust(egui + eframe),Windows / macOS / Linux 三平台原生界面,无 Web 栈。
+当前版本 **v0.0.1**(2026-09-26 首发):编辑、预览、搜索、AI、Git 只读集成与 MCP 集成均已可用。
+技术决策见 [docs/](docs/README.md),演进路线见 [docs/roadmap.md](docs/roadmap.md)。
+
+## 功能特性
+
+**编辑与预览**
+
+- 左右双栏实时预览,CommonMark + GFM(全项目仅 pulldown-cmark 一个解析器,预览与导出无方言漂移)
+- 源码模式 / Live Preview 切换,共用同一缓冲与撤销栈
+- 多标签编辑,代码块语法高亮与一键复制
+
+**文件与知识管理**
+
+- 新建 / 打开 / 保存 / 另存为,原子落盘
+- 文件树:懒加载、`.gitignore` 过滤、当前文件高亮
+- 大纲面板:点击跳编辑器光标或预览对应位置
+- 侧边栏全文搜索,支持正则
+- `[[wikilink]]` 双向链接
+
+**AI 智能层**
+
+- AI 流式写作;未配置 API key 时内置 Mock 演示,开箱可试
+- `ai://` 链接协议与 AI 指令块,AI 修改都在 token/AST 层操作
+- AI commit message、AI 摘要大纲
+- API key 本地加密存取,不进 Git
+
+**版本层**
+
+- Git 只读集成:状态 / 提交历史 / diff / blame / 文件回滚
+
+**外观与配置**
+
+- 浅色 / 深色 / 跟随系统三态主题,`themes/*.ron` 皮肤文件
+- 标准 / 紧凑界面密度,快捷键可改绑,设置持久化
+
+**导出与集成**
+
+- HTML 导出,单文件内嵌样式
+- 内置 MCP 服务器:五个只读工具,stdio / HTTP 双通道;默认关闭,开启后仅绑定 `127.0.0.1`
+
+## 安装
+
+本项目**不做代码签名与公证**(个人开源软件),各平台安装方式:
+
+| 平台 | 方式 |
+|---|---|
+| macOS(推荐) | `brew install --cask crazykun/ailater/latermd`(cask 经 postflight 自动移除 quarantine,无 Gatekeeper 拦截) |
+| Windows | 从 [Releases](https://github.com/ailater/LaterMd/releases) 下 `latermd-x86_64-pc-windows-msvc.zip`(ARM64 机器取 `aarch64` 版),解压即用 |
+| Linux | 下 `latermd-x86_64-unknown-linux-gnu.tar.xz`,解包后 `./latermd` |
+
+- macOS 走 brew 的用户无额外步骤;**从 Releases 直下 dmg** 的用户,拖入 `/Applications/` 后首次打开会被 Gatekeeper 拦(无签名公证的正常表现),执行一次即可:
+
+  ```bash
+  sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app
+  ```
+
+- macOS 的 dmg 为 universal2 双架构(Intel / Apple Silicon 通用)。
+- Windows 无签名直下会触发 SmartScreen,点「更多信息 → 仍要运行」,不视为缺陷。
 
 ## 平台支持
 
@@ -13,37 +72,15 @@
 | macOS 14+ (Sonoma) | ✅ | Metal (wgpu) |
 | Linux (X11 / Wayland) | ✅ | Vulkan (wgpu) |
 
-**显式不支持 Windows 10(含 LTSC)与 macOS 13 及以下** —— 支持它们意味着为 Metal 特性差异和 DX12 降级路径做双份测试,不在本产品范围内。
+**显式不支持 Windows 10(含 LTSC)与 macOS 13 及以下。**
 
 驱动黑名单逃生口:`LATERMD_RENDERER=glow` 环境变量可切换渲染后端(仅诊断用)。
 
-## 安装(发布后)
+## 自动发版
 
-本项目**不做代码签名与公证**(个人开源软件,省 $99/年与证书成本),分发渠道:
+发版 = 在 PR 里把 `Cargo.toml` 的 `workspace.package.version` 提到新版本号(同 PR 在 [CHANGELOG.md](CHANGELOG.md) 加对应小节,它会成为 Release 正文)。合入 `main` 且门禁([Rust](.github/workflows/rust.yml))跑绿后,[auto-tag](.github/workflows/auto-tag.yml) 自动打 tag 并触发 [Release](.github/workflows/release.yml):五目标构建(Linux x64、macOS 双架构、Windows x64 + ARM64)→ 创建 GitHub Release → 合成 macOS universal2 dmg。版本号不变地合入不会重复发版。
 
-```bash
-# macOS(推荐):Homebrew tap,postflight 自动移除 quarantine,无 Gatekeeper 拦截
-brew install --cask crazykun/ailater/latermd
-```
-
-- **Windows**:从 [Releases](https://github.com/ailater/LaterMd/releases) 下 `latermd-x86_64-pc-windows-msvc.zip`(ARM64 机器取 `aarch64-pc-windows-msvc`),解压即用。无签名,SmartScreen 会警告,点「更多信息 → 仍要运行」。
-- **Linux**:下 `latermd-x86_64-unknown-linux-gnu.tar.xz`,解包后 `./latermd`,或自行丢进 `~/.local/bin`。
-- **macOS**:universal2 单 dmg(`latermd-v{版本}-universal2-apple-darwin.dmg`),双架构 lipo 合一,Intel / Apple Silicon 通用。推荐走 brew(postflight 自动去 quarantine);**从 Releases 直下 dmg** 的用户,拖入 `/Applications/` 后首次打开会被 Gatekeeper 拦(本项目无签名公证,提示「无法验证开发者」或「已损坏,无法打开」),执行一次下面的命令即可正常启动(brew 安装的用户不需要):
-
-  ```bash
-  sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app
-  ```
-
-> **当前还没发过版。** 发布链路(cargo-dist 五目标 + macOS dmg + cask)已就位,首次 Release 需先合入打包 PR 并打 tag:`git tag v0.1.0 && git push origin v0.1.0`。在那之前请按上一节本地编译运行。
-
-### 发布一次版本的步骤
-
-```bash
-git tag v0.1.0 && git push origin v0.1.0   # 触发 release.yml:五目标构建 + 建 Release
-                                            # Release 发布后自动触发 macos-dmg.yml 合成 dmg
-```
-
-产物命名固定为 `latermd-{target-triple}.tar.xz|.zip`(**不含版本号**,cask 热链依赖此格式)与 `latermd-v{版本}-universal2-apple-darwin.dmg`。
+发布操作细节与资产核对清单见 [docs/distribution.md](docs/distribution.md)。
 
 ## 技术栈
 
@@ -68,60 +105,25 @@ git tag v0.1.0 && git push origin v0.1.0   # 触发 release.yml:五目标构建 
 
 > 判断标准:如果一项功能不能让「写下一篇技术文档」变得更快,它就不在 P0–P2。
 
-## 构建与运行
-
-> 没有发布产物,跑起来必须本地编译。产物**不能跨平台拷贝** —— Linux 编出来的是 ELF,Windows 上跑不了。
-
-### 前提
+## 从源码构建
 
 | 项 | 要求 |
 |---|---|
-| Rust | **1.98.0**(根目录 `rust-toolchain.toml` 已钉死,rustup 自动切换;egui 0.36.2 要求 ≥ 1.95) |
-| Linux 额外依赖 | `sudo apt-get install -y libxkbcommon-dev`(winit 编译需要) |
-| 图形环境 | Linux 需 X11 / Wayland 会话;无显示器时窗口起不来 |
-
-### 命令
+| Rust | **1.98.0**(根目录 `rust-toolchain.toml` 已钉死,rustup 自动切换) |
+| Linux 额外依赖 | `sudo apt-get install -y libxkbcommon-dev` |
+| 图形环境 | Linux 需 X11 / Wayland 会话 |
 
 ```bash
 cargo run --release -p latermd-app     # 编译并直接运行
-cargo build --release                  # 只编译
 ./target/release/latermd               # 跑已编译好的产物
 ```
 
-产物位置:`target/release/latermd`(Linux 约 31 MB;crate 名 `latermd-app` 不变,bin 名 `latermd`,与发布资产同名)。另有 `target/debug/latermd`(约 393 MB,带调试信息、启动慢)。
-
-### Windows / macOS
-
-同样在各自平台上执行 `cargo run --release -p latermd-app`,仓库无平台特定逻辑。Windows 需 MSVC 生成工具(rustup 默认会装),首次编译 10 分钟级。
-
-**已知限制**:字体候选表目前只列了 Linux 的 Noto Sans CJK / 文泉驿,**Windows 上中文会显示为方块**,界面会给出「⚠ 未找到候选 CJK 字体」的警告。P0 打包前补 `msyh.ttc` 候选(PingFang 同理)。
-
-### 渲染后端
-
-默认 wgpu。`LATERMD_RENDERER=glow` 是驱动黑名单的逃生口,**只在启用 glow feature 的构建里生效**:
-
-```bash
-cargo run --release -p latermd-app --features glow
-```
-
-### 合入 PR 前:本地跑完六项门禁
-
-CI 只在 `main` 上跑(`push: branches: [main]`),所以 PR 合入前必须本地验证:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo doc --no-deps --all-features
-```
-
-改动落在 `vendor/egui_markdown/` 时,再跑一遍上游门禁 `vendor/egui_markdown/check.sh`。
+三平台命令一致(Windows 需 MSVC 生成工具),产物不能跨平台拷贝。
+CJK 字体(微软雅黑 / 苹方 / Noto Sans CJK)已按平台内置候选,中文开箱可用。
 
 ## 开发
 
-分支与推送规则、vendor 改动三类拆分、三条铁律等,见 [AGENTS.md](AGENTS.md)(所有贡献者与 Agent 必读)。
+分支与推送规则、vendor 改动三类拆分、三条铁律与合入门禁,见 [AGENTS.md](AGENTS.md)(所有贡献者与 Agent 必读)。
 
 ## License
 
