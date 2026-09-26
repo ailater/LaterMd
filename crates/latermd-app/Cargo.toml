@@ -38,6 +38,9 @@ latermd-git = { path = "../latermd-git" }
 # 文档库检索核心(P1 搜索已下沉至此,docs/mcp-plan.md §3 方案 A):侧边栏
 # 只留状态机,MCP 的 search_docs/list_files 复用同一实现
 latermd-search = { path = "../latermd-search" }
+# 本地 MCP server(docs/mcp-plan.md):进程内后台线程暴露五个只读工具,
+# 让外部 AI 检索本机文档库
+latermd-mcp = { path = "../latermd-mcp" }
 # 同步文件对话框(ADR-004 清单);Linux 默认走 xdg-portal,不依赖 GTK 开发库
 rfd = "0.17.2"
 # 文件树目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)

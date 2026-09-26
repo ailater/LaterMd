@@ -3,6 +3,17 @@ name = "latermd-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local MCP server exposing read-only document tools (no UI deps)"
+description = "Local MCP server exposing LaterMD's read-only document tools over stdio or 127.0.0.1 HTTP (no UI deps)"
 
 [dependencies]
+# JSON-RPC 请求/响应的解析与序列化(ADR-004 已登记 serde/serde_json)。
+# 协议只用到 initialize / tools/list / tools/call 三个方法,手写结构比引
+# jsonrpc 框架更轻,也不受框架对 MCP 规范版本的滞后约束。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 文档库检索:search_docs / list_files 与侧边栏共用同一实现(mcp-plan §3 方案 A)
+latermd-search = { path = "../latermd-search" }
+# 大纲提取(outline 工具)
+latermd-md = { path = "../latermd-md" }
+# Git 只读状态(git_status 工具);本 crate 不触碰它的写操作(checkout)
+latermd-git = { path = "../latermd-git" }

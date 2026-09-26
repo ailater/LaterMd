@@ -2471,6 +2471,7 @@ dependencies = [
  "latermd-editor",
  "latermd-export",
  "latermd-git",
+ "latermd-mcp",
  "latermd-md",
  "latermd-search",
  "percent-encoding",
@@ -2510,6 +2511,13 @@ dependencies = [
 [[package]]
 name = "latermd-mcp"
 version = "0.1.0"
+dependencies = [
+ "latermd-git",
+ "latermd-md",
+ "latermd-search",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "latermd-md"

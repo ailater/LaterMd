@@ -185,9 +185,11 @@ impl LaterMdApp {
             let settings = &mut state.settings;
             let ai_key = &mut state.ai_key;
             let ai = &state.ai;
+            let mcp = &state.mcp;
             let keymap = &state.keymap;
             let mode = state.theme.mode;
-            let close = crate::settings::dialog(ui, settings, mode, keymap, ai, ai_key, outbox);
+            let close =
+                crate::settings::dialog(ui, settings, mode, keymap, ai, ai_key, mcp, outbox);
             if close.is_some_and(|close| close.clicked()) {
                 settings.open = false;
             }
@@ -216,16 +218,12 @@ impl LaterMdApp {
         }
 
         // ⑦.5 顶层浮层:脏标签关闭确认(标签条 × / Ctrl+W 触发,docs/auto-plan
-        // #11「关闭脏标签确认模态」)。文案与回滚确认同款不可逆警示。
-        if let Some(index) = self.state.tabs.confirm_close {
-            let name = self
-                .state
-                .tabs
-                .tabs
-                .get(index)
-                .map(|tab| tab.document.display_name())
-                .unwrap_or_default();
-            let (confirm, cancel) = tab_close_dialog(ui, &name);
+        // #11「关闭脏标签确认模态」)。文案与回滚确认同款不可逆警示。目标按
+        // 稳定 id 存(`TabsState::confirm_close`):模态是非阻塞 Window,打开
+        // 期间其他关闭入口会使索引漂移;目标被别的路径关掉时 `TabsState::remove`
+        // 已撤下确认,这里自然不再渲染。
+        if let Some(tab) = self.state.tabs.confirm_close_tab() {
+            let (confirm, cancel) = tab_close_dialog(ui, &tab.document.display_name());
             if confirm.clicked() {
                 outbox.push(Message::TabCloseConfirmed);
             }
@@ -307,7 +305,21 @@ fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
         };
         ui.weak(ai);
         separator(ui);
-        ui.weak("MCP: 规划中");
+        // MCP:关闭时只写「关」,开启才展开端点(状态栏是窄条,不堆信息)
+        match &state.mcp.status {
+            crate::mcp::McpStatus::Listening(port) => {
+                ui.weak(format!("MCP: 127.0.0.1:{port}"));
+            }
+            crate::mcp::McpStatus::Failed(_) => {
+                ui.colored_label(crate::ui::tokens::WARN, "MCP: 启动失败");
+            }
+            crate::mcp::McpStatus::Starting => {
+                ui.weak("MCP: 启动中");
+            }
+            crate::mcp::McpStatus::Disabled => {
+                ui.weak("MCP: 关");
+            }
+        }
     });
 }
 

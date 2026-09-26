@@ -17,6 +17,7 @@ mod fonts;
 mod git_diff;
 mod git_panel;
 mod keymap;
+mod mcp;
 mod search;
 mod settings;
 mod state;
@@ -25,8 +26,45 @@ mod theme;
 mod ui;
 
 use eframe::egui;
+use latermd_mcp::{McpConfig, Server};
+use std::path::PathBuf;
+
+/// MCP stdio 通道的开关参数:`latermd --mcp-stdio`(docs/mcp-plan.md §2)。
+pub(crate) const MCP_STDIO_ARG: &str = "--mcp-stdio";
+
+/// headless MCP 通道:`latermd --mcp-stdio`,客户端以子进程方式拉起
+/// (`claude mcp add latermd -- latermd --mcp-stdio`)。
+///
+/// 不进 GUI 事件循环、不初始化窗口;stdin 关闭即退出。**不看 `mcp.json`
+/// 的 enabled** —— 用户显式用这个参数启动就是一次授权,而 `enabled` 管的是
+/// 「GUI 进程内是否自动监听端口」这一件不同的事。
+///
+/// 文档库根取环境变量 `LATERMD_MCP_ROOT`(headless 没有文件树 UI 可交互);
+/// 缺省时工具照常返回「未设置文件树根目录」。
+fn run_mcp_stdio() -> eframe::Result<()> {
+    let config = theme::config_dir()
+        .as_deref()
+        .map(McpConfig::load_from)
+        .unwrap_or_default();
+    let root = std::env::var("LATERMD_MCP_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let server = Server::new(root, config);
+    match latermd_mcp::transport::stdio::serve(&server) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("LaterMD: MCP stdio 通道退出: {error}");
+            Err(eframe::Error::AppCreation(Box::new(error)))
+        }
+    }
+}
 
 fn main() -> eframe::Result<()> {
+    // 子进程式 MCP 通道优先:它不是 GUI 会话,不该初始化窗口与字体
+    if std::env::args().any(|arg| arg == MCP_STDIO_ARG) {
+        return run_mcp_stdio();
+    }
     let renderer = match std::env::var("LATERMD_RENDERER").as_deref() {
         #[cfg(feature = "glow")]
         Ok("glow") => eframe::Renderer::Glow,
@@ -96,7 +134,7 @@ impl LaterMdApp {
 
 #[cfg(test)]
 mod tests {
-    use super::renderer_label;
+    use super::{renderer_label, MCP_STDIO_ARG};
 
     /// 判定与 `main` 的启动选择同规则:认不认 `glow` 取决于 glow feature
     /// (两条产线都会跑到对应分支);值精确匹配小写,大小写变体不认。
@@ -109,5 +147,19 @@ mod tests {
         assert_eq!(renderer_label(Some("wgpu")), "wgpu");
         assert_eq!(renderer_label(Some("GLOW")), "wgpu");
         assert_eq!(renderer_label(None), "wgpu");
+    }
+
+    /// `--mcp-stdio` 只在精确匹配时生效(其它参数照常进 GUI);参数常量与
+    /// main 的判定同源,避免两边写死两份字符串。
+    #[test]
+    fn mcp_stdio_arg_is_matched_exactly() {
+        let args = |args: &[&str]| {
+            args.iter()
+                .map(|arg| (*arg).to_owned())
+                .any(|arg| arg == MCP_STDIO_ARG)
+        };
+        assert!(args(&["latermd", "--mcp-stdio"]));
+        assert!(!args(&["latermd"]));
+        assert!(!args(&["latermd", "--mcp-stdio=1"]), "精确匹配");
     }
 }

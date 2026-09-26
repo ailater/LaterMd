@@ -29,11 +29,13 @@ use crate::file::{self, FileCmd};
 use crate::filetree::{FileTreeSettings, FileTreeState};
 use crate::git_panel::GitPanelState;
 use crate::keymap::{Keymap, Shortcut};
+use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
 use crate::tabs::TabsState;
 use crate::theme::{ThemeMode, ThemeSettings};
 use latermd_editor::EditorBuffer;
+use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -168,6 +170,8 @@ pub struct State {
     /// AI Provider 凭据设置区(P2「凭据管理」):草稿、三态与凭据操作集,
     /// 读写全部经 latermd-creds 在归约发生。
     pub ai_key: AiKeyState,
+    /// MCP server 运行时(配置 + 后台线程 + 调用计数,docs/mcp-plan.md)。
+    pub mcp: McpState,
     /// 快捷键绑定表(用户可改,`keymap.json`;命令层从它读实际键位)。
     pub keymap: Keymap,
     /// 设置对话框(外观 / 快捷键 / AI / MCP 四页)。
@@ -260,6 +264,7 @@ impl Default for State {
             search: SearchState::default(),
             ai: AiState::default(),
             ai_key: AiKeyState::default(),
+            mcp: McpState::default(),
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
             ai_commit_suggestion: None,
@@ -384,6 +389,9 @@ pub enum Message {
     GitCheckoutConfirmed,
     /// 确认模态取消,不触碰工作区。
     GitCheckoutCancelled,
+    /// 保存 MCP 配置(设置页 MCP 页「保存」):归一化 → 落 `mcp.json` → 按
+    /// 开关起停后台服务(**默认关闭**,开了才监听回环端口)。
+    McpConfigSaved(McpConfig),
 }
 
 impl State {
@@ -454,6 +462,7 @@ impl State {
             }
             Message::AiKeyBackendUnavailable => self.ai_key.backend_ok = false,
             Message::AiConfigSaved(config) => self.apply_ai_config(config),
+            Message::McpConfigSaved(config) => self.apply_mcp_config(config),
             Message::KeymapAssign { cmd, shortcut } => self.assign_shortcut(cmd, shortcut),
             Message::KeymapCleared(cmd) => {
                 self.keymap.set(cmd, None);
@@ -478,7 +487,15 @@ impl State {
                 self.request_close_tab(active);
             }
             Message::TabCloseConfirmed => {
-                if let Some(index) = self.tabs.confirm_close.take() {
+                // 按稳定 id 定位确认目标:模态是非阻塞 Window,打开期间其他
+                // 关闭入口会使索引漂移,按索引确认会关错标签。id 失效(目标
+                // 已被其他路径关闭,`TabsState::remove` 已同步撤下确认)则 no-op。
+                if let Some(index) = self
+                    .tabs
+                    .confirm_close
+                    .take()
+                    .and_then(|id| self.tabs.index_by_id(id))
+                {
                     self.remove_tab(index);
                 }
             }
@@ -746,9 +763,13 @@ impl State {
         self.ai.poll()
     }
 
-    /// 启动装载:`ai.json`(AI provider 参数)与 `keymap.json`(键位),并据
-    /// 此装配 provider 运行时。与主题/文件树设置同处调用(见 `main`)。
-    /// 无配置目录(极简环境)时保持内存默认,不报错。
+    /// 启动装载:`ai.json`(AI provider 参数)、`keymap.json`(键位)与
+    /// `mcp.json`(MCP 开关/端口/工具权限),并据此装配 provider 运行时与
+    /// MCP 服务。与主题/文件树设置同处调用(见 `main`)。无配置目录(极简
+    /// 环境)时保持内存默认,不报错。
+    ///
+    /// MCP 只在配置里 `enabled` 时才起线程 —— 默认配置是关闭,故全新安装
+    /// 不会静默监听端口。
     pub fn load_preferences(&mut self) {
         let Some(dir) = self.config_dir() else {
             return;
@@ -757,6 +778,9 @@ impl State {
         let key = self.ai_key.creds.ai_api_key();
         self.ai.set_provider(config, key.as_deref());
         self.keymap = Keymap::load_from(&dir);
+        let mcp = McpConfig::load_from(&dir);
+        self.mcp.set_root(self.file_tree.root.clone());
+        self.mcp.apply_config(mcp);
     }
 
     /// 配置目录:测试注入的 `settings_dir` 优先,否则平台默认目录。
@@ -794,6 +818,25 @@ impl State {
         }
         self.keymap.set(cmd, Some(shortcut));
         self.persist_keymap();
+    }
+
+    /// 保存 MCP 配置(设置页「保存」):归一化 → 落 `mcp.json` → 按开关起停
+    /// 后台服务。**默认关闭**,开启才监听回环端口(docs/mcp-plan.md §5)。
+    ///
+    /// 与 `apply_ai_config` 同款落盘优先:持久化失败就不改内存配置,避免
+    /// 「界面显示已开启、重启却回到关闭」。
+    fn apply_mcp_config(&mut self, config: McpConfig) {
+        if let Some(dir) = self.config_dir() {
+            let mut saved = config.clone();
+            saved.normalize();
+            if let Err(error) = saved.save_to(&dir) {
+                self.tabs.current_mut().document.notice = Some(format!("MCP 配置保存失败:{error}"));
+                return;
+            }
+        }
+        // 服务以「当前文件树根」为检索边界:换根时同步给运行中的 server
+        self.mcp.set_root(self.file_tree.root.clone());
+        self.mcp.apply_config(config);
     }
 
     /// 保存 AI 配置(设置页「保存」):归一化 → 落 `ai.json` → 即时重装配
@@ -847,6 +890,8 @@ impl State {
         self.file_tree.ensure_loaded();
         // 搜索结果收流:非阻塞收空 channel(重绘驱动见 `ui::layout::reduce`)。
         self.search.poll_hits();
+        // MCP:收绑定结果与调用计数(两者都是非阻塞的轻量检查)
+        self.mcp.poll();
     }
 
     fn run_file_cmd(&mut self, cmd: FileCmd) {
@@ -927,12 +972,15 @@ impl State {
     }
 
     /// 关闭请求(标签条 × / Ctrl+W):脏标签先弹确认模态,干净标签直接关。
+    /// 确认目标存**稳定 id** 而非索引 —— 模态是非阻塞 Window,打开期间
+    /// 其他关闭入口会使索引漂移,按漂移后的索引确认会关错标签
+    /// (与 `ai_active_tab` 同手法,见 [`TabsState::confirm_close`])。
     fn request_close_tab(&mut self, index: usize) {
         if index >= self.tabs.tabs.len() {
             return;
         }
         if self.tabs.tabs[index].editor.is_dirty() {
-            self.tabs.confirm_close = Some(index);
+            self.tabs.confirm_close = Some(self.tabs.tabs[index].id);
         } else {
             self.remove_tab(index);
         }
@@ -1016,6 +1064,8 @@ impl State {
     /// 不留旧仓库的快照)。
     fn change_file_tree_root(&mut self, dir: PathBuf) {
         self.file_tree.set_root(dir);
+        // MCP 的检索边界跟着换根(共享句柄,服务不必重启)
+        self.mcp.set_root(self.file_tree.root.clone());
         self.search.reset();
         self.refresh_git();
         if let Err(error) =
@@ -1026,7 +1076,24 @@ impl State {
     }
 
     /// 写盘成功后复位 dirty 并认领新路径;失败只落提示行。
+    ///
+    /// 路径去重(与打开侧三入口同一不变量「同一路径至多一个标签」):目标
+    /// 路径已在**另一**标签打开时拒绝认领并落提示 —— 认领会让同一文件占
+    /// 两个标签,此后两边各保存一次就互相静默覆盖。拒绝发生在写盘之前,
+    /// 盘上内容与另一标签的缓冲都不被触碰;保存到本标签已持有的路径
+    /// (常规 Ctrl+S / 同路径另存为)不受影响。
     fn save_to(&mut self, path: PathBuf) {
+        if self
+            .tabs
+            .find_by_path(&path)
+            .is_some_and(|index| index != self.tabs.active)
+        {
+            self.tabs.current_mut().document.notice = Some(format!(
+                "{} 已在另一标签打开;请先关闭该标签或另选保存路径",
+                path.display()
+            ));
+            return;
+        }
         match file::write(&path, self.tabs.current_mut().editor.text()) {
             Ok(()) => {
                 self.tabs.current_mut().editor.clear_dirty();
@@ -1274,6 +1341,70 @@ mod tests {
         // "light" 必须在盘上,重启 load 才能还原
         let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(json.contains("\"light\""), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCP 端到端:设置页「保存」→ 落 `mcp.json` → 后台线程真的监听 → 用
+    /// 真实 TCP 连接发一次 `initialize` 并收到应答。
+    ///
+    /// 这是 app 侧唯一会**真占端口**的测试,端口取 18731(远离默认 8731,
+    /// 避免与本机已运行的应用实例打架);结束前显式 `stop`,不留监听。
+    #[test]
+    fn mcp_config_saved_starts_server_and_answers_over_http() {
+        let dir = temp_path("mcp-http");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::McpConfigSaved(McpConfig {
+            enabled: true,
+            http_port: 18731,
+            ..McpConfig::default()
+        }));
+        assert!(dir.join("mcp.json").exists(), "配置落盘");
+        assert!(state.tabs.current().document.notice.is_none());
+
+        // 绑定在后台线程发生,轮询等结果(正常毫秒级)
+        for _ in 0..100 {
+            state.mcp.poll();
+            if matches!(state.mcp.status, crate::mcp::McpStatus::Listening(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state.mcp.status,
+            crate::mcp::McpStatus::Listening(18731),
+            "状态行应显示真实监听端口"
+        );
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", 18731)).unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
+        assert!(response.contains("2025-06-18"), "{response}");
+
+        state.mcp.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCP 的检索边界跟着文件树根走(共享句柄,服务不重启):换根后
+    /// `mcp.root()` 即为新根。
+    #[test]
+    fn mcp_root_follows_file_tree_root() {
+        let dir = temp_path("mcp-root");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert_eq!(state.mcp.root(), None);
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        assert_eq!(state.mcp.root(), Some(dir.clone()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2415,7 +2546,11 @@ mod tests {
         assert!(state.tabs.current_mut().editor.is_dirty());
 
         state.apply(Message::TabCloseRequested(index));
-        assert_eq!(state.tabs.confirm_close, Some(index), "脏标签先弹确认");
+        assert_eq!(
+            state.tabs.confirm_close,
+            Some(state.tabs.tabs[index].id),
+            "脏标签先弹确认(目标存稳定 id)"
+        );
         assert_eq!(state.tabs.tabs.len(), 2, "未确认前不移除");
 
         state.apply(Message::TabCloseCancelled);
@@ -2429,6 +2564,129 @@ mod tests {
             state.tabs.tabs[0].editor.text().contains("LaterMD"),
             "回到的是原来的标签(SAMPLE 文档)"
         );
+    }
+
+    /// 回归(独立评审 high):确认模态存稳定 id —— 模态开着期间关掉更靠前
+    /// 的干净标签使索引漂移,「确认关闭」必须仍关掉模态所问的那个标签。
+    /// 修复前按漂移索引移除:用户对 B 确认「关闭并丢弃」,实际被静默丢弃
+    /// 的是漂移到该索引的另一个脏标签 C 的未保存修改。
+    #[test]
+    fn confirm_close_survives_index_drift_from_other_close() {
+        let mut state = State::default();
+        // A(干净,索引0)/ B(脏,索引1)/ C(脏,索引2):评审给出的复现序列
+        state.spawn_tab(None, "B 的正文");
+        state.spawn_tab(None, "C 的正文");
+        let b_id = state.tabs.tabs[1].id;
+        let c_id = state.tabs.tabs[2].id;
+        state.apply(Message::TabActivate(1));
+        state.tabs.current_mut().editor.insert_chars(0, "B 草稿");
+        state.apply(Message::TabActivate(2));
+        state.tabs.current_mut().editor.insert_chars(0, "C 草稿");
+        assert!(!state.tabs.tabs[0].editor.is_dirty(), "前置:A 干净");
+
+        // 点 B 的 ×:模态开在 B 上
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.confirm_close, Some(b_id));
+        assert_eq!(
+            state.tabs.confirm_close_tab().map(|tab| tab.id),
+            Some(b_id),
+            "模态文案来源正是 B"
+        );
+
+        // 模态开着,用户用 Ctrl+W(等价 TabCloseRequested)关掉干净的 A:
+        // B/C 索引各前移一位,确认目标不随索引漂移
+        state.apply(Message::TabCloseRequested(0));
+        assert_eq!(state.tabs.tabs.len(), 2, "A 干净,直接关");
+        assert_eq!(state.tabs.confirm_close, Some(b_id), "确认目标按 id 不漂移");
+
+        // 确认关闭:关掉的必须是 B;C 连同它的未保存修改原样保留
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 1);
+        assert_eq!(
+            state.tabs.tabs[0].id, c_id,
+            "留在原地的是 C(修复前它被静默关掉)"
+        );
+        assert!(state.tabs.tabs[0].editor.text().starts_with("C 草稿"));
+        assert_eq!(state.tabs.confirm_close, None);
+    }
+
+    /// 模态目标本身被其他路径关闭(保存后变干净再 Ctrl+W 直关):确认随
+    /// 移除一并撤下,迟到的「确认关闭」是 no-op,不会误伤漂移到该位置的
+    /// 别的标签。
+    #[test]
+    fn confirm_close_invalidated_when_target_closed_elsewhere() {
+        let mut state = State::default();
+        state.spawn_tab(None, "草稿标签");
+        state.tabs.current_mut().editor.insert_chars(0, "草稿");
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(
+            state.tabs.confirm_close,
+            Some(state.tabs.tabs[1].id),
+            "前置:模态已开在草稿标签上"
+        );
+
+        // 模态开着,但用户先保存(模态不阻塞快捷键)再按 Ctrl+W:目标已
+        // 干净,第二次请求直接移除,确认一并失效
+        state.tabs.tabs[1].editor.clear_dirty();
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.tabs.len(), 1, "干净标签直关");
+        assert_eq!(state.tabs.confirm_close, None, "确认随目标移除撤下");
+        assert_eq!(state.tabs.confirm_close_tab().map(|tab| tab.id), None);
+
+        // 模态已不存在:迟到的确认消息不得关掉任何标签
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 1, "no-op,兜底标签未被误伤");
+    }
+
+    /// 回归(独立评审 medium):另存为的目标已在**另一**标签打开时,拒绝
+    /// 认领路径且不写盘 —— 维持「同一路径至多一个标签」,两个标签不再各
+    /// 保存一次就互相静默覆盖;保存到本标签已持有的路径(常规 Ctrl+S)
+    /// 不受去重影响。
+    #[test]
+    fn save_to_path_open_in_other_tab_is_refused() {
+        let dir = temp_path("saveas-dup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "盘上内容\n").unwrap();
+
+        let mut state = State::default();
+        state.open_path(&note); // note 占一个标签并激活
+        let note_tab = state.tabs.active;
+
+        // 回到未命名草稿标签,把它另存为到 note.md(对话框结果的等价直调)
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.insert_chars(0, "草稿");
+        state.save_to(note.clone());
+        let notice = state.tabs.current().document.notice.as_deref().unwrap();
+        assert!(notice.contains("note.md"), "{notice}");
+        assert!(notice.contains("另一标签"), "{notice}");
+        assert_eq!(
+            state.tabs.current().document.path,
+            None,
+            "草稿标签未认领该路径"
+        );
+        assert_eq!(
+            state.tabs.tabs[note_tab].document.path.as_deref(),
+            Some(note.as_path()),
+            "另一标签的落盘身份不动"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "盘上内容\n",
+            "拒绝发生在写盘之前,盘上内容不被触碰"
+        );
+        assert_eq!(state.tabs.tabs.len(), 2, "标签数不变");
+
+        // 对照:保存到自己已持有的路径照常落盘(常规 Ctrl+S 语义)
+        state.apply(Message::TabActivate(note_tab));
+        state.tabs.current_mut().editor.insert_chars(0, "改后");
+        state.save_to(note.clone());
+        assert_eq!(
+            std::fs::read(&note).unwrap(),
+            state.tabs.current_mut().editor.text().as_bytes()
+        );
+        assert_eq!(state.tabs.current().document.notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ctrl+Tab 循环切换;切换不作废在途流(流绑定发起标签,见
@@ -2477,7 +2735,11 @@ mod tests {
 
         // AI 写入已置 dirty → 关闭走确认模态
         state.apply(Message::TabCloseRequested(0));
-        assert_eq!(state.tabs.confirm_close, Some(0), "发起标签已脏,先弹确认");
+        assert_eq!(
+            state.tabs.confirm_close,
+            Some(state.tabs.tabs[0].id),
+            "发起标签已脏,先弹确认"
+        );
         state.apply(Message::TabCloseConfirmed);
         assert!(!state.ai.is_streaming(), "发起标签被关,流作废");
         assert_eq!(state.ai_active_tab, None, "绑定一并清除");
