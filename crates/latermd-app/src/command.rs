@@ -9,6 +9,7 @@
 //! 平台自适应:`Modifiers::COMMAND` 在 Windows/Linux 是 Ctrl、macOS 是 Cmd
 //! (egui 内建),菜单里经 `Context::format_shortcut` 按平台显示。
 
+use crate::compose::FormatAction;
 use crate::file::FileCmd;
 use crate::state::Message;
 use eframe::egui::{self, Modifiers};
@@ -49,6 +50,42 @@ pub enum Command {
     /// 光标也不丢 undo 栈。默认键 Cmd/Ctrl+/(与主流编辑器的「切换注释」
     /// 同键位,工作台里没有注释语义)。
     ToggleLivePreview,
+    // —— 格式(docs/ui-shell-redesign.md §6.3,左侧即工具条顺序)——
+    /// 加粗。Ctrl/Cmd+B — 这里兑现了 command.rs 原先「Ctrl+B 留给将来的
+    /// 加粗」的注释,ToggleSidebar 因此早在当初就避开了 Ctrl+B。
+    FormatBold,
+    /// 斜体。
+    FormatItalic,
+    /// 删除线。
+    FormatStrike,
+    /// 行内代码。反引号;`Cmd+E` 已被 ExportHtml 占,取 VS Code 同款。
+    FormatInlineCode,
+    /// 链接。
+    FormatLink,
+    /// 一级标题。
+    FormatH1,
+    /// 二级标题。
+    FormatH2,
+    /// 三级标题。
+    FormatH3,
+    /// 引用。
+    FormatQuote,
+    /// 围栏代码块(info string 空)。
+    FormatCodeBlock,
+    /// 分割线。
+    FormatDivider,
+    /// 2×2 表格骨架。
+    FormatTable,
+    /// 无序列表。Shift+8 是 VS Code 同款。
+    FormatBullet,
+    /// 有序列表。
+    FormatOrdered,
+    /// 任务列表(三态循环)。
+    FormatTask,
+    /// 右侧只读预览栏展开/折叠(§3.1)。
+    ToggleRightPreview,
+    /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
+    ToggleZen,
 }
 
 impl Command {
@@ -56,7 +93,10 @@ impl Command {
     pub const FILE: [Command; 4] = [Self::New, Self::Open, Self::Save, Self::SaveAs];
 
     /// 全部命令(快捷键设置页与绑定表遍历的顺序,见 `crate::keymap`)。
-    pub const ALL: [Command; 13] = [
+    ///
+    /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
+    /// 从左到右。
+    pub const ALL: [Command; 30] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -70,7 +110,46 @@ impl Command {
         Self::TabNext,
         Self::TabClose,
         Self::ToggleLivePreview,
+        Self::FormatBold,
+        Self::FormatItalic,
+        Self::FormatStrike,
+        Self::FormatInlineCode,
+        Self::FormatLink,
+        Self::FormatH1,
+        Self::FormatH2,
+        Self::FormatH3,
+        Self::FormatQuote,
+        Self::FormatCodeBlock,
+        Self::FormatDivider,
+        Self::FormatTable,
+        Self::FormatBullet,
+        Self::FormatOrdered,
+        Self::FormatTask,
+        Self::ToggleRightPreview,
+        Self::ToggleZen,
     ];
+
+    /// 格式命令 → 对应的动作,非格式命令为 `None`。
+    pub fn format_action(self) -> Option<FormatAction> {
+        Some(match self {
+            Self::FormatBold => FormatAction::Bold,
+            Self::FormatItalic => FormatAction::Italic,
+            Self::FormatStrike => FormatAction::Strike,
+            Self::FormatInlineCode => FormatAction::InlineCode,
+            Self::FormatLink => FormatAction::Link,
+            Self::FormatH1 => FormatAction::H1,
+            Self::FormatH2 => FormatAction::H2,
+            Self::FormatH3 => FormatAction::H3,
+            Self::FormatQuote => FormatAction::Quote,
+            Self::FormatCodeBlock => FormatAction::CodeBlock,
+            Self::FormatDivider => FormatAction::Divider,
+            Self::FormatTable => FormatAction::Table,
+            Self::FormatBullet => FormatAction::Bullet,
+            Self::FormatOrdered => FormatAction::Ordered,
+            Self::FormatTask => FormatAction::Task,
+            _ => return None,
+        })
+    }
 
     /// 稳定 id:快捷键表 `keymap.json` 的键。命令的显示名会随文案调整,
     /// id 不随,存档才不会因改 label 而失效。
@@ -89,6 +168,23 @@ impl Command {
             Self::TabNext => "tab_next",
             Self::TabClose => "tab_close",
             Self::ToggleLivePreview => "toggle_live_preview",
+            Self::FormatBold => "format_bold",
+            Self::FormatItalic => "format_italic",
+            Self::FormatStrike => "format_strike",
+            Self::FormatInlineCode => "format_inline_code",
+            Self::FormatLink => "format_link",
+            Self::FormatH1 => "format_h1",
+            Self::FormatH2 => "format_h2",
+            Self::FormatH3 => "format_h3",
+            Self::FormatQuote => "format_quote",
+            Self::FormatCodeBlock => "format_code_block",
+            Self::FormatDivider => "format_divider",
+            Self::FormatTable => "format_table",
+            Self::FormatBullet => "format_bullet",
+            Self::FormatOrdered => "format_ordered",
+            Self::FormatTask => "format_task",
+            Self::ToggleRightPreview => "toggle_right_preview",
+            Self::ToggleZen => "toggle_zen",
         }
     }
 
@@ -108,6 +204,23 @@ impl Command {
             Self::TabNext => "下一个标签",
             Self::TabClose => "关闭标签",
             Self::ToggleLivePreview => "切换 Live Preview",
+            Self::FormatBold => FormatAction::Bold.label(),
+            Self::FormatItalic => FormatAction::Italic.label(),
+            Self::FormatStrike => FormatAction::Strike.label(),
+            Self::FormatInlineCode => FormatAction::InlineCode.label(),
+            Self::FormatLink => FormatAction::Link.label(),
+            Self::FormatH1 => FormatAction::H1.label(),
+            Self::FormatH2 => FormatAction::H2.label(),
+            Self::FormatH3 => FormatAction::H3.label(),
+            Self::FormatQuote => FormatAction::Quote.label(),
+            Self::FormatCodeBlock => FormatAction::CodeBlock.label(),
+            Self::FormatDivider => FormatAction::Divider.label(),
+            Self::FormatTable => FormatAction::Table.label(),
+            Self::FormatBullet => FormatAction::Bullet.label(),
+            Self::FormatOrdered => FormatAction::Ordered.label(),
+            Self::FormatTask => FormatAction::Task.label(),
+            Self::ToggleRightPreview => "切换预览栏",
+            Self::ToggleZen => "禅定模式",
         }
     }
 
@@ -140,8 +253,50 @@ impl Command {
             Self::ToggleLivePreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Slash)
             }
-            // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
-            Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => return None,
+            Self::FormatBold => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::B),
+            Self::FormatItalic => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::I),
+            Self::FormatStrike => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::X)
+            }
+            Self::FormatInlineCode => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backtick)
+            }
+            // 链接加 Shift 而非 VS Code 的裸 Ctrl+K:本项目 Ctrl+K 被快捷
+            // 键设置的捕获模式测试当作「任意空闲键」,占上去会让那条回归失真。
+            Self::FormatLink => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::K)
+            }
+            Self::FormatH1 => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Num1),
+            Self::FormatH2 => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Num2),
+            Self::FormatH3 => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Num3),
+            Self::FormatQuote => egui::KeyboardShortcut::new(
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                egui::Key::Period,
+            ),
+            Self::FormatCodeBlock => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::C)
+            }
+            Self::FormatBullet => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::Num8)
+            }
+            Self::FormatOrdered => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::Num7)
+            }
+            Self::FormatTask => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::Num9)
+            }
+            Self::ToggleRightPreview => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
+            }
+            Self::ToggleZen => egui::KeyboardShortcut::new(Modifiers::NONE, egui::Key::F11),
+            // 无快捷键。前三条是 AI 联调入口:不抢键位,等 provider 选型
+            // 定案再定;后两条只从工具条按钮触发(插画布性质的动作,不像
+            // 加粗那样高频到需要键位)。
+            Self::AiMockStream
+            | Self::AiCommitMessage
+            | Self::AiSummary
+            | Self::FormatDivider
+            | Self::FormatTable => return None,
         };
         Some(shortcut)
     }
@@ -159,7 +314,24 @@ impl Command {
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
             Self::TabNext | Self::TabClose => Icon::Files,
-            Self::ToggleLivePreview => Icon::Files,
+            Self::ToggleLivePreview => Icon::Zen,
+            Self::FormatBold
+            | Self::FormatItalic
+            | Self::FormatStrike
+            | Self::FormatH1
+            | Self::FormatH2
+            | Self::FormatH3 => Icon::Table,
+            Self::FormatInlineCode => Icon::CodeInline,
+            Self::FormatLink => Icon::Link,
+            Self::FormatQuote => Icon::Quote,
+            Self::FormatCodeBlock => Icon::CodeBlock,
+            Self::FormatDivider => Icon::Divider,
+            Self::FormatTable => Icon::Table,
+            Self::FormatBullet => Icon::BulletList,
+            Self::FormatOrdered => Icon::OrderedList,
+            Self::FormatTask => Icon::TaskList,
+            Self::ToggleRightPreview => Icon::PanelRight,
+            Self::ToggleZen => Icon::Zen,
         }
     }
 
@@ -179,6 +351,25 @@ impl Command {
             Self::ToggleLivePreview => Message::ToggleLivePreview,
             Self::TabNext => Message::TabNext,
             Self::TabClose => Message::TabCloseActive,
+            Self::ToggleRightPreview => Message::RightPanelToggled,
+            Self::ToggleZen => Message::ZenToggled,
+            // 十六条格式动作一条 match 收干:动作枚举已经在 cmd 里定死了,
+            // 这里只把它装进消息,语义一律看 `compose::apply`
+            Self::FormatBold
+            | Self::FormatItalic
+            | Self::FormatStrike
+            | Self::FormatInlineCode
+            | Self::FormatLink
+            | Self::FormatH1
+            | Self::FormatH2
+            | Self::FormatH3
+            | Self::FormatQuote
+            | Self::FormatCodeBlock
+            | Self::FormatDivider
+            | Self::FormatTable
+            | Self::FormatBullet
+            | Self::FormatOrdered
+            | Self::FormatTask => Message::FormatRequested(self.format_action().unwrap()),
         }
     }
 }

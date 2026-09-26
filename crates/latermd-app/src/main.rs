@@ -15,6 +15,7 @@ mod ai_config;
 mod ai_key;
 mod ai_link;
 mod command;
+mod compose;
 mod export;
 mod file;
 mod filetree;
@@ -149,6 +150,13 @@ struct LaterMdApp {
     /// 无边框模式(自绘标题栏 + 边缘缩放命令区);`main` 启动时按
     /// `LATERMD_NATIVE_DECORATIONS` 读一次,原生装饰路径不画任何自绘 chrome。
     frameless: bool,
+    /// 仅供测试的探针:`draw` 时把格式工具条每个按钮的矩形吐出来。
+    ///
+    /// 生产恒为 `None`(零开销)。存在的理由与 `ui::sidebar` 的
+    /// `SidebarBands` 相同:那些手绘按钮没有可从外部读的名字,而坐标由
+    /// 布局演算决定 —— 想让无头测试点到真按钮,只能让这条路走一遭。
+    #[cfg(test)]
+    format_probe: Option<Box<dyn FnMut(crate::compose::FormatAction, egui::Rect)>>,
 }
 
 impl LaterMdApp {

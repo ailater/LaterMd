@@ -26,6 +26,9 @@ pub const ICON: f32 = 16.0;
 pub const ICON_SM: f32 = 13.0;
 /// 工具栏按钮高度。
 pub const TOOLBAR_H: f32 = 28.0;
+/// Markdown 格式工具条高度(docs/ui-shell-redesign.md §11)。与 `TOOLBAR_H`
+/// 同一量级:两条都在编辑区顶部,高度差一眼可见但不大。
+pub const FORMAT_BAR_H: f32 = 30.0;
 /// 自绘标题栏高度(docs/ui-shell-redesign.md §11,无边框模式才有)。
 pub const TITLEBAR_H: f32 = 36.0;
 /// 标题栏右侧窗口按钮命中区(Win 风整块,mac/Linux 同款统一)。

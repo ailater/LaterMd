@@ -342,6 +342,14 @@ pub enum Message {
     /// 切换右侧只读预览栏(自绘标题栏「关闭右侧」入口,
     /// docs/ui-shell-redesign.md §3.1;M1 起接 `LayoutSettings::right`)。
     RightPanelToggled,
+    /// 切换禅定模式(docs/ui-shell-redesign.md §7;M4 实现,命令层先挂上)。
+    ZenToggled,
+    /// 请求一次 Markdown 格式动作(docs/ui-shell-redesign.md §6.4)。
+    ///
+    /// 工具条按钮与快捷键两个入口同源;真正的语义全在
+    /// [`crate::compose::apply`],归约侧只负责取选区、调它、把结果写回
+    /// 缓冲并把新选区挂到 `TabState::pending_selection`。
+    FormatRequested(crate::compose::FormatAction),
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -469,6 +477,9 @@ impl State {
             Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
             Message::SidebarToggled => self.toggle_left_panel(),
             Message::RightPanelToggled => self.toggle_right_panel(),
+            // M4(13d)补全快照与三条退出;本棒先把标志接通,让命令层链路完整
+            Message::ZenToggled => self.layout.zen = !self.layout.zen,
+            Message::FormatRequested(action) => self.apply_format(action),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
@@ -942,6 +953,26 @@ impl State {
         self.layout.right = !self.layout.right;
     }
 
+    /// 请求一次 Markdown 格式动作(§6.4 链路)。
+    ///
+    /// 语义全在 [`crate::compose::apply`];这里负责三件事:取当前选区 →
+    /// 调用 → 把新文本写回缓冲并把新选区挂 `pending_selection`。选区为
+    /// `None`(UI 还没回填过)时按纯光标(0,0)处理。
+    ///
+    /// 写回用 `replace_all` 而非定点 `replace_range`:`compose::apply` 的
+    /// 产出是**整篇**新文本,要拿到定点 delta 得自己去做 diff(复杂度与
+    /// 收益不成比例)。代价是 `TextEdit` 内建 undoer 的快照被整篇重建打碎,
+    /// Ctrl+Z 可能一次回退一整次格式操作 —— 已知并接受(§9 R3)。
+    fn apply_format(&mut self, action: crate::compose::FormatAction) {
+        let tab = self.tabs.current_mut();
+        let selection = tab.selection.unwrap_or((0, 0));
+        let start = selection.0.min(selection.1);
+        let stop = selection.0.max(selection.1);
+        let (text, new_selection) = crate::compose::apply(action, tab.editor.text(), start..stop);
+        tab.editor.replace_all(&text);
+        tab.pending_selection = Some((new_selection.start, new_selection.end));
+    }
+
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
     /// 就有可编辑的块,而不是「点一下才出现」)。
     fn toggle_live_preview(&mut self) {
@@ -1337,6 +1368,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compose::FormatAction;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("latermd-state-{}-{name}", std::process::id()))
@@ -3303,6 +3335,82 @@ mod tests {
         assert_eq!(
             state.tabs.tabs[0].preview.synced_rev, origin_rev,
             "另一标签的预览快照不动"
+        );
+    }
+
+    /// 格式工具条的**归约那一半**(§6.4 链路中段):`FormatRequested(Bold)`
+    /// → 缓冲变成 `**甲乙丙**`,新选区挂到 `pending_selection` 等 UI 回填。
+    ///
+    /// UI 那一半(谁把它写回 `TextEdit` 的持久 cursor)由
+    /// `ui::layout::clicking_bold_in_a_real_frame_requests_format` 与
+    /// `ui::editor` 的 `write_selection` 覆盖 —— 两段分开钉,是因为
+    /// `TextEdit` 会自行归一化 `CCursorRange`,合并测会耦死在它的行为上。
+    #[test]
+    fn format_requested_rewrites_buffer_and_stages_selection() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲乙丙");
+        state.tabs.current_mut().document.dirty = false;
+        state.tabs.current_mut().selection = Some((0, 3));
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "**甲乙丙**", "整段被包裹");
+        assert_eq!(
+            tab.pending_selection,
+            Some((2, 5)),
+            "新选区覆盖包裹后的三个字,由 UI 下一帧写回"
+        );
+        let staged = tab.pending_selection;
+        // dirty 是帧末 `end_of_logic` 才从 editor 镜像到 document 的,这里
+        // 不能跳步直接读(`end_of_logic_mirrors_editor_dirty` 已钉过)。
+        state.end_of_logic();
+        assert!(state.tabs.current().document.dirty, "格式动作算编辑 → 标脏");
+
+        // 再点一次应当脱掉标记:证明 pending_selection 会被 UI 抄成下一次
+        // 的输入(连点两次 = 上一次附录预期)。
+        state.tabs.current_mut().selection = staged;
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "甲乙丙",
+            "选区正好框住内层 → toggle off"
+        );
+    }
+
+    /// 选区尚未被 UI 回填过(`None`)时按纯光标处理,不 panic、不越界。
+    #[test]
+    fn format_requested_without_selection_falls_back_to_caret() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("只有一行");
+        assert_eq!(state.tabs.current().selection, None, "出厂尚未渲染过");
+
+        state.apply(Message::FormatRequested(FormatAction::H2));
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "## 只有一行", "光标在 0 → 作用于首行");
+        assert!(tab.pending_selection.is_some());
+    }
+
+    /// 格式动作只写当前标签:另一个标签的文本、预览快照、pending 都不动。
+    #[test]
+    fn format_requested_only_touches_active_tab() {
+        let mut state = State::default();
+        state.tabs.open_tab(None, "第二篇");
+        assert_eq!(state.tabs.active, 1);
+        state.tabs.current_mut().selection = Some((0, 3));
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        assert_eq!(state.tabs.tabs[1].editor.text(), "**第二篇**");
+        assert!(state.tabs.tabs[1].pending_selection.is_some());
+        assert_eq!(
+            state.tabs.tabs[0].pending_selection, None,
+            "另一个标签没收到待写回选区"
+        );
+        assert_eq!(
+            state.tabs.tabs[1].pending_selection,
+            Some((2, 5)),
+            "字符偏移:三个汉字被包在两字符标记里"
         );
     }
 }

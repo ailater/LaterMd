@@ -52,17 +52,39 @@ impl egui::TextBuffer for EditorText<'_> {
     }
 }
 
-/// 绘制编辑面板,并在控件返回后维护预览快照与大纲光标协调。返回 TextEdit
+/// `ui::editor` 与 `State` 之间的**光标协调通道**,每帧双向跑一次:
+///
+/// * 出去:`cursor.byte`(大纲高亮)、`selection`(格式工具条的输入);
+/// * 进来:`cursor.jump_to`(大纲跳转)、`pending`(格式动作产出的新选区)。
+///
+/// 三者都是「UI 每帧回填/消费」的同族字段 —— 收成结构体之前它们是三条
+/// 并排的 `&mut` 实参,把 [`ui`] 顶到 9 个(clippy `too_many_arguments`),
+/// 而它们从来都是一起传的。
+pub struct CursorChannel<'a> {
+    /// 大纲↔编辑器:当前光标字节偏移出去,跳转目标进来。
+    pub cursor: &'a mut OutlineCursor,
+    /// 当前选区(字符区间),给格式工具条当输入;`None` = 这一帧还没渲染过。
+    pub selection: &'a mut Option<(usize, usize)>,
+    /// 待写回的新选区,由归约侧挂上、本模块消费。
+    pub pending: &'a mut Option<(usize, usize)>,
+}
+
+/// 绘制编辑面板,并在控件返回后维护预览快照与光标协调。返回 TextEdit
 /// 的响应(焦点/交互归因用,测试也用它拿 widget id)。
 pub fn ui(
     panel: &mut egui::Ui,
     editor: &mut EditorBuffer,
     preview: &mut PreviewState,
-    cursor: &mut OutlineCursor,
+    channel: CursorChannel<'_>,
     live: &mut LiveState,
     mode: RenderMode,
     editor_id: egui::Id,
 ) -> egui::Response {
+    let CursorChannel {
+        cursor,
+        selection,
+        pending,
+    } = channel;
     panel.horizontal(|ui| {
         ui.weak(mode.label());
         if editor.is_dirty() {
@@ -107,20 +129,52 @@ pub fn ui(
         .char_range()
         .map(|range| editor.char_to_byte(range.primary.index.0));
 
-    // 大纲跳转:覆写 TextEdit 持久光标到目标标题,并把焦点还给编辑器。
-    // 存储在下一帧生效。编辑器面板目前没有 ScrollArea,廉价版不滚屏。
-    if let Some(char_idx) = cursor.jump_to.take() {
-        let id = output.response.response.id;
-        let mut state = output.state;
-        state
-            .cursor
-            .set_char_range(Some(egui::text::CCursorRange::one(
-                egui::text::CCursor::new(char_idx),
-            )));
-        state.store(panel.ctx(), id);
-        panel.ctx().memory_mut(|mem| mem.request_focus(id));
+    // 格式工具条的选区双向通道(docs/ui-shell-redesign.md §6.4)。
+    //
+    // 出去:把当前 `CCursorRange` 抄给 `tab.selection` —— 按钮被点中时编辑器
+    // 已失焦,而选区活在这个持久 state 里,归约侧拿不到。读持久化的 cursor
+    // 而不是 `output.cursor_range`(后者在失焦帧是 None)。
+    *selection = output
+        .state
+        .cursor
+        .char_range()
+        .map(|range| (range.primary.index.0, range.secondary.index.0));
+
+    // 进来:格式动作产出的新选区,写回 TextEdit 持久 cursor 并把焦点还给
+    // 编辑器 —— 否则用户还得自己点回编辑区才能继续打字。
+    let mut format_result = pending.take();
+    if let Some(jump) = cursor.jump_to.take() {
+        format_result = Some((jump, jump));
+    }
+    if let Some((start, end)) = format_result {
+        write_selection(
+            panel,
+            &output.response.response.id,
+            &output.state,
+            start,
+            end,
+        );
     }
     output.response.response
+}
+
+/// 把字符区间写进 `TextEdit` 的持久 cursor,并请求焦点。
+fn write_selection(
+    panel: &egui::Ui,
+    id: &egui::Id,
+    state: &egui::widgets::text_edit::TextEditState,
+    start: usize,
+    end: usize,
+) {
+    let mut state = state.clone();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(start),
+            egui::text::CCursor::new(end),
+        )));
+    state.store(panel.ctx(), *id);
+    panel.ctx().memory_mut(|mem| mem.request_focus(*id));
 }
 
 #[cfg(test)]
@@ -139,6 +193,34 @@ mod tests {
         preview: &mut PreviewState,
         cursor: &mut OutlineCursor,
     ) -> egui::Id {
+        let mut selection = None;
+        let mut pending = None;
+        frame_with_channel(
+            ctx,
+            events,
+            now,
+            editor,
+            preview,
+            &mut selection,
+            &mut pending,
+            cursor,
+        )
+    }
+
+    /// 同 [`frame`],额外把 §6.4 的两个槽位交给调用方。八条实参里五条是
+    /// 同一帧的被测对象、一起传是大势所趋,故单独豁免形参计数 lint ——
+    /// 它只作用于本测试辅助,不去污染 `ui` 的 API 面。
+    #[allow(clippy::too_many_arguments)]
+    fn frame_with_channel(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        now: f64,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        selection: &mut Option<(usize, usize)>,
+        pending: &mut Option<(usize, usize)>,
+        cursor: &mut OutlineCursor,
+    ) -> egui::Id {
         let mut live = LiveState::default();
         let id = std::cell::Cell::new(egui::Id::NULL);
         let output = ctx.run_ui(
@@ -153,7 +235,11 @@ mod tests {
                         ui,
                         editor,
                         preview,
-                        cursor,
+                        CursorChannel {
+                            cursor,
+                            selection,
+                            pending,
+                        },
                         &mut live,
                         RenderMode::Source,
                         tab_editor_id(1),
@@ -166,6 +252,86 @@ mod tests {
         // 显式丢弃(与 vendored 层测试同一处理)
         output.drop_without_applying_deltas();
         id.get()
+    }
+
+    /// §6.4 通道的**回来那一半**:归约把新选区挂到 `pending`,本模块把它写
+    /// 进 `TextEdit` 持久 cursor 并把焦点还给编辑器。
+    ///
+    /// 归约那一半(`FormatRequested` → 文本 + `pending_selection`)由
+    /// `state::tests::format_requested_rewrites_buffer_and_stages_selection`
+    /// 钉住,两边分开测是因为它们中间的耦合是**字符偏移**这个契约,不是
+    /// 彼此的内部实现。
+    #[test]
+    fn pending_selection_is_written_back_as_persisted_cursor() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("**甲乙丙**");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = Some((2, 5));
+
+        let id = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+
+        assert!(pending.is_none(), "待写回选区已被消费");
+        let state = TextEditState::load(&ctx, id).expect("已持久化 widget state");
+        let range = state.cursor.char_range().expect("选区已写入");
+        let span = [
+            range.primary.index.0.min(range.secondary.index.0),
+            range.primary.index.0.max(range.secondary.index.0),
+        ];
+        assert_eq!(span, [2, 5], "TextEdit 会归一化端点顺序,故只比对区间");
+        assert!(ctx.memory(|m| m.has_focus(id)), "焦点还给编辑器");
+    }
+
+    /// §6.4 通道的**出去那一半**:`TextEdit` 的选区被抄到 `selection`,这样
+    /// 工具条按钮点击那一帧(编辑器已失焦)归约侧才拿得到它。
+    ///
+    /// 用 `pending` 灌一个已知选区、下一帧读回 —— 比靠按键推光标稳得多:
+    /// 后者经由 `TextEdit` 内部的 `clamp` / 归一化,端点到不准 JB,而这里要
+    /// 钉的是「搬运工」本身,不是 `TextEdit` 的光标规则。
+    #[test]
+    fn selection_is_mirrored_out_for_the_format_bar() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = Some((1, 3));
+
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        // 写入发生在回填之后(同帧先读后写),故这一帧读到的还是旧值
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+
+        let recorded = selection.expect("选区已回填");
+        let span = [recorded.0.min(recorded.1), recorded.0.max(recorded.1)];
+        assert_eq!(span, [1, 3], "上一帧写进去的选区被搬了出来");
     }
 
     fn test_ctx() -> egui::Context {

@@ -193,15 +193,36 @@ impl LaterMdApp {
                     editor,
                     preview,
                     cursor,
+                    selection,
+                    pending_selection,
                     live,
                     id,
                     ..
                 } = tab;
+                // Markdown 格式工具条(docs/ui-shell-redesign.md §6):在文件
+                // 工具栏之下、编辑区之上。它作用的选区由 editor 每帧回填到
+                // `TabState::selection` —— 按钮被点中时编辑器已失焦,选区
+                // 活不过那一帧。
+                // 测试探针:把这一帧各按钮的实测位置交出去,让无头测试点得到
+                // 真按钮。生产路径取 None 分支(零开销)。
+                #[cfg(not(test))]
+                crate::ui::format_bar::ui(ui, &state.keymap, outbox);
+                #[cfg(test)]
+                crate::ui::format_bar::ui_with_probe(
+                    ui,
+                    &state.keymap,
+                    outbox,
+                    self.format_probe.as_deref_mut(),
+                );
                 crate::ui::editor::ui(
                     ui,
                     editor,
                     preview,
-                    cursor,
+                    crate::ui::editor::CursorChannel {
+                        cursor,
+                        selection,
+                        pending: pending_selection,
+                    },
                     live,
                     state.render_mode,
                     crate::ui::editor::tab_editor_id(*id),
@@ -1321,6 +1342,69 @@ mod tests {
             "只收右栏,左栏保持:left={} right={}",
             app.state.layout.left,
             app.state.layout.right
+        );
+    }
+
+    /// **真实帧里的工具条点击**:走完 `LaterMdApp::draw` 的五帧节奏能把加粗
+    /// 按钮点出来(M3 验收点)。
+    ///
+    /// 按钮位置由内置探针给出 —— 它前面压着标签条与文件工具栏,高度是布局
+    /// 演算的结果,手搓坐标必然与真实帧错位(M2 已经在标题栏上踩过一次)。
+    /// 只断言「消息出来了」:后面「消息 → 文本」那一截归 `state::tests`,
+    /// 分层是因为 TextEdit 内部会对 `CCursorRange` 做归一化,把两者捆在一
+    /// 条测试里会让人分不清是链路断了还是 egui 改了选区。
+    #[test]
+    fn clicking_bold_in_a_real_frame_requests_format() {
+        use crate::compose::FormatAction;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut app = LaterMdApp::default();
+        let center = Rc::new(RefCell::new(egui::Pos2::ZERO));
+        {
+            let sink = center.clone();
+            app.format_probe = Some(Box::new(move |action, rect| {
+                if action == FormatAction::Bold {
+                    *sink.borrow_mut() = rect.center();
+                }
+            }));
+        }
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        frame(&mut app, Vec::new());
+        app.format_probe = None;
+        let center = *center.borrow();
+        assert!(center.x > 0.0, "探针拿到了加粗按钮的位置:{center:?}");
+
+        // sizing pass → moved → press → release:面板层前几遍 widget 不参与
+        // 命中测试,与既有点击测试同一节奏
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::FormatRequested(FormatAction::Bold)],
+            "工具条按钮在真实三栏帧里点得动,且不被相邻控件抢走"
         );
     }
 }
