@@ -137,7 +137,9 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![0..text.len()]
+            // 不用 `vec![0..len]`:clippy 的 single_range_in_vec_init 会把它
+            // 读成「长度为 1 的 Range 序列」的误写;这里确实只要一个区间
+            std::iter::once(0..text.len()).collect()
         };
     }
     // ② 连续化:每块**吃到下一块的内容起点**(块间空行归前一块),最后一块
@@ -199,6 +201,95 @@ fn is_segment_break(token: &Token<'_>) -> bool {
         Token::Text { style, .. } => style.heading.is_some(),
         _ => false,
     }
+}
+
+/// `[[wikilink]]` 展开成的链接 scheme(P3「双向链接」)。
+///
+/// 预览层按它拦截点击(打开同名文档),非本 scheme 的链接仍交系统浏览器。
+pub const WIKI_SCHEME: &str = "wiki://";
+
+/// 一条 `[[wikilink]]`:目标文档名与它在源码中的字节区间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wikilink {
+    /// 目标文档名(`[[目标]]` 或 `[[目标|显示名]]` 的前半段)。
+    pub target: String,
+    /// 链接显示名;省略显示名时与目标同名。
+    pub label: String,
+    /// `[[` 起到 `]]` 止的源码区间。
+    pub span: Range<usize>,
+}
+
+/// 抽出全部 `[[wikilink]]`。
+///
+/// **围栏代码块内的 `[[…]]` 不算链接** —— Rust 的 `arr[[0]]`、嵌套容器字面量
+/// 都长这样,展开会把代码改坏。判定与 CommonMark 一致:以 ``` / ~~~ 围栏
+/// 切换「代码中」状态。
+pub fn wikilinks(text: &str) -> Vec<Wikilink> {
+    let mut links = Vec::new();
+    let mut in_code = false;
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &text[index..];
+        // 行首围栏切换代码态
+        let line_start = index == 0 || bytes[index - 1] == b'\n';
+        if line_start {
+            let trimmed = rest.trim_start_matches([' ', '\t']);
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_code = !in_code;
+            }
+        }
+        if !in_code && rest.starts_with("[[") {
+            if let Some(end) = rest.find("]]") {
+                let inner = &rest[2..end];
+                if !inner.contains('\n') && !inner.contains('[') {
+                    let (target, label) = match inner.split_once('|') {
+                        Some((target, label)) => (target.trim(), label.trim()),
+                        None => (inner.trim(), inner.trim()),
+                    };
+                    if !target.is_empty() {
+                        links.push(Wikilink {
+                            target: target.to_owned(),
+                            label: label.to_owned(),
+                            span: index..index + end + 2,
+                        });
+                    }
+                }
+                index += end + 2;
+                continue;
+            }
+        }
+        // 按字符前进(不切断 UTF-8)
+        let step = text[index..].chars().next().map_or(1, char::len_utf8);
+        index += step;
+    }
+    links
+}
+
+/// 把 `[[目标]]` 展开成 Markdown 链接 `[显示名](<wiki://目标>)`,供**预览
+/// 渲染**使用;源码本身一字不改(roadmap P0 验收:「`.md` 保持原样」)。
+///
+/// 目标用尖括号包裹:CommonMark 的 `<…>` 链接目标允许空格,中文与带空格的
+/// 文档名才不会被解析器截断。
+pub fn expand_wikilinks(text: &str) -> String {
+    let links = wikilinks(text);
+    if links.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + links.len() * 8);
+    let mut cursor = 0;
+    for link in links {
+        out.push_str(&text[cursor..link.span.start]);
+        out.push('[');
+        out.push_str(&link.label);
+        out.push_str("](<");
+        out.push_str(WIKI_SCHEME);
+        out.push_str(&link.target);
+        out.push_str(">)");
+        cursor = link.span.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
@@ -317,6 +408,49 @@ mod tests {
         };
         let end = start + needle.len();
         span.start <= start && span.end >= end
+    }
+
+    /// wikilink:普通链接、`[[目标|显示名]]`、中文与带空格的目标。
+    #[test]
+    fn wikilinks_capture_target_label_and_span() {
+        let text = "见 [[架构决策]] 与 [[Note One|笔记一]]、[[中文 文档]]。";
+        let links = wikilinks(text);
+        let targets: Vec<&str> = links.iter().map(|link| link.target.as_str()).collect();
+        let labels: Vec<&str> = links.iter().map(|link| link.label.as_str()).collect();
+        assert_eq!(targets, vec!["架构决策", "Note One", "中文 文档"]);
+        assert_eq!(labels, vec!["架构决策", "笔记一", "中文 文档"]);
+        for link in &links {
+            assert!(
+                text[link.span.start..link.span.end].starts_with("[["),
+                "区间应对齐 [[…]]"
+            );
+            assert!(text[link.span.start..link.span.end].ends_with("]]"));
+        }
+    }
+
+    /// 围栏代码块内的 `[[…]]` 不是链接(Rust 的 `arr[[0]]` 会被误伤)。
+    #[test]
+    fn wikilinks_skip_fenced_code_blocks() {
+        let text = "正文 [[目标]]\n\n```rust\nlet v = arr[[0]];\n```\n\n尾 [[另一个]]\n";
+        let links = wikilinks(text);
+        let targets: Vec<&str> = links.iter().map(|link| link.target.as_str()).collect();
+        assert_eq!(targets, vec!["目标", "另一个"]);
+    }
+
+    /// 展开:变成 `<wiki://目标>` 形式的链接,源码其它部分逐字保留。
+    #[test]
+    fn expand_wikilinks_rewrites_only_the_links() {
+        let text = "见 [[架构决策]] 的下一节。";
+        let expanded = expand_wikilinks(text);
+        assert_eq!(expanded, "见 [架构决策](<wiki://架构决策>) 的下一节。");
+        // 无链接时原样返回(不产生无谓拷贝路径上的差异)
+        assert_eq!(expand_wikilinks("没有链接"), "没有链接");
+        // 展开结果真能被解析成链接 token(否则拦截无从谈起)
+        let doc = parse(&expanded);
+        assert!(doc
+            .tokens
+            .iter()
+            .any(|token| matches!(token, Token::Link { .. })));
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块

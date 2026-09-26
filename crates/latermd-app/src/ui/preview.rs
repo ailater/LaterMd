@@ -23,6 +23,15 @@ fn ai_link_color(dark_mode: bool) -> egui::Color32 {
     }
 }
 
+/// `[[wikilink]]` 的链接色(青绿,与 ai:// 的紫罗兰区分),按明暗主题取两档。
+fn wiki_link_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(0x6C, 0xD4, 0xC0)
+    } else {
+        egui::Color32::from_rgb(0x0F, 0x7A, 0x66)
+    }
+}
+
 /// 指令卡「已完成」状态色(绿),按明暗主题取两档,取色法同 [`ai_link_color`]。
 fn done_color(dark_mode: bool) -> egui::Color32 {
     if dark_mode {
@@ -80,6 +89,8 @@ enum AiCardStatus {
 struct AiLinkHandler {
     clicked: RefCell<Vec<Message>>,
     color: egui::Color32,
+    /// 当前明暗(wikilink 取色用,与 ai:// 走两套色)。
+    dark_mode: bool,
     /// AI 是否在流(卡片「进行中」判据,取自 [`AiState::is_streaming`])。
     streaming: bool,
     /// 最近一次真实发起的 prompt(卡片状态匹配键,取自 [`AiState::last_prompt`])。
@@ -92,10 +103,11 @@ struct AiLinkHandler {
 }
 
 impl AiLinkHandler {
-    fn new(color: egui::Color32, ai: &AiState) -> Self {
+    fn new(color: egui::Color32, dark_mode: bool, ai: &AiState) -> Self {
         Self {
             clicked: RefCell::new(Vec::new()),
             color,
+            dark_mode,
             streaming: ai.is_streaming(),
             last_prompt: ai.last_prompt.clone(),
             card_count: Cell::new(0),
@@ -137,6 +149,14 @@ impl LinkHandler for AiLinkHandler {
     /// ai:// 链接换色;`underline: true` 只是声明意图 —— vendored 层当前
     /// 未消费该字段(hover 下划线对全部链接无条件绘制),见 decisions-pending #11。
     fn link_style(&self, href: &str) -> Option<LinkStyle> {
+        // [[wikilink]] 用青绿,与 ai:// 的紫罗兰区分:两种链接的点击后果不同
+        // (一个开文档、一个发起 AI 流),颜色不该撞
+        if href.starts_with(latermd_md::WIKI_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(wiki_link_color(self.dark_mode)),
+                underline: true,
+            });
+        }
         href.starts_with(SCHEME).then_some(LinkStyle {
             color: Some(self.color),
             underline: true,
@@ -144,6 +164,15 @@ impl LinkHandler for AiLinkHandler {
     }
 
     fn click(&self, _text: &str, href: &str, _ui: &mut egui::Ui) -> bool {
+        if let Some(target) = href.strip_prefix(latermd_md::WIKI_SCHEME) {
+            let target = target.trim();
+            if !target.is_empty() {
+                self.clicked.borrow_mut().push(Message::WikilinkClicked {
+                    target: target.to_owned(),
+                });
+                return true;
+            }
+        }
         match ai_link::parse(href) {
             Some(prompt) => {
                 self.clicked
@@ -238,8 +267,14 @@ pub fn ui(panel: &mut egui::Ui, preview: &PreviewState, ai: &AiState, outbox: &m
             // 清空 vendored 层临时缓存,增量高亮与分段缓存全部失效
             // (AGENTS.md §6.7)。内容变化已在上游按修订号节流,这里每帧
             // 拿到的都是"仅在变化时重建"的同一字符串。
-            let handler = AiLinkHandler::new(ai_link_color(ui.visuals().dark_mode), ai);
-            MarkdownLabel::new(egui::Id::new("preview-md"), &preview.text)
+            let handler = AiLinkHandler::new(
+                ai_link_color(ui.visuals().dark_mode),
+                ui.visuals().dark_mode,
+                ai,
+            );
+            // 渲染的是**展开过 wikilink 的**文本:源码里的 [[X]] 在这里已是
+            // [X](<wiki://X>) 链接,点击由下面的 handler 拦截
+            MarkdownLabel::new(egui::Id::new("preview-md"), &preview.rendered)
                 .wrap()
                 // heal:true = 每帧渲染前对整篇文本补闭合(vendored parser::heal),
                 // AI 流式输出的残缺帧(未闭合 fence/加粗)语法合法,完整文档
@@ -275,8 +310,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut outbox = Vec::new();
         ctx.run_ui(RawInput::default(), |ui| {
-            let handler =
-                AiLinkHandler::new(ai_link_color(ui.visuals().dark_mode), &AiState::default());
+            let handler = AiLinkHandler::new(
+                ai_link_color(ui.visuals().dark_mode),
+                ui.visuals().dark_mode,
+                &AiState::default(),
+            );
             assert!(handler.click("续写", "ai://write?prompt=%E7%BB%AD%E5%86%99", ui));
             assert!(
                 !handler.click("LaterMD", "https://github.com/ailater/LaterMd", ui),
@@ -341,17 +379,21 @@ mod tests {
     #[test]
     fn card_status_follows_last_prompt_and_streaming() {
         let color = ai_link_color(true);
-        let idle = AiLinkHandler::new(color, &ai_state(false, None));
+        let idle = AiLinkHandler::new(color, true, &ai_state(false, None));
         assert_eq!(idle.card_status("续写"), AiCardStatus::Idle);
 
-        let running = AiLinkHandler::new(color, &ai_state(true, Some("续写")));
+        let running = AiLinkHandler::new(color, true, &ai_state(true, Some("续写")));
         assert_eq!(running.card_status("续写"), AiCardStatus::Running);
 
-        let done = AiLinkHandler::new(color, &ai_state(false, Some("续写")));
+        let done = AiLinkHandler::new(color, true, &ai_state(false, Some("续写")));
         assert_eq!(done.card_status("续写"), AiCardStatus::Done);
 
         // 其它卡片不受牵连:菜单发起的 prompt 是拼装文本,不等任何指令
-        let unrelated = AiLinkHandler::new(color, &ai_state(true, Some("请续写以下文档内容:\n……")));
+        let unrelated = AiLinkHandler::new(
+            color,
+            true,
+            &ai_state(true, Some("请续写以下文档内容:\n……")),
+        );
         assert_eq!(unrelated.card_status("续写"), AiCardStatus::Idle);
     }
 
@@ -380,8 +422,10 @@ mod tests {
         let ctx = egui::Context::default();
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |panel| {
+            let text = doc.to_owned();
             let preview = PreviewState {
-                text: doc.to_owned(),
+                rendered: latermd_md::expand_wikilinks(&text),
+                text,
                 synced_rev: 0,
                 outline: Vec::new(),
             };
@@ -409,7 +453,7 @@ mod tests {
     /// 不受展示截断影响),经 drain_into 进 outbox,与 ai:// 链接同一归约入口。
     #[test]
     fn execute_routes_ai_link_clicked_with_full_instruction() {
-        let handler = AiLinkHandler::new(ai_link_color(true), &AiState::default());
+        let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
         handler.request_execute("总结,本文要点!(含标点)");
         let mut outbox = Vec::new();
         handler.drain_into(&mut outbox);
@@ -417,6 +461,31 @@ mod tests {
             outbox,
             vec![Message::AiLinkClicked {
                 prompt: Ok("总结,本文要点!(含标点)".into())
+            }]
+        );
+    }
+
+    /// `[[wikilink]]` 的点击:`wiki://` 被拦成 [`Message::WikilinkClicked`],
+    /// 不交系统浏览器;空目标不拦(交回默认行为)。
+    #[test]
+    fn wiki_link_click_is_intercepted_as_wikilink_message() {
+        let ctx = egui::Context::default();
+        let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
+        let intercepted = std::cell::Cell::new(true);
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            handler.click("架构决策", "wiki://架构决策", ui);
+            // 普通 http 链接不拦:交回 vendored 默认的 open_url
+            intercepted.set(handler.click("x", "https://example.com", ui));
+        });
+        output.drop_without_applying_deltas();
+        assert!(!intercepted.get(), "http 链接不应被拦");
+
+        let mut outbox = Vec::new();
+        handler.drain_into(&mut outbox);
+        assert_eq!(
+            outbox,
+            vec![Message::WikilinkClicked {
+                target: "架构决策".into()
             }]
         );
     }
@@ -433,7 +502,7 @@ mod tests {
         // 取回 handler 记录的卡片 id。省掉 ScrollArea 外壳不影响结论:
         // push_id 是相对父 ui 的,稳定性断言看的是相对成分。
         let render = |doc: &str| {
-            let handler = AiLinkHandler::new(ai_link_color(true), &AiState::default());
+            let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
             ctx.run_ui(RawInput::default(), |ui| {
                 MarkdownLabel::new(egui::Id::new("preview-md"), doc)
                     .wrap()
