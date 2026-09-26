@@ -133,6 +133,50 @@ pub struct TreeEntry {
 /// - 目录在前、名称不区分大小写字典序;超出 `cap` 的截断并计数。
 ///
 /// `cap` 参数化只为测试可注入小值;生产恒为 [`MAX_CHILDREN`]。
+/// 在文档库根下按**名称**找文档:`[[wikilink]]` 的解析落点(P3 双向链接)。
+///
+/// 匹配口径:文件名(去扩展名)与目标**忽略大小写全等**,扩展名须是
+/// `.md` / `.markdown`。目标带 `/` 时按相对路径直取(先原样、再补扩展名)。
+///
+/// 遍历复用 `latermd_search`(与侧边栏搜索、MCP `list_files` 同一份实现),
+/// 因此同样尊重 `.gitignore`;超过条目上限的部分找不到 —— 与搜索结果的截断
+/// 同语义,不谎称全库精确。
+pub fn find_by_name(root: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    // ① 带路径分隔符:按相对路径直取(先原样、再补扩展名)
+    if target.contains('/') || target.contains('\\') {
+        for candidate in [
+            root.join(target),
+            root.join(format!("{target}.md")),
+            root.join(format!("{target}.markdown")),
+        ] {
+            if candidate.is_file() && latermd_search::is_markdown(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    // ② 按文件名全库找(忽略大小写)
+    let outcome =
+        latermd_search::list_files(root, None, None, latermd_search::MAX_LIST_ENTRIES).ok()?;
+    let wanted = target.to_lowercase();
+    outcome
+        .entries
+        .iter()
+        .filter(|entry| !entry.is_dir && latermd_search::is_markdown(&entry.path))
+        .find(|entry| {
+            entry
+                .path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase())
+                .as_deref()
+                == Some(wanted.as_str())
+        })
+        .map(|entry| root.join(&entry.path))
+}
+
 pub fn list_children(dir: &Path, cap: usize) -> DirChildren {
     let mut dirs: Vec<TreeEntry> = Vec::new();
     let mut files: Vec<TreeEntry> = Vec::new();
@@ -487,5 +531,58 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wikilink_tests {
+    use super::*;
+
+    fn vault(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("latermd-wiki-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("子目录")).unwrap();
+        std::fs::write(dir.join("架构决策.md"), "# 架构\n").unwrap();
+        std::fs::write(dir.join("子目录/Note One.markdown"), "# note\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored.md\n").unwrap();
+        std::fs::write(dir.join("ignored.md"), "x").unwrap();
+        dir
+    }
+
+    /// 按文件名找:忽略大小写、两种扩展名都认、嵌套目录也能命中。
+    #[test]
+    fn find_by_name_matches_stem_case_insensitively() {
+        let root = vault("stem");
+        assert_eq!(
+            find_by_name(&root, "架构决策"),
+            Some(root.join("架构决策.md"))
+        );
+        assert_eq!(
+            find_by_name(&root, "NOTE ONE"),
+            Some(root.join("子目录/Note One.markdown")),
+            "忽略大小写 + 嵌套 + .markdown"
+        );
+        assert_eq!(find_by_name(&root, "不存在"), None);
+        assert_eq!(find_by_name(&root, "  "), None, "空目标");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `.gitignore` 排除的文件不当跳转目标(与搜索同一套语义)。
+    #[test]
+    fn find_by_name_respects_gitignore() {
+        let root = vault("ignored");
+        assert_eq!(find_by_name(&root, "ignored"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 带路径分隔符的目标按相对路径直取。
+    #[test]
+    fn find_by_name_accepts_relative_paths() {
+        let root = vault("path");
+        assert_eq!(
+            find_by_name(&root, "子目录/Note One"),
+            Some(root.join("子目录/Note One.markdown"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

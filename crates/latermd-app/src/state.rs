@@ -118,21 +118,33 @@ pub struct SidebarState {
 /// 只在编辑器修订号前进(或整篇换入)时重建,与预览同步是同一时机;
 /// vendored 层内部还会按 text hash 二次缓存,空闲帧零开销。
 pub struct PreviewState {
-    /// 当前喂给 [`egui_markdown::MarkdownLabel`] 的全文。
+    /// 当前快照的**源文本**(大纲 `span` 索引它,与编辑器缓冲同源)。
+    ///
+    /// 渲染走 [`Self::rendered`] —— wikilink 展开会改变偏移,渲染文本不能
+    /// 与源码偏移混用。生产路径当前只读 `rendered`,`text` 是快照真源与
+    /// 「空闲帧不重建」这类不变量的锚点。
+    #[allow(dead_code)]
     pub text: String,
     /// 快照对应的 [`EditorBuffer::revision`]。
     pub synced_rev: u64,
     /// 文档大纲,与 `text` 同一次重建产出,`span` 直接索引该文本。
     pub outline: Vec<OutlineItem>,
+    /// 喂给预览的**渲染文本**:`[[wikilink]]` 已展开成 `wiki://` 链接
+    /// (P3 双向链接)。源码 `text` 一字不改 —— 展开只影响渲染。
+    pub rendered: String,
 }
 
 impl PreviewState {
     /// 以编辑器当前内容建立快照(文本 + 大纲)。
     pub fn new(editor: &EditorBuffer) -> Self {
+        let text = editor.text().to_owned();
         Self {
-            text: editor.text().to_owned(),
+            // 展开放在重建里而不是每帧:wikilink 展开要遍历全文,空闲帧
+            // 不该付这个代价(与「修订号前进才重建」同一条规则)
+            rendered: latermd_md::expand_wikilinks(&text),
+            outline: latermd_md::outline(&text),
+            text,
             synced_rev: editor.revision(),
-            outline: latermd_md::outline(editor.text()),
         }
     }
 
@@ -340,6 +352,9 @@ pub enum Message {
     SearchResultClicked(PathBuf, usize),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
+    /// 点击预览里的 `[[wikilink]]`,载荷为目标文档名:归约里在文档库内找同名
+    /// 文档并打开(找不着落提示行,不静默无反应)。
+    WikilinkClicked { target: String },
     /// 发起 AI Mock 流式续写(命令层入口);流式进行中在归约里被忽略
     /// (防重入,见 [`AiState::start`])。
     AiStart,
@@ -455,6 +470,7 @@ impl State {
                 self.open_search_hit(&path, line_no);
             }
             Message::OutlineItemClicked(span) => self.jump_cursor_to_heading(span),
+            Message::WikilinkClicked { target } => self.open_wikilink(&target),
             Message::AiStart => self.start_ai_stream(),
             Message::AiChunk { delta } => self.append_ai_delta(&delta),
             Message::AiDone => {
@@ -998,6 +1014,26 @@ impl State {
         }
         if let Err(error) = self.theme.save_to(self.settings_dir.as_deref()) {
             self.tabs.current_mut().document.notice = Some(error.to_string());
+        }
+    }
+
+    /// 打开 `[[wikilink]]` 指向的文档:在文档库根下按文件名找(忽略大小写与
+    /// `.md`/`.markdown` 扩展名差异),找到即走与文件树点击同一条 `open_path`
+    /// (路径去重、脏标签规则都在那里);找不着落提示行。
+    ///
+    /// 没选文档库根时直接提示 —— 与 MCP 工具同口径:没有检索范围就不猜。
+    fn open_wikilink(&mut self, target: &str) {
+        let Some(root) = self.file_tree.root.clone() else {
+            self.tabs.current_mut().document.notice =
+                Some("未设置文件树根目录,无法跳转链接".to_owned());
+            return;
+        };
+        match crate::filetree::find_by_name(&root, target) {
+            Some(path) => self.open_path(&path),
+            None => {
+                self.tabs.current_mut().document.notice =
+                    Some(format!("文档库里没有「{target}」这篇文档"));
+            }
         }
     }
 
@@ -1621,6 +1657,59 @@ mod tests {
         let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
         assert_eq!(reloaded_theme.density, Density::Compact);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[[wikilink]]`:命中即打开同名文档(与文件树点击同一条路径),找不到
+    /// 落提示行 —— 不静默无反应。
+    #[test]
+    fn wikilink_opens_matching_document_or_notices() {
+        let dir = temp_path("wikilink");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("架构决策.md"), "# 架构\n").unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+
+        state.apply(Message::WikilinkClicked {
+            target: "架构决策".into(),
+        });
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("架构决策.md").as_path()),
+            "按文件名命中"
+        );
+        assert!(state.tabs.current().document.notice.is_none());
+
+        // 找不到:提示行给出文档名
+        state.apply(Message::WikilinkClicked {
+            target: "不存在".into(),
+        });
+        assert!(state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("不存在")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未选文档库根时点 wikilink:提示「先选根目录」,不猜路径。
+    #[test]
+    fn wikilink_without_root_notices() {
+        let mut state = State::default();
+        state.apply(Message::WikilinkClicked {
+            target: "任何文档".into(),
+        });
+        assert!(state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("未设置文件树根目录")));
     }
 
     /// 切 Live Preview 只翻标志:文本、修订号、dirty 都不动(共用同一 rope

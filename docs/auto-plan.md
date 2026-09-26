@@ -34,7 +34,7 @@
 | 8 | p2b-theme | 皮肤批次 B：三态切换（亮/暗/跟随系统）+ 自定义皮肤文件（RON 导出至 themes/）+ 视觉打磨 | ✅完成 | feat(app): 皮肤批次 B——三态主题(跟随系统 1s 节流轮询)+themes/*.ron 皮肤文件+标准/紧凑密度;feat 与 docs 两 commits 经 PR 合入 |
 | 12 | mcp-server | 本地 MCP server：五只读工具 + stdio/HTTP 双通道 + 设置页(用户 2026-09-26 追加) | ✅完成 | feat(mcp): latermd-mcp + latermd-search 下沉,PR #23 合入;docs: mcp-plan 阶段 ①-④ 全完成;口径见 decisions-pending #22 |
 | 9 | p3-live-preview | Live Preview：块级 caret 路由 + 聚焦块裸源码；**共用同一 rope buffer 与 undo 栈**（roadmap 铁律） | ✅完成(v1) | feat(md): blocks() 块划分(区间连续覆盖全文);feat(app): live.rs 活动块编辑代理 + RenderMode 分派 + Cmd+/ 命令;选区扩展与内联半隐藏留 v2 |
-| 10 | p3-nav | 大纲预览跳转（复用 section_to_token 映射）+ `[[wikilink]]` 双向链接（LinkHandler） | ⏳待开始 | — |
+| 10 | p3-nav | 大纲预览跳转（复用 section_to_token 映射）+ `[[wikilink]]` 双向链接（LinkHandler） | 🔄进行中 | `[[wikilink]]` 已落地（PR 合入）；**大纲预览跳转待做**：需 vendored 暴露 section 的 y 坐标（①类改动 + check.sh 门禁） |
 
 状态图例：⏳待开始 → 🔄进行中 → ✅完成 / ❌挂起（3 次失败）/ ⛔受阻（依赖挂起）。
 
