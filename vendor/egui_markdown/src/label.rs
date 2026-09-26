@@ -271,6 +271,65 @@ pub struct MarkdownLabel<'a> {
   code_theme: Option<&'a syntect::highlighting::Theme>,
 }
 
+/// One laid-out section, with enough geometry for callers to scroll to it.
+///
+/// `MarkdownLabel` paints everything into a single galley, so a caller (e.g. an
+/// outline pane) has no way to know where a given section ended up. Recording the
+/// anchors lets it say "scroll the preview to this heading" without reaching into
+/// galley internals.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionAnchor {
+  /// Byte offset of the section start **within the rendered text**
+  /// (the text handed to [`MarkdownLabel::new`], after any `heal`/pre-processing).
+  pub byte_start: usize,
+  /// Y offset of the section's first row, relative to the label's top-left corner.
+  pub y: f32,
+}
+
+/// Read the anchors recorded by the last render of the label with this `id`.
+///
+/// Returns `None` when the label has not been rendered in the current frame
+/// (e.g. culled), in which case callers should simply not scroll.
+pub fn section_anchors(ui: &egui::Ui, id: egui::Id) -> Option<Vec<SectionAnchor>> {
+  ui.data(|d| d.get_temp(id.with("section-anchors")))
+}
+
+/// Compute the anchors of a freshly laid-out galley.
+///
+/// Rows carry their character count (one glyph per char), so walking the rows and
+/// accumulating gives each row's character range; a section starts at the row that
+/// contains its first character. `PlacedRow::pos.y` is relative to the galley
+/// origin, which is exactly what a `ScrollArea` caller needs.
+fn compute_section_anchors(galley: &egui::epaint::text::Galley) -> Vec<SectionAnchor> {
+  let mut anchors = Vec::with_capacity(galley.job.sections.len());
+  for (index, section) in galley.job.sections.iter().enumerate() {
+    // byte_start is already absolute within `galley.job.text`
+    let byte_start = section.byte_range.start.0;
+    // Convert to a char offset: rows are counted in chars, bytes are not.
+    let char_start = galley.job.text[..byte_start.min(galley.job.text.len())].chars().count();
+    let mut y = f32::NAN;
+    // Walk the rows from the top for **this** section: an empty row contributes
+    // no glyphs, so it must still advance the cursor by one visual line.
+    let mut char_cursor = 0usize;
+    for row in &galley.rows {
+      let row_len = row.row.glyphs.len();
+      if char_start < char_cursor + row_len.max(1) {
+        y = row.pos.y;
+        break;
+      }
+      char_cursor += row_len.max(1);
+    }
+    if y.is_nan() && index + 1 == galley.job.sections.len() {
+      // Trailing empty section: park it at the very bottom rather than dropping it
+      y = galley.rect.bottom();
+    }
+    if !y.is_nan() {
+      anchors.push(SectionAnchor { byte_start, y });
+    }
+  }
+  anchors
+}
+
 impl<'a> MarkdownLabel<'a> {
   /// Create a new markdown label with the given widget ID and markdown source text.
   pub fn new(id: Id, text: &'a str) -> Self {
@@ -986,6 +1045,18 @@ impl<'a> MarkdownLabel<'a> {
     ui.data_mut(|d| d.insert_temp(size_cache_id, (ctx_hash, max_width, size)));
   }
 
+  /// Publish the geometry of every section under this label's id.
+  ///
+  /// `origin_y` is the label's own top in the parent's coordinate space; anchors
+  /// are stored absolute so a `ScrollArea` can `scroll_to_rect` them directly.
+  fn record_section_anchors(&self, ui: &egui::Ui, galley: &egui::epaint::text::Galley, origin_y: f32) {
+    let anchors: Vec<SectionAnchor> = compute_section_anchors(galley)
+      .into_iter()
+      .map(|anchor| SectionAnchor { byte_start: anchor.byte_start, y: anchor.y + origin_y })
+      .collect();
+    ui.data_mut(|d| d.insert_temp(self.id.with("section-anchors"), anchors));
+  }
+
   #[allow(clippy::too_many_arguments)]
   fn render_galley(
     &self,
@@ -1023,6 +1094,7 @@ impl<'a> MarkdownLabel<'a> {
 
     if !self.interactable {
       let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+      self.record_section_anchors(ui, &galley, rect.min.y);
       paint_decorations(ui, hr_positions, &galley, &code_block_rects, rect.min, decoration_width, style);
       ui.painter().galley(rect.min, galley.clone(), color);
       if let Some(handler) = self.link_handler {
@@ -1032,6 +1104,7 @@ impl<'a> MarkdownLabel<'a> {
     }
 
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    self.record_section_anchors(ui, &galley, rect.min.y);
     paint_decorations(ui, hr_positions, &galley, &code_block_rects, response.rect.min, decoration_width, style);
 
     let disable_text_selection = !self.selectable || ui.input(|input| input.modifiers.shift);
