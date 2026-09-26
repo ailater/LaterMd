@@ -1,11 +1,17 @@
 # cargo-dist 发布配置(docs/roadmap.md「打包」条目;AGENTS.md §5 三平台矩阵)
-# release.yml 由 `dist generate` 生成并维护,禁止手改(dist 会把手改视为 error);
+# release.yml 由 `dist generate` 生成,但带有三处 LOCAL PATCH(见 docs/distribution.md §1:
+# workflow_dispatch 入口 / actions:write / host 尾部 dispatch macos-dmg)——
+# dist 运行时会校验 release.yml 与模板逐字节一致,补丁必然触发
+# "has out of date contents" 硬错误(2026-09-26 v0.0.1 首发实测踩中),
+# 故必须 allow-dirty。将来 `dist generate` 重生成后,补丁须按 distribution.md 清单重打。
 # macOS universal2 dmg 走自建 custom job,不经本文件的 installer 通道。
 
 [workspace]
 members = ["cargo:."]
 
 [dist]
+# release.yml 带 LOCAL PATCH,关闭 CI 模板一致性校验(0.33 的 allow-dirty 是类别列表,理由见文件头注释)
+allow-dirty = ["ci"]
 # CI 内安装的 dist 版本钉死(生成的 release.yml 里 dist installer URL 由此读取)
 cargo-dist-version = "0.33.0"
 # CI 后端与发布渠道:GitHub Release(AGENTS.md §5 分发策略)

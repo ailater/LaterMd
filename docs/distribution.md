@@ -54,6 +54,12 @@ PR 合入 main(版本号已 bump)
 2. `permissions` 增加 `"actions": "write"`(host job 要 dispatch macos-dmg);
 3. host job 尾部「Dispatch macOS dmg build」步骤。
 
+**LOCAL PATCH 的前置条件**:`dist-workspace.toml` 里 `allow-dirty = ["ci"]`。
+dist 0.33 运行时会校验 release.yml 与生成模板逐字节一致,任何补丁都会触发
+「has out of date contents and needs to be regenerated」硬错误退出
+(2026-09-26 v0.0.1 首发实测踩中);`["ci"]` 精确放行这一类校验。
+**若移除补丁回归纯模板,应同时移除 allow-dirty**,恢复漂移检测。
+
 **版本策略**:tag 号永远取自 Cargo.toml(workspace.package.version),
 auto-tag 不自行递增 —— dist 强制 tag 与包版本一致,自动改号必失配;
 bot 直推 main 改版本号会被分支保护拦截。版本号不变地合入 main 不发版
@@ -186,7 +192,8 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
    Release 的 dmg step summary 值;见 §3.4 的 auto-bump 空档)。
 4. dist 配置(dist-workspace.toml)改动后本地必须重跑 §3.1 第 3 步的
    manifest 校验,再 `dist generate` 重新生成 release.yml —— 重新生成会
-   **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上。
+   **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上;allow-dirty 见 §1
+   的前置条件说明。
 
 ## 5. 无签名路线的用户侧影响(README「安装」节的依据)
 
