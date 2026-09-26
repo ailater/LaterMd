@@ -128,6 +128,7 @@ vendored `egui_markdown` 存在于 `vendor/egui_markdown/`，以下结论均已�
 - **IME 是头号风险。** Windows 微软拼音 + macOS 简体拼音的候选框跟随、不吞字、不抢焦点，必须在 M0 阶段实测掉，不要想当然。
 - **分支与推送（多人协作）。** `main` 是受保护的集成分支，**禁止直接 push 到 main、禁止 force push**。日常在 `feature/<短横线主题>` 上工作（修缺陷用 `fix/<主题>`，基础设施用 `chore/<主题>`）；commit 完成后 `git push -u origin <branch>` 推同名远端分支，不留本地堆积，再 `gh pr create` 开 PR 合入 `main`。
 - **CI 只在 `main` 上跑**（`.github/workflows/rust.yml` 只保留 `push: branches: [main]`）。因此**合入 PR 前必须在本地跑完六项门禁**：`cargo fmt --all --check`、三轮 `cargo clippy --workspace --all-targets`（default / `--no-default-features` / `--all-features`，均 `-D warnings`）、`cargo test --workspace --all-features`、`cargo doc --no-deps --all-features`；vendor 改动加跑 `vendor/egui_markdown/check.sh`。合入后 main 上的 CI 是兜底，不是第一道防线。
+- **门禁必须跑在"最终要合入的那个 head"上**：PR 合并**之后**再往该分支推的 commit **不会进 main**（PR 已关闭，分支后续的提交无人搬运），main 于是拿到没过门禁的版本。2026-09-26 实测踩过一次：`feature/p3-live-preview` 合并后补推的 clippy 修复（`cfdb812`）没进 main，main 的 Gate 当场红在 `clippy (default)`，要靠下一个 PR 顺带把同一处改回来才转绿。**补提交一律另开分支 + 新 PR**；合入后也要确认 `origin/main` 最新 run 是绿的再往下走。
 - **PR 描述要求**：vendor 改动必须标明类别（①上游可合 / ②私有删改 / ③仓库接驳，见 §6），便于将来 cherry-pick 与解 subtree 冲突；非 vendor 改动注明「非 vendor」即可。
 - **与 main 同步用 rebase，不用 merge**：开工前 `git pull --rebase origin main`，PR 落后于 main 时同样 rebase 后 force push **自己的分支**（不是 main）。工作区有他人未提交改动、rebase 无法启动时，允许用 `git merge origin/main` 例外。
 - 仓库设置侧应为 `main` 开启分支保护（要求 PR），把「禁止直推 main」固化下来，别只靠自觉。
