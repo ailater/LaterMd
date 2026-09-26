@@ -362,6 +362,10 @@ fn apply_shell_to(style: &mut egui::Style) {
     v.selection.stroke = egui::Stroke::NONE;
     // 圆角:控件 6(WorkBuddy 的圆润感)。0.36 的窗口/菜单圆角字段已不在
     // Visuals/Spacing 的公开面,浮窗圆角走 egui 出厂值,不做覆盖
+    // 滚动条:出厂 12px 偏粗,WorkBuddy 是细浅条
+    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.scroll.bar_inner_margin = 4.0;
+    style.spacing.scroll.bar_outer_margin = 2.0;
     // 分隔线弱化:panel 之间靠底色分区,线只在必要时出现
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
