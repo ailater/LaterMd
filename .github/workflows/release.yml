@@ -16,6 +16,8 @@
 name: Release
 permissions:
   "contents": "write"
+  # LOCAL PATCH(非 dist 模板):host job 尾部要 dispatch macos-dmg.yml
+  "actions": "write"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -43,6 +45,10 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  # LOCAL PATCH(非 dist 模板):auto-tag.yml 用 GITHUB_TOKEN dispatch 到 tag ref。
+  # GITHUB_TOKEN 推的 tag 不会触发上面的 on: push: tags(GitHub 防递归规则),
+  # 唯一例外通道就是 workflow_dispatch,故补此入口。
+  workflow_dispatch:
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -277,6 +283,17 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      # LOCAL PATCH(非 dist 模板):GITHUB_TOKEN 建的 Release 不会触发
+      # macos-dmg.yml 的 on: release 事件(GitHub 防递归规则),
+      # macOS universal2 dmg 的合成必须由此处显式 dispatch 到 main
+      # (dmg job 只用 main 上的 packaging/macos/Info.plist,版本号走 tag 入参)。
+      - name: "Dispatch macOS dmg build"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run macos-dmg.yml \
+            --ref "${{ github.event.repository.default_branch }}" \
+            -f tag="${{ needs.plan.outputs.tag }}"
 
   announce:
     needs:

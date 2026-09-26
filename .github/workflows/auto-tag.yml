@@ -1,0 +1,78 @@
+# 合入 main 自动发版(用户需求 2026-09-26:提交/merge 到 main 就自动打 tag)
+#
+# 版本策略(重要):tag 版本号永远取自 Cargo.toml 的 workspace.package.version,
+# 本 workflow 不自行递增 —— dist 强制 tag 与包版本一致,自动改号必失配;而
+# bot 直推 main 改 Cargo.toml 会被分支保护拦截。因此:发版 = PR 里把版本号
+# 提到新值(同 PR 建议带上 CHANGELOG.md 小节,它会成为 Release 正文),
+# 合入后门禁跑绿,本 workflow 自动打 tag 并触发完整发布链。
+#
+# 触发方式:workflow_run 监听 Rust 门禁(rust.yml)在 main 上跑绿,
+# 而非裸 push 事件 —— 门禁红了就不该发版,这是发布的前置闸门。
+#
+# 链路(三段,缺一不可):
+#   本 workflow ──gh workflow run──▶ release.yml(dispatch 到 tag ref)
+#   release.yml host job ──gh workflow run──▶ macos-dmg.yml
+#
+# 为什么必须用 workflow_dispatch 显式串,而不是让 tag push / release published
+# 事件自然触发:GitHub 防递归规则 —— GITHUB_TOKEN 造成的事件(推 tag、发 Release)
+# 不会触发新 workflow run,唯一例外是 workflow_dispatch / repository_dispatch。
+# 详见 docs/distribution.md §1。
+
+name: Auto Tag
+
+on:
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false # 排队执行,避免连续合入时竞态
+
+permissions:
+  contents: write # push tag
+  actions: write # gh workflow run
+
+jobs:
+  tag-and-dispatch:
+    # 只在门禁跑绿时进入;版本未变或 tag 已存在时脚本内快速跳过
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout(完整历史,判重与打 tag 用)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: 读版本号,无对应 tag 则打 tag
+        id: next
+        run: |
+          set -euo pipefail
+          VER=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          if ! echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Cargo.toml 版本号 $VER 不是合法 SemVer,中止" >&2
+            exit 1
+          fi
+          TAG="v$VER"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git tag -l "$TAG")" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tag $TAG 已存在(本版本已发或版本未变),跳过"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG (auto)"
+          git push origin "$TAG"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Release 构建
+        if: steps.next.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          gh workflow run release.yml --ref "$TAG"
+          echo "已 dispatch release.yml @ $TAG"

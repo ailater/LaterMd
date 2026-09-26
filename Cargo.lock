@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-ai"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde_json",
  "ureq",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-app"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "criterion",
  "dark-light",
@@ -2513,35 +2513,35 @@ dependencies = [
 
 [[package]]
 name = "latermd-creds"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "keyring",
 ]
 
 [[package]]
 name = "latermd-editor"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "latermd-export"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "latermd-git"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "git2",
 ]
 
 [[package]]
 name = "latermd-mcp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "latermd-git",
  "latermd-md",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-md"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "egui_markdown",
  "pulldown-cmark",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-search"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "grep-searcher",
  "ignore",

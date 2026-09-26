@@ -1,9 +1,12 @@
 # macOS universal2 dmg —— cargo-dist 不产 dmg,且 0.33 无 universal2 target
 # (上游 config/v1/mod.rs 标 FIXME),故自建本 job。
 #
-# 时序:dist 的 release.yml 在 tag push 时构建各架构 tar.xz 并创建 Release,
-# 本 workflow 监听「Release 已发布」,下载两个架构的二进制 → lipo 合一 →
-# 打成 .app bundle → 合成 dmg → 回传同一 Release。
+# 时序:dist 的 release.yml 构建各架构 tar.xz 并创建 Release 后,由其 host job
+# 尾部 `gh workflow run macos-dmg.yml -f tag=<tag>` 显式 dispatch 本 workflow
+# (release.yml 用 GITHUB_TOKEN 建 Release,该事件不会触发 on: release ——
+# GitHub 防递归规则,workflow_dispatch 是唯一例外通道,详见 docs/distribution.md §1)。
+# on: release 保留给人工/PAT 场景(手动在 GitHub 页面发 Release 仍可触发)。
+# 本 job 下载两个架构的二进制 → lipo 合一 → 打成 .app bundle → 合成 dmg → 回传同一 Release。
 #
 # 为什么要 .app 而不是裸二进制:macOS 的 GUI 应用必须走 bundle 才能正常获得
 # 窗口焦点与输入法上下文(直接跑命令行二进制会丢 IME 候选框跟随),这是
@@ -17,18 +20,36 @@ name: macOS dmg
 on:
   release:
     types: [published]
+  # 常规通道:release.yml host job dispatch(tag 入参)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要合成 dmg 的版本 tag(如 v0.0.1)"
+        required: true
 
 permissions:
   contents: write
+
+# 同一 tag 若被 release 事件与 dispatch 双触发,只跑一个
+concurrency:
+  group: macos-dmg-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: true
 
 jobs:
   universal-dmg:
     runs-on: macos-14
     steps:
+      # Info.plist 是仓库文件(packaging/macos/Info.plist),必须 checkout
+      # (dispatch 走 main,release 事件走 tag 对应提交,两者内容一致)
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
       - name: 取版本号
         id: ver
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
