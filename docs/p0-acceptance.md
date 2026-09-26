@@ -54,6 +54,8 @@
 
 ## 4. 出 P0 前必须补的三件事
 
+> **操作步骤与判据见 [acceptance-checklist.md](acceptance-checklist.md)**（人工真机验收清单，2026-09-26 新增）。本节只列"哪三件事"，执行细节一律以那份清单为准。
+
 1. **首个 tag 跑通发布链路**:合入打包 PR → `git tag v0.1.0 && git push origin v0.1.0` → 确认 release.yml 五目标产物齐备、macos-dmg.yml 合成 dmg 成功。
 2. **真机 IME 实测**(M0 遗留,头号风险):Win11 微软拼音 + macOS 14 简体拼音,记录候选框跟随 / 连续输入不吞字 / 窗口切换不抢焦点。macOS 必须走 `.app` 启动(裸二进制丢输入法上下文)。
 3. **三平台装一次、跑一次**:Win11 DX12 与 macOS Metal 的 adapter 上报确认(M0 验证 3),以及连续写作的稳定性长跑(验收 2 的人工部分)。
