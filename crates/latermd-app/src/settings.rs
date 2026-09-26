@@ -121,40 +121,58 @@ pub fn dialog(
         .resizable(true)
         .open(&mut open)
         .show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                // 左:竖排分页(固定宽,不随内容抖)
-                ui.allocate_ui_with_layout(
-                    egui::vec2(120.0, ui.available_height()),
-                    egui::Layout::top_down_justified(egui::Align::Min),
-                    |ui| {
-                        for tab in SettingsTab::ALL {
-                            if icons::icon_tab(ui, tab.icon(), tab.label(), settings.tab == tab)
-                                .clicked()
-                            {
-                                settings.tab = tab;
-                                // 换页清空上一页的残留提示与捕获状态
-                                settings.notice = None;
-                                settings.capture = None;
-                            }
-                        }
-                    },
-                );
-                ui.separator();
-                // 右:当前页内容(可滚动,长表单不被窗口裁掉)
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-body")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match settings.tab {
-                        SettingsTab::Appearance => {
-                            appearance(ui, settings, theme, skins, system_theme_ok, outbox)
-                        }
-                        SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
-                        SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
-                        SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
+            // 骨架:底部按钮条 + 左分页列 + 中央滚动区,全部用 `exact_size`
+            // 的 Panel 定形。此前用 `ui.horizontal` + `available_height()` +
+            // `auto_shrink([false,false])` 的组合,ScrollArea 会请求全部可用
+            // 宽,而 Window 宽又由内容决定 —— 二者互相喂,每帧把窗口撑大一
+            // 圈,直到横贯全屏(2026-09-26 实测弹窗被拉成 1920x200 的扁条,
+            // 分页列被挤没)。Panel 定形后各区域尺寸与内容解耦,反馈消失。
+            egui::Panel::bottom("settings-footer")
+                .exact_size(40.0)
+                .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8, 4)))
+                .show(ui, |ui| {
+                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = Some(ui.button("关闭"));
                     });
-            });
-            ui.separator();
-            close = Some(ui.button("关闭"));
+                });
+            // 左:竖排分页(固定宽;WorkBuddy 观感 = 分页列吃侧栏灰、内容区吃窗底)
+            egui::Panel::left("settings-tabs")
+                .exact_size(112.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(crate::theme::shell_tokens(ui.visuals().dark_mode).sidebar)
+                        .inner_margin(egui::Margin::same(8)),
+                )
+                .show(ui, |ui| {
+                    for tab in SettingsTab::ALL {
+                        if icons::icon_tab(ui, tab.icon(), tab.label(), settings.tab == tab)
+                            .clicked()
+                        {
+                            settings.tab = tab;
+                            // 换页清空上一页的残留提示与捕获状态
+                            settings.notice = None;
+                            settings.capture = None;
+                        }
+                    }
+                });
+            // 右:当前页内容(可滚动,长表单不被窗口裁掉;父级已有界,
+            // auto_shrink([false,false]) 只作用于面板内部,不再反哺窗口尺寸)
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().inner_margin(egui::Margin::same(8)))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings-body")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match settings.tab {
+                            SettingsTab::Appearance => {
+                                appearance(ui, settings, theme, skins, system_theme_ok, outbox)
+                            }
+                            SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
+                            SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
+                            SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
+                        });
+                });
         });
     settings.open = open;
     close

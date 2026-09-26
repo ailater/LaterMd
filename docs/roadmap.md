@@ -21,6 +21,7 @@
 [x] MCP 附加项   2026-09-26 落地(原登记为「P3 之后」):latermd-search 下沉 + latermd-mcp 五只读工具 + stdio/HTTP 双通道 + 设置页 MCP 页与状态栏;默认关闭,只绑 127.0.0.1。详见 [mcp-plan.md](mcp-plan.md)
 [x] P3 深水区    Live Preview v1 + [[wikilink]] + 大纲预览跳转 均已于 2026-09-26 落地;剩余增强 = Live Preview v2(内联半隐藏)、Live Preview 选区扩展、反向链接面板
 多标签已落地(2026-09-26,用户追加需求)
+[ ] 外壳重构      ← 2026-09-26 规格已产出([ui-shell-redesign.md](ui-shell-redesign.md)),**D1–D5 待坤哥拍板**(auto-plan #13);拍板后按 M1–M5 五里程碑推进(8.5 工作日):标题栏+三栏重排 / 左栏三段式 / 格式工具条 / 禅定 / 收口
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
