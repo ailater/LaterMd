@@ -19,7 +19,7 @@
 [x] P2 版本层     Git 只读集成已落地(2026-09-25);凭据管理已落地(2026-09-25);P2 全部完成(latermd-creds + AI key 闸门/设置区经 PR #20 携带合入)
 [x] P2.5 界面打磨   2026-09-26 全部落地:批次 B-light(图标/工具栏/状态栏/设置对话框/快捷键可改绑/AI 配置页)+ 批次 B 本体(三态主题含跟随系统 + themes/*.ron 皮肤文件 + 标准/紧凑密度),设计规格见 docs/ui-polish.md
 [x] MCP 附加项   2026-09-26 落地(原登记为「P3 之后」):latermd-search 下沉 + latermd-mcp 五只读工具 + stdio/HTTP 双通道 + 设置页 MCP 页与状态栏;默认关闭,只绑 127.0.0.1。详见 [mcp-plan.md](mcp-plan.md)
-[~] P3 深水区    Live Preview v1(2026-09-26)+ [[wikilink]] 双向链接(2026-09-26)已落地;剩余 = 大纲预览跳转(需 vendored 暴露 section 坐标,①类改动)+ Live Preview v2(内联半隐藏)
+[x] P3 深水区    Live Preview v1 + [[wikilink]] + 大纲预览跳转 均已于 2026-09-26 落地;剩余增强 = Live Preview v2(内联半隐藏)、Live Preview 选区扩展、反向链接面板
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
@@ -194,7 +194,7 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 | 模块 | 内容 | 依赖 |
 |---|---|---|
 | **Live Preview** | 光标所在 block 显示源码，其余富渲染 | Token source_span（阶段 0 已做） |
-| 大纲预览跳转 | 复用现有 `section_to_token` 映射 | — |
+| 大纲预览跳转 | 复用现有 `section_to_token` 映射 | — | **2026-09-26 落地**：vendored 新增 `section_anchors()`（①类）暴露各 section 的 y，app 侧点大纲时把 span 换算成滚动目标，预览滚到该节顶部 |
 | 双向链接 `[[wikilink]]` | 通过 `LinkHandler` 实现 | — | **2026-09-26 落地**：`latermd_md::expand_wikilinks` 只改渲染（源码不动），LinkHandler 拦 `wiki://`，按文件名在库内找文档并打开；反向链接面板未做 |
 
 > 全文检索已并入 P1 侧边栏搜索，本阶段无检索条目。

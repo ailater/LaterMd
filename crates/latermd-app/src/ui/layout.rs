@@ -171,7 +171,7 @@ impl LaterMdApp {
         egui::CentralPanel::default().show(ui, |ui| {
             crate::ui::preview::ui(
                 ui,
-                &self.state.tabs.current().preview,
+                &mut self.state.tabs.current_mut().preview,
                 &self.state.ai,
                 outbox,
             );
