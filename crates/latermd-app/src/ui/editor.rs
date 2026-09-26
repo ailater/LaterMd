@@ -6,6 +6,7 @@
 //! undo/redo 用 `TextEdit` 内建 undoer(快照存于其 widget state)。
 //! 大纲跳转也在这里应用:覆写 TextEdit 持久光标并交还焦点。
 
+use crate::live::{self, LiveState, RenderMode};
 use crate::state::{OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
@@ -58,14 +59,21 @@ pub fn ui(
     editor: &mut EditorBuffer,
     preview: &mut PreviewState,
     cursor: &mut OutlineCursor,
+    live: &mut LiveState,
+    mode: RenderMode,
     editor_id: egui::Id,
 ) -> egui::Response {
     panel.horizontal(|ui| {
-        ui.weak("源码");
+        ui.weak(mode.label());
         if editor.is_dirty() {
             ui.weak("· 已修改");
         }
     });
+    // 两种模式共用同一个 rope buffer 与同一套撤销语义(roadmap 铁律):这里
+    // 只是分派,没有任何「把光标/文本从一种模式搬到另一种」的恢复逻辑。
+    if mode == RenderMode::Live {
+        return live::ui(panel, editor, preview, cursor, live, editor_id);
+    }
 
     let line_height = {
         let font = egui::FontSelection::Style(egui::TextStyle::Monospace).resolve(panel.style());
@@ -131,6 +139,7 @@ mod tests {
         preview: &mut PreviewState,
         cursor: &mut OutlineCursor,
     ) -> egui::Id {
+        let mut live = LiveState::default();
         let id = std::cell::Cell::new(egui::Id::NULL);
         let output = ctx.run_ui(
             RawInput {
@@ -139,7 +148,18 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                id.set(super::ui(ui, editor, preview, cursor, tab_editor_id(1)).id);
+                id.set(
+                    super::ui(
+                        ui,
+                        editor,
+                        preview,
+                        cursor,
+                        &mut live,
+                        RenderMode::Source,
+                        tab_editor_id(1),
+                    )
+                    .id,
+                );
             },
         );
         // egui 0.36 的 TexturesDelta drop 检查:测试里不消费绘制增量,

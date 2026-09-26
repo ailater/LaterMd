@@ -17,6 +17,7 @@ mod fonts;
 mod git_diff;
 mod git_panel;
 mod keymap;
+mod live;
 mod mcp;
 mod search;
 mod settings;

@@ -19,7 +19,7 @@
 [x] P2 版本层     Git 只读集成已落地(2026-09-25);凭据管理已落地(2026-09-25);P2 全部完成(latermd-creds + AI key 闸门/设置区经 PR #20 携带合入)
 [x] P2.5 界面打磨   2026-09-26 全部落地:批次 B-light(图标/工具栏/状态栏/设置对话框/快捷键可改绑/AI 配置页)+ 批次 B 本体(三态主题含跟随系统 + themes/*.ron 皮肤文件 + 标准/紧凑密度),设计规格见 docs/ui-polish.md
 [x] MCP 附加项   2026-09-26 落地(原登记为「P3 之后」):latermd-search 下沉 + latermd-mcp 五只读工具 + stdio/HTTP 双通道 + 设置页 MCP 页与状态栏;默认关闭,只绑 127.0.0.1。详见 [mcp-plan.md](mcp-plan.md)
-[ ] P3 深水区
+[~] P3 深水区    Live Preview v1 已落地(2026-09-26):Cmd+/ 切模式,块级源码/富渲染混合,共用同一 rope buffer;剩余 = 大纲预览跳转 + [[wikilink]] + Live Preview v2(内联半隐藏)
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
@@ -202,8 +202,8 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 ### Live Preview 三块补工
 
 1. `Token::source_span` —— **阶段 0 已完成**
-2. 块级 caret 路由（↑/↓ 跨 block、Home/End、选区扩展）—— 3-4 周，无捷径
-3. 内联标记半隐藏 —— v1 可简化为「聚焦时整条源码裸出来」
+2. 块级 caret 路由（↑/↓ 跨 block、Home/End、选区扩展）—— **2026-09-26 落地 v1**：`latermd_md::blocks` 切块（区间连续覆盖全文）+ `crates/latermd-app/src/live.rs` 的活动块编辑代理（`BlockBuffer` 落回同一 rope）；↑ 在块首去上一块末、↓ 在块尾去下一块首，Home/End 仍走 TextEdit 内建，选区扩展未做
+3. 内联标记半隐藏 —— **v1 按「聚焦时整条源码裸出来」交付**（块级切换，不做 `**` 半隐藏）；v2 再做块内分段
 
 ### 一条不能违反的原则
 

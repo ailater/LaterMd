@@ -45,6 +45,10 @@ pub enum Command {
     TabNext,
     /// 关闭当前标签(脏则确认模态;Ctrl/Cmd+W)。
     TabClose,
+    /// 源码模式 ↔ Live Preview 互换(P3):共用一个 rope buffer,切模式不丢
+    /// 光标也不丢 undo 栈。默认键 Cmd/Ctrl+/(与主流编辑器的「切换注释」
+    /// 同键位,工作台里没有注释语义)。
+    ToggleLivePreview,
 }
 
 impl Command {
@@ -52,7 +56,7 @@ impl Command {
     pub const FILE: [Command; 4] = [Self::New, Self::Open, Self::Save, Self::SaveAs];
 
     /// 全部命令(快捷键设置页与绑定表遍历的顺序,见 `crate::keymap`)。
-    pub const ALL: [Command; 12] = [
+    pub const ALL: [Command; 13] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -65,6 +69,7 @@ impl Command {
         Self::AiSummary,
         Self::TabNext,
         Self::TabClose,
+        Self::ToggleLivePreview,
     ];
 
     /// 稳定 id:快捷键表 `keymap.json` 的键。命令的显示名会随文案调整,
@@ -83,6 +88,7 @@ impl Command {
             Self::AiSummary => "ai_summary",
             Self::TabNext => "tab_next",
             Self::TabClose => "tab_close",
+            Self::ToggleLivePreview => "toggle_live_preview",
         }
     }
 
@@ -101,6 +107,7 @@ impl Command {
             Self::AiSummary => "AI: 生成摘要",
             Self::TabNext => "下一个标签",
             Self::TabClose => "关闭标签",
+            Self::ToggleLivePreview => "切换 Live Preview",
         }
     }
 
@@ -130,6 +137,9 @@ impl Command {
             }
             Self::TabNext => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Tab),
             Self::TabClose => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::W),
+            Self::ToggleLivePreview => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Slash)
+            }
             // 无快捷键:poll_shortcuts 不轮询它,菜单里也不展示键位
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => return None,
         };
@@ -149,6 +159,7 @@ impl Command {
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
             Self::TabNext | Self::TabClose => Icon::Files,
+            Self::ToggleLivePreview => Icon::Files,
         }
     }
 
@@ -165,6 +176,7 @@ impl Command {
             Self::AiMockStream => Message::AiStart,
             Self::AiCommitMessage => Message::AiCommitRequested,
             Self::AiSummary => Message::AiSummaryRequested,
+            Self::ToggleLivePreview => Message::ToggleLivePreview,
             Self::TabNext => Message::TabNext,
             Self::TabClose => Message::TabCloseActive,
         }

@@ -80,6 +80,127 @@ pub fn outline(text: &str) -> Vec<OutlineItem> {
         .collect()
 }
 
+/// 把文档切成**块**(P3 Live Preview 的骨架):返回每个块的源码字节区间。
+///
+/// 三条规定(由 Live Preview 的编辑语义倒逼出来):
+///
+/// 1. **覆盖全文、连续、无重叠**:块区间首尾相接且并集等于整篇 —— 光标块
+///    在 Live Preview 下是被编辑的区间,若有字节落在任何块之外,在那儿敲
+///    一个字符就会**静默丢失**。
+/// 2. **块间空行归前一块**:段落之间的 `\n\n` 收进上一块的尾部(最后一块吃
+///    到文末),这样每块的源码都是可直接独立解析的片段,富渲染也不会因为
+///    前导空行在顶部空出一段。
+/// 3. **块级 token 独占一块**:代码块、表格、分隔线、标题各自成块 —— 它们
+///    内部的结构(表格行、代码缩进)不该被相邻段落的源码混进来。
+///
+/// 空文档返回空表;纯空行文档整篇算一块(编辑需要落点)。
+pub fn blocks(text: &str) -> Vec<Range<usize>> {
+    let md = egui_markdown::parser::parse(text);
+    // ① 先按 token 划出「内容段」(记录内容起点与 span 终点),Newline 单独
+    //    处理 —— 它的字节在 ② 里随边界分配。
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < md.tokens.len() {
+        match &md.tokens[i] {
+            Token::Newline => {
+                i += 1;
+            }
+            // 块级:独占一段(代码块从此包含它的 ``` 起始 fence)。起点同样
+            // 要跳过前导空行 —— 否则分隔符会归到代码块头上,富渲染时顶部
+            // 凭空空出一段
+            Token::CodeBlock { .. } | Token::Table(_) | Token::HorizontalRule => {
+                let span = &md.spans[i];
+                segments.push((skip_newlines(text, span.start), span.end));
+                i += 1;
+            }
+            Token::Text { style, .. } if style.heading.is_some() => {
+                let span = &md.spans[i];
+                segments.push((content_start(text, span, &md.tokens[i]), span.end));
+                i += 1;
+            }
+            // 其余:连续的非块级 token 合并成一段(列表项与它的文本同段)
+            _ => {
+                let start = content_start(text, &md.spans[i], &md.tokens[i]);
+                let mut end = md.spans[i].end;
+                let mut j = i + 1;
+                while j < md.tokens.len() && !is_segment_break(&md.tokens[j]) {
+                    end = md.spans[j].end;
+                    j += 1;
+                }
+                segments.push((start, end));
+                i = j;
+            }
+        }
+    }
+    if segments.is_empty() {
+        // 没有内容 token(空文档 / 纯空行):整篇一块,保证有编辑落点
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![0..text.len()]
+        };
+    }
+    // ② 连续化:每块**吃到下一块的内容起点**(块间空行归前一块),最后一块
+    //    到文末。
+    let mut blocks = Vec::with_capacity(segments.len());
+    let mut cursor = 0_usize;
+    for (index, (start, _end)) in segments.iter().enumerate() {
+        let block_end = if index + 1 == segments.len() {
+            text.len()
+        } else {
+            segments[index + 1].0.max(*start)
+        };
+        let block_start = cursor.min(*start);
+        if block_end > block_start {
+            blocks.push(block_start..block_end);
+            cursor = block_end;
+        }
+    }
+    blocks
+}
+
+/// 从 `pos` 起跳过连续的换行与回车(CRLF 的 `\r` 也算分隔符的一部分)。
+fn skip_newlines(text: &str, mut pos: usize) -> usize {
+    let bytes = text.as_bytes();
+    while pos < bytes.len() && (bytes[pos] == b'\n' || bytes[pos] == b'\r') {
+        pos += 1;
+    }
+    pos.min(text.len())
+}
+
+/// 段的**内容起点**。
+///
+/// 不能直接拿 span 起点:vendored 的平铺 span 会吸收前一块尾部的换行(后一段
+/// 的 span 里含着 `\n\n` 前缀),代码块闭合的 ``` 也会被算进后一段的 span。
+/// 这里用 token 自带的文本在 span 区间内定位真正的起点;块级 token(代码块
+/// 的 fence 属于内容)没有这一步,直接用 span 起点。
+fn content_start(text: &str, span: &Range<usize>, token: &Token<'_>) -> usize {
+    let needle: Option<&str> = match token {
+        Token::Text { text, .. } => Some(text.as_ref()),
+        Token::ListMarker { marker, .. } => Some(marker.as_ref()),
+        Token::Link { text, .. } => Some(text.as_ref()),
+        Token::Image { alt, .. } => Some(alt.as_ref()),
+        _ => None,
+    };
+    let end = span.end.min(text.len());
+    match needle {
+        Some(needle) if !needle.is_empty() && span.start <= end => text[span.start..end]
+            .find(needle)
+            .map_or(span.start, |offset| span.start + offset),
+        _ => span.start,
+    }
+}
+
+/// 是否要在此 token 处断开内容段(空行与块级 token 都算)。
+fn is_segment_break(token: &Token<'_>) -> bool {
+    match token {
+        Token::Newline => true,
+        Token::CodeBlock { .. } | Token::Table(_) | Token::HorizontalRule => true,
+        Token::Text { style, .. } => style.heading.is_some(),
+        _ => false,
+    }
+}
+
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
 /// 它的标题前(无则到文末)。更深层级的标题(`###`)是该节的子内容,一并
 /// 属于节;标题文本按 `trim` 后全等匹配,层级精确匹配。
@@ -196,6 +317,77 @@ mod tests {
         };
         let end = start + needle.len();
         span.start <= start && span.end >= end
+    }
+
+    /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块
+    /// 是被编辑的区间,任何落在块外的字节都会在敲键时静默丢失。
+    fn assert_covers_text(text: &str, blocks: &[Range<usize>]) {
+        let mut cursor = 0;
+        for block in blocks {
+            assert_eq!(block.start, cursor, "块区间不连续: {blocks:?}");
+            assert!(block.end > block.start, "空块区间: {block:?}");
+            cursor = block.end;
+        }
+        assert_eq!(cursor, text.len(), "未覆盖到文末: {blocks:?}");
+    }
+
+    /// 段落按空行切分,块间空行归前一块(每块可独立解析)。
+    #[test]
+    fn blocks_split_paragraphs_and_own_trailing_blank_line() {
+        let text = "# 标题\n\n正文一段\n\n正文二段\n";
+        let blocks = blocks(text);
+        let slices: Vec<&str> = blocks.iter().map(|b| &text[b.start..b.end]).collect();
+        assert_eq!(slices, vec!["# 标题\n\n", "正文一段\n\n", "正文二段\n"]);
+        assert_covers_text(text, &blocks);
+    }
+
+    /// 代码块整块成一段:**含闭合 fence**(vendored 的 span 只到内容末尾,
+    /// 直接拿 span 当边界会把 ``` 切到下一块)。
+    #[test]
+    fn blocks_keep_fenced_code_block_intact() {
+        let text = "前言\n\n```rust\nfn main() {}\n```\n\n后记\n";
+        let blocks = blocks(text);
+        let slices: Vec<&str> = blocks.iter().map(|b| &text[b.start..b.end]).collect();
+        assert_eq!(
+            slices,
+            vec!["前言\n\n", "```rust\nfn main() {}\n```\n\n", "后记\n"]
+        );
+        assert_covers_text(text, &blocks);
+    }
+
+    /// 表格与列表:表格整块;列表**每项**一块(每项都可单独进 Live 编辑)。
+    #[test]
+    fn blocks_cover_tables_and_list_items() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n\n尾段\n";
+        let table_blocks = blocks(text);
+        assert_eq!(table_blocks.len(), 2, "{table_blocks:?}");
+        assert!(text[table_blocks[0].start..table_blocks[0].end].starts_with("| a |"));
+        assert_covers_text(text, &table_blocks);
+
+        let list = "- 一\n- 二\n\n尾\n";
+        let list_blocks = blocks(list);
+        let slices: Vec<&str> = list_blocks.iter().map(|b| &list[b.start..b.end]).collect();
+        assert_eq!(slices, vec!["- 一\n", "- 二\n\n", "尾\n"]);
+        assert_covers_text(list, &list_blocks);
+    }
+
+    /// 边界:空文档无块;纯空行整篇一块(编辑需要落点);单段无换行也成块。
+    #[test]
+    fn blocks_handle_empty_and_degenerate_input() {
+        assert!(blocks("").is_empty());
+        let blank = "\n\n\n";
+        assert_eq!(blocks(blank), vec![0..blank.len()]);
+        let single = "hello world";
+        assert_eq!(blocks(single), vec![0..single.len()]);
+    }
+
+    /// CRLF 与中文:块的字节边界仍连续覆盖(CRLF 的 `\r` 属于行内容)。
+    #[test]
+    fn blocks_cover_crlf_and_cjk_text() {
+        let text = "中文标题\r\n\r\n正文内容\r\n";
+        let blocks = blocks(text);
+        assert_covers_text(text, &blocks);
+        assert!(!blocks.is_empty());
     }
 
     #[test]

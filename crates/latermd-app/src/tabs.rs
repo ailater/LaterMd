@@ -15,6 +15,7 @@
 //!   开新标签不改写入目标也不中断;只有发起标签被关闭才作废(剩余块
 //!   无处可写,写进任何别的标签都是写错文档)。
 
+use crate::live::LiveState;
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,8 @@ pub struct TabState {
     pub preview: PreviewState,
     /// 大纲↔编辑器光标协调。
     pub cursor: OutlineCursor,
+    /// Live Preview 的块表与活动块(仅在 Live 模式下使用)。
+    pub live: LiveState,
 }
 
 impl TabState {
@@ -46,6 +49,7 @@ impl TabState {
             },
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
+            live: LiveState::default(),
             editor,
         }
     }
@@ -57,6 +61,7 @@ impl TabState {
         self.document.path = path;
         self.document.notice = None;
         self.preview.rebuild(&self.editor);
+        self.live.reset();
     }
 }
 
@@ -66,8 +71,11 @@ pub struct TabsState {
     pub tabs: Vec<TabState>,
     /// 当前标签索引。
     pub active: usize,
-    /// 待确认关闭的脏标签索引;`Some` 时 UI 显示确认模态。
-    pub confirm_close: Option<usize>,
+    /// 待确认关闭的脏标签**稳定 id**;`Some` 时 UI 显示确认模态。不存索引:
+    /// 模态是非阻塞 Window,打开期间其他关闭入口(标签条 × / Ctrl+W)还会
+    /// 动标签列表使索引漂移,按漂移索引确认会关错标签;id 不随增删漂移
+    /// (与在途 AI 流的 `State::ai_active_tab` 同手法)。
+    pub confirm_close: Option<u64>,
     /// 下一个标签的 id(自增,不复用 —— 关了再开新标签,编辑器 undo/光标
     /// 状态必须是全新的)。
     next_id: u64,
@@ -116,6 +124,13 @@ impl TabsState {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
+    /// 待确认关闭的标签(确认模态的文案来源);id 已失效(目标被移除)返回
+    /// `None`,模态随之不再渲染。
+    pub fn confirm_close_tab(&self) -> Option<&TabState> {
+        let id = self.confirm_close?;
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+
     /// 开新标签(换入 `text`)并激活,返回新标签索引。打开文件**永远走
     /// 这里**,当前标签的缓冲与 dirty 不受影响。
     pub fn open_tab(&mut self, path: Option<PathBuf>, text: &str) -> usize {
@@ -145,12 +160,18 @@ impl TabsState {
     }
 
     /// 移除标签(调用方保证脏确认已过)。关掉最后一个即换入新的空标签;
-    /// 当前指针跟着修正(关的是当前或更靠前的标签时前移一位)。
+    /// 当前指针跟着修正(关的是当前或更靠前的标签时前移一位)。待确认
+    /// 关闭的正是被移除的标签时,确认一并撤下 —— 目标已没了,模态不再
+    /// 显示,迟到的确认消息变成 no-op 而不是关掉漂移到该索引的别的标签。
     pub fn remove(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
+        let removed = self.tabs[index].id;
         self.tabs.remove(index);
+        if self.confirm_close == Some(removed) {
+            self.confirm_close = None;
+        }
         if self.tabs.is_empty() {
             let id = self.next_id;
             self.next_id += 1;
