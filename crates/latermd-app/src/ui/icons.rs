@@ -295,7 +295,11 @@ pub fn icon_tab(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> e
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if response.hovered() {
+        // WorkBuddy 风:选中项浅蓝圆角底,悬停浅灰
+        if selected {
+            let selected_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).selected_bg;
+            painter.rect_filled(rect, RADIUS_SM, selected_bg);
+        } else if response.hovered() {
             painter.rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
         }
         icon.draw(
