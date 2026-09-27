@@ -27,25 +27,48 @@
 
 ## 2. 设计 token（本轮引入，落在 `ui/tokens.rs`）
 
+> **2026-09-27 回写（外壳重构 M5 收口）**：本表按 `tokens.rs` 现值逐项核对订正。
+> `TOOLBAR_H` 已于 2026-09-26 订正为 28，本轮复核一致。三处设计与实现不一致：
+> `SPACE_LG` / `STATUSBAR_H` / `RADIUS_MD` 从未落地进 `tokens.rs`（git `-S` 全历史
+> 只命中本文件），删划线标注；`ACCENT` 已随 WorkBuddy 风外壳改为飞书蓝
+> （decisions-pending #30，2026-09-26）。外壳重构新增 token 见 §2.1。
+
 | 类别 | token | 值 | 用途 |
 |---|---|---|---|
 | 间距 | `SPACE_XS` | 4 | 图标与文字间隙 |
 | | `SPACE_SM` | 6 | 按钮内边距（水平） |
 | | `SPACE_MD` | 10 | 工具栏分组间距 |
-| | `SPACE_LG` | 14 | 面板内容边距 |
+| | ~~`SPACE_LG`~~ | ~~14~~ | 设计列出、未落地（无消费者，`tokens.rs` 无此常量） |
 | 尺寸 | `ICON` | 16 | 图标方框边长（按钮内） |
 | | `ICON_SM` | 13 | 页签/菜单内图标 |
 | | `TOOLBAR_H` | 28 | 工具栏按钮高度（原文误记 32，2026-09-26 订正，与 tokens.rs 对齐） |
-| | `STATUSBAR_H` | 24 | 状态栏高度 |
+| | ~~`STATUSBAR_H`~~ | ~~24~~ | 未落地：状态栏高度由行高自然决定（实测 22px，[m5-acceptance.md](m5-acceptance.md) §0） |
 | 圆角 | `RADIUS_SM` | 4 | 按钮 |
-| | `RADIUS_MD` | 6 | 面板/浮窗 |
-| 语义色 | `ACCENT` | 紫罗兰 `#8B7CF6`（明）/ `#A78BFA`（暗） | 主按钮、AI 相关、选中态 |
+| | ~~`RADIUS_MD`~~ | ~~6~~ | 未落 tokens 常量：控件圆角 6 由 `theme::shell_tokens` 投影进 egui Style（decisions-pending #30） |
+| 语义色 | `ACCENT`（`accent(ui)` 函数） | 飞书蓝 `#3370FF`（明）/ `#6C9FFF`（暗） | 页签选中、选中态下划线、主按钮（2026-09-26 WorkBuddy 定，#30） |
 | | `WARN` | `#EBB43C` | 可行动降级（沿用回滚 dirty 警示黄） |
 | | `DANGER` | `#EB6060` | 不可逆警示（沿用回滚文案红） |
 | | `OK` | `#60C878` | 已配置 / 成功态 |
 
-> ACCENT 取紫罗兰与既有的 `ai://` 链接色（decisions-pending #11 已定为紫罗兰两档）
-> 同源，避免「AI 是蓝色、AI 按钮是另一种色」的分裂。
+> ACCENT 原定紫罗兰（与 `ai://` 链接色同源，decisions-pending #11）；2026-09-26 换
+> WorkBuddy 飞书蓝后，**AI 专属元素（`ai://` 链接、指令卡）保留紫罗兰**（`ui::preview`
+> 的 `ai_link_color`）—— 强调色中立化后 AI 是全界面唯一的紫，反而更醒目（#30）。
+
+### 2.1 外壳重构 token 增补（M1–M4，2026-09-27 回写；出处 [ui-shell-redesign.md](ui-shell-redesign.md) §11）
+
+| token | 值 | 里程碑 | 用途 |
+|---|---|---|---|
+| `TITLEBAR_H` | 36 | M1 | 自绘标题栏高（仅无边框模式画） |
+| `WINDOW_BTN` | 32×24 | M1 | 标题栏右侧窗口按钮命中区（Win 风整块，三平台统一） |
+| `SIDEBAR_MIN_W` | 180 | M1/M2 | 左栏宽度下限（160→180，R4：三段式后 160 不够） |
+| `PREVIEW_DEFAULT_W` / `PREVIEW_MIN_W` | 420 / 260 | M1 | 右预览初始宽 / 下限 |
+| `NAV_ROW_H` | 26 | M2 | 左栏视图导航行高（选中行实测 26px 见 m5-acceptance §1②） |
+| `NAV_BAR_W` | 2 | M2 | 选中行左侧 accent 竖条宽（整行选中态的另一半） |
+| ~~`NAV_BOTTOM_H`~~ | ~~28~~ | M2 引入、M5 删除 | 随左栏底段设置行撤销而删除（decisions-pending #31，`d797451`），`tokens.rs` 现无此常量 |
+| `FORMAT_BAR_H` | 30 | M3 | Markdown 格式工具条高 |
+| `ZEN_TEXT_W` | 720 | M4 | 禅定正文限宽（ui-design.md §1.2「沉浸」参数） |
+| `ZEN_EXIT_MARGIN` | 10 | M4 | 「退出禅定」浮层到内容区右上角留白 |
+| `ZEN_GUTTER` | 24 | M4 | 禅定内容区四周留白（**必须整数**：`Margin` 是 i8，f32 被 round 吞小数） |
 
 **不引入 CSS 式主题引擎、不做每控件自定义**（roadmap 专题「明确不做」）。token 是
 Rust 常量而非 serde 结构 —— 皮肤文件（批次 B）才需要序列化，本轮不需要。
