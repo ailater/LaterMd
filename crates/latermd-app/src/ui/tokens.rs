@@ -63,6 +63,61 @@ pub const ZEN_GUTTER: f32 = 24.0;
 
 /// 按钮圆角。
 pub const RADIUS_SM: f32 = 4.0;
+/// 标准 egui 控件的圆角(2026-09-27 U0,抄 armas 同档)。
+///
+/// 与 `RADIUS_SM` 并存的原因:后者是自绘小件(圆点、角标)的量级,前者给
+/// 按钮/输入框这类有面积的东西 —— 面积越大,同样的圆角看着越尖。`theme.rs`
+/// 的 `apply_shell_to` 此前硬写 `same(6)`,本轮起改引本常量,避免「token 写着
+/// 4、界面跑着 6」的两处真源。
+///
+/// **类型是 `u8` 不是 `f32`**:egui 0.36 的 `CornerRadius::same` 签名收 `u8`
+/// (`epaint/src/corner_radius.rs:59`),本常量只喂它,故按它的口径定义。
+pub const RADIUS: u8 = 6;
+
+// —— 控件(2026-09-27 U0:数值抄 armas,见 docs/ui-modernization.md)——
+
+/// 输入框内边距(水平)。
+pub const INPUT_PAD_X: f32 = 12.0;
+/// 输入框内边距(垂直)。
+pub const INPUT_PAD_Y: f32 = 8.0;
+/// 标准控件的统一高度(输入框 / 按钮 / 复选框 / 下拉)。
+///
+/// **按钮与输入框同高** —— 设计系统的常规做法:高度统一才有横向节奏,
+/// 同排的「输入框 + 按钮」(如设置页的 base_url / model)不会一高一矮。
+///
+/// 曾担心它与自绘工具条(`TOOLBAR_H` 28 / `FORMAT_BAR_H` 30)同屏高矮不齐,
+/// 经核**该担心不成立**:工具条是自绘的,高度走自己的常量,**不读
+/// `interact_size`**;且两者分处编辑区顶部与弹窗,不同屏。故不另设按钮高度。
+///
+/// 出厂值 18 过于局促(像开发者工具),36 是 armas 同档。
+pub const INPUT_H: f32 = 36.0;
+/// 控件之间的间距(水平 / 垂直)。出厂是 (8, 3),垂直 3 太挤。
+pub const CONTROL_GAP: egui::Vec2 = egui::Vec2::new(8.0, 6.0);
+/// 正文与按钮字号。
+///
+/// egui 出厂 13。中文在 13 下笔画挤(字形本身比拉丁密),14 是可读性下限之上
+/// 最贴近现代排版的一档。西文走 Inter、中文走 CJK fallback(U1),同一字号
+/// 下两者基线不同,需在真机上目视基线对齐。
+pub const FONT_SM: f32 = 14.0;
+/// 次级文字:提示行、状态栏。
+pub const FONT_XS: f32 = 12.0;
+/// 标题字号。
+pub const FONT_LG: f32 = 18.0;
+
+// —— 细节层(2026-09-27 U3:焦点环 / 滚动条 / 分隔线)——
+
+/// 焦点环描边宽度。egui 出厂没有焦点环(只换底色),键盘操作时看不出焦点在哪。
+///
+/// **不要用 `WidgetVisuals::expansion` 做外扩**:它连控件的分配尺寸一起撑大,
+/// 会让 `horizontal_wrapped` 的工具条换行、点击落空(见 `theme.rs` 的注释)。
+/// 环画在控件矩形内即可。
+pub const FOCUS_RING: f32 = 2.0;
+/// 滚动条宽度。出厂 12 偏粗(像开发者工具),8 是「细浅条」的量级。
+pub const SCROLL_W: f32 = 8.0;
+/// 滚动条与内容的内边距。
+pub const SCROLL_INNER: f32 = 4.0;
+/// 滚动条与容器外缘的留白。
+pub const SCROLL_OUTER: f32 = 2.0;
 
 // —— 语义色 ——
 

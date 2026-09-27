@@ -1916,9 +1916,18 @@ mod tests {
             )
             .drop_without_applying_deltas();
         };
+        // 探针取**第二帧**的坐标,不是第一帧。egui 首帧的面板宽度与
+        // `horizontal_wrapped` 换行尚未稳定 —— 实测 Task 按钮的 y 从 103 跳到
+        // 136(整整一行),差 33px 已超过按钮自身高度 28,拿首帧坐标去点击
+        // 必然落空。U0 把控件尺寸抬上来之后这个差值才大到暴露(U0 之前差值
+        // 小、恰好还在按钮内,测试侥幸通过)。
+        //
+        // 真实启动看不到这次跳动(首帧不呈现),但无头测试第一帧就取样,
+        // 所以这里必须先跑一帧预热。
         frame(&mut app, Vec::new());
-        app.format_probe = None;
+        frame(&mut app, Vec::new());
         let center = *center.borrow();
+        app.format_probe = None;
         assert!(center.x > 0.0, "探针拿到 Task 按钮:{center:?}");
 
         // 光标落在首行行中(非行首,字符 2)并聚焦

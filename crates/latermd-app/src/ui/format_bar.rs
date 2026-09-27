@@ -88,7 +88,11 @@ fn rich(
     glyph: &str,
     style: impl Fn(egui::RichText) -> egui::RichText,
 ) -> egui::Response {
-    let width = ui.spacing().interact_size.y.max(tokens::ICON + 8.0);
+    // 宽度**不取 `interact_size`**:那是「标准控件高度」的 token,拿它当宽度
+    // 会让「控件变高」顺带「按钮变宽」—— U0 把 18 抬到 36 时,本按钮宽从 24
+    // 涨到 36,17 枚一起撑爆 `horizontal_wrapped` 的换行预算,工具条点击测试
+    // 当场红。格式条按钮是**自绘**的,尺寸由自己的 token 定,与标准控件解耦。
+    let width = tokens::ICON + 8.0;
     let size = egui::vec2(width, tokens::FORMAT_BAR_H);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let enabled = ui.is_enabled();

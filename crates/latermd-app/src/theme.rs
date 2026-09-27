@@ -31,6 +31,8 @@ use eframe::egui::Color32;
 use egui_markdown_style::MarkdownStyle;
 use serde::{Deserialize, Serialize};
 
+use crate::ui::tokens;
+
 /// 配置文件名,落在平台配置目录下。
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -348,7 +350,73 @@ fn apply_shell(ctx: &egui::Context) {
     }
 }
 
+/// 现代化控件 token(2026-09-27 U0)。
+///
+/// egui 出厂值是「开发者工具」量级:控件高 18、字号 13、按钮内边距 (4,1)、
+/// 垂直间距 3 —— 挤在一起。本函数把它们抬到现代排版的一档。**数值抄 armas,
+/// 不引它的 crate**(见 docs/ui-modernization.md U0:能抄数值的不引库)。
+///
+/// 只管与明暗无关的尺寸与字号;取色的部分(焦点环等)在 `apply_shell_to`
+/// 里做,那里才有 `shell_tokens` 的色。
+fn apply_tokens(style: &mut egui::Style) {
+    // 控件高度:只抬 y。x 是滑块/拖柄的最小宽度,动它没意义
+    style.spacing.interact_size.y = tokens::INPUT_H;
+    style.spacing.button_padding = egui::vec2(tokens::INPUT_PAD_X, tokens::INPUT_PAD_Y);
+    style.spacing.item_spacing = tokens::CONTROL_GAP;
+    // 滚动条:出厂 12 偏粗。放在这里而不是 `apply_shell_to`,是因为
+    // `apply_density` 会拿基准 style 重算 scroll 参数 —— 写在壳样式里会被
+    // 它按出厂值覆盖回去(原实现就踩了这个:设了 8,密度一跑变回 12)。
+    style.spacing.scroll.bar_width = tokens::SCROLL_W;
+    style.spacing.scroll.bar_inner_margin = tokens::SCROLL_INNER;
+    style.spacing.scroll.bar_outer_margin = tokens::SCROLL_OUTER;
+    // 字号:出厂 13 → 14。中文在 13 下笔画挤(字形密度高于拉丁),
+    // 14 是可读性下限之上最贴近现代排版的一档。
+    for (text_style, size, family) in [
+        (
+            egui::TextStyle::Small,
+            tokens::FONT_XS,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Body,
+            tokens::FONT_SM,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Button,
+            tokens::FONT_SM,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Heading,
+            tokens::FONT_LG,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Monospace,
+            tokens::FONT_SM,
+            egui::FontFamily::Monospace,
+        ),
+    ] {
+        style
+            .text_styles
+            .insert(text_style, egui::FontId::new(size, family));
+    }
+}
+
+/// 缩放基准:出厂 style + 现代化 token。
+///
+/// `apply_density` 必须以此为基准,不能直接用 `egui::Style::default()` ——
+/// 否则密度切换(含首次)会把 `apply_tokens` 设的尺寸**抹回出厂值**,
+/// 因为它是拿 base 重算再整体赋值的。
+fn base_style() -> egui::Style {
+    let mut style = egui::Style::default();
+    apply_tokens(&mut style);
+    style
+}
+
 fn apply_shell_to(style: &mut egui::Style) {
+    apply_tokens(style);
     let c = shell_tokens(style.visuals.dark_mode);
     let v = &mut style.visuals;
     v.panel_fill = c.sidebar;
@@ -364,14 +432,12 @@ fn apply_shell_to(style: &mut egui::Style) {
     v.selection.stroke = egui::Stroke::new(1.0, c.text);
     // 圆角:控件 6(WorkBuddy 的圆润感)。0.36 的窗口/菜单圆角字段已不在
     // Visuals/Spacing 的公开面,浮窗圆角走 egui 出厂值,不做覆盖
-    // 滚动条:出厂 12px 偏粗,WorkBuddy 是细浅条
-    style.spacing.scroll.bar_width = 8.0;
-    style.spacing.scroll.bar_inner_margin = 4.0;
-    style.spacing.scroll.bar_outer_margin = 2.0;
+    // 滚动条参数不在本函数设 —— `apply_density` 会拿基准 style 重算 scroll,
+    // 写在这里会被它按出厂值覆盖。已移入 `apply_tokens`(见其注释)。
     // 分隔线弱化:panel 之间靠底色分区,线只在必要时出现
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
-    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(tokens::RADIUS);
     let widgets = [
         (&mut v.widgets.inactive, c.text, Color32::TRANSPARENT),
         (&mut v.widgets.hovered, c.text, c.hover),
@@ -382,11 +448,24 @@ fn apply_shell_to(style: &mut egui::Style) {
         widget.fg_stroke = egui::Stroke::new(1.0, fg);
         widget.bg_fill = bg;
         widget.weak_bg_fill = bg;
-        widget.corner_radius = egui::CornerRadius::same(6);
+        widget.corner_radius = egui::CornerRadius::same(tokens::RADIUS);
         widget.bg_stroke = egui::Stroke::NONE;
     }
     // 输入框/按钮内的弱文字(占位符)用次要色
-    style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    // 焦点环(2026-09-27 U3)。**egui 0.36 没有 `widgets.focused` 这个字段** ——
+    // `Widgets::style`(`egui/src/style.rs:1272`)的选择顺序是:不可交互 →
+    // 「按下 / **有焦点** / 刚点击」→ hover → inactive。也就是说**焦点控件
+    // 复用的是 `active` 视觉**,没有独立状态可设。故焦点环落在 `active` 的
+    // `bg_stroke` 上(上面循环里把它设成了 NONE)。副作用是按下态也会显示
+    // 这圈描边 —— 按下本来就该有反馈,可接受。
+    //
+    // **不要设 `expansion`**:它会把控件的**分配尺寸**一起撑大,格式条是
+    // `horizontal_wrapped`,多出的几 px 足以触发换行 —— 结果是按下那一刻
+    // 按钮换了行、指针释放时已不在原按钮上,点击整个落空
+    // (`ui::layout::tests::task_button_cycling_on_cjk_never_panics` 当场红)。
+    // 焦点环画在控件矩形内即可,代价是吃掉 2px 内边距,可接受。
+    v.widgets.active.bg_stroke = egui::Stroke::new(tokens::FOCUS_RING, c.accent);
     let _ = c.secondary; // 占位符色由 egui 的 weak_fg 承接,这里保持默认层级
 }
 
@@ -411,7 +490,8 @@ fn apply_density(ctx: &egui::Context, density: Density) {
         // 但不改字号(改字号会牺牲中文可读性)
         Density::Compact => (0.7_f32, 0.8_f32),
     };
-    let base = egui::Style::default();
+    // 基准必须是「出厂 + 现代化 token」,否则压缩/还原时会把控件尺寸抹回出厂值
+    let base = base_style();
     let margin = base.spacing.window_margin;
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = base.spacing.item_spacing * scale;
@@ -813,10 +893,15 @@ mod tests {
         assert_eq!(skin_file_name("a:b?c"), "a_b_c");
     }
 
-    /// 密度:切到紧凑后间距真变小,切回标准恢复出厂值(不累积缩放)。
+    /// 密度:切到紧凑后间距真变小,切回标准能还原(不累积缩放)。
+    ///
+    /// **基准是「标准密度应用后」的值,不是 egui 出厂值** —— 出厂值不含
+    /// `apply_tokens`(现代化 token),拿它当基准等于在断言「apply 不改变间距」,
+    /// 而 U0 之后 apply 确实会改(出厂 (8,3) → `CONTROL_GAP` (8,6))。
     #[test]
     fn density_compacts_spacing_and_restores() {
         let ctx = egui::Context::default();
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
         let standard = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
 
         let compact = ThemeSettings {
