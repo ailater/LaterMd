@@ -36,6 +36,7 @@ use crate::search::SearchState;
 use crate::settings::SettingsState;
 use crate::tabs::TabsState;
 use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
+use crate::ui::image_dialog::ImageDialogState;
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
@@ -204,6 +205,10 @@ pub struct State {
     pub render_mode: RenderMode,
     /// 设置对话框(外观 / 快捷键 / AI / MCP 四页)。
     pub settings: SettingsState,
+    /// 图片框对话框(docs/image-plan.md A 段):草稿 alt/url 归它持有,
+    /// 归约只置 `open` 与消费插入,UI 经 `&mut` 改草稿 —— 与 `SettingsState`
+    /// 持草稿同款分工(`TextEdit` 是立即模式控件,草稿必须能就地 `&mut`)。
+    pub image_dialog: ImageDialogState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -304,6 +309,7 @@ impl Default for State {
             render_mode: RenderMode::default(),
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
+            image_dialog: ImageDialogState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
             skins: SkinCatalog::default(),
@@ -350,6 +356,16 @@ pub enum Message {
     /// [`crate::compose::apply`],归约侧只负责取选区、调它、把结果写回
     /// 缓冲并把新选区挂到 `TabState::pending_selection`。
     FormatRequested(crate::compose::FormatAction),
+    /// 打开「图片框」对话框(工具条 Image 按钮 / `Cmd/Ctrl+Shift+I` 产出,
+    /// docs/image-plan.md A 段)。归约置 `image_dialog.open` 并按选区预填
+    /// alt —— 选中文字就是要保留的替代文字(`compose::insert_image` 的约定)。
+    ImageDialogOpened,
+    /// 图片框点「插入」:归约里走 [`crate::compose::insert_image`] 写入活动
+    /// 标签,新选区落在 alt 位;对话框关闭并清空草稿。url 为空是防御分支
+    /// (UI 已禁用按钮),不动文档只关框。
+    ImageInserted { alt: String, url: String },
+    /// 图片框点「取消」:仅关闭对话框并清空草稿,文档与选区不动。
+    ImageDialogClosed,
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -479,6 +495,9 @@ impl State {
             Message::RightPanelToggled => self.toggle_right_panel(),
             Message::ZenToggled => self.toggle_zen(),
             Message::FormatRequested(action) => self.apply_format(action),
+            Message::ImageDialogOpened => self.open_image_dialog(),
+            Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
+            Message::ImageDialogClosed => self.close_image_dialog(),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
@@ -987,6 +1006,57 @@ impl State {
         if let Some(byte) = tab.cursor.byte {
             tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
         }
+    }
+
+    /// 打开图片框(docs/image-plan.md A 段):alt 按当前选区预填 —— 选中
+    /// 文字就是要保留的替代文字(`compose::insert_image` 的文档约定),
+    /// url 清空由用户填。
+    fn open_image_dialog(&mut self) {
+        let tab = self.tabs.current();
+        let selection = tab.selection.unwrap_or((0, 0));
+        let start = selection.0.min(selection.1);
+        let stop = selection.0.max(selection.1);
+        let text = tab.editor.text();
+        // 选区是字符偏移,取文字前折成字节(compose 全族同款口径)。
+        let alt = if stop > start {
+            text.get(tab.editor.char_to_byte(start)..tab.editor.char_to_byte(stop))
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            String::new()
+        };
+        self.image_dialog = ImageDialogState {
+            open: true,
+            alt,
+            url: String::new(),
+        };
+    }
+
+    /// 图片框「插入」:写回路径与 [`Self::apply_format`] 同款(整篇替换 +
+    /// `pending_selection` 回填 + `cursor.byte` 边界折算),新选区落在
+    /// alt 位便于直接覆写;完成后关框清草稿。
+    fn insert_image(&mut self, alt: &str, url: &str) {
+        self.close_image_dialog();
+        // 防御:地址为空 UI 侧「插入」按钮已禁用,这里兜底不动文档。
+        if url.trim().is_empty() {
+            return;
+        }
+        let tab = self.tabs.current_mut();
+        let selection = tab.selection.unwrap_or((0, 0));
+        let start = selection.0.min(selection.1);
+        let stop = selection.0.max(selection.1);
+        let (text, new_selection) =
+            crate::compose::insert_image(tab.editor.text(), start..stop, url, alt);
+        tab.editor.replace_all(&text);
+        tab.pending_selection = Some((new_selection.start, new_selection.end));
+        if let Some(byte) = tab.cursor.byte {
+            tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+        }
+    }
+
+    /// 关闭图片框并清空草稿(插入与取消共用;下次打开重新按选区预填)。
+    fn close_image_dialog(&mut self) {
+        self.image_dialog = ImageDialogState::default();
     }
 
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
@@ -3428,5 +3498,79 @@ mod tests {
             Some((2, 5)),
             "字符偏移:三个汉字被包在两字符标记里"
         );
+    }
+
+    /// 图片框开框:alt 按选区预填(选中的文字就是替代文字),url 清空,
+    /// `open` 置位 —— `compose::insert_image` 文档里「归约侧预填」的约定。
+    #[test]
+    fn image_dialog_open_prefills_alt_from_selection() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲乙丙丁");
+        state.tabs.current_mut().selection = Some((0, 3));
+
+        state.apply(Message::ImageDialogOpened);
+
+        assert!(state.image_dialog.open);
+        assert_eq!(state.image_dialog.alt, "甲乙丙");
+        assert_eq!(state.image_dialog.url, "", "url 恒由用户填");
+    }
+
+    /// 图片框插入:`![alt](url)` 写入、新选区落在 alt 位(跳过 `![` 两个
+    /// 字符)、对话框关闭并清空草稿;写回路径与格式动作同源。
+    #[test]
+    fn image_inserted_writes_markdown_and_closes_dialog() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("开头\n");
+        state.tabs.current_mut().selection = Some((3, 3));
+
+        state.apply(Message::ImageInserted {
+            alt: "示意图".to_owned(),
+            url: "https://x/y.png".to_owned(),
+        });
+
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "开头\n![示意图](https://x/y.png)");
+        assert_eq!(
+            tab.pending_selection,
+            Some((5, 8)),
+            "新选区落在 alt 位(跳过 `![`),便于直接覆写"
+        );
+        assert!(!state.image_dialog.open);
+        assert!(state.image_dialog.alt.is_empty() && state.image_dialog.url.is_empty());
+    }
+
+    /// 图片框插入的防御分支:url 为空(UI 已禁用按钮)不动文档,只关框。
+    #[test]
+    fn image_inserted_with_empty_url_touches_nothing() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲乙丙");
+        state.image_dialog.open = true;
+
+        state.apply(Message::ImageInserted {
+            alt: String::new(),
+            url: "  ".to_owned(),
+        });
+
+        assert_eq!(state.tabs.current().editor.text(), "甲乙丙");
+        assert_eq!(state.tabs.current().pending_selection, None);
+        assert!(!state.image_dialog.open);
+    }
+
+    /// 图片框取消:只关框清草稿,文档与选区不动。
+    #[test]
+    fn image_dialog_closed_touches_document_not() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲乙丙");
+        state.image_dialog = ImageDialogState {
+            open: true,
+            alt: "示意图".to_owned(),
+            url: "https://x/y.png".to_owned(),
+        };
+
+        state.apply(Message::ImageDialogClosed);
+
+        assert!(!state.image_dialog.open);
+        assert_eq!(state.image_dialog.alt, "");
+        assert_eq!(state.tabs.current().editor.text(), "甲乙丙");
     }
 }

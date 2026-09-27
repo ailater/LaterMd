@@ -19,7 +19,7 @@
 
 use std::ops::Range;
 
-/// 格式动作。十六个,与工具条四组按钮一一对应。
+/// 格式动作。十七个,与工具条四组按钮一一对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatAction {
     /// `**粗体**`
@@ -48,6 +48,13 @@ pub enum FormatAction {
     Divider,
     /// 2×2 表格骨架。
     Table,
+    /// `![alt](url)` 图片(docs/image-plan.md A 段)。
+    ///
+    /// 与其余十六条不同:它需要 alt 与 url **两个**用户输入,工具条按钮与
+    /// 快捷键都只**开对话框**,不直接改文档 —— 真正的写入走
+    /// [`insert_image`]。列在动作枚举里,是为了让「图标 / 提示 / 键位 /
+    /// 分组」四处与别的动作同构。
+    Image,
     /// `- `
     Bullet,
     /// `1. `
@@ -74,6 +81,7 @@ impl FormatAction {
             CodeBlock => "代码块",
             Divider => "分割线",
             Table => "表格",
+            Image => "图片",
             Bullet => "无序列表",
             Ordered => "有序列表",
             Task => "任务列表",
@@ -82,7 +90,7 @@ impl FormatAction {
 
     /// 工具条顺序:组内按 `ALL` 出现顺序,组间按
     /// [`FormatGroup::ALL`]。
-    pub const ALL: [FormatAction; 16] = [
+    pub const ALL: [FormatAction; 17] = [
         FormatAction::Bold,
         FormatAction::Italic,
         FormatAction::Strike,
@@ -96,6 +104,7 @@ impl FormatAction {
         FormatAction::CodeBlock,
         FormatAction::Divider,
         FormatAction::Table,
+        FormatAction::Image,
         FormatAction::Bullet,
         FormatAction::Ordered,
         FormatAction::Task,
@@ -109,7 +118,7 @@ pub enum FormatGroup {
     Inline,
     /// 标题:H1 / H2 / H3 / 正文。
     Heading,
-    /// 块:引用 / 代码块 / 分割线 / 表格。
+    /// 块:引用 / 代码块 / 分割线 / 表格 / 图片。
     Block,
     /// 列表:无序 / 有序 / 任务。
     List,
@@ -130,8 +139,8 @@ impl FormatGroup {
         match self {
             FormatGroup::Inline => &FormatAction::ALL[0..5],
             FormatGroup::Heading => &FormatAction::ALL[5..9],
-            FormatGroup::Block => &FormatAction::ALL[9..13],
-            FormatGroup::List => &FormatAction::ALL[13..16],
+            FormatGroup::Block => &FormatAction::ALL[9..14],
+            FormatGroup::List => &FormatAction::ALL[14..17],
         }
     }
 }
@@ -141,6 +150,12 @@ const TABLE_SKELETON: &str = "| 列 1 | 列 2 |\n| --- | --- |\n|  |  |\n|  |  |
 
 /// 链接 placeholders:新建链接时 url 占位成 `https://`,让用户直接覆写。
 const LINK_URL: &str = "https://";
+
+/// 图片 placeholder:同 `LINK_URL`,工具条/快捷键直触(不经对话框)时用它。
+///
+/// 与链接共用同一个字面量而非另定常量:两者的「待覆写占位」语义一样,
+/// 分家只会让将来改占位时漏改一处。
+const IMAGE_URL: &str = LINK_URL;
 
 /// 应用一次格式动作,返回**(新文本, 新选区)**。
 ///
@@ -166,7 +181,25 @@ pub fn apply(action: FormatAction, text: &str, sel: Range<usize>) -> (String, Ra
         CodeBlock => view.insert_block("```\n", "\n```\n"),
         Divider => view.insert_block("", "---\n"),
         Table => view.insert_block("", TABLE_SKELETON),
+        Image => view.image(IMAGE_URL, None),
     }
+}
+
+/// 插入 `![alt](url)`,返回**(新文本, 新选区)**;新选区落在 **alt** 上。
+///
+/// 这是「图片框」对话框三条来源(网络地址 / 本地文件 / 图床上传)共同的
+/// 汇流点(docs/image-plan.md §2):对话框只产出 `(url, alt)`,文本动作只有
+/// 这一个,因此能被单测穷尽。
+///
+/// 新选区落在 alt 而不是整段:alt 是给人读的说明,比 url 更需要立刻填,
+/// 留选区让用户直接覆写(与 [`View::link`] 落在 url 上是同一个「落在最需
+/// 要马上写的地方」的判据 —— 链接的标题通常已有选区,图片的 alt 通常空着)。
+///
+/// 选区非空的情形:`sel` 覆盖的文字被替换掉(而不是被当 alt)—— 调用方要
+/// 保留选中文字应当自己传进 `alt`(归约侧 [`crate::state`] 开对话框时就是
+/// 这么预填的)。
+pub fn insert_image(text: &str, sel: Range<usize>, url: &str, alt: &str) -> (String, Range<usize>) {
+    View::new(text, sel).image(url, Some(alt))
 }
 
 /// 已知的**行前缀**,按长度降序 —— 匹配时要先试长的(`### ` 先于 `# `)。
@@ -282,8 +315,7 @@ impl<'a> View<'a> {
         (format!("{left}{open}{mid}{close}{right}"), start..end)
     }
 
-    /// 链接:`[选中](url)`,新选区落在 url 上便于直接覆写;无选区时 dvस्थित
-    /// 标题为空。
+    /// 链接:`[选中](url)`,新选区落在 url 上便于直接覆写;无选区时标题为空。
     fn link(self) -> (String, Range<usize>) {
         let (a, b) = (self.byte_of(self.start), self.byte_of(self.stop));
         let (left, mid, right) = (&self.text[..a], &self.text[a..b], &self.text[b..]);
@@ -293,6 +325,21 @@ impl<'a> View<'a> {
         let out = format!("{left}[{mid}]({LINK_URL}){right}");
         let url_end = url_start + LINK_URL.chars().count();
         (out, url_start..url_end)
+    }
+
+    /// 图片:`![alt](url)`,新选区落在 alt 上。
+    ///
+    /// `alt` 为 `None` 时取**选中文字**当 alt(与 [`Self::link`] 同手法);
+    /// 传 `Some` 则由调用方定(对话框已让用户填过),此时选中文字被替换。
+    fn image(self, url: &str, alt: Option<&str>) -> (String, Range<usize>) {
+        let (a, b) = (self.byte_of(self.start), self.byte_of(self.stop));
+        let (left, mid, right) = (&self.text[..a], &self.text[a..b], &self.text[b..]);
+        let alt = alt.unwrap_or(mid);
+        let out = format!("{left}![{alt}]({url}){right}");
+        // 选区落在 alt:跳过 `![` 两个字符
+        let start = left.chars().count() + 2;
+        let end = start + alt.chars().count();
+        (out, start..end)
     }
 
     /// **行前缀类**:作用于选区覆盖的所有整行。已是该前缀 → 去掉
@@ -399,6 +446,15 @@ mod tests {
 
     fn bold(text: &str, sel: Range<usize>) -> (String, Range<usize>) {
         apply(FormatAction::Bold, text, sel)
+    }
+
+    /// 按**字符**取选区覆盖的文字 —— 选区是字符偏移,CJK 下 `&out[sel]`
+    /// 会切在多字节序列中间 panic。
+    fn sel_text(out: &str, sel: Range<usize>) -> String {
+        out.chars()
+            .skip(sel.start)
+            .take(sel.end - sel.start)
+            .collect()
     }
 
     /// `**x**`:无选区插成对标记 + 光标居中;有选区包裹;再点去包裹。
@@ -531,6 +587,47 @@ mod tests {
             .take(sel.end - sel.start)
             .collect();
         assert_eq!(selected, "https://");
+    }
+
+    /// 图片(`insert_image`):空文档 / 有选区 / 行内 / 行尾四种情形,新选区
+    /// 一律落在 alt 上(alt 是给人读的,比 url 更需要立刻覆写)。
+    #[test]
+    fn image_inserts_with_selection_on_alt() {
+        // 空文档:整段凭空出现,alt 被选中
+        let (out, sel) = insert_image("", 0..0, "https://x/y.png", "示意图");
+        assert_eq!(out, "![示意图](https://x/y.png)");
+        assert_eq!(sel_text(&out, sel), "示意图");
+
+        // 有选区:选中文字被替换(alt 由调用方给定,不取自选区)
+        let (out, sel) = insert_image("甲乙丙", 0..3, "u", "图");
+        assert_eq!(out, "![图](u)");
+        assert_eq!(sel_text(&out, sel), "图");
+
+        // 行内:两侧正文都不动(插入不凭空造空格)
+        let (out, sel) = insert_image("ab cd", 3..3, "u", "x");
+        assert_eq!(out, "ab ![x](u)cd");
+        assert_eq!(sel_text(&out, sel.clone()), "x");
+        assert_eq!(sel.start, 5, "跳过 `![` 两个字符");
+
+        // 行尾(CJK):末尾追加,偏移按字符
+        let (out, sel) = insert_image("中文行", 3..3, "u", "图");
+        assert_eq!(out, "中文行![图](u)");
+        assert_eq!(sel_text(&out, sel), "图");
+    }
+
+    /// 工具条/快捷键直触(不经对话框)的骨架:`![选中](https://)`。
+    ///
+    /// 与 `Link` 一样留 url 占位待覆写;alt 取选中文字 —— 框住一段话再点图
+    /// 片,那句话就该是图片说明。
+    #[test]
+    fn image_action_inserts_a_skeleton_using_selection_as_alt() {
+        let (out, sel) = apply(FormatAction::Image, "甲乙", 0..2);
+        assert_eq!(out, "![甲乙](https://)");
+        assert_eq!(sel_text(&out, sel), "甲乙", "新选区落在 alt(选中文字)");
+
+        let (out, sel) = apply(FormatAction::Image, "", 0..0);
+        assert_eq!(out, "![](https://)");
+        assert_eq!(sel, 2..2, "无选区时光标停在 alt 开头等着填");
     }
 
     /// 空文本 / 越界选区不 panic,且结果自洽(防御:UI 侧选区可能来自过期快照)。

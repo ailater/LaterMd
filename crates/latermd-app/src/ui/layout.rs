@@ -269,9 +269,9 @@ impl LaterMdApp {
                 );
             });
 
-        // ⑤ 顶层浮层四件套(commit 建议 / 设置 / 回滚确认 / 关标签确认):
-        // 浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后取语义上的
-        // 「最上层」。三栏与禅定两条布局路径共用,理由见
+        // ⑤ 顶层浮层五件套(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
+        // 图片框):浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后
+        // 取语义上的「最上层」。三栏与禅定两条布局路径共用,理由见
         // [`Self::draw_overlay_dialogs`]。
         self.draw_overlay_dialogs(ui);
 
@@ -284,9 +284,9 @@ impl LaterMdApp {
         }
     }
 
-    /// 顶层浮层四件套,存在才显示:commit message 建议、设置对话框、回滚
-    /// 确认、脏标签关闭确认。浮窗是独立 Area 层,不参与 panel 嵌套,各浮窗
-    /// 的机制说明见其函数文档。
+    /// 顶层浮层五件套,存在才显示:commit message 建议、设置对话框、回滚
+    /// 确认、脏标签关闭确认、图片框。浮窗是独立 Area 层,不参与 panel 嵌套,
+    /// 各浮窗的机制说明见其函数文档。
     ///
     /// **三栏与禅定两条布局路径都要调它。** `draw` 在禅定帧整体分叉提前
     /// return,浮层若只画在三栏路径,禅定里**可达**的入口就成了哑弹:设置
@@ -358,6 +358,22 @@ impl LaterMdApp {
             }
             if cancel.clicked() {
                 outbox.push(Message::TabCloseCancelled);
+            }
+        }
+
+        // 图片框(docs/image-plan.md A 段):只收 alt 与 url 两个草稿,插入
+        // 在归约走 `compose::insert_image`;地址为空时「插入」按钮在对话框
+        // 里已被禁用。点击插入时草稿还在 state 上,克隆进消息载荷。
+        if self.state.image_dialog.open {
+            let (insert, cancel) =
+                crate::ui::image_dialog::dialog(ui, &mut self.state.image_dialog);
+            if insert.clicked() {
+                let alt = self.state.image_dialog.alt.clone();
+                let url = self.state.image_dialog.url.clone();
+                outbox.push(Message::ImageInserted { alt, url });
+            }
+            if cancel.clicked() {
+                outbox.push(Message::ImageDialogClosed);
             }
         }
     }

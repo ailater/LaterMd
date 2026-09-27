@@ -1,8 +1,12 @@
 //! Markdown 格式工具条(docs/ui-shell-redesign.md §6)。
 //!
-//! 十六个动作分四组:行内 / 标题 / 块 / 列表。点击只发
+//! 十七个动作分四组:行内 / 标题 / 块 / 列表。点击只发
 //! [`Message::FormatRequested`],语义全在 [`crate::compose`] —— 本模块
 //! 一行 Markdown 逻辑都没有。
+//!
+//! 唯一的例外是**图片**:它要 alt 与 url 两个输入,点了是开「图片框」对话
+//! 框(发 [`Message::ImageDialogOpened`]),不是改文档(docs/image-plan.md
+//! A 段)。
 //!
 //! ## 形态选择
 //!
@@ -16,7 +20,7 @@
 //!
 //! 文件动作收在左栏顶段(`ui::sidebar` 的 top_actions),本条是「对**选
 //! 区**做文本级动作」,与文件级动作分居两处,心智模型不同;单独一条也让
-//! 十六个按钮有完整的横向空间,不与谁挤。
+//! 十七个按钮有完整的横向空间,不与谁挤。
 
 use crate::command::Command;
 use crate::compose::{FormatAction, FormatGroup};
@@ -29,14 +33,14 @@ use eframe::egui;
 /// 绘制整条格式工具条。键位文案取自 `keymap`(用户可改)。
 ///
 /// 面板拖窄时逐组换行(`horizontal_wrapped`)而不是溢出裁切 —— 中间栏最窄
-/// 可到 400px 左右,十六个按钮不可能一行排完。
+/// 可到 400px 左右,十七个按钮不可能一行排完。
 pub fn ui(panel: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
     ui_with_probe(panel, keymap, outbox, None::<fn(FormatAction, egui::Rect)>)
 }
 
 /// 同 [`ui`],额外把每个按钮的 `(动作, 矩形)` 交给 `probe`(`None` 即不探针)。
 ///
-/// 无头测试量按钮位置用:十六个按钮的具体坐标由 `horizontal_wrapped` 的换
+/// 无头测试量按钮位置用:十七个按钮的具体坐标由 `horizontal_wrapped` 的换
 /// 行演算 + 它前面的标签条/提示行共同决定,手搓必然与真实帧错位。
 pub fn ui_with_probe(
     panel: &mut egui::Ui,
@@ -54,7 +58,13 @@ pub fn ui_with_probe(
                     probe(*action, response.rect);
                 }
                 if response.clicked() {
-                    outbox.push(Message::FormatRequested(*action));
+                    // 图片是唯一「点了不改文档」的动作:它开对话框收 alt 与
+                    // url,插入在归约里发生
+                    outbox.push(if *action == FormatAction::Image {
+                        Message::ImageDialogOpened
+                    } else {
+                        Message::FormatRequested(*action)
+                    });
                 }
             }
             // 组之间是竖向分隔条,最后一组之后不画
@@ -143,6 +153,7 @@ fn icon_of(action: FormatAction) -> Icon {
         FormatAction::CodeBlock => CodeBlock,
         FormatAction::Divider => Divider,
         FormatAction::Table => Table,
+        FormatAction::Image => Image,
         FormatAction::Bullet => BulletList,
         FormatAction::Ordered => OrderedList,
         FormatAction::Task => TaskList,
@@ -178,6 +189,7 @@ fn command_of(action: FormatAction) -> Option<Command> {
         FormatAction::CodeBlock => FormatCodeBlock,
         FormatAction::Divider => FormatDivider,
         FormatAction::Table => FormatTable,
+        FormatAction::Image => ImageInsert,
         FormatAction::Bullet => FormatBullet,
         FormatAction::Ordered => FormatOrdered,
         FormatAction::Task => FormatTask,
@@ -198,7 +210,7 @@ mod tests {
     use egui::{Event, PointerButton, RawInput, Rect};
     use std::cell::Cell;
 
-    /// 十六个动作各有一个 command:这是「键位与图标都挂在命令层」的守卫,
+    /// 十七个动作各有一个 command:这是「键位与图标都挂在命令层」的守卫,
     /// 也是 `Plain` 目前没有 Command 这一事实的唯一登记处。
     #[test]
     fn every_action_has_a_command_except_plain() {
@@ -269,8 +281,71 @@ mod tests {
         assert_eq!(outbox, vec![Message::FormatRequested(FormatAction::Bold)]);
     }
 
-    /// 自绘图标基本不重合。十六个动作里六个形态类走 RichText(不经
-    /// `icon_of`),余下十个各有各的画面。
+    /// 点图片按钮是**开对话框**,不是发格式请求 —— 十七个动作里只有它走
+    /// 这条路径(需要 alt 与 url 两个输入)。
+    #[test]
+    fn clicking_image_requests_the_dialog_not_a_format() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        // 探针帧:用**真实工具条布局**拿 Image 按钮的位置。单画一枚按钮的
+        // 矩形与整条工具条不重合(十七枚换行排布,单独画的 Image 在原点,
+        // 那个位置在整条里是 Bold —— 首版测试就栽在这里),必须经
+        // `ui_with_probe` 在同一布局里取矩形。
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                super::ui_with_probe(
+                    ui,
+                    &Keymap::builtin(),
+                    &mut Vec::new(),
+                    Some(|action: FormatAction, button_rect: Rect| {
+                        if action == FormatAction::Image {
+                            rect.set(button_rect);
+                        }
+                    }),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        let center = rect.get().center();
+        assert!(center.x > 0.0, "探针拿到了图片按钮的位置:{center:?}");
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        // sizing pass → moved → press → release:面板层前几遍 widget 不参与
+        // 命中测试,与 ui::layout 的点击测试同一节奏
+        for events in [
+            Vec::new(),
+            Vec::new(),
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &Keymap::builtin(), &mut outbox),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::ImageDialogOpened]);
+    }
+
+    /// 自绘图标基本不重合。十七个动作里六个形态类走 RichText(不经
+    /// `icon_of`),余下十一个各有各的画面。
     #[test]
     fn icons_are_distinct_per_action() {
         use std::collections::HashSet;
@@ -278,11 +353,11 @@ mod tests {
             .iter()
             .map(|action| format!("{:?}", icon_of(*action)))
             .collect();
-        // 6 个形态类共用一个占位值 + 10 个自绘各一枚 = 11 枚;任何两枚被
-        // 借来借去都会掉到 10 以下(`Plain` 曾借 `Table` 的旧账)。
+        // 6 个形态类共用一个占位值 + 11 个自绘各一枚 = 12 枚;任何两枚被
+        // 借来借去都会掉到 11 以下(`Plain` 曾借 `Table` 的旧账)。
         assert_eq!(
             seen.len(),
-            11,
+            12,
             "图标疑似复用(除形态类占位外不应有重码):{:?}",
             seen.iter().collect::<Vec<_>>()
         );

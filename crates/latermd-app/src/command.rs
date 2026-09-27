@@ -82,6 +82,13 @@ pub enum Command {
     FormatOrdered,
     /// 任务列表(三态循环)。
     FormatTask,
+    /// 插入图片(docs/image-plan.md A 段):开「图片框」对话框,填 alt 与
+    /// URL 后插入 `![alt](url)`。
+    ///
+    /// 与上面十六条不同 —— 那些点了就直接改文档,这条要先收两个输入,因此
+    /// 归约是「开对话框」而不是「执行格式」。它也没有
+    /// [`Self::format_action`]:真正的文本动作由 `compose::insert_image` 承担。
+    ImageInsert,
     /// 右侧只读预览栏展开/折叠(§3.1)。
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
@@ -96,7 +103,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 30] = [
+    pub const ALL: [Command; 31] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -125,6 +132,7 @@ impl Command {
         Self::FormatBullet,
         Self::FormatOrdered,
         Self::FormatTask,
+        Self::ImageInsert,
         Self::ToggleRightPreview,
         Self::ToggleZen,
     ];
@@ -183,6 +191,7 @@ impl Command {
             Self::FormatBullet => "format_bullet",
             Self::FormatOrdered => "format_ordered",
             Self::FormatTask => "format_task",
+            Self::ImageInsert => "image_insert",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
         }
@@ -219,6 +228,10 @@ impl Command {
             Self::FormatBullet => FormatAction::Bullet.label(),
             Self::FormatOrdered => FormatAction::Ordered.label(),
             Self::FormatTask => FormatAction::Task.label(),
+            // 图片单独取名:工具条按钮显示的是 `FormatAction::Image` 的
+            // 「图片」,命令层要的是动作名「插入图片」(快捷键设置页里
+            // 「图片」两个字说不清是干什么的)
+            Self::ImageInsert => "插入图片",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
         }
@@ -285,6 +298,11 @@ impl Command {
             Self::FormatTask => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::Num9)
             }
+            // 图片:加 Shift 是因为 Ctrl/Cmd+I 已是斜体(与链接同款处理:
+            // 占用键位前先看格式命令已经占过什么)。
+            Self::ImageInsert => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::I)
+            }
             Self::ToggleRightPreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
@@ -330,6 +348,7 @@ impl Command {
             Self::FormatBullet => Icon::BulletList,
             Self::FormatOrdered => Icon::OrderedList,
             Self::FormatTask => Icon::TaskList,
+            Self::ImageInsert => Icon::Image,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
         }
@@ -348,6 +367,7 @@ impl Command {
             Self::AiMockStream => Message::AiStart,
             Self::AiCommitMessage => Message::AiCommitRequested,
             Self::AiSummary => Message::AiSummaryRequested,
+            Self::ImageInsert => Message::ImageDialogOpened,
             Self::ToggleLivePreview => Message::ToggleLivePreview,
             Self::TabNext => Message::TabNext,
             Self::TabClose => Message::TabCloseActive,

@@ -3,6 +3,7 @@
 pub mod editor;
 pub mod format_bar;
 pub mod icons;
+pub mod image_dialog;
 pub mod layout;
 pub mod menubar;
 pub mod preview;
