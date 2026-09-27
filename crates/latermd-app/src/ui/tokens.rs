@@ -42,8 +42,6 @@ pub const PREVIEW_DEFAULT_W: f32 = 420.0;
 pub const PREVIEW_MIN_W: f32 = 260.0;
 /// 左栏视图导航的行高(docs/ui-shell-redesign.md §11,M2 三段式)。
 pub const NAV_ROW_H: f32 = 26.0;
-/// 左栏底段预留高度(设置行)。
-pub const NAV_BOTTOM_H: f32 = 28.0;
 /// 导航选中行的左侧竖条宽度(整行选中态的另一半)。
 pub const NAV_BAR_W: f32 = 2.0;
 /// 禅定模式的正文限宽(docs/ui-shell-redesign.md §11;源出 ui-design.md

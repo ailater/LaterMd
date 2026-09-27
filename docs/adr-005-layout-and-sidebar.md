@@ -97,7 +97,27 @@ fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);
 
 ### 3.2 最终代码
 
+> **2026-09-27 修订（外壳重构落地后的 panel 分工；形态与论证见
+> [ui-shell-redesign.md](ui-shell-redesign.md) §1 布局图与 §4，此处只记结论）**：
+> 下方代码块是 2026-09-24 初版（编辑器为第二个 `Panel::left`、预览占
+> `CentralPanel`）。外壳重构后左右关系对调、编辑器回到中央，现行顺序
+> （`crates/latermd-app/src/ui/layout.rs` `draw`）：
+>
+> | 序 | panel | 内容 | 理由（出处见规格） |
+> |---|---|---|---|
+> | 1 | `Panel::top("titlebar")` 36px | 自绘标题栏：文档名 + 右端七钮（┃左 / ┃右 / ⦿禅定 / ⚙设置 / ─ / ⤢ / ✕） | D1 无边框自绘；仅默认无边框模式画，`LATERMD_NATIVE_DECORATIONS=1` 时整条不渲染 |
+> | 2 | `Panel::top("menubar")` | 菜单栏，全部命令的可发现性入口 | D2 保留独立菜单栏行 |
+> | 3 | `Panel::bottom("statusbar")` | 状态栏，**横跨全窗底部** | 必须在 nav/preview **之前**画：先画者占满全窗横向，后画只占中央残余区（`d797451` 修复，decisions-pending #31） |
+> | 4 | `Panel::left("nav")`（180..=400，`show_collapsible`） | 左栏三段式：顶动作行 / 视图导航 / ScrollArea 中段 | D3 单栏三段式；下限 160→180（R4） |
+> | 5 | `Panel::right("preview")`（260..=880，`show_collapsible`） | 只读预览 | `Panel::right` 必须先于 `CentralPanel`（先加的最外层） |
+> | 6 | `CentralPanel` = 编辑器 | 标签条 / 提示行 / 格式工具条 / 源码编辑区 | 顺序铁律仍成立：`CentralPanel` 最后加，编辑器吃剩余宽度，左右开合只让中间伸缩。编辑器曾改用 `Panel::left("editor")`，致中央残余区无人认领出现第四条黑条，`d797451` 回归 `CentralPanel` |
+> | 7 | 浮层（`egui::Window`）与 `edge_resize_zones` | commit 建议 / 设置 / 回滚 / 关标签确认浮窗；四边四角 resize 命中区 | Area 层不参与 panel 嵌套；命中区必须**最后分配**（同层命中后分配者胜，见 `ui/titlebar.rs` 模块文档） |
+>
+> 禅定模式是**另一套 panel 组合**（titlebar + 限宽 720 的 `CentralPanel`），不是给
+> 三栏各加可见性开关（规格 §7）。§3.3 的 `show_collapsible` 结论不变，直接复用。
+
 ```rust
+// 初版记录（2026-09-24；已被上方 2026-09-27 修订取代，保留作历史对照）。
 // crates/latermd-app/src/ui/layout.rs
 use eframe::egui;
 

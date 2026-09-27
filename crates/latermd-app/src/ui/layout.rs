@@ -139,7 +139,17 @@ impl LaterMdApp {
             crate::ui::menubar::ui(ui, &self.state.keymap, &mut self.outbox);
         });
 
-        // ② 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
+        // ② 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
+        // (docs/ui-polish.md §4),工具栏得以只留动作。
+        //
+        // **必须在左右栏之前加**:先加的最外层、先画者占满全窗横向 ——
+        // 若放在 nav/preview 之后,它就只在中央残余区里横跨,左右栏脚下
+        // 各缺一截(2026-09-27 用户实测反馈的第二条)。
+        egui::Panel::bottom("statusbar").show(ui, |ui| {
+            status_bar(ui, &self.state);
+        });
+
+        // ③ 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
         // 原地持有 `&mut bool`,因此先解构再把闭包要用的其余状态分头借用
         // (都与这两个 bool 不相交)。
         //
@@ -168,7 +178,7 @@ impl LaterMdApp {
                 );
             });
 
-        // ③ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
+        // ④ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
         // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
         // 都只是让中间伸缩,不会挤掉谁。
         let right = &mut self.state.layout.right;
@@ -190,21 +200,34 @@ impl LaterMdApp {
                 );
             });
 
-        // ④ 编辑器:源文本这份唯一真源住在中间,标签条与文件工具栏在其上。
+        // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条/提示行/格式工具条在其上。
         // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
+        //
+        // 曾经用 `Panel::left("editor")` 承载:那之后中央残余区由无人认领
+        // 的背景补位,预览左侧多出一条侧栏色的黑条(2026-09-27 用户实测
+        // 反馈的第一条)。编辑器回到 `CentralPanel` 才真正「吃掉剩余宽度」。
         //
         // TextEdit 是立即模式控件,必须原地持有 `&mut` 缓冲,故 editor /
         // preview 快照 / 大纲光标的借用下放到本闭包内(归约/绘制二分对这对
         // 「控件附属状态」的例外见 state.rs)。
         let state = &mut self.state;
         let outbox = &mut self.outbox;
-        egui::Panel::left("editor")
-            .resizable(true)
-            .default_size(500.0)
+        // 编辑器区显式铺内容色:panel 默认 fill 是 `panel_fill`(侧栏色),
+        // 不覆盖的话编辑器与右预览会出现两种底色(theme.rs 的口径是
+        // 「编辑器与预览面板显式 .fill;侧栏吃 panel_fill」)。margin 取
+        // `Frame::side_top_panel` 的出厂值,不因换底挪动既有布局。
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+            )
             .show(ui, |ui| {
-                // 标签条(多标签 #11)在文件工具栏之上:先选文档,再对文档操作
+                // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作
                 crate::ui::tabs::ui(ui, &state.tabs, outbox);
-                crate::ui::toolbar::ui(ui, &state.tabs.current().document, &state.keymap, outbox);
+                // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
+                // decisions-pending #32)
+                notice_bar(ui, &state.tabs.current().document, outbox);
                 let tab = state.tabs.current_mut();
                 let crate::tabs::TabState {
                     editor,
@@ -246,9 +269,35 @@ impl LaterMdApp {
                 );
             });
 
-        // ⑤ 顶层浮层:commit message 建议(存在才显示)。panel 顺序铁律只
-        // 约束 panel(浮窗是独立 Area 层,不参与嵌套),画在最后取语义上的
-        // 「最上层」。
+        // ⑤ 顶层浮层四件套(commit 建议 / 设置 / 回滚确认 / 关标签确认):
+        // 浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后取语义上的
+        // 「最上层」。三栏与禅定两条布局路径共用,理由见
+        // [`Self::draw_overlay_dialogs`]。
+        self.draw_overlay_dialogs(ui);
+
+        // ⑥ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
+        // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
+        // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
+        // 所有面板之后,不影响任何 panel 的布局。
+        if self.frameless {
+            crate::ui::titlebar::edge_resize_zones(ui);
+        }
+    }
+
+    /// 顶层浮层四件套,存在才显示:commit message 建议、设置对话框、回滚
+    /// 确认、脏标签关闭确认。浮窗是独立 Area 层,不参与 panel 嵌套,各浮窗
+    /// 的机制说明见其函数文档。
+    ///
+    /// **三栏与禅定两条布局路径都要调它。** `draw` 在禅定帧整体分叉提前
+    /// return,浮层若只画在三栏路径,禅定里**可达**的入口就成了哑弹:设置
+    /// 齿轮挂在禅定同样保留的标题栏上(D4 × decisions-pending #31),点击后
+    /// 弹窗要悬置到退出禅定才突然出现;Ctrl+W 是全局命令,禅定里触发脏标签
+    /// 关闭确认同样悬置。浮窗与布局分叉无关(2026-09-27 评审修复)。
+    fn draw_overlay_dialogs(&mut self, ui: &mut egui::Ui) {
+        let outbox = &mut self.outbox;
+
+        // commit message 建议:复制即时写系统剪贴板,关闭只发消息,清建议的
+        // 归约在 `App::logic`(见 `commit_dialog` 文档)。
         if let Some(subject) = self.state.ai_commit_suggestion.clone() {
             let (_, close) = commit_dialog(ui, &subject);
             if close.clicked() {
@@ -256,39 +305,30 @@ impl LaterMdApp {
             }
         }
 
-        // ⑥ 顶层浮层:设置对话框(外观 / 快捷键 / AI / MCP)。凭据读写只在
-        // 归约(Message),对话框只持草稿与展示状态;关闭按钮原地翻转开关。
+        // 设置(外观 / 快捷键 / AI / MCP):凭据读写只在归约(Message),
+        // 对话框只持草稿与展示状态;关闭按钮原地翻转开关。
         if self.state.settings.open {
             let state = &mut self.state;
-            let settings = &mut state.settings;
-            let ai_key = &mut state.ai_key;
-            let ai = &state.ai;
-            let mcp = &state.mcp;
-            let keymap = &state.keymap;
-            let theme = &state.theme;
-            let skins = &state.skins;
-            let system_theme_ok = state.system_theme_ok;
             let close = crate::settings::dialog(
                 ui,
-                settings,
-                theme,
-                skins,
-                system_theme_ok,
-                keymap,
-                ai,
-                ai_key,
-                mcp,
+                &mut state.settings,
+                &state.theme,
+                &state.skins,
+                state.system_theme_ok,
+                &state.keymap,
+                &state.ai,
+                &mut state.ai_key,
+                &state.mcp,
                 outbox,
             );
             if close.is_some_and(|close| close.clicked()) {
-                settings.open = false;
+                state.settings.open = false;
             }
         }
 
-        // ⑦ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
-        // 即确认弹窗(与 commit 建议浮窗同模式);文案显式警示不可逆,目标
-        // 恰是编辑器当前文档时追加针对性警示(见 `checkout_extra_warning`),
-        // checkout 只在「回滚」按钮点击之后的归约里执行。
+        // 回滚确认:文案显式警示不可逆,目标恰是编辑器当前文档时追加针对性
+        // 警示(见 `checkout_extra_warning`);checkout 只在「回滚」按钮点击
+        // 之后的归约里执行。
         if let Some(path) = self.state.git.confirm_checkout.clone() {
             let open_in_editor = self.state.git.absolute_path(&path).is_some_and(|abs| {
                 self.state.tabs.current().document.path.as_deref() == Some(abs.as_path())
@@ -307,11 +347,10 @@ impl LaterMdApp {
             }
         }
 
-        // ⑦.5 顶层浮层:脏标签关闭确认(标签条 × / Ctrl+W 触发,docs/auto-plan
-        // #11「关闭脏标签确认模态」)。文案与回滚确认同款不可逆警示。目标按
-        // 稳定 id 存(`TabsState::confirm_close`):模态是非阻塞 Window,打开
-        // 期间其他关闭入口会使索引漂移;目标被别的路径关掉时 `TabsState::remove`
-        // 已撤下确认,这里自然不再渲染。
+        // 脏标签关闭确认(标签条 × / Ctrl+W 触发):目标按稳定 id 存
+        // (`TabsState::confirm_close`),打开期间其他关闭入口会使索引漂移;
+        // 目标被别的路径关掉时 `TabsState::remove` 已撤下确认,这里自然
+        // 不再渲染。
         if let Some(tab) = self.state.tabs.confirm_close_tab() {
             let (confirm, cancel) = tab_close_dialog(ui, &tab.document.display_name());
             if confirm.clicked() {
@@ -320,20 +359,6 @@ impl LaterMdApp {
             if cancel.clicked() {
                 outbox.push(Message::TabCloseCancelled);
             }
-        }
-
-        // ⑧ 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
-        // (docs/ui-polish.md §4),工具栏得以只留动作。
-        egui::Panel::bottom("statusbar").show(ui, |ui| {
-            status_bar(ui, &self.state);
-        });
-
-        // ⑨ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
-        // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
-        // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
-        // 所有面板之后,不影响任何 panel 的布局。
-        if self.frameless {
-            crate::ui::titlebar::edge_resize_zones(ui);
         }
     }
 
@@ -418,6 +443,11 @@ impl LaterMdApp {
         // 的那个 widget —— 同层命中的后来者优先(机制见
         // `ui::titlebar::edge_resize_zones` 的文档)。
         zen_exit_button(ui, &mut self.outbox);
+
+        // 顶层浮层与三栏路径同一份:禅定保留的标题栏上有设置齿轮、Ctrl+W
+        // 是全局命令 —— 入口在禅定里可达,浮窗就必须跟着可达(见
+        // [`Self::draw_overlay_dialogs`])。
+        self.draw_overlay_dialogs(ui);
 
         // 边缘缩放区同样必须在全部 panel 之后(同上)。
         if self.frameless {
@@ -551,10 +581,36 @@ fn separator(ui: &mut egui::Ui) {
     ui.weak("·");
 }
 
+/// 编辑器面板顶部的提示行(存在才显示):保存失败、撞键拒绝等需要用户
+/// 知晓并手动收起的提示。原文件工具栏的能力,工具栏退役后迁此保持不变
+/// (decisions-pending #32)。返回「知道了」按钮的响应(`None` = 本帧无
+/// 提示;测试定位用,与 `checkout_dialog` 同款手法)。
+fn notice_bar(
+    ui: &mut egui::Ui,
+    document: &crate::state::DocumentState,
+    outbox: &mut Vec<Message>,
+) -> Option<egui::Response> {
+    let notice = document.notice.as_deref()?;
+    let mut dismiss = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(ui.visuals().error_fg_color, notice);
+        let button = ui.small_button("知道了");
+        if button.clicked() {
+            outbox.push(Message::NoticeDismissed);
+        }
+        dismiss = Some(button);
+    });
+    dismiss
+}
 /// 光标行列(1 起):行按换行数,列按该行字符数(中文按字计,与编辑器
 /// 的视觉列一致)。
+///
+/// `byte` 可能是**过期快照**:格式动作在归约侧整篇替换文本,而本函数在
+/// 同一帧的绘制序里先于编辑器跑,拿到的还是按旧文本折出的字节(状态栏
+/// 2026-09-27 实测崩溃:「byte index not a char boundary」)。收缩到字符
+/// 边界而非钳长,越界与非边界一并兜住。
 fn cursor_position(text: &str, byte: usize) -> (usize, usize) {
-    let byte = byte.min(text.len());
+    let byte = text.floor_char_boundary(byte.min(text.len()));
     let before = &text[..byte];
     let line = before.matches('\n').count() + 1;
     let col = before.chars().rev().take_while(|ch| *ch != '\n').count() + 1;
@@ -1488,10 +1544,270 @@ mod tests {
         );
     }
 
+    /// M5 收口:标题栏齿轮(2026-09-27 迁自左栏底段设置行)在**完整
+    /// frameless draw** 路径下点得动,且走完归约后设置对话框真的打开
+    /// (decisions-pending #31;左栏版本的能力迁移验收点)。
+    ///
+    /// 帧序与 `frameless_draw_renders_and_toggles_sidebar_via_titlebar`
+    /// 同款:按钮矩形由 `titlebar::button_rects` 与绘制同源给出。
+    #[test]
+    fn titlebar_settings_gear_opens_the_dialog() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        assert!(!app.state.settings.open);
+
+        let bar = Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        let gear = crate::ui::titlebar::TitleButton::Settings;
+        let index = crate::ui::titlebar::TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == gear)
+            .unwrap();
+        let center = crate::ui::titlebar::button_rects(bar)[index].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // sizing pass → moved → press → release:面板层前几遍 widget 不参与
+        // 命中测试,与既有点击测试同一节奏
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::SettingsOpened(
+                crate::settings::SettingsTab::Appearance
+            )],
+            "齿轮点击发默认页消息,不被相邻窗口按钮/边缘命令区抢走"
+        );
+
+        // 下一帧归约:对话框开关翻转,再画一帧浮窗真实渲染不 panic
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(app.state.settings.open, "归约后设置对话框已打开");
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        )
+        .drop_without_applying_deltas();
+    }
+
+    /// 禅定里的标题栏齿轮不再是哑弹(2026-09-27 评审修复):禅定保留标题栏
+    /// (D4)且齿轮迁入标题栏(decisions-pending #31)后,入口在禅定里可达,
+    /// 而设置浮窗曾只画在三栏路径 —— 点击无反应,弹窗悬置到退出禅定才突然
+    /// 出现。修复后禅定帧同样渲染浮窗:齿轮点得动 → 归约开窗 → 禅定帧里
+    /// 真的画出来(取证走本帧 shapes 的文案,与 `zen_draw_skips_…` 同款)。
+    #[test]
+    fn zen_settings_gear_opens_the_dialog_inside_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state.apply(Message::ZenToggled);
+        assert!(app.state.layout.zen);
+
+        let bar = Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        let gear = crate::ui::titlebar::TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == crate::ui::titlebar::TitleButton::Settings)
+            .unwrap();
+        let center = crate::ui::titlebar::button_rects(bar)[gear].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // sizing pass → moved → press → release(与既有齿轮测试同一节奏)
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::SettingsOpened(
+                crate::settings::SettingsTab::Appearance
+            )],
+            "禅定帧里齿轮照常发消息,不被右上角退出浮层/边缘命令区抢走"
+        );
+
+        // 归约开窗,再画禅定帧:浮窗真的画出来了(修复前这里找不到任何设置
+        // 页专属文案 —— 弹窗悬置到退出禅定才出现)。「快捷键」只由设置浮窗
+        // 的左分页列画出,SAMPLE_MD 与禅定 chrome 都不含它。
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(app.state.settings.open, "归约后设置对话框已打开");
+        let zen = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            zen.iter().any(|t| t.contains("快捷键")),
+            "禅定帧里设置浮窗已渲染:{zen:?}"
+        );
+        assert!(
+            app.state.layout.zen,
+            "开设置不悄悄退出禅定(不静默改变用户状态)"
+        );
+    }
+
+    /// 同根因的旁支(2026-09-27 一并修):Ctrl+W 是全局命令,禅定里触发脏
+    /// 标签关闭时,确认浮窗曾同样悬置到退出禅定才出现。修复后禅定帧直接
+    /// 渲染确认浮窗。
+    #[test]
+    fn zen_ctrl_w_on_dirty_tab_shows_close_confirm_inside_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "未保存改动");
+
+        // Ctrl+W(默认绑定 TabClose)→ 脏标签挂起确认而不是直接关
+        reduce(
+            &mut app,
+            vec![Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+        );
+        assert!(
+            app.state.tabs.confirm_close_tab().is_some(),
+            "脏标签关闭挂起确认"
+        );
+
+        let zen = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            zen.iter().any(|t| t.contains("关闭标签")),
+            "禅定帧里确认浮窗已渲染:{zen:?}"
+        );
+    }
+
+    /// M5 收口(2026-09-27 修复用户实测回归):非禅定态的 panel 序列恰为
+    /// titlebar / menubar / statusbar / nav / preview + 中央编辑器。
+    ///
+    /// 三条取证分别对应三条反馈:
+    /// - 顺序:标题栏最顶、菜单栏次之、状态栏贴底(文本矩形自上而下);
+    /// - 状态栏**横跨全窗底部**:它的文本落在左栏脚下(x < 左栏宽度)——
+    ///   修复前 statusbar 画在左右栏之后,被夹在中央残余区,文本 x 必然
+    ///   大于左栏宽度;
+    /// - **无黑条**:中央竖直带上的采样点全部被内容色矩形盖住 —— 编辑器
+    ///   曾用 `Panel::left`,其后中央残余区无人认领,预览左侧多一条侧栏
+    ///   色的黑条;回到 `CentralPanel` 后 nav 右缘到 preview 左缘连续覆盖。
+    #[test]
+    fn panel_order_spans_statusbar_and_fills_the_center() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+
+        let shapes = draw_shapes(&mut app, &ctx, screen);
+        let title = topmost_text(&shapes, "LaterMD —");
+        let menubar = topmost_text(&shapes, "文件");
+        let status = topmost_text(&shapes, "248 字");
+        let nav = topmost_text(&shapes, "未选择根目录");
+
+        // 自上而下:标题栏 → 菜单栏(都在自己那条带里)
+        assert!(
+            title.top() < crate::ui::tokens::TITLEBAR_H,
+            "标题栏最顶:{title:?}"
+        );
+        assert!(
+            menubar.top() > crate::ui::tokens::TITLEBAR_H && menubar.top() < 100.0,
+            "菜单栏紧随标题栏:{menubar:?}"
+        );
+        // 状态栏贴底且横跨:文本 x 落在左栏宽度以内(左栏 default 240)
+        assert!(
+            status.top() > screen.height() - 40.0,
+            "状态栏贴底:{status:?}"
+        );
+        assert!(
+            status.left() < 100.0,
+            "状态栏横跨全窗底部(文本须在左栏脚下):{status:?}"
+        );
+        // 左栏在左,右缘不超过 default 宽度(240)放一点余量
+        assert!(
+            nav.left() < 240.0 && nav.right() < 260.0,
+            "左栏在左侧:{nav:?}"
+        );
+
+        // 无黑条:menubar 与 statusbar 之间的中央高度上,从左栏右缘到
+        // 右栏内部连续被内容色覆盖。黑条回归时(编辑器窄 left panel 之右、
+        // 预览之左)采样点会露背景色。
+        let content = crate::theme::content_fill(true);
+        for x in [250.0, 500.0, 760.0, 800.0, 1100.0] {
+            let probe = egui::pos2(x, 400.0);
+            assert!(
+                covered_by_fill(&shapes, content, probe),
+                "({x}, 400) 未被内容色覆盖:中央区有黑条"
+            );
+        }
+    }
+
     /// **真实帧里的工具条点击**:走完 `LaterMdApp::draw` 的五帧节奏能把加粗
     /// 按钮点出来(M3 验收点)。
     ///
-    /// 按钮位置由内置探针给出 —— 它前面压着标签条与文件工具栏,高度是布局
+    /// 按钮位置由内置探针给出 —— 它前面压着标签条与提示行,高度是布局
     /// 演算的结果,手搓坐标必然与真实帧错位(M2 已经在标题栏上踩过一次)。
     /// 只断言「消息出来了」:后面「消息 → 文本」那一截归 `state::tests`,
     /// 分层是因为 TextEdit 内部会对 `CCursorRange` 做归一化,把两者捆在一
@@ -1551,6 +1867,203 @@ mod tests {
         );
     }
 
+    /// 任务列表崩溃回归(2026-09-27 用户实测「点几次就崩溃」)。
+    ///
+    /// 全链路:真实 `reduce`+`draw`、真实格式条 Task 按钮、CJK 文本行中
+    /// 光标,三态循环两整圈(六次点击)。崩溃机制:格式归约整篇替换文本
+    /// 后,状态栏(绘制序先于编辑器)拿按**旧文本**折出的 `cursor.byte`
+    /// 切**新文本**,`byte index not a char boundary` panic —— 修复在
+    /// `cursor_position` 的边界收缩与 `apply_format` 的字节重折算。
+    #[test]
+    fn task_button_cycling_on_cjk_never_panics() {
+        use crate::compose::FormatAction;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("纯中文行\n第二行乙");
+        let id = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+
+        let center = Rc::new(RefCell::new(egui::Pos2::ZERO));
+        {
+            let sink = center.clone();
+            app.format_probe = Some(Box::new(move |action, rect| {
+                if action == FormatAction::Task {
+                    *sink.borrow_mut() = rect.center();
+                }
+            }));
+        }
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.reduce(ui.ctx());
+                    app.draw(ui);
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        frame(&mut app, Vec::new());
+        app.format_probe = None;
+        let center = *center.borrow();
+        assert!(center.x > 0.0, "探针拿到 Task 按钮:{center:?}");
+
+        // 光标落在首行行中(非行首,字符 2)并聚焦
+        let mut st = egui::widgets::text_edit::TextEditState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(2),
+        )));
+        st.store(&ctx, id);
+        ctx.memory_mut(|mem| mem.request_focus(id));
+
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let states = ["- [ ] 纯中文行", "- [x] 纯中文行", "- 纯中文行"];
+        for cycle in 0..6 {
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+                Vec::new(),
+            ] {
+                frame(&mut app, events);
+            }
+            let head = app
+                .state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                head,
+                states[cycle % 3],
+                "第 {} 次点击后首行应为三态之一",
+                cycle + 1
+            );
+        }
+        // 第七次点击:周期闭环,回到未勾态
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+            Vec::new(),
+        ] {
+            frame(&mut app, events);
+        }
+        let head = app
+            .state
+            .tabs
+            .current()
+            .editor
+            .text()
+            .lines()
+            .next()
+            .unwrap();
+        assert_eq!(head, "- [ ] 纯中文行", "三态周期 3:第七次点击回到未勾态");
+    }
+
+    /// 状态栏行列换算对**非边界字节**不 panic:过期快照的字节可能落在
+    /// CJK 字符中间(见 `task_button_cycling_on_cjk_never_panics` 的机制
+    /// 说明),收缩到所属字符起点而不是 panic。
+    #[test]
+    fn cursor_position_tolerates_stale_mid_char_bytes() {
+        let text = "- [ ] 纯中文行\n第二行乙";
+        // 字节 14 落在 '文'(12..15)中间 —— 崩溃帧的实值;收缩到 '中'
+        // 之后(字节 12),按字符计列
+        let (line, col) = cursor_position(text, 14);
+        assert_eq!((line, col), (1, 9));
+        // 越界钳制到文末仍是合法行为
+        let (line, _) = cursor_position(text, 10_000);
+        assert_eq!(line, 2);
+        // 正常路径不变
+        assert_eq!(cursor_position("abc", 2), (1, 3));
+        assert_eq!(cursor_position("甲乙\n丙", 7), (2, 1), "第二行行首");
+    }
+
+    /// 提示行(原文件工具栏的能力,工具栏退役后迁到编辑器面板顶,
+    /// decisions-pending #32):有提示时渲染提示文本与「知道了」,点击发
+    /// `NoticeDismissed`;无提示不渲染任何东西。
+    #[test]
+    fn notice_bar_shows_notice_and_dismiss_button_sends_message() {
+        use crate::state::DocumentState;
+
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+        let document = DocumentState {
+            path: None,
+            dirty: false,
+            notice: Some("Ctrl+S 已被「导出 HTML」占用".to_owned()),
+        };
+
+        // 帧 1:渲染拿「知道了」按钮位置
+        ctx.run_ui(RawInput::default(), |ui| {
+            let dismiss = notice_bar(ui, &document, &mut outbox);
+            rect.set(dismiss.expect("有提示必有按钮").rect);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产消息");
+        assert!(rect.get().width() > 0.0, "按钮有实测矩形");
+
+        // 帧 2-4:点「知道了」→ NoticeDismissed
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    notice_bar(ui, &document, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::NoticeDismissed]);
+
+        // 无提示:不渲染按钮
+        let clean = DocumentState {
+            path: None,
+            dirty: false,
+            notice: None,
+        };
+        ctx.run_ui(RawInput::default(), |ui| {
+            assert!(notice_bar(ui, &clean, &mut Vec::new()).is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+
     /// 跑若干帧 draw(sizing pass 之后 widget 才参与命中测试)。
     fn draw_frames(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect, frames: usize) {
         for _ in 0..frames {
@@ -1568,7 +2081,17 @@ mod tests {
     /// 跑两帧完整 draw(sizing pass 之后布局演算才稳定),返回第二帧的绘制
     /// 产物供像素层取证。
     fn draw_frame(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect) -> Vec<String> {
-        let mut painted = Vec::new();
+        painted_text(&draw_shapes(app, ctx, screen))
+    }
+
+    /// [`draw_frame`] 的 shapes 版:文本之外还要量 fill 矩形(布局取证要的
+    /// 不只是「画没画」,还有「画在哪、盖多宽」)。
+    fn draw_shapes(
+        app: &mut LaterMdApp,
+        ctx: &egui::Context,
+        screen: Rect,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let mut shapes = Vec::new();
         for i in 0..2 {
             let output = ctx.run_ui(
                 RawInput {
@@ -1578,17 +2101,17 @@ mod tests {
                 |ui| app.draw(ui),
             );
             if i == 1 {
-                painted = painted_text(&output);
+                shapes = output.shapes.clone();
             }
             output.drop_without_applying_deltas();
         }
-        painted
+        shapes
     }
 
     /// 本帧**真的画出来的所有文本**(取自 shapes,不是布局意图)。
-    fn painted_text(output: &FullOutput) -> Vec<String> {
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         let mut texts = Vec::new();
-        for clipped in &output.shapes {
+        for clipped in shapes {
             if let egui::epaint::Shape::Text(text) = &clipped.shape {
                 for line in text.galley.job.text.split('\n') {
                     texts.push(line.to_owned());
@@ -1596,6 +2119,42 @@ mod tests {
             }
         }
         texts
+    }
+
+    /// 文本 → 其包围盒里**最靠上**的那一处(同名文案可能出现在多个 panel,
+    /// 「文件」既是菜单栏首项又是左栏导航首行;断言 panel 顺序要的是前者)。
+    fn topmost_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Rect {
+        shapes
+            .iter()
+            .filter_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                text.galley
+                    .job
+                    .text
+                    .split('\n')
+                    .any(|line| line.contains(needle))
+                    .then_some(clipped.shape.visual_bounding_rect())
+            })
+            .min_by_key(|rect| rect.top().to_bits())
+            .unwrap_or_else(|| panic!("{needle:?} 未绘制"))
+    }
+
+    /// `color` 填充矩形是否盖住 `pos`(布局取证:中央区不允许再出现无人
+    /// 认领的背景条 —— 黑条回归时采样点上没有任何内容色矩形)。
+    fn covered_by_fill(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+        pos: egui::Pos2,
+    ) -> bool {
+        shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Rect(shape)
+                    if shape.fill == color && shape.rect.contains(pos)
+            )
+        })
     }
 
     /// 禅定是**另一套 panel 组合**:三栏路径的 menubar / nav / editor /
@@ -1624,8 +2183,8 @@ mod tests {
             zen.iter().any(|t| t.contains("未命名")),
             "窗口 chrome 保留:{zen:?}"
         );
-        // menubar / 状态栏 / 侧边栏 / 文件工具栏的专属文案全部消失
-        for gone in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+        // menubar / 状态栏 / 侧边栏 / 格式工具条的专属文案全部消失
+        for gone in ["文件", "248 字", "未选择根目录", "无序列表"] {
             assert!(
                 !zen.iter().any(|t| t.contains(gone)),
                 "禅定帧里不该出现 {gone:?}:{zen:?}"
@@ -1633,9 +2192,10 @@ mod tests {
         }
         // 取证信号都取「只有那一条 panel 才会画」的专属文案:
         // 「文件」= menubar 首项、「248 字」= statusbar 的字数统计、
-        // 「未选择根目录」= 左栏文件树、「Ctrl+N」= 编辑器上方文件工具栏的 tooltip
-        // (tooltip 只在 hover 时才画,故改用同样只属于它的「导出 HTML」按钮文案)
-        for present in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+        // 「未选择根目录」= 左栏文件树、「无序列表」= 编辑器上方格式工具条
+        // 的按钮 tooltip(只在 hover 时才画;改用按钮本体自绘的「H1」字形
+        // 文案 —— 它只由格式工具条的 rich 按钮画出)
+        for present in ["文件", "248 字", "未选择根目录", "H1"] {
             assert!(
                 three.iter().any(|t| t.contains(present)),
                 "取证有效:三栏帧里能找到 {present:?}"

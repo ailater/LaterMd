@@ -980,6 +980,13 @@ impl State {
         let (text, new_selection) = crate::compose::apply(action, tab.editor.text(), start..stop);
         tab.editor.replace_all(&text);
         tab.pending_selection = Some((new_selection.start, new_selection.end));
+        // 整篇替换后,按旧文本折出的 `cursor.byte` 对新文本可能不再是字符
+        // 边界(状态栏同帧就会拿它切片,2026-09-27 实测崩溃)。byte_to_char
+        // 把非边界归到所属字符起点(ropey 语义),char_to_byte 再折回本文本
+        // 的边界字节;下一帧编辑器照常回填准确值。
+        if let Some(byte) = tab.cursor.byte {
+            tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+        }
     }
 
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
