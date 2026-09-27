@@ -269,9 +269,35 @@ impl LaterMdApp {
                 );
             });
 
-        // ⑤ 顶层浮层:commit message 建议(存在才显示)。panel 顺序铁律只
-        // 约束 panel(浮窗是独立 Area 层,不参与嵌套),画在最后取语义上的
-        // 「最上层」。
+        // ⑤ 顶层浮层四件套(commit 建议 / 设置 / 回滚确认 / 关标签确认):
+        // 浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后取语义上的
+        // 「最上层」。三栏与禅定两条布局路径共用,理由见
+        // [`Self::draw_overlay_dialogs`]。
+        self.draw_overlay_dialogs(ui);
+
+        // ⑥ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
+        // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
+        // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
+        // 所有面板之后,不影响任何 panel 的布局。
+        if self.frameless {
+            crate::ui::titlebar::edge_resize_zones(ui);
+        }
+    }
+
+    /// 顶层浮层四件套,存在才显示:commit message 建议、设置对话框、回滚
+    /// 确认、脏标签关闭确认。浮窗是独立 Area 层,不参与 panel 嵌套,各浮窗
+    /// 的机制说明见其函数文档。
+    ///
+    /// **三栏与禅定两条布局路径都要调它。** `draw` 在禅定帧整体分叉提前
+    /// return,浮层若只画在三栏路径,禅定里**可达**的入口就成了哑弹:设置
+    /// 齿轮挂在禅定同样保留的标题栏上(D4 × decisions-pending #31),点击后
+    /// 弹窗要悬置到退出禅定才突然出现;Ctrl+W 是全局命令,禅定里触发脏标签
+    /// 关闭确认同样悬置。浮窗与布局分叉无关(2026-09-27 评审修复)。
+    fn draw_overlay_dialogs(&mut self, ui: &mut egui::Ui) {
+        let outbox = &mut self.outbox;
+
+        // commit message 建议:复制即时写系统剪贴板,关闭只发消息,清建议的
+        // 归约在 `App::logic`(见 `commit_dialog` 文档)。
         if let Some(subject) = self.state.ai_commit_suggestion.clone() {
             let (_, close) = commit_dialog(ui, &subject);
             if close.clicked() {
@@ -279,39 +305,30 @@ impl LaterMdApp {
             }
         }
 
-        // ⑥ 顶层浮层:设置对话框(外观 / 快捷键 / AI / MCP)。凭据读写只在
-        // 归约(Message),对话框只持草稿与展示状态;关闭按钮原地翻转开关。
+        // 设置(外观 / 快捷键 / AI / MCP):凭据读写只在归约(Message),
+        // 对话框只持草稿与展示状态;关闭按钮原地翻转开关。
         if self.state.settings.open {
             let state = &mut self.state;
-            let settings = &mut state.settings;
-            let ai_key = &mut state.ai_key;
-            let ai = &state.ai;
-            let mcp = &state.mcp;
-            let keymap = &state.keymap;
-            let theme = &state.theme;
-            let skins = &state.skins;
-            let system_theme_ok = state.system_theme_ok;
             let close = crate::settings::dialog(
                 ui,
-                settings,
-                theme,
-                skins,
-                system_theme_ok,
-                keymap,
-                ai,
-                ai_key,
-                mcp,
+                &mut state.settings,
+                &state.theme,
+                &state.skins,
+                state.system_theme_ok,
+                &state.keymap,
+                &state.ai,
+                &mut state.ai_key,
+                &state.mcp,
                 outbox,
             );
             if close.is_some_and(|close| close.clicked()) {
-                settings.open = false;
+                state.settings.open = false;
             }
         }
 
-        // ⑦ 顶层浮层:回滚确认(存在才显示)。egui 无内建阻塞模态,Window
-        // 即确认弹窗(与 commit 建议浮窗同模式);文案显式警示不可逆,目标
-        // 恰是编辑器当前文档时追加针对性警示(见 `checkout_extra_warning`),
-        // checkout 只在「回滚」按钮点击之后的归约里执行。
+        // 回滚确认:文案显式警示不可逆,目标恰是编辑器当前文档时追加针对性
+        // 警示(见 `checkout_extra_warning`);checkout 只在「回滚」按钮点击
+        // 之后的归约里执行。
         if let Some(path) = self.state.git.confirm_checkout.clone() {
             let open_in_editor = self.state.git.absolute_path(&path).is_some_and(|abs| {
                 self.state.tabs.current().document.path.as_deref() == Some(abs.as_path())
@@ -330,11 +347,10 @@ impl LaterMdApp {
             }
         }
 
-        // ⑦.5 顶层浮层:脏标签关闭确认(标签条 × / Ctrl+W 触发,docs/auto-plan
-        // #11「关闭脏标签确认模态」)。文案与回滚确认同款不可逆警示。目标按
-        // 稳定 id 存(`TabsState::confirm_close`):模态是非阻塞 Window,打开
-        // 期间其他关闭入口会使索引漂移;目标被别的路径关掉时 `TabsState::remove`
-        // 已撤下确认,这里自然不再渲染。
+        // 脏标签关闭确认(标签条 × / Ctrl+W 触发):目标按稳定 id 存
+        // (`TabsState::confirm_close`),打开期间其他关闭入口会使索引漂移;
+        // 目标被别的路径关掉时 `TabsState::remove` 已撤下确认,这里自然
+        // 不再渲染。
         if let Some(tab) = self.state.tabs.confirm_close_tab() {
             let (confirm, cancel) = tab_close_dialog(ui, &tab.document.display_name());
             if confirm.clicked() {
@@ -343,14 +359,6 @@ impl LaterMdApp {
             if cancel.clicked() {
                 outbox.push(Message::TabCloseCancelled);
             }
-        }
-
-        // ⑥ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
-        // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
-        // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
-        // 所有面板之后,不影响任何 panel 的布局。
-        if self.frameless {
-            crate::ui::titlebar::edge_resize_zones(ui);
         }
     }
 
@@ -435,6 +443,11 @@ impl LaterMdApp {
         // 的那个 widget —— 同层命中的后来者优先(机制见
         // `ui::titlebar::edge_resize_zones` 的文档)。
         zen_exit_button(ui, &mut self.outbox);
+
+        // 顶层浮层与三栏路径同一份:禅定保留的标题栏上有设置齿轮、Ctrl+W
+        // 是全局命令 —— 入口在禅定里可达,浮窗就必须跟着可达(见
+        // [`Self::draw_overlay_dialogs`])。
+        self.draw_overlay_dialogs(ui);
 
         // 边缘缩放区同样必须在全部 panel 之后(同上)。
         if self.frameless {
@@ -1608,6 +1621,124 @@ mod tests {
             |ui| app.draw(ui),
         )
         .drop_without_applying_deltas();
+    }
+
+    /// 禅定里的标题栏齿轮不再是哑弹(2026-09-27 评审修复):禅定保留标题栏
+    /// (D4)且齿轮迁入标题栏(decisions-pending #31)后,入口在禅定里可达,
+    /// 而设置浮窗曾只画在三栏路径 —— 点击无反应,弹窗悬置到退出禅定才突然
+    /// 出现。修复后禅定帧同样渲染浮窗:齿轮点得动 → 归约开窗 → 禅定帧里
+    /// 真的画出来(取证走本帧 shapes 的文案,与 `zen_draw_skips_…` 同款)。
+    #[test]
+    fn zen_settings_gear_opens_the_dialog_inside_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state.apply(Message::ZenToggled);
+        assert!(app.state.layout.zen);
+
+        let bar = Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        let gear = crate::ui::titlebar::TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == crate::ui::titlebar::TitleButton::Settings)
+            .unwrap();
+        let center = crate::ui::titlebar::button_rects(bar)[gear].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // sizing pass → moved → press → release(与既有齿轮测试同一节奏)
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::SettingsOpened(
+                crate::settings::SettingsTab::Appearance
+            )],
+            "禅定帧里齿轮照常发消息,不被右上角退出浮层/边缘命令区抢走"
+        );
+
+        // 归约开窗,再画禅定帧:浮窗真的画出来了(修复前这里找不到任何设置
+        // 页专属文案 —— 弹窗悬置到退出禅定才出现)。「快捷键」只由设置浮窗
+        // 的左分页列画出,SAMPLE_MD 与禅定 chrome 都不含它。
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(app.state.settings.open, "归约后设置对话框已打开");
+        let zen = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            zen.iter().any(|t| t.contains("快捷键")),
+            "禅定帧里设置浮窗已渲染:{zen:?}"
+        );
+        assert!(
+            app.state.layout.zen,
+            "开设置不悄悄退出禅定(不静默改变用户状态)"
+        );
+    }
+
+    /// 同根因的旁支(2026-09-27 一并修):Ctrl+W 是全局命令,禅定里触发脏
+    /// 标签关闭时,确认浮窗曾同样悬置到退出禅定才出现。修复后禅定帧直接
+    /// 渲染确认浮窗。
+    #[test]
+    fn zen_ctrl_w_on_dirty_tab_shows_close_confirm_inside_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "未保存改动");
+
+        // Ctrl+W(默认绑定 TabClose)→ 脏标签挂起确认而不是直接关
+        reduce(
+            &mut app,
+            vec![Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+        );
+        assert!(
+            app.state.tabs.confirm_close_tab().is_some(),
+            "脏标签关闭挂起确认"
+        );
+
+        let zen = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            zen.iter().any(|t| t.contains("关闭标签")),
+            "禅定帧里确认浮窗已渲染:{zen:?}"
+        );
     }
 
     /// M5 收口(2026-09-27 修复用户实测回归):非禅定态的 panel 序列恰为
