@@ -477,8 +477,7 @@ impl State {
             Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
             Message::SidebarToggled => self.toggle_left_panel(),
             Message::RightPanelToggled => self.toggle_right_panel(),
-            // M4(13d)补全快照与三条退出;本棒先把标志接通,让命令层链路完整
-            Message::ZenToggled => self.layout.zen = !self.layout.zen,
+            Message::ZenToggled => self.toggle_zen(),
             Message::FormatRequested(action) => self.apply_format(action),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
@@ -951,6 +950,16 @@ impl State {
     /// 翻转右栏(只读预览)可见性;写盘同上由帧末统一负责。
     fn toggle_right_panel(&mut self) {
         self.layout.right = !self.layout.right;
+    }
+
+    /// 进/出禅定(§7)。进出各走 `LayoutSettings` 上那两个同名方法 —— 快照
+    /// 怎么存怎么还原由它们自己说了算,`State` 不插手第二个真相源。
+    fn toggle_zen(&mut self) {
+        if self.layout.zen {
+            self.layout.exit_zen();
+        } else {
+            self.layout.enter_zen();
+        }
     }
 
     /// 请求一次 Markdown 格式动作(§6.4 链路)。

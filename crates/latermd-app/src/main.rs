@@ -157,6 +157,13 @@ struct LaterMdApp {
     /// 布局演算决定 —— 想让无头测试点到真按钮,只能让这条路走一遭。
     #[cfg(test)]
     format_probe: Option<Box<dyn FnMut(crate::compose::FormatAction, egui::Rect)>>,
+    /// 仅供测试的探针:`draw_zen` 时把正文层实测到的内容宽度吐出来。
+    ///
+    /// 同上。720 限宽发生在 `CentralPanel` 内部的 `vertical_centered` 那一
+    /// 层,从外面读不到 —— 想在测试里验「限宽真的生效」。要么在这里留个口,
+    /// 要么在测试里重演同一段布局(而后者验证不了 `draw_zen` 有没有真调)。
+    #[cfg(test)]
+    zen_probe: Option<Box<dyn FnMut(f32)>>,
 }
 
 impl LaterMdApp {

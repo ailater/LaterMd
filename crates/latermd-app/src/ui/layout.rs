@@ -4,6 +4,7 @@
 //! `App::logic` 只归约状态,`App::ui` 只绘制,两者严格分离(铁律)。
 
 use crate::state::Message;
+use crate::ui::tokens;
 use crate::LaterMdApp;
 use eframe::egui;
 
@@ -101,6 +102,22 @@ impl LaterMdApp {
     /// `App::ui` 的面板主体。独立成函数是为了测试能在同一 run_ui 帧里按
     /// eframe 顺序(先 `reduce` 后绘制)跑完整帧。
     fn draw(&mut self, ui: &mut egui::Ui) {
+        // 禅定模式(§7)是**另一整套面板组合**,不是给三栏各加一个 if:
+        // 藏面板的最佳办法是从一开始就不添加它(侧栏宽度演算与 z 序全部
+        // 让位),而不是添加了再把可见性摁掉。故在这里整体分叉。
+        //
+        // 但**只对布局分叉,不对窗口 chrome 分叉**。规格 §7 的「全部退场」
+        // 是按原生装饰窗口画的:自绘标题栏退场后,OS 那一根还在,窗口照样
+        // 能拖能关。本产品的标题栏是自绘的(D1),无边框模式下 OS 不提供
+        // 任何 chrome —— 真照字面连同 chrome 一起藏,退出禅定的四条出口里
+        // 两条(标题栏 Zen 按钮、右上浮层入口所在的画布)会同时失效。D4
+        // 担心的「怎么退出」在这里会成真,故 Zen 只让三栏让位:**它是布局
+        // 态,不是窗口态**。
+        if self.state.layout.zen {
+            self.draw_zen(ui);
+            return;
+        }
+
         // ⓪ 自绘窗口骨架之一:36px 自绘标题栏(仅无边框模式;
         // LATERMD_NATIVE_DECORATIONS=1 的原生装饰路径不画,行为与旧版
         // 完全一致)。
@@ -319,6 +336,131 @@ impl LaterMdApp {
             crate::ui::titlebar::edge_resize_zones(ui);
         }
     }
+
+    /// 禅定模式的整套面板组合(§7)。
+    ///
+    /// 四条出口在此合流:F11 / 标题栏 Zen 按钮 / Esc / 右上角「退出禅定」。
+    fn draw_zen(&mut self, ui: &mut egui::Ui) {
+        // Zen 是**另一套 panel 组合**而非「给三栏各加一个 if」:藏面板的最佳
+        // 办法是从一开始就不添加它(侧栏宽度演算与 z 序全部让位),而不是
+        // 添加了再把可见性摁掉。窗口 chrome 保留的理由见 [`Self::draw`]。
+        if self.frameless {
+            egui::Panel::top("titlebar")
+                .exact_size(crate::ui::tokens::TITLEBAR_H)
+                .frame(
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::ZERO)
+                        .fill(ui.visuals().panel_fill),
+                )
+                .show(ui, |ui| {
+                    crate::ui::titlebar::ui(ui, &self.state, &mut self.outbox);
+                });
+        }
+
+        // Esc 退出禅定(§7)。
+        //
+        // Esc 不在 command 表里:它是**禅定内的 (mode-local) 出口**而不是一条
+        // 全局命令 —— 塞进 command 表会和别处的 Esc 语义撞车。
+        //
+        // 在 panel 之前消费而非嵌在某棵子树里:消费即把事件从输入流移除,
+        // 后面绘制的预览区(User 端点 SUCH  as `ai://` 链接)看不见它。
+        let escape = ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if escape {
+            self.outbox.push(Message::ZenToggled);
+        }
+
+        // 正文:**唯一的** CentralPanel,吃掉标题栏以外的全部剩余空间。预览
+        // 因此天然占满内容区,再在内部按 [`tokens::ZEN_TEXT_W`] 限宽居中 ——
+        // 「让一个 panel 占满」与「内容限宽」是两件事,分别由 central panel
+        // 与内部的 `set_max_width` 各管一段。
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    // `Frame::inner_margin` 收 `impl Into<Margin>`,`Margin` 是
+                    // i8 ;`f32` 走 `From<f32>` 时被 round 掉小数,故 `ZEN_GUTTER`
+                    // 取整数常量(24),不留 24.5 这种会被静默吞掉的值。
+                    .inner_margin(tokens::ZEN_GUTTER)
+                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+            )
+            .show(ui, |ui| {
+                // 720 限宽居中,但**下限.md 的可用宽度**:窗口窄于
+                // `720 + 2×gutter` 时必须跟着缩,否则 preview 会被推出内容区右
+                // 缘 —— 窄窗写 Markdown 是常态(半屏贴左边),溢出等于逼出横向
+                // 滚动。"限宽" 是上限而非定值,这正是它与 `set_width` 的区别。
+                //
+                // `vertical_centered`(top_down + Align::Center)负责把不足 720
+                // 的内容横向居中,`set_max_width` 负责把超宽的夹回来:两者分工
+                // 不同,缺任一个都不成立。
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(tokens::ZEN_TEXT_W.min(ui.available_width()));
+                    // 宽度探针(仅测试):把这一层实测出来的内容宽度交出去,
+                    // 让无头测试量得到 720 限宽真的生效了。**刻意放在这里而
+                    // 不是在测试里重演同一段布局** —— 后者只是在验证
+                    // `set_max_width` 本身,验证不了 `draw_zen` 有没有真的调它。
+                    #[cfg(test)]
+                    if let Some(probe) = self.zen_probe.as_deref_mut() {
+                        probe(ui.max_rect().width());
+                    }
+                    // 与三栏路径同一个 widget:同一个 `PreviewState`、同一条
+                    // 渲染链路,不另起一份。
+                    //
+                    // 解构再分头借用:`&mut self.state.tabs` 与 `&self.state.ai`
+                    // 是同一棵树上的不相交分支,挨着写会被借用检查器拦下。
+                    let LaterMdApp { state, outbox, .. } = self;
+                    let tab = state.tabs.current_mut();
+                    crate::ui::preview::ui(ui, &mut tab.preview, &state.ai, outbox);
+                });
+            });
+
+        // 右上角「退出禅定」:Zen 里唯一的常驻 chrome,因此必须是最后分配
+        // 的那个 widget —— 同层命中的后来者优先(机制见
+        // `ui::titlebar::edge_resize_zones` 的文档)。
+        zen_exit_button(ui, &mut self.outbox);
+
+        // 边缘缩放区同样必须在全部 panel 之后(同上)。
+        if self.frameless {
+            crate::ui::titlebar::edge_resize_zones(ui);
+        }
+    }
+}
+
+/// 禅定模式的「退出禅定」浮层(§7)。返回其矩形供测试定位。
+///
+/// **用 `allocate_rect` 绝对摆放而不是 widget 流式布局**:它浮在 CentralPanel
+/// 之上而不是挤占正文宽度 —— 流式布局会把这颗按钮压进 720 限宽里,正文随之
+/// 被推歪。
+///
+/// 但它**仍必须是最后分配的那个 widget**:同层命中裁剪 = 后分配者优先
+/// (机制见 [`crate::ui::titlebar::edge_resize_zones`]),晚分配才能盖住
+/// CentralPanel 而不是被它盖住。
+///
+/// 抑制视觉噪音:安静时用 `weak_text_color`,指针一到才升到全对比度。禅定
+/// 的价值是「屏幕上没有别的东西」,一颗始终全黑的按钮会把注意力从正文上
+/// 拽走(带 tooltip 兜住「这玩意儿能点」的可发现性)。
+fn zen_exit_button(ui: &mut egui::Ui, outbox: &mut Vec<Message>) -> egui::Rect {
+    let size = egui::vec2(tokens::ICON + 12.0, tokens::TOOLBAR_H);
+    let rect = egui::Rect::from_min_size(
+        ui.max_rect().right_top()
+            - egui::vec2(size.x + tokens::ZEN_EXIT_MARGIN, -tokens::ZEN_EXIT_MARGIN),
+        size,
+    );
+    let response = ui
+        .allocate_rect(rect, egui::Sense::click())
+        .on_hover_text("退出禅定 (Esc)");
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        crate::ui::icons::Icon::Zen.draw(ui.painter(), rect.center(), tokens::ICON, color);
+    }
+    if response.clicked() {
+        outbox.push(Message::ZenToggled);
+    }
+    rect
 }
 
 /// 快捷键捕获(设置页「改键」):本帧的按键就是新键位。
@@ -543,10 +685,11 @@ mod tests {
     use super::*;
     use crate::state;
     use egui::{
-        Event, FullOutput, Key, Modifiers, OutputCommand, PointerButton, RawInput, Rect,
+        Event, FullOutput, Key, Modifiers, OutputCommand, PointerButton, Pos2, RawInput, Rect,
         ViewportCommand,
     };
     use std::cell::Cell;
+    use std::rc::Rc;
 
     fn key_s(modifiers: Modifiers) -> Event {
         Event::Key {
@@ -1405,6 +1548,298 @@ mod tests {
             app.outbox,
             vec![Message::FormatRequested(FormatAction::Bold)],
             "工具条按钮在真实三栏帧里点得动,且不被相邻控件抢走"
+        );
+    }
+
+    /// 跑若干帧 draw(sizing pass 之后 widget 才参与命中测试)。
+    fn draw_frames(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect, frames: usize) {
+        for _ in 0..frames {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    /// 跑两帧完整 draw(sizing pass 之后布局演算才稳定),返回第二帧的绘制
+    /// 产物供像素层取证。
+    fn draw_frame(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect) -> Vec<String> {
+        let mut painted = Vec::new();
+        for i in 0..2 {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            if i == 1 {
+                painted = painted_text(&output);
+            }
+            output.drop_without_applying_deltas();
+        }
+        painted
+    }
+
+    /// 本帧**真的画出来的所有文本**(取自 shapes,不是布局意图)。
+    fn painted_text(output: &FullOutput) -> Vec<String> {
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                for line in text.galley.job.text.split('\n') {
+                    texts.push(line.to_owned());
+                }
+            }
+        }
+        texts
+    }
+
+    /// 禅定是**另一套 panel 组合**:三栏路径的 menubar / nav / editor /
+    /// statusbar / right-preview 全部不再被添加(§7 验收点)。
+    ///
+    /// 这正是藏面板的正确办法 —— 从一开始就不添加它,而不是添加了再把可见
+    /// 性摁掉:后者留给平台的宽度演算与命中层级照旧吃掉资源,纠正起来也难。
+    ///
+    /// 取证走**本帧真的画进了 shapes 的文本**,而不是去看 flags:flags 会对
+    /// 「添加了但摁掉可见性」这种错误实现照样放行。
+    #[test]
+    fn zen_draw_skips_the_three_column_panels() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+
+        let three = draw_frame(&mut app, &ctx, screen);
+        app.state.apply(Message::ZenToggled);
+        let zen = draw_frame(&mut app, &ctx, screen);
+
+        // 标题栏保留(理由见 `draw` 的入禅注释):文档名是它画的
+        assert!(
+            zen.iter().any(|t| t.contains("未命名")),
+            "窗口 chrome 保留:{zen:?}"
+        );
+        // menubar / 状态栏 / 侧边栏 / 文件工具栏的专属文案全部消失
+        for gone in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+            assert!(
+                !zen.iter().any(|t| t.contains(gone)),
+                "禅定帧里不该出现 {gone:?}:{zen:?}"
+            );
+        }
+        // 取证信号都取「只有那一条 panel 才会画」的专属文案:
+        // 「文件」= menubar 首项、「248 字」= statusbar 的字数统计、
+        // 「未选择根目录」= 左栏文件树、「Ctrl+N」= 编辑器上方文件工具栏的 tooltip
+        // (tooltip 只在 hover 时才画,故改用同样只属于它的「导出 HTML」按钮文案)
+        for present in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+            assert!(
+                three.iter().any(|t| t.contains(present)),
+                "取证有效:三栏帧里能找到 {present:?}"
+            );
+        }
+        // 正文仍然渲染在同一个 PreviewState 上(禅定不是换渲染器)
+        assert!(!zen.is_empty(), "禅定帧仍有内容被绘制:{zen:?}");
+        assert!(app.state.layout.zen, "绘制不翻转禅定");
+    }
+
+    /// Zen 下正文按 `ZEN_TEXT_W` 限宽。宽度由 `draw_zen` 自己吐出来(探针见
+    /// `LaterMdApp::zen_probe`):这是**它把多宽的画布交给了预览**,不是我们
+    /// 在测试里另搭一个 720 的 Ui 自证。
+    ///
+    /// 窗口够宽时限宽生效;窗口本身就窄于 720 时被夹到可用宽度 —— 那条分支
+    /// 由下一个用例看。
+    #[test]
+    fn zen_body_ui_is_clamped_to_the_reading_width() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+
+        let width = Rc::new(Cell::new(0.0f32));
+        {
+            let sink = width.clone();
+            app.zen_probe = Some(Box::new(move |w| sink.set(w)));
+        }
+        for _ in 0..2 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(width.get(), tokens::ZEN_TEXT_W, "窗口够宽时限宽锁定在 720");
+    }
+
+    /// 窗口窄于 720 时限宽被夹到可用宽度,而不是溢出成横向滚动 —— 「限宽」
+    /// 是上限而非定值,这是 `set_max_width` 与 `set_width` 的区别所在。
+    #[test]
+    fn zen_body_shrinks_below_the_reading_width_on_narrow_windows() {
+        let ctx = egui::Context::default();
+        let narrow = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 600.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+
+        let width = Rc::new(Cell::new(0.0f32));
+        {
+            let sink = width.clone();
+            app.zen_probe = Some(Box::new(move |w| sink.set(w)));
+        }
+        for _ in 0..2 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(narrow),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        let measured = width.get();
+        assert!(
+            measured > 0.0 && measured <= tokens::ZEN_TEXT_W,
+            "窄窗下收缩到可用宽度且不超 720,实测 {measured}"
+        );
+        assert!(
+            measured <= narrow.width(),
+            "不越过窗口宽度:{measured} vs {}",
+            narrow.width()
+        );
+    }
+
+    /// Esc 是禅定的出口之一(§7):它在禅定帧里被当作退出 signal 消费掉,
+    /// 而不是渗到后面的预览区。由此一条线索得出的结论:draw 会把它唱 overriding
+    /// 掉, 紧接着的其它 帧 不再见到它。
+    #[test]
+    fn zen_frame_consumes_escape_and_requests_exit() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+        let escape = Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        draw_frames(&mut app, &ctx, screen, 2);
+
+        ctx.run_ui(
+            RawInput {
+                events: vec![escape.clone()],
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.outbox, vec![Message::ZenToggled], "Esc 转成退出禅定");
+
+        // 下一帧不再见到同一枚 Esc:它已被上一帧消费出输入流
+        app.outbox.clear();
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        )
+        .drop_without_applying_deltas();
+        assert!(app.outbox.is_empty(), "Esc 不是「按住不放」的遗留事件");
+    }
+
+    /// 右上角「退出禅定」浮层在真实帧里点得动(§7 验收点)。位置由
+    /// `zen_exit_button` 的返回值给出 —— 它是绝对摆放的,手搓坐标必然与真实
+    /// 帧错位(M2 已经在标题栏上踩过一次)。
+    #[test]
+    fn zen_exit_button_is_clickable_in_a_real_frame() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+
+        let center = std::cell::RefCell::new(Pos2::ZERO);
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                *center.borrow_mut() = zen_exit_button(ui, &mut Vec::new()).center();
+            },
+        )
+        .drop_without_applying_deltas();
+        let center = center.into_inner();
+        assert!(center.x > screen.left(), "浮层取到了真实位置:{center:?}");
+        // 它在内容区右上角,而不是整帧左上角或屏幕外
+        assert!(center.y < tokens::ZEN_EXIT_MARGIN + 100.0, "贴内容区上沿");
+
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::ZenToggled],
+            "浮层按钮不被 CentralPanel 抢走"
+        );
+
+        // 归约在下一帧:还原到进入前的三栏
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(!app.state.layout.zen, "已退出禅定");
+        assert!(app.state.layout.left && app.state.layout.right, "三栏还原");
+    }
+
+    /// 禅定的**迭代性**:进/出一整轮后面板组合与进入前逐项一致(§12 验收点),
+    /// 这是 `pre_zen` 快照存在的全部理由。
+    #[test]
+    fn zen_roundtrip_restores_the_exact_column_combination() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        // 先把 left 关掉:如果退出禅定一律全开,这条用例会当场红
+        app.state.apply(Message::SidebarToggled);
+        assert!(!app.state.layout.left && app.state.layout.right);
+
+        app.state.apply(Message::ZenToggled);
+        draw_frames(&mut app, &ctx, screen, 2);
+        app.state.apply(Message::ZenToggled);
+        assert!(
+            !app.state.layout.left && app.state.layout.right,
+            "逐项还原:left={} right={}",
+            app.state.layout.left,
+            app.state.layout.right
         );
     }
 }
