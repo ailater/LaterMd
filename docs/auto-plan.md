@@ -43,6 +43,15 @@
 | 14 | lp-v2 | Live Preview v2：内联标记半隐藏（块内分段，`**` 等标记聚焦时半透明而非整块裸源码）+ 选区扩展，依赖 #9(v1 已完成) | ⏳待开始 | roadmap「P3 深水区」剩余增强；铁律：共用同一 rope buffer 与 undo 栈 |
 | 15 | backlinks | 反向链接面板：全仓扫描 `[[wikilink]]` 引用，侧栏面板列出「谁链接了当前文档」+ 点击跳转，依赖 #10(wikilink 已完成) | ⏳待开始 | roadmap「P3 深水区」剩余增强；扫描复用 latermd-search 遍历骨架 |
 | 16 | icon-embed | 应用图标接入：main.rs `ViewportBuilder::with_icon(IconData)`(include_bytes assets/logo/deliverables/png/icon-64.png + image crate 解码) + latermd-app Cargo.toml 加 `image = { version = "0.25", default-features = false, features = ["png"] }`(与 vendored 层同源) + ADR-004 登记;失败回落默认图标不拦启动。图标素材已打磨就绪(LOGO-SPEC v1.1) | ⏳待开始 | 坤哥 2026-09-27 反馈「运行时图标不像」;M2 在途故未抢写 src/,由本条目落地 |
+| 17 | find-replace | 单文档查找替换:Ctrl+F 浮条(当前文档内查找,Enter/N 高亮下一个,计数)、Ctrl+H 替换(单个/全部,全部替换走单条 undo,字符偏移用 ByteIndex 换算防 CJK 错位) | ⏳待开始 | 编辑器标配缺口(2026-09-27 盘点,全仓搜索有但文档内查找替换无);与多标签联动:作用于 active tab |
+| 18 | autosave | 自动保存与崩溃恢复:编辑停顿 30s 或切标签时把脏缓冲落 `<doc>.latermd-draft`(与原文件同目录或状态目录);启动检测孤儿 draft 弹恢复条(恢复/丢弃);正常保存/关闭即清 draft | ⏳待开始 | 防丢是编辑器基本盘;draft 不进 Git 忽略清单之外的地方,文件树过滤 `*.latermd-draft` |
+| 19 | ime-follow | Linux IME 候选框跟随:光标移动时上报 IME 位置(egui 0.36 ViewportCommand::IMEPosition 或 input IME 事件链),fcitx5 实测候选框贴光标;m0-report 验证 1 销账 | ⏳待开始 | m0 挂账「输入可用但候选框不跟随」;Win/mac 行为留真机人工项 |
+| 20 | ai-adapters | AI provider 补全:Anthropic(messages API/SSE)与 Ollama(本地 /api/chat NDJSON)两个 adapter,与 openai.rs 同 trait;设置页 provider 三选一;mock 不动 | ⏳待开始 | #3 只交付了 OpenAI 兼容端;key 由用户填(decisions-pending #3),无 key 走 mock |
+| 21 | image-paste | 图片粘贴/拖拽插入:编辑器 Ctrl+V 图片字节或拖入图片文件→存 `<doc名>.assets/`→光标处插相对路径引用;预览经 vendored 图片 widget 渲染;文件树过滤 assets 目录本身 | ⏳待开始 | 写作刚需(截图入文);PNG/JPEG/WebP 白名单,超 5MB 提示 |
+| 22 | cask-bump | Homebrew cask 自动回填:Release 发布 workflow 追加一步,gh api 更新 crazykun/homebrew-ailater 的 Cask latermd.rb(version + universal2 dmg sha256),失败仅告警不阻塞发布 | ⏳待开始 | macos-dmg.yml 注释明说「auto-bump 只管 Formula,cask 靠手动」——发版链路最后一块手动环节 |
+| 23 | font-prefs | 编辑器字号/行距用户设置:外观页两滑杆(字号 12-24 默认 15,行距 1.2-2.0 默认 1.5),持久化 settings.json,作用于编辑器与预览正文(标题按比例) | ⏳待开始 | 密度档位特意不动字号,用户手动可调是缺口;CJK 可读性下限 12 |
+| 24 | command-palette | Ctrl+P 快速打开:居中浮层,模糊搜文件树全部 md(打开)+ Command 全集(执行),↑↓ 选择 Enter 确认,Esc 关 | ⏳待开始 | 现代编辑器标配体验;复用 Command enum 与文件树快照,无新依赖 |
+| 25 | export-pdf | 导出 PDF:headless 渲染(铁律 2 的验证场——latermd-render 不依赖 egui),printpdf 或 HTML→PDF 选型走 ADR;CJK 字体嵌入 | ⏳待开始 | 最重的候选,列队尾;P0 只交付了导出 HTML |
 
 状态图例：⏳待开始 → 🔄进行中 → ✅完成 / ❌挂起（3 次失败）/ ⛔受阻（依赖挂起）。
 
