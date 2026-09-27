@@ -98,12 +98,9 @@ fn rich(
     let enabled = ui.is_enabled();
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if response.hovered() && enabled {
-            painter.rect_filled(
-                rect,
-                tokens::RADIUS_SM,
-                ui.visuals().widgets.hovered.bg_fill,
-            );
+        if enabled {
+            // 与 `icons::icon_button` 同一套 hover 淡入
+            icons::hover_fill(ui, &response, rect, tokens::RADIUS_SM);
         }
         // 走 `WidgetText::into_galley` 而不是 `painter.text`:后者签名的
         // `impl ToString` 会把 RichText 降级成纯字符串,strong / italics /

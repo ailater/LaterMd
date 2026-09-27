@@ -323,6 +323,25 @@ impl Icon {
     }
 }
 
+/// 自绘按钮的 hover 底色,**带淡入**(2026-09-27 U3)。
+///
+/// 出厂写法是 `if hovered { 画满 }` —— 硬切,鼠标扫过一排按钮就是一串闪动。
+/// 这里用 egui 自带的 `animate_bool` 拿 0..1 的插值,乘进底色 alpha;不引
+/// 任何动画库(GPL 的 egui_transition_animation 已否)。
+///
+/// **不要用 `WidgetVisuals::expansion` 之类的路子做这个**:它连控件分配尺寸
+/// 一起撑大,会触发 `horizontal_wrapped` 换行、点击落空(见 `theme.rs` 焦点
+/// 环处的注释)。alpha 插值不动布局。
+pub fn hover_fill(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, radius: f32) {
+    let t = ui
+        .ctx()
+        .animate_bool(response.id.with("hover"), response.hovered());
+    if t > 0.0 {
+        let fill = ui.visuals().widgets.hovered.bg_fill.gamma_multiply(t);
+        ui.painter().rect_filled(rect, radius, fill);
+    }
+}
+
 /// 纯图标按钮(左栏顶段动作、标题栏齿轮等):宽度只够一个图标,语义靠
 /// tooltip 补。
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip_text: &str) -> egui::Response {
@@ -331,8 +350,8 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip_text: &str) -> egui::R
     let enabled = ui.is_enabled();
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if response.hovered() && enabled {
-            painter.rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
+        if enabled {
+            hover_fill(ui, &response, rect, RADIUS_SM);
         }
         let color = if enabled {
             ui.visuals().text_color()
