@@ -1,15 +1,15 @@
-//! 自绘线性图标体系(docs/ui-polish.md §3)。
+//! 图标体系:egui-phosphor(2026-09-27 U2,坤哥放行「全量迁移」)。
 //!
-//! **为什么自绘而不是字体字符**:egui 无内置图标集,emoji / Unicode 符号
-//! (✎ 🗋 ⌘)在三平台缺字风险真实(AGENTS.md §5 已把字体列为风险项)。全部
-//! 图标用 `Painter` 画线段/圆/矩形:零字体依赖、零纹理依赖、随主题取色、
-//! 在高 DPI 下不会因位图缩放糊掉。
+//! **2026-09-27 之前是 `Painter` 自绘线段**,理由是「egui 无内置图标集、
+//! emoji/Unicode 符号在三平台缺字」。那个论据对**系统字体**成立,对 phosphor
+//! 这类**字体内嵌在 crate 里**的库不成立(见 decisions-pending #34 的修订)。
+//! 坤哥 2026-09-27 拍板选乙:全量迁移,本模块退役自绘。
 //!
-//! 坐标约定:以 `size` 为基准的 `[-0.5, 0.5]` 归一化空间,线宽 `size / 12`
-//! (16px 图标 = 1.33px 线)。改 `size` 即整体等比缩放,不存在第二套坐标。
+//! 字形是内嵌 TTF 的私有区码位(U+E0xx),不查系统字体,三平台一致;代价是
+//! 二进制 +1.03 MiB(可开 `subset` feature 裁剪,暂不开)。
 
 use crate::ui::tokens::{ICON, RADIUS_SM, SPACE_SM, SPACE_XS, TOOLBAR_H};
-use eframe::egui::{self, Align2, Color32, Painter, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, Painter, Pos2, Rect};
 
 /// 图标标识。新增图标 = 加枚举变体 + [`Icon::draw`] 一个分支,调用方无需
 /// 感知绘制细节。
@@ -74,12 +74,6 @@ pub enum Icon {
     /// 规格 §6.1 原本写的是 Unicode `¶`;这里改自绘:文首「图标是矢量自绘,
     /// 不是字体字符」(ui-polish §1.1)对 Gecko/缺字环境的顾虑同样适用。
     Paragraph,
-    /// 图片(docs/image-plan.md A 段):外框 + 山 + 日(右上小圆)。
-    ///
-    /// 与 `Table`(网格)的区分靠「框内是折线不是横竖分割线」;与 `Open`
-    /// (文件夹)的区分靠右上角那个实心日 —— 都是「外框 + 内部图形」,少了
-    /// 太阳就退化成文件夹。
-    Image,
     /// 无序列表:三点 + 三线。
     BulletList,
     /// 有序列表:三条竖短线(序号笔画抽象)+ 三线。
@@ -91,248 +85,80 @@ pub enum Icon {
 impl Icon {
     /// 在 `center` 处以 `size` 边长画图标,颜色由调用方给(通常取 visuals
     /// 前景色,禁用态取 weak)。
-    pub fn draw(self, painter: &Painter, center: Pos2, size: f32, color: Color32) {
-        let stroke = Stroke::new((size / 12.0).max(1.0), color);
-        // 归一化坐标 → 屏幕坐标
-        let at = |x: f32, y: f32| center + Vec2::new(x * size, y * size);
-        let seg = |a: (f32, f32), b: (f32, f32)| {
-            painter.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke)
-        };
-        let path = |pts: &[(f32, f32)]| {
-            for pair in pts.windows(2) {
-                seg(pair[0], pair[1]);
-            }
-        };
-        let frame = |a: (f32, f32), b: (f32, f32)| {
-            painter.rect_stroke(
-                Rect::from_two_pos(at(a.0, a.1), at(b.0, b.1)),
-                size * 0.08,
-                stroke,
-                egui::StrokeKind::Outside,
-            );
-        };
-        let fill = |a: (f32, f32), b: (f32, f32)| {
-            painter.rect_filled(
-                Rect::from_two_pos(at(a.0, a.1), at(b.0, b.1)),
-                size * 0.06,
-                color,
-            );
-        };
-        let dot = |c: (f32, f32), r: f32| painter.circle_filled(at(c.0, c.1), r * size, color);
-        let ring = |c: (f32, f32), r: f32| painter.circle_stroke(at(c.0, c.1), r * size, stroke);
-        // 四角星:`k` 为缩放。
-        let star = |c: (f32, f32), k: f32| {
-            let (x, y) = c;
-            path(&[
-                (x, y - 0.42 * k),
-                (x + 0.13 * k, y - 0.13 * k),
-                (x + 0.42 * k, y),
-                (x + 0.13 * k, y + 0.13 * k),
-                (x, y + 0.42 * k),
-                (x - 0.13 * k, y + 0.13 * k),
-                (x - 0.42 * k, y),
-                (x - 0.13 * k, y - 0.13 * k),
-                (x, y - 0.42 * k),
-            ]);
-        };
-        // 折线近似圆弧(egui 无 arc API);返回终点坐标,箭头用它接续。
-        let arc = |c: (f32, f32), r: f32, a0: f32, a1: f32| -> (f32, f32) {
-            let steps = 18usize;
-            let point = |i: usize| {
-                let t = a0 + (a1 - a0) * (i as f32 / steps as f32);
-                (c.0 + r * t.cos(), c.1 + r * t.sin())
-            };
-            for i in 0..steps {
-                seg(point(i), point(i + 1));
-            }
-            point(steps)
-        };
-
+    /// 对应的 phosphor 码位。
+    ///
+    /// 映射是**人工挑的**,不是按名字硬套 —— 同一个动作在两套体系里常常不叫
+    /// 一个名字(自绘 `Save` → phosphor `FLOPPY_DISK`;自绘 `Theme` →
+    /// `PALETTE`)。挑错很难看,挑完要在真机上逐个过一眼。
+    pub fn glyph(self) -> &'static str {
+        use egui_phosphor::regular as ph;
         match self {
-            Self::New => {
-                frame((-0.42, -0.40), (0.02, 0.42));
-                seg((-0.30, -0.14), (-0.08, -0.14));
-                seg((-0.30, 0.06), (-0.08, 0.06));
-                seg((0.20, 0.02), (0.44, 0.02));
-                seg((0.32, -0.10), (0.32, 0.14));
-            }
-            Self::Open => {
-                frame((-0.42, -0.22), (0.42, 0.38));
-                path(&[
-                    (-0.42, -0.22),
-                    (-0.42, -0.40),
-                    (-0.12, -0.40),
-                    (-0.04, -0.22),
-                ]);
-            }
-            Self::Save => {
-                frame((-0.42, -0.40), (0.42, 0.40));
-                frame((-0.18, -0.40), (0.18, -0.04));
-                seg((-0.24, 0.20), (0.24, 0.20));
-                seg((-0.24, 0.32), (0.24, 0.32));
-            }
-            Self::SaveAs => {
-                // 软盘缩小让位给右下箭头,两者不重叠
-                frame((-0.46, -0.40), (-0.02, 0.34));
-                frame((-0.28, -0.40), (-0.06, -0.10));
-                seg((-0.32, 0.14), (-0.08, 0.14));
-                seg((0.08, 0.02), (0.44, 0.40));
-                seg((0.44, 0.40), (0.20, 0.40));
-                seg((0.44, 0.40), (0.44, 0.16));
-            }
-            Self::Export => {
-                seg((0.0, -0.42), (0.0, 0.10));
-                path(&[(-0.20, -0.08), (0.0, 0.12), (0.20, -0.08)]);
-                seg((-0.36, 0.30), (0.36, 0.30));
-            }
-            Self::Sidebar => {
-                frame((-0.44, -0.36), (0.44, 0.36));
-                fill((-0.44, -0.36), (-0.24, 0.36));
-            }
-            Self::Theme => {
-                ring((0.0, 0.0), 0.15);
-                // 六条射线,每 60°
-                for step in 0..6 {
-                    let angle = std::f32::consts::PI / 3.0 * step as f32;
-                    let (cos, sin) = (angle.cos(), angle.sin());
-                    seg((cos * 0.26, sin * 0.26), (cos * 0.40, sin * 0.40));
-                }
-            }
-            Self::Ai => {
-                star((0.02, 0.04), 1.0);
-                star((0.32, -0.28), 0.42);
-            }
-            Self::Files => {
-                frame((-0.06, -0.36), (0.42, 0.34));
-                frame((-0.42, -0.28), (0.06, 0.42));
-            }
-            Self::Search => {
-                ring((-0.08, -0.08), 0.20);
-                seg((0.06, 0.06), (0.36, 0.36));
-            }
-            Self::Outline => {
-                for row in [-0.28_f32, 0.0, 0.28] {
-                    dot((-0.30, row), 0.05);
-                    seg((-0.14, row), (0.38, row));
-                }
-            }
-            Self::Git => {
-                dot((-0.28, -0.28), 0.11);
-                dot((-0.28, 0.30), 0.11);
-                dot((0.28, 0.02), 0.11);
-                seg((-0.28, -0.28), (-0.28, 0.30));
-                seg((-0.28, 0.12), (0.28, 0.02));
-            }
-            Self::Settings => {
-                ring((0.0, 0.0), 0.16);
-                seg((0.0, -0.44), (0.0, -0.28));
-                seg((0.0, 0.28), (0.0, 0.44));
-                seg((-0.44, 0.0), (-0.28, 0.0));
-                seg((0.28, 0.0), (0.44, 0.0));
-            }
-            Self::Reset => {
-                // 3/4 圆弧 + 末端箭头:260° → -40°(顺时针收口)
-                let end = arc(
-                    (0.0, 0.0),
-                    0.32,
-                    std::f32::consts::PI * 1.45,
-                    std::f32::consts::PI * 3.05,
-                );
-                seg(end, (end.0 + 0.02, end.1 + 0.20));
-                seg(end, (end.0 + 0.20, end.1 - 0.04));
-            }
-            Self::PanelRight => {
-                frame((-0.44, -0.36), (0.44, 0.36));
-                fill((0.24, -0.36), (0.44, 0.36));
-            }
-            Self::Zen => {
-                ring((0.0, 0.0), 0.30);
-                dot((0.0, 0.0), 0.09);
-            }
-            Self::Minimize => {
-                seg((-0.30, 0.0), (0.30, 0.0));
-            }
-            Self::Maximize => {
-                frame((-0.28, -0.28), (0.28, 0.28));
-            }
-            Self::Restore => {
-                // 后框被前框遮住的左、下两边不画,保持「还原」辨识度
-                path(&[(-0.06, -0.34), (0.34, -0.34), (0.34, 0.06)]);
-                frame((-0.34, -0.06), (0.06, 0.34));
-            }
-            Self::Close => {
-                seg((-0.28, -0.28), (0.28, 0.28));
-                seg((-0.28, 0.28), (0.28, -0.28));
-            }
-            // —— 格式工具条:全部线段/圆点自绘,零字形依赖(ui-polish §1.1)——
-            Self::CodeInline => {
-                path(&[(-0.10, -0.26), (-0.30, 0.0), (-0.10, 0.26)]);
-                path(&[(0.10, -0.26), (0.30, 0.0), (0.10, 0.26)]);
-            }
-            Self::CodeBlock => {
-                frame((-0.42, -0.34), (0.42, 0.34));
-                path(&[(-0.10, -0.16), (-0.24, 0.0), (-0.10, 0.16)]);
-                path(&[(0.10, -0.16), (0.24, 0.0), (0.10, 0.16)]);
-            }
-            Self::Link => {
-                // 两枚斜置 oval(用矩形缺角近似),中间一横连接
-                frame((-0.40, -0.18), (-0.06, 0.18));
-                frame((0.06, -0.18), (0.40, 0.18));
-                seg((-0.06, 0.0), (0.06, 0.0));
-            }
-            Self::Quote => {
-                fill((-0.40, -0.26), (-0.30, 0.26));
-                seg((-0.16, -0.14), (0.40, -0.14));
-                seg((-0.16, 0.14), (0.28, 0.14));
-            }
-            Self::Divider => {
-                seg((-0.44, 0.0), (0.44, 0.0));
-                seg((-0.36, -0.22), (0.36, -0.22));
-                seg((-0.36, 0.22), (0.36, 0.22));
-            }
-            Self::Table => {
-                frame((-0.42, -0.32), (0.42, 0.32));
-                seg((-0.42, -0.08), (0.42, -0.08));
-                seg((0.0, -0.32), (0.0, 0.32));
-            }
-            Self::Image => {
-                frame((-0.44, -0.34), (0.44, 0.34));
-                // 山:一折到底的两段线,落在框的下半部
-                path(&[(-0.32, 0.18), (-0.08, -0.16), (0.14, 0.18)]);
-                // 日:右上实心小圆(半径取线宽量级,大了会糊成一坨)
-                dot((0.28, -0.16), 0.06);
-            }
-            Self::Paragraph => {
-                for (row, stop) in [(-0.30_f32, 0.42), (-0.10, 0.42), (0.10, 0.42), (0.30, 0.20)] {
-                    seg((-0.42, row), (stop, row));
-                }
-            }
-            Self::BulletList => {
-                for row in [-0.26_f32, 0.0, 0.26] {
-                    dot((-0.34, row), 0.06);
-                    seg((-0.18, row), (0.40, row));
-                }
-            }
-            Self::OrderedList => {
-                // 序号用抽象笔画:三条不等长短竖,不与具体字形绑定
-                for (row, length) in [(-0.26_f32, 0.16), (0.0, 0.20), (0.26, 0.12)] {
-                    path(&[
-                        (-0.40, row - length / 2.0),
-                        (-0.34, row - length / 2.0),
-                        (-0.34, row + length / 2.0),
-                    ]);
-                    seg((-0.18, row), (0.40, row));
-                }
-            }
-            Self::TaskList => {
-                frame((-0.42, -0.24), (-0.14, 0.04));
-                // 首框打勾
-                path(&[(-0.38, -0.04), (-0.28, 0.04), (-0.16, -0.16)]);
-                frame((-0.42, 0.16), (-0.14, 0.44));
-                seg((-0.02, -0.10), (0.42, -0.10));
-                seg((-0.02, 0.30), (0.42, 0.30));
-            }
+            Self::New => ph::FILE_PLUS,
+            Self::Open => ph::FOLDER_OPEN,
+            Self::Save => ph::FLOPPY_DISK,
+            Self::SaveAs => ph::FLOPPY_DISK_BACK,
+            Self::Export => ph::EXPORT,
+            Self::Sidebar => ph::SIDEBAR,
+            Self::Theme => ph::PALETTE,
+            Self::Ai => ph::SPARKLE,
+            Self::Files => ph::FOLDERS,
+            Self::Search => ph::MAGNIFYING_GLASS,
+            Self::Outline => ph::TEXT_INDENT,
+            Self::Git => ph::GIT_BRANCH,
+            Self::Settings => ph::GEAR,
+            Self::Reset => ph::ARROW_COUNTER_CLOCKWISE,
+            Self::PanelRight => ph::SQUARE_SPLIT_HORIZONTAL,
+            Self::Zen => ph::ARROWS_OUT,
+            Self::Minimize => ph::MINUS,
+            Self::Maximize => ph::SQUARE,
+            // 窗口「还原」= 两个叠放的方块,phosphor 里 COPY 正是这个形状
+            Self::Restore => ph::COPY,
+            Self::Close => ph::X,
+            Self::CodeInline => ph::CODE,
+            Self::CodeBlock => ph::CODE_BLOCK,
+            Self::Link => ph::LINK,
+            Self::Quote => ph::QUOTES,
+            Self::Divider => ph::MINUS,
+            Self::Table => ph::TABLE,
+            Self::Paragraph => ph::PARAGRAPH,
+            Self::BulletList => ph::LIST_BULLETS,
+            Self::OrderedList => ph::LIST_NUMBERS,
+            Self::TaskList => ph::LIST_CHECKS,
         }
+    }
+
+    /// 画在 `center` 居中处。
+    ///
+    /// phosphor 是**字体**,所以绘制退化成排版一段文本。字体族走
+    /// `Proportional`:`fonts::install` 把 phosphor 作为它的 fallback 插在
+    /// Inter 之后,私有区码位会落到 phosphor 上。若某个 Context 没跑过
+    /// install(无头测试正是如此),码位只是**没字形**,显示豆腐但**不 panic**
+    /// —— 这正是没走「单独一个 `FontFamily::Name` 族」的原因:未绑定族在
+    /// epaint 里是 panic(见 `fonts.rs` 里 SemiBold 那段注释)。
+    pub fn draw(self, painter: &Painter, center: Pos2, size: f32, color: Color32) {
+        let font = egui::FontId::new(size, egui::FontFamily::Proportional);
+        let galley = painter.layout_no_wrap(self.glyph().to_owned(), font, color);
+        let rect = Align2::CENTER_CENTER.anchor_size(center, galley.size());
+        painter.galley(rect.min, galley, color);
+    }
+}
+
+/// 自绘按钮的 hover 底色,**带淡入**(2026-09-27 U3)。
+///
+/// 出厂写法是 `if hovered { 画满 }` —— 硬切,鼠标扫过一排按钮就是一串闪动。
+/// 这里用 egui 自带的 `animate_bool` 拿 0..1 的插值,乘进底色 alpha;不引
+/// 任何动画库(GPL 的 egui_transition_animation 已否)。
+///
+/// **不要用 `WidgetVisuals::expansion` 之类的路子做这个**:它连控件分配尺寸
+/// 一起撑大,会触发 `horizontal_wrapped` 换行、点击落空(见 `theme.rs` 焦点
+/// 环处的注释)。alpha 插值不动布局。
+pub fn hover_fill(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, radius: f32) {
+    let t = ui
+        .ctx()
+        .animate_bool(response.id.with("hover"), response.hovered());
+    if t > 0.0 {
+        let fill = ui.visuals().widgets.hovered.bg_fill.gamma_multiply(t);
+        ui.painter().rect_filled(rect, radius, fill);
     }
 }
 
@@ -344,8 +170,8 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip_text: &str) -> egui::R
     let enabled = ui.is_enabled();
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if response.hovered() && enabled {
-            painter.rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
+        if enabled {
+            hover_fill(ui, &response, rect, RADIUS_SM);
         }
         let color = if enabled {
             ui.visuals().text_color()
@@ -452,19 +278,6 @@ mod tests {
             Icon::Maximize,
             Icon::Restore,
             Icon::Close,
-            // 格式工具条(新增图标务必加进来:本测试是「每条绘制分支都不
-            // panic」的唯一守卫)
-            Icon::CodeInline,
-            Icon::CodeBlock,
-            Icon::Link,
-            Icon::Quote,
-            Icon::Divider,
-            Icon::Table,
-            Icon::Image,
-            Icon::Paragraph,
-            Icon::BulletList,
-            Icon::OrderedList,
-            Icon::TaskList,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {

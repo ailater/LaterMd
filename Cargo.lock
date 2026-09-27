@@ -873,12 +873,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "color_quant"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1277,6 +1271,15 @@ dependencies = [
  "smallvec",
  "unicode-segmentation",
  "web-sys",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -1831,16 +1834,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gif"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
-dependencies = [
- "color_quant",
- "weezl",
-]
-
-[[package]]
 name = "git2"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2244,25 +2237,10 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
- "color_quant",
- "gif",
- "image-webp",
  "moxcms",
  "num-traits",
  "png 0.18.1",
  "tiff",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
-name = "image-webp"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
-dependencies = [
- "byteorder-lite",
- "quick-error",
 ]
 
 [[package]]
@@ -2511,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-ai"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "serde_json",
  "ureq",
@@ -2519,19 +2497,16 @@ dependencies = [
 
 [[package]]
 name = "latermd-app"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
- "arboard",
  "criterion",
  "dark-light",
  "eframe",
- "egui_extras",
+ "egui-phosphor",
  "egui_markdown",
  "egui_markdown_style",
  "ignore",
- "image",
  "latermd-ai",
- "latermd-bed",
  "latermd-creds",
  "latermd-editor",
  "latermd-export",
@@ -2547,46 +2522,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "latermd-bed"
-version = "0.0.2"
-dependencies = [
- "base64 0.23.1",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "latermd-creds"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "keyring",
 ]
 
 [[package]]
 name = "latermd-editor"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "latermd-export"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "latermd-git"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "git2",
 ]
 
 [[package]]
 name = "latermd-mcp"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "latermd-git",
  "latermd-md",
@@ -2597,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-md"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "egui_markdown",
  "pulldown-cmark",
@@ -2605,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "latermd-search"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "grep-searcher",
  "ignore",
@@ -2750,16 +2715,6 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
-
-[[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
 
 [[package]]
 name = "mime_guess2"
@@ -4801,9 +4756,7 @@ checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
 dependencies = [
  "base64 0.23.1",
  "flate2",
- "getrandom 0.4.3",
  "log",
- "mime_guess",
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
