@@ -393,7 +393,7 @@ pub struct LayoutSettings {
 - [ ] `compose::apply` 12 组语义全覆盖（含 CJK 多字节、空选区、toggle off、跨行前缀）
 - [ ] 左栏 180px 下限下无裁切、换行正常
 - [ ] 标题栏：拖动可移动窗口；双击标题区最大化/还原；六按钮 hover/按下两态齐全
-- [ ] 明/暗两套主题下像素采样验收（照 #28 的做法：`import` 截图 + 采样 RGB）
+- [x] 明/暗两套主题下像素采样验收（照 #28 的做法：`import` 截图 + 采样 RGB;2026-09-27 完成,证据见 [m5-acceptance.md](m5-acceptance.md)）
 - [ ] 触摸屏/高分屏无回归（本机 1.0 ppi 无法验，进人工清单）
 
 ---
