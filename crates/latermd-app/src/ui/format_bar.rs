@@ -14,9 +14,9 @@
 //!
 //! ## 为什么要单独一条
 //!
-//! 文件工具栏是「对**文档**做文件级动作」,本条是「对**选区**做文本级动
-//! 作」,心智模型不同;分开之后各自的宽度压力也小得多 —— 十六个按钮平铺
-//! 进文件栏会把文档名挤没。
+//! 文件动作收在左栏顶段(`ui::sidebar` 的 top_actions),本条是「对**选
+//! 区**做文本级动作」,与文件级动作分居两处,心智模型不同;单独一条也让
+//! 十六个按钮有完整的横向空间,不与谁挤。
 
 use crate::command::Command;
 use crate::compose::{FormatAction, FormatGroup};
@@ -37,7 +37,7 @@ pub fn ui(panel: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
 /// 同 [`ui`],额外把每个按钮的 `(动作, 矩形)` 交给 `probe`(`None` 即不探针)。
 ///
 /// 无头测试量按钮位置用:十六个按钮的具体坐标由 `horizontal_wrapped` 的换
-/// 行演算 + 它前面的标签条/文件工具栏共同决定,手搓必然与真实帧错位。
+/// 行演算 + 它前面的标签条/提示行共同决定,手搓必然与真实帧错位。
 pub fn ui_with_probe(
     panel: &mut egui::Ui,
     keymap: &Keymap,

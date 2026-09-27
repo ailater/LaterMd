@@ -217,15 +217,25 @@ impl<'a> View<'a> {
     }
 
     /// 字符偏移 → 字节偏移。
+    ///
+    /// 产出恒为字符边界 —— 本模块全部 `text[a..b]` 切片的唯一边界源头
+    /// (`nth` 产出的本就是边界,floor 是防御层)。将来若有人改动换算,
+    /// 错位输入只会语义偏移,不会 panic。
     fn byte_of(&self, char_idx: usize) -> usize {
-        self.text
+        let byte = self
+            .text
             .char_indices()
             .nth(char_idx)
-            .map_or(self.text.len(), |(byte, _)| byte)
+            .map_or(self.text.len(), |(byte, _)| byte);
+        self.text.floor_char_boundary(byte)
     }
 
     /// 选区所在行的**行尾(不含换行符)**,以及行尾之后到下一个换行
     /// (或文末)的位置。
+    ///
+    /// 两个产出恒为字符边界:`rfind('\n')`/`find('\n')` 落在 `\n` 上,
+    /// `idx + 1` 与 `bytes.end + offset` 因此也是边界 —— `set_prefix` /
+    /// `cycle_task` 直接拿它们切 `&text[a..b]` 是安全的。
     fn selected_line_bytes(&self) -> (usize, usize) {
         let bytes = self.byte_of(self.start)..self.byte_of(self.stop);
         let line_start = self.text[..bytes.start]
@@ -534,6 +544,33 @@ mod tests {
             let (out2, sel2) = apply(action, "甲乙", 99..99);
             assert!(sel2.start <= sel2.end && sel2.end <= out2.chars().count());
         }
+    }
+
+    /// 任务列表 CJK 回归(2026-09-27 用户实测崩溃的语义层覆盖):纯中文行
+    /// 三态循环各两次、空选区、跨多行含 CJK、行中光标(非行首)。全链路
+    /// (真实按钮 + 归约 + 状态栏)的对应回归在 `ui::layout` 测试。
+    #[test]
+    fn task_on_pure_cjk_in_three_selection_shapes() {
+        // 纯中文行,行中光标:三态循环两整圈(六次)后回到起点
+        let mut text = "- 甲乙丙".to_owned();
+        for expected in ["- [ ] 甲乙丙", "- [x] 甲乙丙", "- 甲乙丙"]
+            .iter()
+            .cycle()
+            .take(6)
+        {
+            let (out, _) = apply(FormatAction::Task, &text, 3..3);
+            assert_eq!(&out, expected, "从 {text:?} 推进一档");
+            text = out;
+        }
+
+        // 跨多行含 CJK:覆盖的整行各自推进,选区不越界
+        let (out, sel) = apply(FormatAction::Task, "甲乙\n丙丁戊\n己", 2..6);
+        assert_eq!(out, "- [ ] 甲乙\n- [ ] 丙丁戊\n己");
+        assert!(sel.end <= out.chars().count(), "{sel:?} 越界");
+
+        // 空文本:无行可作用,不 panic 也不产文(行类动作的既有语义)
+        let (out, _) = apply(FormatAction::Task, "", 0..0);
+        assert_eq!(out, "");
     }
 
     /// 分组切片与 `ALL` 对齐:`actions()` 是 `ALL` 的**连续分区**,既不重

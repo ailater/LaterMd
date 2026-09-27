@@ -127,17 +127,35 @@ pub(crate) fn nav_row_center_y(top: f32, tab: SidebarTab) -> f32 {
     top + crate::ui::tokens::NAV_ROW_H * (index as f32 + 0.5)
 }
 
-/// 左栏高频文件动作(docs/ui-shell-redesign.md §5 顶段)。
+/// 左栏高频文件动作(docs/ui-shell-redesign.md §5 顶段;2026-09-27 起
+/// 是文件动作的**唯一常驻按钮入口** —— 编辑器区顶部的文件工具栏退役,
+/// actions 收口到本栏,decisions-pending #32)。
 ///
-/// 这五个在顶部菜单栏里都有,这里是**第二入口**而非迁移 —— 规格的
-/// 「可发现性守恒」要求菜单栏一个不删(ui-polish §1.2「工具栏是高频投影,
-/// 菜单栏负责全部」的同款分工)。`horizontal_wrapped`:左栏拖到 180px 下限
-/// 时换行而不是溢出裁切(R4)。
+/// 全集 = [`Command::FILE`] + `ExportHtml`;AI 与视图开关不在此列
+/// (AI 在菜单栏「AI」,视图开关在标题栏按钮)。菜单栏的菜单项一个不删
+/// —— 这里是快捷入口,不是唯一入口(ui-polish §1.2「菜单栏负责全部」)。
+/// `horizontal_wrapped`:左栏拖到 180px 下限时换行而不是溢出裁切(R4)。
 fn top_actions(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
+    top_actions_with_probe(panel, outbox, None);
+}
+
+/// 同 [`top_actions`],额外把每个按钮的 `(命令, 矩形)` 交给 `probe`。
+///
+/// 无头测试量按钮位置用(与 `ui::format_bar::ui_with_probe` 同款手法):
+/// 按钮坐标由 `horizontal_wrapped` 的换行演算决定,手搓必然与真实帧错位。
+fn top_actions_with_probe(
+    panel: &mut egui::Ui,
+    outbox: &mut Vec<Message>,
+    probe: Option<&mut dyn FnMut(Command, egui::Rect)>,
+) {
+    let mut probe = probe;
     panel.horizontal_wrapped(|ui| {
         for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
             let response =
                 crate::ui::icons::icon_button(ui, cmd.icon(), &tooltip_of(cmd, &Keymap::builtin()));
+            if let Some(probe) = probe.as_deref_mut() {
+                probe(cmd, response.rect);
+            }
             if response.clicked() {
                 outbox.push(cmd.message());
             }
@@ -145,8 +163,8 @@ fn top_actions(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
     });
 }
 
-/// 按钮悬浮提示:命令名 + 出厂键位(与顶部工具栏 `toolbar::button` 同款
-/// 口径;键位可改,这里取的是出厂默认,够指路就够)。
+/// 按钮悬浮提示:命令名 + 出厂键位(键位可改,这里取的是出厂默认,够
+/// 指路就够;改键在设置「快捷键」页)。
 fn tooltip_of(cmd: Command, keymap: &Keymap) -> String {
     match keymap.get(cmd) {
         Some(shortcut) => format!("{}({})", cmd.label(), shortcut.platform_text()),
@@ -1179,6 +1197,159 @@ mod tests {
             search,
             git,
             outbox,
+        );
+    }
+
+    // —— M5 收口:top_actions 是文件动作的唯一常驻按钮入口(编辑器区顶
+    // 部的文件工具栏退役,decisions-pending #32;原 `ui::toolbar` 的测试
+    // 迁移至此)——
+
+    /// 全量命令的 tooltip 口径:命令名 + 出厂键位(键位可改,出厂默认够
+    /// 指路;原 `toolbar::button` 的同款口径)。
+    #[test]
+    fn top_actions_tooltip_carries_label_and_builtin_shortcut() {
+        let keymap = Keymap::builtin();
+        for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
+            let tooltip = tooltip_of(cmd, &keymap);
+            assert!(
+                tooltip.starts_with(cmd.label()),
+                "{cmd:?}: tooltip 应以命令名开头:{tooltip}"
+            );
+            if let Some(shortcut) = keymap.get(cmd) {
+                let platform = shortcut.platform_text();
+                assert!(
+                    tooltip.contains(&platform),
+                    "{cmd:?}: tooltip 应带键位 {platform}:{tooltip}"
+                );
+            }
+        }
+    }
+
+    /// 全量文件动作按钮逐个点得动:真实 `top_actions_with_probe` 路径下
+    /// 点击各发对应命令消息(原 `toolbar_button_sends_command_message` 的
+    /// 全量版;仅渲染帧不产消息)。
+    #[test]
+    fn clicking_every_top_action_sends_its_command() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let commands: Vec<Command> = Command::FILE
+            .iter()
+            .copied()
+            .chain([Command::ExportHtml])
+            .collect();
+        let ctx = egui::Context::default();
+        let rects = Rc::new(RefCell::new(Vec::<(Command, Rect)>::new()));
+
+        // 帧 1:探针拿按钮矩形(仅渲染,顺带断言不产消息)
+        {
+            let sink = rects.clone();
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                super::top_actions_with_probe(
+                    ui,
+                    &mut Vec::new(),
+                    Some(&mut |cmd, rect| {
+                        sink.borrow_mut().push((cmd, rect));
+                    }),
+                );
+            });
+            output.drop_without_applying_deltas();
+        }
+        let rects = rects.borrow().clone();
+        assert_eq!(
+            rects.iter().map(|(cmd, _)| *cmd).collect::<Vec<_>>(),
+            commands,
+            "按钮全集 = Command::FILE + ExportHtml,不多不少"
+        );
+
+        // 每按钮三帧(moved / press / release):点击发出对应消息
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for (cmd, rect) in rects {
+            let mut outbox = Vec::new();
+            let center = rect.center();
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(center, true)],
+                vec![click(center, false)],
+            ] {
+                let output = ctx.run_ui(
+                    RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| super::top_actions_with_probe(ui, &mut outbox, None),
+                );
+                output.drop_without_applying_deltas();
+            }
+            assert_eq!(outbox, vec![cmd.message()], "{cmd:?} 按钮点击出对应消息");
+        }
+    }
+
+    /// hover 出 tooltip:指针停在按钮上时,tooltip 文本(含出厂键位)真实
+    /// 渲染出来(`everything_is_visible` 是 egui 自己的 UI 测试手法,免去
+    /// tooltip 延迟)。
+    #[test]
+    fn hovering_top_action_shows_shortcut_tooltip() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ctx = egui::Context::default();
+        let save_rect = Rc::new(RefCell::new(Rect::NOTHING));
+        {
+            let sink = save_rect.clone();
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                super::top_actions_with_probe(
+                    ui,
+                    &mut Vec::new(),
+                    Some(&mut |cmd, rect| {
+                        if cmd == Command::Save {
+                            *sink.borrow_mut() = rect;
+                        }
+                    }),
+                );
+            });
+            output.drop_without_applying_deltas();
+        }
+        let center = save_rect.borrow().center();
+        assert!(center.x > 0.0, "探针拿到保存按钮");
+
+        ctx.memory_mut(|mem| mem.set_everything_is_visible(true));
+        // 两帧:hover 判定用上一帧的指针位置,tooltip 在下一帧才渲染
+        let mut shapes = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![Event::PointerMoved(center)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| super::top_actions_with_probe(ui, &mut Vec::new(), None),
+            );
+            shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+        }
+        let shortcut = Keymap::builtin()
+            .get(Command::Save)
+            .map(|s| s.platform_text())
+            .unwrap_or_default();
+        let expected = format!("保存({shortcut})");
+        let painted: Vec<String> = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.iter().any(|t| t.contains(&expected)),
+            "tooltip 应含 {expected:?},实际画出的文本:{painted:?}"
         );
     }
 }

@@ -154,7 +154,7 @@ egui::CentralPanel::default()
 
 | 段 | 高度 | 内容 |
 |---|---|---|
-| **顶段·动作行** | 固定 ~32px | 新建 / 打开 / 保存 / 另存为 / 导出 —— 五个图标按钮（`Icon::New/Open/Save/SaveAs/Export` 已存在）。横向 `horizontal_wrapped`，窄时换行不裁切 |
+| **顶段·动作行** | 固定 ~32px | **文件动作全集**：新建 / 打开 / 保存 / 另存为 / 导出 HTML —— 五个图标按钮（`Command::FILE` + `ExportHtml`；2026-09-27 起是文件动作的**唯一常驻按钮入口**，decisions-pending #32）。横向 `horizontal_wrapped`，窄时换行不裁切 |
 | **次段·视图导航** | 固定 ~4 行 | 文件树 / 搜索 / 大纲 / Git —— 竖排列表行，**整行选中态**：`selected_bg` 底 + 左侧 2px `accent` 竖条（照抄 #28 已画的页签选中态）
 
                                                                                                    点击只发 `Message::SidebarTabChanged(tab)` |
@@ -176,8 +176,11 @@ ScrollArea::vertical()
 不用嵌套 `Panel`（会造成 widget id 与 z-order 意外），也不用 `bottom_up`（左右 snap 会让
 网段的阅读顺序与代码顺序相反，后续读代码的人必踩）。
 
-> **可发现性守恒**：原 top menubar 的命令一个不删；左栏顶段的五个是「高频」，等于给了第二入口。
-> 这与 ui-polish §1.2 定的「工具栏是高频投影，菜单栏负责全部」一致。
+> **可发现性守恒**：原 top menubar 的命令一个不删。2026-09-27 修订（decisions-pending
+> #32）：编辑器区顶部的文件工具栏（`ui/toolbar.rs`，ui-polish 批次产物）与左栏顶段
+> 重复，**整体退役**；文件动作收口为左栏顶段图标版 + 菜单栏菜单项两个入口。工具栏的
+> AI 下拉不补（菜单栏「AI」已有），`ToggleSidebar`/`ToggleTheme` 不补（标题栏 `┃左`、
+> 菜单栏「视图」与设置浮窗外观页已有）；`document.notice` 提示行迁编辑器面板顶。
 
 ---
 
@@ -369,6 +372,14 @@ pub struct LayoutSettings {
 | **M3** 格式工具条 | `compose.rs`（纯函数 + 12 用例单测）、`ui/format_bar.rs`、12 个 `Command` + 键位、`EditorBuffer::replace_range`、`TabState::selection/pending_selection` 回填链路 | D3 | 3d |
 | **M4** 禅定 | 进出 `pre_zen` 快照、限宽 720 居中、退出三入口 | M1 | 1d |
 | **M5** 收口 | 六项门禁 + 像素验收截图 + 期 `layout.json` 持久化 + 文档回写 | 全部 | 1.5d |
+
+**落地记录（2026-09-27，M5 收口棒）**：M1–M4 合入 main 后的第二批用户反馈两项已处理——
+①文件工具栏退役、文件动作收口左栏图标版（§5 / decisions-pending #32）；
+②任务列表 CJK 崩溃：根因不在 `compose.rs`（字符口径全程安全、不可 panic），而是格式归约
+整篇替换文本后，状态栏（绘制序先于编辑器）同帧拿按**旧文本**折出的 `cursor.byte` 切
+**新文本**，`byte index not a char boundary` panic。修复 = `cursor_position` 收缩到字符
+边界 + `apply_format` 把失效字节重折算；全链路回归（真实 Task 按钮 ×7 连点 + 归约 +
+状态栏）与 compose 层三情形（空选区 / 跨多行 CJK / 行中光标）测试钉住。
 
 **每个里程碑出口都要跑**（AGENTS §8 的既有约定，CI 只在 main 跑）：
 `cargo fmt --all --check`、三轮 `cargo clippy --workspace --all-targets -D warnings`

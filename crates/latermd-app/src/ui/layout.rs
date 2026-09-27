@@ -200,7 +200,7 @@ impl LaterMdApp {
                 );
             });
 
-        // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条与文件工具栏在其上。
+        // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条/提示行/格式工具条在其上。
         // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
         //
         // 曾经用 `Panel::left("editor")` 承载:那之后中央残余区由无人认领
@@ -223,9 +223,11 @@ impl LaterMdApp {
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
             .show(ui, |ui| {
-                // 标签条(多标签 #11)在文件工具栏之上:先选文档,再对文档操作
+                // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作
                 crate::ui::tabs::ui(ui, &state.tabs, outbox);
-                crate::ui::toolbar::ui(ui, &state.tabs.current().document, &state.keymap, outbox);
+                // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
+                // decisions-pending #32)
+                notice_bar(ui, &state.tabs.current().document, outbox);
                 let tab = state.tabs.current_mut();
                 let crate::tabs::TabState {
                     editor,
@@ -566,10 +568,36 @@ fn separator(ui: &mut egui::Ui) {
     ui.weak("·");
 }
 
+/// 编辑器面板顶部的提示行(存在才显示):保存失败、撞键拒绝等需要用户
+/// 知晓并手动收起的提示。原文件工具栏的能力,工具栏退役后迁此保持不变
+/// (decisions-pending #32)。返回「知道了」按钮的响应(`None` = 本帧无
+/// 提示;测试定位用,与 `checkout_dialog` 同款手法)。
+fn notice_bar(
+    ui: &mut egui::Ui,
+    document: &crate::state::DocumentState,
+    outbox: &mut Vec<Message>,
+) -> Option<egui::Response> {
+    let notice = document.notice.as_deref()?;
+    let mut dismiss = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(ui.visuals().error_fg_color, notice);
+        let button = ui.small_button("知道了");
+        if button.clicked() {
+            outbox.push(Message::NoticeDismissed);
+        }
+        dismiss = Some(button);
+    });
+    dismiss
+}
 /// 光标行列(1 起):行按换行数,列按该行字符数(中文按字计,与编辑器
 /// 的视觉列一致)。
+///
+/// `byte` 可能是**过期快照**:格式动作在归约侧整篇替换文本,而本函数在
+/// 同一帧的绘制序里先于编辑器跑,拿到的还是按旧文本折出的字节(状态栏
+/// 2026-09-27 实测崩溃:「byte index not a char boundary」)。收缩到字符
+/// 边界而非钳长,越界与非边界一并兜住。
 fn cursor_position(text: &str, byte: usize) -> (usize, usize) {
-    let byte = byte.min(text.len());
+    let byte = text.floor_char_boundary(byte.min(text.len()));
     let before = &text[..byte];
     let line = before.matches('\n').count() + 1;
     let col = before.chars().rev().take_while(|ch| *ch != '\n').count() + 1;
@@ -1648,7 +1676,7 @@ mod tests {
     /// **真实帧里的工具条点击**:走完 `LaterMdApp::draw` 的五帧节奏能把加粗
     /// 按钮点出来(M3 验收点)。
     ///
-    /// 按钮位置由内置探针给出 —— 它前面压着标签条与文件工具栏,高度是布局
+    /// 按钮位置由内置探针给出 —— 它前面压着标签条与提示行,高度是布局
     /// 演算的结果,手搓坐标必然与真实帧错位(M2 已经在标题栏上踩过一次)。
     /// 只断言「消息出来了」:后面「消息 → 文本」那一截归 `state::tests`,
     /// 分层是因为 TextEdit 内部会对 `CCursorRange` 做归一化,把两者捆在一
@@ -1706,6 +1734,203 @@ mod tests {
             vec![Message::FormatRequested(FormatAction::Bold)],
             "工具条按钮在真实三栏帧里点得动,且不被相邻控件抢走"
         );
+    }
+
+    /// 任务列表崩溃回归(2026-09-27 用户实测「点几次就崩溃」)。
+    ///
+    /// 全链路:真实 `reduce`+`draw`、真实格式条 Task 按钮、CJK 文本行中
+    /// 光标,三态循环两整圈(六次点击)。崩溃机制:格式归约整篇替换文本
+    /// 后,状态栏(绘制序先于编辑器)拿按**旧文本**折出的 `cursor.byte`
+    /// 切**新文本**,`byte index not a char boundary` panic —— 修复在
+    /// `cursor_position` 的边界收缩与 `apply_format` 的字节重折算。
+    #[test]
+    fn task_button_cycling_on_cjk_never_panics() {
+        use crate::compose::FormatAction;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("纯中文行\n第二行乙");
+        let id = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+
+        let center = Rc::new(RefCell::new(egui::Pos2::ZERO));
+        {
+            let sink = center.clone();
+            app.format_probe = Some(Box::new(move |action, rect| {
+                if action == FormatAction::Task {
+                    *sink.borrow_mut() = rect.center();
+                }
+            }));
+        }
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.reduce(ui.ctx());
+                    app.draw(ui);
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        frame(&mut app, Vec::new());
+        app.format_probe = None;
+        let center = *center.borrow();
+        assert!(center.x > 0.0, "探针拿到 Task 按钮:{center:?}");
+
+        // 光标落在首行行中(非行首,字符 2)并聚焦
+        let mut st = egui::widgets::text_edit::TextEditState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(2),
+        )));
+        st.store(&ctx, id);
+        ctx.memory_mut(|mem| mem.request_focus(id));
+
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let states = ["- [ ] 纯中文行", "- [x] 纯中文行", "- 纯中文行"];
+        for cycle in 0..6 {
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+                Vec::new(),
+            ] {
+                frame(&mut app, events);
+            }
+            let head = app
+                .state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                head,
+                states[cycle % 3],
+                "第 {} 次点击后首行应为三态之一",
+                cycle + 1
+            );
+        }
+        // 第七次点击:周期闭环,回到未勾态
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+            Vec::new(),
+        ] {
+            frame(&mut app, events);
+        }
+        let head = app
+            .state
+            .tabs
+            .current()
+            .editor
+            .text()
+            .lines()
+            .next()
+            .unwrap();
+        assert_eq!(head, "- [ ] 纯中文行", "三态周期 3:第七次点击回到未勾态");
+    }
+
+    /// 状态栏行列换算对**非边界字节**不 panic:过期快照的字节可能落在
+    /// CJK 字符中间(见 `task_button_cycling_on_cjk_never_panics` 的机制
+    /// 说明),收缩到所属字符起点而不是 panic。
+    #[test]
+    fn cursor_position_tolerates_stale_mid_char_bytes() {
+        let text = "- [ ] 纯中文行\n第二行乙";
+        // 字节 14 落在 '文'(12..15)中间 —— 崩溃帧的实值;收缩到 '中'
+        // 之后(字节 12),按字符计列
+        let (line, col) = cursor_position(text, 14);
+        assert_eq!((line, col), (1, 9));
+        // 越界钳制到文末仍是合法行为
+        let (line, _) = cursor_position(text, 10_000);
+        assert_eq!(line, 2);
+        // 正常路径不变
+        assert_eq!(cursor_position("abc", 2), (1, 3));
+        assert_eq!(cursor_position("甲乙\n丙", 7), (2, 1), "第二行行首");
+    }
+
+    /// 提示行(原文件工具栏的能力,工具栏退役后迁到编辑器面板顶,
+    /// decisions-pending #32):有提示时渲染提示文本与「知道了」,点击发
+    /// `NoticeDismissed`;无提示不渲染任何东西。
+    #[test]
+    fn notice_bar_shows_notice_and_dismiss_button_sends_message() {
+        use crate::state::DocumentState;
+
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+        let document = DocumentState {
+            path: None,
+            dirty: false,
+            notice: Some("Ctrl+S 已被「导出 HTML」占用".to_owned()),
+        };
+
+        // 帧 1:渲染拿「知道了」按钮位置
+        ctx.run_ui(RawInput::default(), |ui| {
+            let dismiss = notice_bar(ui, &document, &mut outbox);
+            rect.set(dismiss.expect("有提示必有按钮").rect);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产消息");
+        assert!(rect.get().width() > 0.0, "按钮有实测矩形");
+
+        // 帧 2-4:点「知道了」→ NoticeDismissed
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    notice_bar(ui, &document, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::NoticeDismissed]);
+
+        // 无提示:不渲染按钮
+        let clean = DocumentState {
+            path: None,
+            dirty: false,
+            notice: None,
+        };
+        ctx.run_ui(RawInput::default(), |ui| {
+            assert!(notice_bar(ui, &clean, &mut Vec::new()).is_none());
+        })
+        .drop_without_applying_deltas();
     }
 
     /// 跑若干帧 draw(sizing pass 之后 widget 才参与命中测试)。
@@ -1827,8 +2052,8 @@ mod tests {
             zen.iter().any(|t| t.contains("未命名")),
             "窗口 chrome 保留:{zen:?}"
         );
-        // menubar / 状态栏 / 侧边栏 / 文件工具栏的专属文案全部消失
-        for gone in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+        // menubar / 状态栏 / 侧边栏 / 格式工具条的专属文案全部消失
+        for gone in ["文件", "248 字", "未选择根目录", "无序列表"] {
             assert!(
                 !zen.iter().any(|t| t.contains(gone)),
                 "禅定帧里不该出现 {gone:?}:{zen:?}"
@@ -1836,9 +2061,10 @@ mod tests {
         }
         // 取证信号都取「只有那一条 panel 才会画」的专属文案:
         // 「文件」= menubar 首项、「248 字」= statusbar 的字数统计、
-        // 「未选择根目录」= 左栏文件树、「Ctrl+N」= 编辑器上方文件工具栏的 tooltip
-        // (tooltip 只在 hover 时才画,故改用同样只属于它的「导出 HTML」按钮文案)
-        for present in ["文件", "248 字", "未选择根目录", "导出 HTML"] {
+        // 「未选择根目录」= 左栏文件树、「无序列表」= 编辑器上方格式工具条
+        // 的按钮 tooltip(只在 hover 时才画;改用按钮本体自绘的「H1」字形
+        // 文案 —— 它只由格式工具条的 rich 按钮画出)
+        for present in ["文件", "248 字", "未选择根目录", "H1"] {
             assert!(
                 three.iter().any(|t| t.contains(present)),
                 "取证有效:三栏帧里能找到 {present:?}"

@@ -323,58 +323,8 @@ impl Icon {
     }
 }
 
-/// 工具栏按钮:图标 + 文字 + 右侧灰阶快捷键。
-///
-/// 为什么不复用 `egui::Button`:它不接受自绘图标(只认 `TextureId`),且
-/// `shortcut_text` 在窄面板下会把按钮撑爆。这里改为手工
-/// `allocate_exact_size` + `Painter` 绘制:宽度按内容精确计算,`ui` 处于
-/// 禁用态时整体走 weak 前景色且点击不触发。
-pub fn icon_text_button(
-    ui: &mut egui::Ui,
-    icon: Icon,
-    label: &str,
-    shortcut: Option<&str>,
-) -> egui::Response {
-    let (rect, response) = allocate_button(ui, label, shortcut);
-    let color = ui.visuals().text_color();
-    let weak = ui.visuals().weak_text_color();
-    let enabled = ui.is_enabled();
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let hovered = response.hovered() && enabled;
-        if hovered {
-            painter.rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
-        }
-        let icon_color = if enabled { color } else { weak };
-        icon.draw(
-            painter,
-            egui::pos2(rect.left() + SPACE_SM + ICON / 2.0, rect.center().y),
-            ICON,
-            icon_color,
-        );
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        painter.text(
-            egui::pos2(rect.left() + SPACE_SM + ICON + SPACE_XS, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            font.clone(),
-            icon_color,
-        );
-        if let Some(shortcut) = shortcut {
-            painter.text(
-                egui::pos2(rect.right() - SPACE_SM, rect.center().y),
-                Align2::RIGHT_CENTER,
-                shortcut,
-                font,
-                weak,
-            );
-        }
-    }
-    tooltip(response, label, shortcut)
-}
-
-/// 纯图标按钮(工具栏右侧的齿轮等):宽度只够一个图标,语义靠 tooltip 补。
+/// 纯图标按钮(左栏顶段动作、标题栏齿轮等):宽度只够一个图标,语义靠
+/// tooltip 补。
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip_text: &str) -> egui::Response {
     let size = egui::vec2(ICON + 2.0 * SPACE_SM, TOOLBAR_H);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -460,48 +410,6 @@ pub fn icon_tab(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> e
     response
 }
 
-/// 按钮宽度:图标 + 间隙 + 文字(+ 快捷键),两侧内边距。
-fn allocate_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    shortcut: Option<&str>,
-) -> (Rect, egui::Response) {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let weak = ui.visuals().weak_text_color();
-    let label_w = ui
-        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_owned(), font.clone(), weak))
-        .rect
-        .width();
-    let shortcut_w = shortcut
-        .map(|text| {
-            ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font.clone(), weak))
-                .rect
-                .width()
-        })
-        .unwrap_or(0.0);
-    let width = SPACE_SM
-        + ICON
-        + SPACE_XS
-        + label_w
-        + if shortcut.is_some() {
-            SPACE_XS * 2.0 + shortcut_w
-        } else {
-            0.0
-        }
-        + SPACE_SM;
-    let size = egui::vec2(width, TOOLBAR_H);
-    ui.allocate_exact_size(size, egui::Sense::click())
-}
-
-/// 悬浮提示:`label` 单列;有快捷键时附在括号内 —— 按钮上已显示键位,
-/// tooltip 里再给一次是为了让纯图标按钮也有可发现性。
-fn tooltip(response: egui::Response, label: &str, shortcut: Option<&str>) -> egui::Response {
-    match shortcut {
-        Some(shortcut) => response.on_hover_text(format!("{label} ({shortcut})")),
-        None => response.on_hover_text(label),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,48 +446,6 @@ mod tests {
             });
             output.drop_without_applying_deltas();
         }
-    }
-
-    /// 图标按钮可点击:三帧合成点击后 `clicked` 为真;仅渲染不产生点击。
-    #[test]
-    fn icon_text_button_clickable() {
-        let ctx = egui::Context::default();
-        let rect = std::cell::Cell::new(Rect::NOTHING);
-        let mut clicked = false;
-
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let response = icon_text_button(ui, Icon::Save, "保存", Some("Ctrl+S"));
-            rect.set(response.rect);
-            clicked = response.clicked();
-        });
-        output.drop_without_applying_deltas();
-        assert!(!clicked, "仅渲染不产生点击");
-        assert!(rect.get().width() > ICON, "宽度容纳图标与文字");
-
-        let center = rect.get().center();
-        let click = |pressed| egui::Event::PointerButton {
-            pos: center,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        for events in [
-            vec![egui::Event::PointerMoved(center)],
-            vec![click(true)],
-            vec![click(false)],
-        ] {
-            let output = ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    clicked = icon_text_button(ui, Icon::Save, "保存", Some("Ctrl+S")).clicked();
-                },
-            );
-            output.drop_without_applying_deltas();
-        }
-        assert!(clicked, "按钮可点击");
     }
 
     /// 页签:选中态与未选中态都能渲染,点击返回 clicked(选中与否由调用方
