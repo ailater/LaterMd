@@ -139,7 +139,17 @@ impl LaterMdApp {
             crate::ui::menubar::ui(ui, &self.state.keymap, &mut self.outbox);
         });
 
-        // ② 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
+        // ② 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
+        // (docs/ui-polish.md §4),工具栏得以只留动作。
+        //
+        // **必须在左右栏之前加**:先加的最外层、先画者占满全窗横向 ——
+        // 若放在 nav/preview 之后,它就只在中央残余区里横跨,左右栏脚下
+        // 各缺一截(2026-09-27 用户实测反馈的第二条)。
+        egui::Panel::bottom("statusbar").show(ui, |ui| {
+            status_bar(ui, &self.state);
+        });
+
+        // ③ 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
         // 原地持有 `&mut bool`,因此先解构再把闭包要用的其余状态分头借用
         // (都与这两个 bool 不相交)。
         //
@@ -168,7 +178,7 @@ impl LaterMdApp {
                 );
             });
 
-        // ③ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
+        // ④ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
         // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
         // 都只是让中间伸缩,不会挤掉谁。
         let right = &mut self.state.layout.right;
@@ -190,17 +200,28 @@ impl LaterMdApp {
                 );
             });
 
-        // ④ 编辑器:源文本这份唯一真源住在中间,标签条与文件工具栏在其上。
+        // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条与文件工具栏在其上。
         // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
+        //
+        // 曾经用 `Panel::left("editor")` 承载:那之后中央残余区由无人认领
+        // 的背景补位,预览左侧多出一条侧栏色的黑条(2026-09-27 用户实测
+        // 反馈的第一条)。编辑器回到 `CentralPanel` 才真正「吃掉剩余宽度」。
         //
         // TextEdit 是立即模式控件,必须原地持有 `&mut` 缓冲,故 editor /
         // preview 快照 / 大纲光标的借用下放到本闭包内(归约/绘制二分对这对
         // 「控件附属状态」的例外见 state.rs)。
         let state = &mut self.state;
         let outbox = &mut self.outbox;
-        egui::Panel::left("editor")
-            .resizable(true)
-            .default_size(500.0)
+        // 编辑器区显式铺内容色:panel 默认 fill 是 `panel_fill`(侧栏色),
+        // 不覆盖的话编辑器与右预览会出现两种底色(theme.rs 的口径是
+        // 「编辑器与预览面板显式 .fill;侧栏吃 panel_fill」)。margin 取
+        // `Frame::side_top_panel` 的出厂值,不因换底挪动既有布局。
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+            )
             .show(ui, |ui| {
                 // 标签条(多标签 #11)在文件工具栏之上:先选文档,再对文档操作
                 crate::ui::tabs::ui(ui, &state.tabs, outbox);
@@ -322,13 +343,7 @@ impl LaterMdApp {
             }
         }
 
-        // ⑧ 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
-        // (docs/ui-polish.md §4),工具栏得以只留动作。
-        egui::Panel::bottom("statusbar").show(ui, |ui| {
-            status_bar(ui, &self.state);
-        });
-
-        // ⑨ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
+        // ⑥ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
         // 全部 panel 之后分配**(机制见 ui::titlebar::edge_resize_zones 的
         // 文档:同层命中、后分配者在同距裁决中胜出);此处光标推进位于
         // 所有面板之后,不影响任何 panel 的布局。
@@ -1488,6 +1503,148 @@ mod tests {
         );
     }
 
+    /// M5 收口:标题栏齿轮(2026-09-27 迁自左栏底段设置行)在**完整
+    /// frameless draw** 路径下点得动,且走完归约后设置对话框真的打开
+    /// (decisions-pending #31;左栏版本的能力迁移验收点)。
+    ///
+    /// 帧序与 `frameless_draw_renders_and_toggles_sidebar_via_titlebar`
+    /// 同款:按钮矩形由 `titlebar::button_rects` 与绘制同源给出。
+    #[test]
+    fn titlebar_settings_gear_opens_the_dialog() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        assert!(!app.state.settings.open);
+
+        let bar = Rect::from_min_max(
+            screen.left_top(),
+            screen.left_top() + egui::vec2(screen.width(), crate::ui::tokens::TITLEBAR_H),
+        );
+        let gear = crate::ui::titlebar::TitleButton::Settings;
+        let index = crate::ui::titlebar::TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == gear)
+            .unwrap();
+        let center = crate::ui::titlebar::button_rects(bar)[index].center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // sizing pass → moved → press → release:面板层前几遍 widget 不参与
+        // 命中测试,与既有点击测试同一节奏
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        assert_eq!(
+            app.outbox,
+            vec![Message::SettingsOpened(
+                crate::settings::SettingsTab::Appearance
+            )],
+            "齿轮点击发默认页消息,不被相邻窗口按钮/边缘命令区抢走"
+        );
+
+        // 下一帧归约:对话框开关翻转,再画一帧浮窗真实渲染不 panic
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+        assert!(app.state.settings.open, "归约后设置对话框已打开");
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        )
+        .drop_without_applying_deltas();
+    }
+
+    /// M5 收口(2026-09-27 修复用户实测回归):非禅定态的 panel 序列恰为
+    /// titlebar / menubar / statusbar / nav / preview + 中央编辑器。
+    ///
+    /// 三条取证分别对应三条反馈:
+    /// - 顺序:标题栏最顶、菜单栏次之、状态栏贴底(文本矩形自上而下);
+    /// - 状态栏**横跨全窗底部**:它的文本落在左栏脚下(x < 左栏宽度)——
+    ///   修复前 statusbar 画在左右栏之后,被夹在中央残余区,文本 x 必然
+    ///   大于左栏宽度;
+    /// - **无黑条**:中央竖直带上的采样点全部被内容色矩形盖住 —— 编辑器
+    ///   曾用 `Panel::left`,其后中央残余区无人认领,预览左侧多一条侧栏
+    ///   色的黑条;回到 `CentralPanel` 后 nav 右缘到 preview 左缘连续覆盖。
+    #[test]
+    fn panel_order_spans_statusbar_and_fills_the_center() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+
+        let shapes = draw_shapes(&mut app, &ctx, screen);
+        let title = topmost_text(&shapes, "LaterMD —");
+        let menubar = topmost_text(&shapes, "文件");
+        let status = topmost_text(&shapes, "248 字");
+        let nav = topmost_text(&shapes, "未选择根目录");
+
+        // 自上而下:标题栏 → 菜单栏(都在自己那条带里)
+        assert!(
+            title.top() < crate::ui::tokens::TITLEBAR_H,
+            "标题栏最顶:{title:?}"
+        );
+        assert!(
+            menubar.top() > crate::ui::tokens::TITLEBAR_H && menubar.top() < 100.0,
+            "菜单栏紧随标题栏:{menubar:?}"
+        );
+        // 状态栏贴底且横跨:文本 x 落在左栏宽度以内(左栏 default 240)
+        assert!(
+            status.top() > screen.height() - 40.0,
+            "状态栏贴底:{status:?}"
+        );
+        assert!(
+            status.left() < 100.0,
+            "状态栏横跨全窗底部(文本须在左栏脚下):{status:?}"
+        );
+        // 左栏在左,右缘不超过 default 宽度(240)放一点余量
+        assert!(
+            nav.left() < 240.0 && nav.right() < 260.0,
+            "左栏在左侧:{nav:?}"
+        );
+
+        // 无黑条:menubar 与 statusbar 之间的中央高度上,从左栏右缘到
+        // 右栏内部连续被内容色覆盖。黑条回归时(编辑器窄 left panel 之右、
+        // 预览之左)采样点会露背景色。
+        let content = crate::theme::content_fill(true);
+        for x in [250.0, 500.0, 760.0, 800.0, 1100.0] {
+            let probe = egui::pos2(x, 400.0);
+            assert!(
+                covered_by_fill(&shapes, content, probe),
+                "({x}, 400) 未被内容色覆盖:中央区有黑条"
+            );
+        }
+    }
+
     /// **真实帧里的工具条点击**:走完 `LaterMdApp::draw` 的五帧节奏能把加粗
     /// 按钮点出来(M3 验收点)。
     ///
@@ -1568,7 +1725,17 @@ mod tests {
     /// 跑两帧完整 draw(sizing pass 之后布局演算才稳定),返回第二帧的绘制
     /// 产物供像素层取证。
     fn draw_frame(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect) -> Vec<String> {
-        let mut painted = Vec::new();
+        painted_text(&draw_shapes(app, ctx, screen))
+    }
+
+    /// [`draw_frame`] 的 shapes 版:文本之外还要量 fill 矩形(布局取证要的
+    /// 不只是「画没画」,还有「画在哪、盖多宽」)。
+    fn draw_shapes(
+        app: &mut LaterMdApp,
+        ctx: &egui::Context,
+        screen: Rect,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let mut shapes = Vec::new();
         for i in 0..2 {
             let output = ctx.run_ui(
                 RawInput {
@@ -1578,17 +1745,17 @@ mod tests {
                 |ui| app.draw(ui),
             );
             if i == 1 {
-                painted = painted_text(&output);
+                shapes = output.shapes.clone();
             }
             output.drop_without_applying_deltas();
         }
-        painted
+        shapes
     }
 
     /// 本帧**真的画出来的所有文本**(取自 shapes,不是布局意图)。
-    fn painted_text(output: &FullOutput) -> Vec<String> {
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         let mut texts = Vec::new();
-        for clipped in &output.shapes {
+        for clipped in shapes {
             if let egui::epaint::Shape::Text(text) = &clipped.shape {
                 for line in text.galley.job.text.split('\n') {
                     texts.push(line.to_owned());
@@ -1596,6 +1763,42 @@ mod tests {
             }
         }
         texts
+    }
+
+    /// 文本 → 其包围盒里**最靠上**的那一处(同名文案可能出现在多个 panel,
+    /// 「文件」既是菜单栏首项又是左栏导航首行;断言 panel 顺序要的是前者)。
+    fn topmost_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Rect {
+        shapes
+            .iter()
+            .filter_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                text.galley
+                    .job
+                    .text
+                    .split('\n')
+                    .any(|line| line.contains(needle))
+                    .then_some(clipped.shape.visual_bounding_rect())
+            })
+            .min_by_key(|rect| rect.top().to_bits())
+            .unwrap_or_else(|| panic!("{needle:?} 未绘制"))
+    }
+
+    /// `color` 填充矩形是否盖住 `pos`(布局取证:中央区不允许再出现无人
+    /// 认领的背景条 —— 黑条回归时采样点上没有任何内容色矩形)。
+    fn covered_by_fill(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+        pos: egui::Pos2,
+    ) -> bool {
+        shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Rect(shape)
+                    if shape.fill == color && shape.rect.contains(pos)
+            )
+        })
     }
 
     /// 禅定是**另一套 panel 组合**:三栏路径的 menubar / nav / editor /

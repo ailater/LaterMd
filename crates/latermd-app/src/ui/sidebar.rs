@@ -20,7 +20,6 @@ use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
 use crate::git_panel::GitPanelState;
 use crate::keymap::Keymap;
 use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
-use crate::settings::SettingsTab;
 use crate::state::{Message, SidebarTab};
 use latermd_git::{CommitInfo, FileStatus, StatusKind};
 use latermd_md::OutlineItem;
@@ -41,11 +40,11 @@ pub struct OutlineView<'a> {
     pub cursor_byte: Option<usize>,
 }
 
-/// 绘制左栏(**三段式**,docs/ui-shell-redesign.md §5,D3 已拍板):
-/// 顶段高频文件动作 → 次段四行视图导航 → 中段视图内容(吃掉剩余高度)
-/// → 底段设置。
+/// 绘制左栏(docs/ui-shell-redesign.md §5,D3 已拍板;2026-09-27 修订,
+/// 见 decisions-pending #31):顶段高频文件动作 → 次段四行视图导航 →
+/// 中段视图内容(吃掉剩余高度)。原「底段设置」行已迁至标题栏右端齿轮。
 ///
-/// 中段「吃掉剩余」用手算 `max_height = available - NAV_BOTTOM_H`,不上
+/// 中段「吃掉剩余」由 `ScrollArea` 的 `max_height = available` 承担,不上
 /// 嵌套 `Panel`(会造成 widget id 与 z-order 意外),也不用 `bottom_up`
 /// (左右 snap 会让各段的阅读顺序与代码顺序相反)。
 ///
@@ -79,15 +78,11 @@ pub fn ui(
     view_nav(panel, *active_tab, outbox);
     let y2 = panel.cursor().top();
     panel.separator();
-    // 底段高度从 available 里预扣:设置行高 + 它上面那条 `item_spacing`
-    // (不扣的话借助 stats 看不出,实测会溢出 3px 把底段挤到可视区外)
-    let reserved = crate::ui::tokens::NAV_BOTTOM_H + panel.spacing().item_spacing.y;
-    let body_height = (panel.available_height() - reserved).max(0.0);
     let y3 = panel.cursor().top();
     egui::ScrollArea::vertical()
         .id_salt("nav-body")
         .auto_shrink([false, false])
-        .max_height(body_height)
+        .max_height(panel.available_height())
         .show(panel, |ui| match *active_tab {
             SidebarTab::Files => files_panel(ui, file_tree, current_file, git, outbox),
             SidebarTab::Search => search_panel(ui, search, file_tree.root.as_deref(), outbox),
@@ -95,14 +90,11 @@ pub fn ui(
             SidebarTab::Git => git_panel(ui, git, outbox),
         });
     let y4 = panel.cursor().top();
-    settings_row(panel, outbox);
-    let y5 = panel.cursor().top();
 
     SidebarBands {
         top: band(y0, y1),
         nav: band(y1, y2),
         body: band(y3, y4),
-        bottom: band(y4, y5),
     }
 }
 
@@ -116,10 +108,8 @@ pub struct SidebarBands {
     pub top: egui::Rect,
     /// 次段:四行视图导航(每行 `NAV_ROW_H` 高)。
     pub nav: egui::Rect,
-    /// 中段:当前视图内容,吃掉剩余高度。
+    /// 中段:当前视图内容,吃掉剩余高度(至左栏底部)。
     pub body: egui::Rect,
-    /// 底段:设置行。
-    pub bottom: egui::Rect,
 }
 
 /// 单条视图导航行的**竖直中心 y**(相对传进来的 `panel`)。
@@ -164,8 +154,8 @@ fn tooltip_of(cmd: Command, keymap: &Keymap) -> String {
     }
 }
 
-/// 左栏次段的视图导航:四行竖排,**整行选中态** —— 浅色底 + 左侧 2px
-/// 强调色竖条(照抄 ui-polish 的页签选中态,不用重boBox 再辨证)。
+/// 左栏次段的视图导航:四行竖排,**整行选中态** —— selected_bg 底 +
+/// 左侧 2px 强调色竖条(照抄 tabs 的页签选中态,不用重boBox 再辨证)。
 ///
 /// 点击只发 [`Message::SidebarTabChanged`],切换本身在归约。
 fn view_nav(panel: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Message>) {
@@ -188,7 +178,7 @@ fn nav_row(ui: &mut egui::Ui, tab: SidebarTab, selected: bool) -> egui::Response
     )
 }
 
-/// 图标 + 文字的整行按钮,高度可调(左栏次段导航与底段设置共用)。
+/// 图标 + 文字的整行按钮,高度可调(左栏次段视图导航用)。
 ///
 /// 手绘而非 `Button` 是为了「整行选中态」:浅色底打满可用宽 + 左侧 2px
 /// 强调色竖条(ui-polish 页签选中态的同款口径)。`Sense::click` 打在
@@ -207,10 +197,13 @@ fn icon_label_row(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let visuals = ui.visuals();
-        // 整行选中态:底 + 左侧 2px 竖条;hover 用内建 hover 底
+        // 整行选中态:selected_bg + 左侧 2px 竖条(与 tabs 的页签选中同款,
+        // `widgets.hovered` 在浅色下恰好等于侧栏底色,选中行会整体消失);
+        // hover 用内建 hover 底
         if selected {
             let accent = crate::ui::tokens::accent(ui);
-            painter.rect_filled(rect, 0.0, visuals.widgets.hovered.bg_fill);
+            let selected_bg = crate::theme::shell_tokens(visuals.dark_mode).selected_bg;
+            painter.rect_filled(rect, 0.0, selected_bg);
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     rect.left_top(),
@@ -252,32 +245,6 @@ fn icon_label_row(
         );
     }
     response
-}
-
-/// 左栏底段的设置行:左键打开设置对话框默认页,右键弹出四项直达。
-///
-/// 四项直达是「少点一次」的快捷方式,不改变任何状态 —— 与顶部菜单同源的
-/// [`Message::SettingsOpened`]。
-fn settings_row(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
-    let response = icon_label_row(
-        panel,
-        crate::ui::icons::Icon::Settings,
-        "设置",
-        false,
-        crate::ui::tokens::NAV_BOTTOM_H,
-    );
-    if response.clicked() {
-        outbox.push(Message::SettingsOpened(SettingsTab::Appearance));
-    }
-    response.context_menu(|ui| {
-        for tab in SettingsTab::ALL {
-            if ui.button(tab.label()).clicked() {
-                outbox.push(Message::SettingsOpened(tab));
-                // egui 0.36 的 popup 默认 `CloseOnClick`:点完菜单项自己就关,
-                // 没有(也不需要)`ui.close_menu()` 这类手动关闭调用。
-            }
-        }
-    });
 }
 
 /// 大纲列表。数据来自 [`crate::state::PreviewState`] 的快照,文档变化时随
@@ -1055,15 +1022,16 @@ mod tests {
         );
     }
 
-    /// 三段式骨架:四段自上而下排满左栏、互不重叠,中段吃掉除底段以外的
-    /// 全部剩余高度(M2 验收点)。宽度下限 180px 时同样成立 —— 顶段在窄栏
-    /// 里会换行变高,中段让出的高度随之变少。
+    /// 三段式骨架:三段自上而下排满左栏、互不重叠,中段吃掉全部剩余高度
+    /// (M2 验收点;底段设置行已迁至标题栏齿轮,decisions-pending #31)。
+    /// 宽度下限 180px 时同样成立 —— 顶段在窄栏里会换行变高,中段让出的
+    /// 高度随之变少。
     #[test]
     fn three_bands_fill_the_panel_top_down() {
         let ctx = egui::Context::default();
         let (tree, _root) = sample_tree();
+        let height = Cell::new(0.0f32);
         let mut bands = None;
-        let whole_slack = Cell::new(0.0f32);
         ctx.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -1073,21 +1041,25 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let slack = ui.spacing().item_spacing.y + 1.0;
-                let whole = ui_whole(ui, SidebarTab::Files, &tree, &GitPanelState::default());
-                whole_slack.set(slack);
-                bands = Some(whole);
+                height.set(ui.max_rect().bottom());
+                bands = Some(ui_whole(
+                    ui,
+                    SidebarTab::Files,
+                    &tree,
+                    &GitPanelState::default(),
+                ));
             },
         )
         .drop_without_applying_deltas();
         let bands = bands.unwrap();
-        let slack = whole_slack.get();
 
         assert!(bands.top.top() < bands.nav.top(), "顶段在次段之上");
+        assert!(bands.nav.top() < bands.body.top(), "次段在中段之上");
         assert!(
-            bands.bottom.height() <= crate::ui::tokens::NAV_BOTTOM_H + slack,
-            "底段不超过预留高度(放行一个 item_spacing):{}",
-            bands.bottom.height()
+            bands.body.bottom() >= height.get() - 1.0,
+            "中段吃到左栏底部(不再为底段预留):body.bottom={} panel.bottom={}",
+            bands.body.bottom(),
+            height.get()
         );
     }
 
@@ -1158,71 +1130,6 @@ mod tests {
             outbox,
             vec![Message::SidebarTabChanged(SidebarTab::Search)],
             "导航行点击只发一条切换消息"
-        );
-    }
-
-    /// 底段设置行:左键发 `SettingsOpened(Appearance)`,即设置对话框的
-    /// 默认落地页(与顶部菜单「设置」入口同源)。
-    #[test]
-    fn clicking_settings_row_opens_default_tab() {
-        let (tree, _root) = sample_tree();
-        let ctx = egui::Context::default();
-        let mut outbox = Vec::new();
-        let bottom = Cell::new(Rect::NOTHING);
-
-        ctx.run_ui(
-            RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
-                )),
-                ..Default::default()
-            },
-            |ui| {
-                bottom
-                    .set(ui_whole(ui, SidebarTab::Files, &tree, &GitPanelState::default()).bottom);
-            },
-        )
-        .drop_without_applying_deltas();
-
-        let mut active = SidebarTab::Files;
-        let mut search = SearchState::default();
-        let git = GitPanelState::default();
-        let target = egui::pos2(
-            crate::ui::tokens::SIDEBAR_MIN_W / 2.0,
-            bottom.get().center().y,
-        );
-        let click = |pressed| Event::PointerButton {
-            pos: target,
-            button: PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        for events in [
-            Vec::new(),
-            Vec::new(),
-            vec![Event::PointerMoved(target)],
-            vec![click(true)],
-            vec![click(false)],
-        ] {
-            ctx.run_ui(
-                RawInput {
-                    events,
-                    screen_rect: Some(Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(crate::ui::tokens::SIDEBAR_MIN_W, 600.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| {
-                    ui_whole_with(ui, &mut active, &mut search, &tree, &git, &mut outbox);
-                },
-            )
-            .drop_without_applying_deltas();
-        }
-        assert_eq!(
-            outbox,
-            vec![Message::SettingsOpened(SettingsTab::Appearance)]
         );
     }
 

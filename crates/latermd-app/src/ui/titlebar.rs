@@ -10,6 +10,7 @@
 //! 同一批纯函数,测试与绘制零偏差。
 
 use crate::command::Command;
+use crate::settings::SettingsTab;
 use crate::state::{Message, State};
 use crate::ui::icons::Icon;
 use crate::ui::tokens::{DANGER, ICON, ICON_SM, RADIUS_SM, SPACE_SM};
@@ -21,7 +22,8 @@ pub const EDGE_T: f32 = 6.0;
 /// 四角缩放命中块边长(盖住边条交叠,角上命中对角方向)。
 pub const CORNER_T: f32 = 12.0;
 
-/// 标题栏右端六个窗口按钮,从左到右(docs/ui-shell-redesign.md §3.1 顺序)。
+/// 标题栏右端七个窗口按钮,从左到右(docs/ui-shell-redesign.md §3.1 顺序;
+/// 齿轮为 2026-09-27 用户指令新增,见 decisions-pending #31)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleButton {
     /// 关闭/打开左栏(翻转侧边栏可见性)。
@@ -29,6 +31,8 @@ pub enum TitleButton {
     /// 关闭/打开右栏(消息由三分栏重排棒消费)。
     PanelRight,
     Zen,
+    /// 设置:左键开默认页,右键四页直达(原 M2 左栏底段设置行迁来)。
+    Settings,
     /// 最小化。
     Minimize,
     /// 最大化 / 还原(按当前状态切图标)。
@@ -38,10 +42,11 @@ pub enum TitleButton {
 }
 
 /// 标题按钮的绘制顺序(= 命中矩形从左到右的顺序)。
-pub const TITLE_BUTTONS: [TitleButton; 6] = [
+pub const TITLE_BUTTONS: [TitleButton; 7] = [
     TitleButton::PanelLeft,
     TitleButton::PanelRight,
     TitleButton::Zen,
+    TitleButton::Settings,
     TitleButton::Minimize,
     TitleButton::Maximize,
     TitleButton::Close,
@@ -54,6 +59,7 @@ pub fn icon_of(button: TitleButton, maximized: bool) -> Icon {
         TitleButton::PanelLeft => Icon::Sidebar,
         TitleButton::PanelRight => Icon::PanelRight,
         TitleButton::Zen => Icon::Zen,
+        TitleButton::Settings => Icon::Settings,
         TitleButton::Minimize => Icon::Minimize,
         TitleButton::Maximize if maximized => Icon::Restore,
         TitleButton::Maximize => Icon::Maximize,
@@ -61,11 +67,11 @@ pub fn icon_of(button: TitleButton, maximized: bool) -> Icon {
     }
 }
 
-/// 六个按钮的命中矩形:`WINDOW_BTN` 整块从标题栏右缘连续向左排,垂直
+/// 七个按钮的命中矩形:`WINDOW_BTN` 整块从标题栏右缘连续向左排,垂直
 /// 居中,无间隙(VS Code / Chrome 同款)。绘制与测试共用本函数。
-pub fn button_rects(bar: Rect) -> [Rect; 6] {
+pub fn button_rects(bar: Rect) -> [Rect; 7] {
     let top = bar.center().y - crate::ui::tokens::WINDOW_BTN.y / 2.0;
-    let mut rects = [Rect::NOTHING; 6];
+    let mut rects = [Rect::NOTHING; 7];
     for (i, rect) in rects.iter_mut().enumerate() {
         let left = bar.right() - (TITLE_BUTTONS.len() - i) as f32 * crate::ui::tokens::WINDOW_BTN.x;
         *rect = Rect::from_min_size(Pos2::new(left, top), crate::ui::tokens::WINDOW_BTN);
@@ -300,6 +306,19 @@ fn window_button(
                 None => action.to_owned(),
             })
         }
+        TitleButton::Settings => {
+            // 右键四页直达随 settings 行一并迁来(不丢能力,decisions-pending
+            // #31)。`context_menu` 消费 Response、返回弹层打开状态,借 clone
+            // 注册菜单,原 response 继续供悬浮/点击判定用。
+            response.clone().context_menu(|ui| {
+                for tab in SettingsTab::ALL {
+                    if ui.button(tab.label()).clicked() {
+                        outbox.push(Message::SettingsOpened(tab));
+                    }
+                }
+            });
+            response.on_hover_text("设置(右键直达各页)")
+        }
         TitleButton::Minimize => response.on_hover_text("最小化"),
         TitleButton::Maximize => {
             response.on_hover_text(if maximized { "还原" } else { "最大化" })
@@ -310,6 +329,9 @@ fn window_button(
         TitleButton::PanelLeft if response.clicked() => outbox.push(Message::SidebarToggled),
         TitleButton::PanelRight if response.clicked() => outbox.push(Message::RightPanelToggled),
         TitleButton::Zen if response.clicked() => outbox.push(Message::ZenToggled),
+        TitleButton::Settings if response.clicked() => {
+            outbox.push(Message::SettingsOpened(SettingsTab::Appearance));
+        }
         TitleButton::Minimize if response.clicked() => {
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
@@ -418,7 +440,7 @@ mod tests {
         (outbox.contains(&Message::SidebarToggled), commands)
     }
 
-    /// 六按钮从右缘等宽连续排布:无重叠、右缘贴齐、垂直居中,顺序与
+    /// 七按钮从右缘等宽连续排布:无重叠、右缘贴齐、垂直居中,顺序与
     /// `TITLE_BUTTONS` 一致(左 → 右)。
     #[test]
     fn button_rects_tile_from_the_right_edge() {
@@ -430,7 +452,7 @@ mod tests {
             assert_eq!((rect.width(), rect.height()), (btn.x, btn.y));
             assert_eq!(
                 rect.right(),
-                bar.right() - (5 - i) as f32 * btn.x,
+                bar.right() - (6 - i) as f32 * btn.x,
                 "第 {i} 个按钮右缘"
             );
             assert_eq!(rect.center().y, bar.center().y, "垂直居中");
@@ -441,8 +463,18 @@ mod tests {
                 );
             }
         }
-        assert_eq!(rects[5].right(), bar.right(), "关闭键贴右缘");
-        assert_eq!(rects[0].left(), bar.right() - 6.0 * btn.x, "左起第一个");
+        assert_eq!(rects[6].right(), bar.right(), "关闭键贴右缘");
+        assert_eq!(rects[0].left(), bar.right() - 7.0 * btn.x, "左起第一个");
+        // 齿轮在最小化左侧(2026-09-27 用户指令:设置入口挪标题栏右端)
+        let settings = TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == TitleButton::Settings)
+            .unwrap();
+        let minimize = TITLE_BUTTONS
+            .iter()
+            .position(|b| *b == TitleButton::Minimize)
+            .unwrap();
+        assert!(settings < minimize, "齿轮在最小化左侧");
     }
 
     /// 最大化按钮的图标随窗口状态切换,其余按钮不受影响。
@@ -576,17 +608,21 @@ mod tests {
         // 自己裁决,本模块连左右两栏当前是什么状态都不必知道。
         let commands = press(2, &state, &mut outbox);
         assert!(commands.is_empty(), "禅定键不发视口命令");
+        // 齿轮(2026-09-27 迁自左栏底段设置行):左键开默认页,不发视口命令
+        let commands = press(3, &state, &mut outbox);
+        assert!(commands.is_empty(), "齿轮不发视口命令");
         assert_eq!(
             outbox,
             vec![
                 Message::SidebarToggled,
                 Message::RightPanelToggled,
-                Message::ZenToggled
+                Message::ZenToggled,
+                Message::SettingsOpened(crate::settings::SettingsTab::Appearance)
             ]
         );
-        assert!(press(3, &state, &mut outbox).contains(&ViewportCommand::Minimized(true)));
-        assert!(press(4, &state, &mut outbox).contains(&ViewportCommand::Maximized(true)));
-        assert!(press(5, &state, &mut outbox).contains(&ViewportCommand::Close));
+        assert!(press(4, &state, &mut outbox).contains(&ViewportCommand::Minimized(true)));
+        assert!(press(5, &state, &mut outbox).contains(&ViewportCommand::Maximized(true)));
+        assert!(press(6, &state, &mut outbox).contains(&ViewportCommand::Close));
     }
 
     /// 八个边缘命令区:命中即发对应方向的 BeginResize。

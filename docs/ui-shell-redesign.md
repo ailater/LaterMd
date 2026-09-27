@@ -14,7 +14,7 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│ ⠿  a.md *                          ⌈左│ ⌈右│ ⦿ │ ─ │ ⤢ │ ✕ │  ← ① 自绘标题栏
+│ ⠿  a.md *                  ⌈左│ ⌈右│ ⦿ │ ⚙ │ ─ │ ⤢ │ ✕ │  ← ① 自绘标题栏
 ├───────────────────────────────────────────────────────────────────────┤
 │ 文件 ▾ 导出 ▾ 视图 ▾ AI ▾ 设置 ▾                                      │  ← ② 菜单栏(D2)
 ├──────────┬──────────────────────────┬─────────────────────────────────┤
@@ -30,11 +30,13 @@
 │          │                          │                                 │
 │ (文件树) │                          │                                 │
 ├──────────┴──────────────────────────┴─────────────────────────────────┤
-│ ⚙ 设置                                                   ← ③ 底段      │
-├───────────────────────────────────────────────────────────────────────┤
 │ a.md · 行 12:4 · 1,204 字 · 深色 · wgpu · AI:Mock · MCP:关              │
 └───────────────────────────────────────────────────────────────────────┘
 ```
+
+> 2026-09-27 修订（用户指令，decisions-pending #31）：左栏底段「⚙ 设置」行取消，
+> 设置入口挪到标题栏右端齿轮（上图的 ⚙，最小化左侧）；状态栏横跨全窗底部
+> （在左右栏之前画）。原 M2 版图见 git 历史。
 
 **禅定模式（⑥ 独占全窗）**：①②③④ 全部退场，只剩居中的只读渲染正文（限宽 720px），
 右上角浮出「退出禅定」。
@@ -77,13 +79,14 @@
 | 按钮 | 语义 | hover 提示 |
 |---|---|---|
 | `┃左` | 左侧导航 开/关（直接翻转 `LayoutState::left`） | 「关闭左侧 / 打开左侧（Ctrl+\）」 |
-| `┃右` | 右侧预览 开/关 | 「关闭右侧 / 打开右侧（Ctrl+Alt+R）」 |
+| `┃右` | 右侧预览 开/关 | 「关闭右侧（Ctrl+Alt+R）」 |
 | `⦿` | 禅定模式 | 「禅定模式（F11）」 |
+| `⚙` | 设置（2026-09-27 增，左键默认页 / 右键四页直达，decisions-pending #31） | 「设置（右键直达各页）」 |
 | `─` | 最小化 | — |
 | `⤢` | 最大化 / 还原（按当前状态显示不同图标） | — |
 | `✕` | 关闭窗口 | — |
 
-> 六个按钮排成一组；`✕` 的 hover 底取 `DANGER`（既有 token，`ui/tokens.rs`），
+> 七个按钮排成一组；`✕` 的 hover 底取 `DANGER`（既有 token，`ui/tokens.rs`），
 > 其余取 `hover` token。这是仿 VS Code / Chrome 的一致写法，不需要新增语义色。
 
 ### 3.2 实现要点（已核实的 egui 0.36.2 API）
@@ -118,6 +121,7 @@
 // ui/layout.rs :: draw
 egui::Panel::top("titlebar").show(ui, |ui| ui::titlebar::ui(ui, ...));   // D1
 egui::Panel::top("menubar").show(ui, |ui| ui::menubar::ui(...));         // D2 保留
+egui::Panel::bottom("statusbar").show(...)  // 必须在 nav/preview 之前：先画者占满全窗横向（2026-09-27 修复）
 
 egui::Panel::left("nav")
     .resizable(true).default_size(240.0).size_range(180.0..=420.0)
@@ -155,7 +159,7 @@ egui::CentralPanel::default()
 
                                                                                                    点击只发 `Message::SidebarTabChanged(tab)` |
 | **中段·视图内容** | 吃掉剩余 | Files=根目录行+懒加载树 / Search=输入+开关+流式结果 / Outline=标题树+当前小节高亮 / Git=改动+diff+历史。全部沿用现有实现，只是包在 `ScrollArea` 里 |
-| **底段·设置** | 固定 ~28px | 齿轮 + 「设置」一行；左键打开设置对话框默认页，右键/`▸` 弹出四项直达（外观 / 快捷键 / AI / MCP） |
+| ~~底段·设置~~ | — | **2026-09-27 撤销**（用户指令，decisions-pending #31）：齿轮挪到标题栏右端，左栏收回三段（顶动作 / 视图导航 / 中段），`NAV_BOTTOM_H` 随之删除 |
 
 **中段吃掉剩余高度的做法**（egui 里沒有 flex-grow）：
 
@@ -163,12 +167,10 @@ egui::CentralPanel::default()
 top_actions(ui, ...);
 view_nav(ui, ...);
 ui.separator();
-let reserved = NAV_BOTTOM_H;                       // 底段预留
 ScrollArea::vertical()
     .id_salt("nav-body")
-    .max_height(ui.available_height() - reserved)  // 显式吃掉剩余
+    .max_height(ui.available_height())             // 显式吃掉剩余（至左栏底部）
     .show(ui, |ui| match view { /* 四页 */ });
-settings_row(ui, ...);                              // 落在最底部
 ```
 
 不用嵌套 `Panel`（会造成 widget id 与 z-order 意外），也不用 `bottom_up`（左右 snap 会让
@@ -349,7 +351,7 @@ pub struct LayoutSettings {
 | `PREVIEW_DEFAULT_W` | 420.0 | 右预览初始宽 |
 | `FORMAT_BAR_H` | 30.0 | 格式工具条 |
 | `NAV_ROW_H` | 26.0 | 左栏导航行高 |
-| `NAV_BOTTOM_H` | 28.0 | 左栏底段预留 |
+| ~~`NAV_BOTTOM_H`~~ | ~~28.0~~ | 已随底段设置行撤销删除（2026-09-27，decisions-pending #31） |
 | `ZEN_TEXT_W` | 720.0 | 禅定正文限宽 |
 | `WINDOW_BTN` | 32×24 | 标题栏右侧按钮命中区（Win 风整块，mac/Linux 同款收统一） |
 
