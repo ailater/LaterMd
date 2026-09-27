@@ -1,13 +1,16 @@
 # LaterMD 演进路线图
 
-日期: 2026-09-24
-状态: 已接受
+日期: 2026-09-24  
+状态: 已接受  
 关联: 全部 ADR
 
-> 本文件是 **动态清单**，不重复各 ADR 的论证，只记录阶段划分、验收标准与当前位置。
+> 本文件是 **动态清单**，不重复各 ADR 的论证，只记录阶段划分、验收标准与当前位置。  
 > 论证见 [adr-001](adr-001-gui-and-architecture.md)、[adr-002](adr-002-platform-renderer-wysiwyg.md)、[adr-003](adr-003-renderer-and-ecosystem-audit.md)、[adr-004](adr-004-technical-stack.md)、[adr-005](adr-005-layout-and-sidebar.md)。
 
+
+
 ---
+
 
 ## 当前位置
 
@@ -22,23 +25,25 @@
 [x] P3 深水区    Live Preview v1 + [[wikilink]] + 大纲预览跳转 均已于 2026-09-26 落地;剩余增强 = Live Preview v2(内联半隐藏)、Live Preview 选区扩展、反向链接面板 → 2026-09-26 已入自动流水线(auto-plan #14/#15)
 多标签已落地(2026-09-26,用户追加需求)
 [x] 外壳重构      2026-09-27 全部落地(规格 2026-09-26 产出:[ui-shell-redesign.md](ui-shell-redesign.md),D1–D5 按默认拍板 decisions-pending #30;M1–M5 = auto-plan 13a–13e):M1 自绘标题栏+三栏重排 `389dafb`、M2 左栏三段式 `8f07cd5`、M3 格式工具条 `b7c918b`、M4 禅定 `7fd24a6`、M5 收口(修复三连 `d797451`/`bff7405` + 明暗像素采样验收 11 断言 [m5-acceptance.md](m5-acceptance.md))**均于 2026-09-27 合入 main**(此前本行曾记「M1 已落地 2026-09-26」,以 git 合入日期为准订正);真机遗留(无边框拖窗/resize 于 Win/mac)见 acceptance-checklist §8 三项
+[ ] 图片框 + 图床   规格 [image-plan.md](image-plan.md)(2026-09-27 坤哥指令),A–D 四段共 4d:**待放行**,未写 src/;A 段(插入骨架)代码已在 `feature/image-a` 写成但未提交、且差 state/layout 四处接线,此刻编不过
+[ ] 表情符号(emoji)面板   规格 [emoji-plan.md](emoji-plan.md)(2026-09-27 坤哥指令),E1–E4 共 ~1.3d:**待放行**;E1(按钮 + 面板)0.5d 可独立先交付。**实测两条硬事实**:egui 0.36.2 默认字体链已含黑白 Noto Emoji(零新增依赖即可渲染);但**彩色 emoji 上游不支持**,应用内是黑白、导出 HTML 仍是彩色
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
 
-| 模块 | commit |
-|---|---|
+| 模块                                                                 | commit    |
+| ------------------------------------------------------------------ | --------- |
 | M0 可自动化验证（[m0-report.md](m0-report.md)：中文字体注入 + bench 数据 + 六项验证状态） | `75871fa` |
-| latermd-md 解析与大纲数据层 | `18ca4c0` |
-| 三栏布局骨架（侧边栏/编辑器/预览 + State/Message 归约） | `33fa18f` |
-| 源码编辑与实时预览 | `a3f760f` |
-| 文件新建/打开/保存/另存为 | `6710669` |
-| 大纲面板与光标跳转 | `8c00cdd` |
-| HTML 导出（latermd-export） | `35f0bf0` |
-| 主题切换与持久化（settings.json） | `bf32495` |
-| 统一快捷键与菜单栏 | `b0bbc2c` |
-| 文件树基础版（懒加载 + .gitignore + 当前文件高亮） | `37c9e0c` |
-| 修复：大纲跳转 span 过期越界钳制 + 保存/导出原子落盘 | `efedd6b` |
+| latermd-md 解析与大纲数据层                                                | `18ca4c0` |
+| 三栏布局骨架（侧边栏/编辑器/预览 + State/Message 归约）                              | `33fa18f` |
+| 源码编辑与实时预览                                                          | `a3f760f` |
+| 文件新建/打开/保存/另存为                                                     | `6710669` |
+| 大纲面板与光标跳转                                                          | `8c00cdd` |
+| HTML 导出（latermd-export）                                            | `35f0bf0` |
+| 主题切换与持久化（settings.json）                                            | `bf32495` |
+| 统一快捷键与菜单栏                                                          | `b0bbc2c` |
+| 文件树基础版（懒加载 + .gitignore + 当前文件高亮）                                  | `37c9e0c` |
+| 修复：大纲跳转 span 过期越界钳制 + 保存/导出原子落盘                                    | `efedd6b` |
 
 > P0 范围表对照：Markdown 与代码高亮已由 vendor 提供，上表已覆盖其余功能条目。
 >
@@ -46,7 +51,7 @@
 >
 > **剩余**：上段打包的首跑验证，与 M0 两条真机项（Win/mac IME、Win/mac wgpu；Linux IME 已首测 —— 输入可用、候选框不跟随，缺陷排查挂账见 m0-report.md 验证 1）。
 
-> Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
+> Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui\_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 
 ---
 
@@ -77,23 +82,24 @@ cargo doc --no-deps --all-features
 
 ---
 
+
 ## 阶段 1：M0 技术验证（2 周）
 
 **目标**：三条不过则不继续。这是**唯一允许失败便宜的阶段**。
 
-| # | 验证项 | 验收标准 | 关联 ADR |
-|---|---|---|---|
-| 1 | **IME 中文输入** | Win11 微软拼音 + macOS 14 简体拼音：候选框跟随 caret、不吞字、不抢焦点 | ADR-002 §6 |
-| 2 | **长文档性能** | 10 万字 md 滚动到中部 ≥ 55fps（验证视口剔除生效） | ADR-002 §3.5 |
-| 3 | **wgpu 三 target** | Win11(DX12) / macOS14(Metal) / Linux(Vulkan) 均能启动且报告合理 adapter | ADR-002 §6 |
+| # | 验证项               | 验收标准                                                           | 关联 ADR       |
+| - | ----------------- | -------------------------------------------------------------- | ------------ |
+| 1 | **IME 中文输入**      | Win11 微软拼音 + macOS 14 简体拼音：候选框跟随 caret、不吞字、不抢焦点                | ADR-002 §6   |
+| 2 | **长文档性能**         | 10 万字 md 滚动到中部 ≥ 55fps（验证视口剔除生效）                               | ADR-002 §3.5 |
+| 3 | **wgpu 三 target** | Win11(DX12) / macOS14(Metal) / Linux(Vulkan) 均能启动且报告合理 adapter | ADR-002 §6   |
 
 **补充建议（来自 P0 风险前移）**：
 
-| # | 附加验证 | 目的 |
-|---|---|---|
-| 4 | **流式性能边界** | mock LLM 每 100ms 喂一个 chunk，跑上游现成的 `bench_render_scroll_code_streaming`，记录 500 / 2000 / 10000 行帧率 |
-| 5 | **中文渲染** | 在 Deepin 上确认中文不显示方块；同时定案字体方案（`fontdb` / `font-kit` / cfg 原生） |
-| 6 | **tokio ↔ egui 通道** | `mpsc` + `request_repaint()` 往返无锁竞争 |
+| # | 附加验证                | 目的                                                                                               |
+| - | ------------------- | ------------------------------------------------------------------------------------------------ |
+| 4 | **流式性能边界**          | mock LLM 每 100ms 喂一个 chunk，跑上游现成的 `bench_render_scroll_code_streaming`，记录 500 / 2000 / 10000 行帧率 |
+| 5 | **中文渲染**            | 在 Deepin 上确认中文不显示方块；同时定案字体方案（`fontdb` / `font-kit` / cfg 原生）                                     |
+| 6 | **tokio ↔ egui 通道** | `mpsc` + `request_repaint()` 往返无锁竞争                                                              |
 
 第 4-6 项很便宜，但第 4 项是唯一有真实信息量的。
 
@@ -107,35 +113,37 @@ cargo doc --no-deps --all-features
 
 **目标**：能写下一篇技术文档并交付给别人看。
 
+
 ### 范围
 
-| 模块 | 内容 | 周期 |
-|---|---|---|
-| 三栏布局 | `Panel::left` × 2 + `CentralPanel`，全部可调宽；侧边栏 `show_collapsible` | 0.5 周 |
-| 编辑器 | 双栏源码编辑 + 实时预览 | 2 周 |
-| 文件操作 | 新建 / 打开 / 保存 / 另存为 | 0.5 周 |
-| Markdown | CommonMark + GFM（表格、任务列表、删除线、脚注） | 已由 vendor 提供 |
-| 代码高亮 | syntect + 复制按钮 | 已由 vendor 提供 |
-| 导出 | HTML | 1 周 |
-| **主题系统**（专题批次 A） | token 化 `Theme` + Light/Dark 双内置皮肤，外壳/正文/代码高亮**三层联动** + 切换入口 + 持久化。详见文末「专题：界面美化与皮肤系统」 | 1.5 周 |
-| 快捷键 | `Ctrl` / `Cmd` 自动适配 | 0.5 周 |
-| **文件树**（基础版） | `ignore` + 懒加载 + `.gitignore` + 点击打开 + 当前文件高亮 | 1.5 周 |
-| **大纲**（廉价版） | AST 提取标题 + 点击跳编辑器光标。**不跳预览** | 0.5 周 |
-| 打包 | 三平台产物发 GitHub Release；macOS universal2 dmg 经 [crazykun/homebrew-ailater](https://github.com/crazykun/homebrew-ailater) cask 分发（复刻 lscreen 模式） | 1 周 |
+| 模块               | 内容                                                                                                                                            | 周期           |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| 三栏布局             | `Panel::left` × 2 + `CentralPanel`，全部可调宽；侧边栏 `show_collapsible`                                                                               | 0.5 周        |
+| 编辑器              | 双栏源码编辑 + 实时预览                                                                                                                                 | 2 周          |
+| 文件操作             | 新建 / 打开 / 保存 / 另存为                                                                                                                            | 0.5 周        |
+| Markdown         | CommonMark + GFM（表格、任务列表、删除线、脚注）                                                                                                              | 已由 vendor 提供 |
+| 代码高亮             | syntect + 复制按钮                                                                                                                                | 已由 vendor 提供 |
+| 导出               | HTML                                                                                                                                          | 1 周          |
+| **主题系统**（专题批次 A） | token 化 `Theme` + Light/Dark 双内置皮肤，外壳/正文/代码高亮**三层联动** + 切换入口 + 持久化。详见文末「专题：界面美化与皮肤系统」                                                         | 1.5 周        |
+| 快捷键              | `Ctrl` / `Cmd` 自动适配                                                                                                                           | 0.5 周        |
+| **文件树**（基础版）     | `ignore` + 懒加载 + `.gitignore` + 点击打开 + 当前文件高亮                                                                                                 | 1.5 周        |
+| **大纲**（廉价版）      | AST 提取标题 + 点击跳编辑器光标。**不跳预览**                                                                                                                  | 0.5 周        |
+| 打包               | 三平台产物发 GitHub Release；macOS universal2 dmg 经 [crazykun/homebrew-ailater](https://github.com/crazykun/homebrew-ailater) cask 分发（复刻 lscreen 模式） | 1 周          |
 
 > **分发依赖（非阻塞）**：无签名证书路线已定（AGENTS.md §5）。macOS cask 复刻 `lscreen` 写法（universal2 单 dmg + postflight 去 quarantine + livecheck）；接入 tap 的 auto-bump 流水线只需在其 `FORMULAS` 表 / `Casks/` 加一项，随时可办，无审批等待。
+
 
 ### crate 增量创建表（防止「开工即 8 个空 crate」）
 
 ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨架是过早抽象（违反 AGENTS.md §8）。按下表增量创建：
 
-| 时机 | 新建 crate | 理由 |
-|---|---|---|
-| 阶段 0（Vendor） | workspace 根 + `latermd-app`（空窗口） | M0 验证需要载体 |
-| P0 开工 | `latermd-md`、`latermd-editor`、`latermd-export` | 解析/token 层与 rope/光标层是三条铁律的落点，必须有独立边界；HTML 导出是 P0 验收项 |
-| P1 开工 | `latermd-ai` | provider trait 与流式 |
-| P2 开工 | `latermd-git` | 只读 Git |
-| 出现第二个消费者时 | `latermd-render`、`latermd-core` | render（绘制指令 IR）在只有 egui 一个后端时没有存在价值；core（状态机/DTO）的职责在 P0 由 `latermd-app` 承担，等 AI 消息总线复杂化后再抽 |
+| 时机           | 新建 crate                                       | 理由                                                                                          |
+| ------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| 阶段 0（Vendor） | workspace 根 + `latermd-app`（空窗口）               | M0 验证需要载体                                                                                   |
+| P0 开工        | `latermd-md`、`latermd-editor`、`latermd-export` | 解析/token 层与 rope/光标层是三条铁律的落点，必须有独立边界；HTML 导出是 P0 验收项                                        |
+| P1 开工        | `latermd-ai`                                   | provider trait 与流式                                                                          |
+| P2 开工        | `latermd-git`                                  | 只读 Git                                                                                      |
+| 出现第二个消费者时    | `latermd-render`、`latermd-core`                | render（绘制指令 IR）在只有 egui 一个后端时没有存在价值；core（状态机/DTO）的职责在 P0 由 `latermd-app` 承担，等 AI 消息总线复杂化后再抽 |
 
 ### 验收
 
@@ -146,18 +154,19 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 
 ---
 
+
 ## 阶段 3：P1 差异化（+7.5-9.5 周）
 
 **目标**：AI 成为产品的差异点，而非附加功能。
 
-| 模块 | 内容 | 周期 |
-|---|---|---|
-| AI 流式写作 | `heal()` + `LinkHandler` + provider trait（OpenAI / Anthropic / Ollama） | 3 周 |
-| `ai://` 链接协议 | `.link_style()` + `.click()` 拦截 | 0.5 周 |
-| AI 指令块 | `.is_block_code_widget()` → `.block_code_widget()`（原写法 `.is_block_widget()` 实测仅作用于 `Token::Link` 的 href、够不到围栏代码块，见 decisions-pending #12） | 1 周 |
-| AI commit message | — | 0.5 周 |
-| AI 摘要 / 大纲 | — | 1 周 |
-| **搜索**（即全文检索，P3 不再重复） | `ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果 | 1.5 周 |
+| 模块                    | 内容                                                                                                                                        | 周期    |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| AI 流式写作               | `heal()` + `LinkHandler` + provider trait（OpenAI / Anthropic / Ollama）                                                                    | 3 周   |
+| `ai://` 链接协议          | `.link_style()` + `.click()` 拦截                                                                                                           | 0.5 周 |
+| AI 指令块                | `.is_block_code_widget()` → `.block_code_widget()`（原写法 `.is_block_widget()` 实测仅作用于 `Token::Link` 的 href、够不到围栏代码块，见 decisions-pending #12） | 1 周   |
+| AI commit message     | —                                                                                                                                         | 0.5 周 |
+| AI 摘要 / 大纲            | —                                                                                                                                         | 1 周   |
+| **搜索**（即全文检索，P3 不再重复） | `ignore` + `grep-searcher` + `regex`，300ms 防抖 + 可取消 + 流式结果                                                                                | 1.5 周 |
 
 ### 关键约束
 
@@ -171,11 +180,11 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 
 **目标**：Git 成为可信的时间轴，**只做只读**。
 
-| 模块 | 内容 |
-|---|---|
-| Git 只读集成 | 状态、历史、diff、blame、回滚 |
-| 文件树 Git 标记 | M / A / U / ? 与 `git2::statuses()` 联动 |
-| 凭据管理 | 三平台封装（Credential Manager / Keychain / libsecret） |
+| 模块         | 内容                                               |
+| ---------- | ------------------------------------------------ |
+| Git 只读集成   | 状态、历史、diff、blame、回滚                              |
+| 文件树 Git 标记 | M / A / U / ? 与 `git2::statuses()` 联动            |
+| 凭据管理       | 三平台封装（Credential Manager / Keychain / libsecret） |
 
 **明确不做**：rebase、cherry-pick、LFS、submodule、多仓库。
 
@@ -193,11 +202,11 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 
 ## 阶段 5：P3 深水区（+8-10 周）
 
-| 模块 | 内容 | 依赖 |
-|---|---|---|
-| **Live Preview** | 光标所在 block 显示源码，其余富渲染 | Token source_span（阶段 0 已做） |
-| 大纲预览跳转 | 复用现有 `section_to_token` 映射 | — | **2026-09-26 落地**：vendored 新增 `section_anchors()`（①类）暴露各 section 的 y，app 侧点大纲时把 span 换算成滚动目标，预览滚到该节顶部 |
-| 双向链接 `[[wikilink]]` | 通过 `LinkHandler` 实现 | — | **2026-09-26 落地**：`latermd_md::expand_wikilinks` 只改渲染（源码不动），LinkHandler 拦 `wiki://`，按文件名在库内找文档并打开；反向链接面板未做 |
+| 模块                  | 内容                         | 依赖                         |                                                                                                            |
+| ------------------- | -------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Live Preview**    | 光标所在 block 显示源码，其余富渲染      | Token source_span（阶段 0 已做） |                                                                                                            |
+| 大纲预览跳转              | 复用现有 `section_to_token` 映射 | —                          | **2026-09-26 落地**：vendored 新增 `section_anchors()`（①类）暴露各 section 的 y，app 侧点大纲时把 span 换算成滚动目标，预览滚到该节顶部      |
+| 双向链接 `[[wikilink]]` | 通过 `LinkHandler` 实现        | —                          | **2026-09-26 落地**：`latermd_md::expand_wikilinks` 只改渲染（源码不动），LinkHandler 拦 `wiki://`，按文件名在库内找文档并打开；反向链接面板未做 |
 
 > 全文检索已并入 P1 侧边栏搜索，本阶段无检索条目。
 
@@ -217,8 +226,8 @@ ADR-001 §3 的 8-crate 结构是**终态**，不是开工指令。空 crate 骨
 
 ## 专题：界面美化与皮肤系统
 
-日期：2026-09-24（规划新增）
-状态：已接受
+日期：2026-09-24（规划新增）  
+状态：已接受  
 **定位：美化服务于「长时间写作的舒适度」与产品门面，不是皮肤引擎项目。** 夜间/白天模式是长时间写作的护眼刚需（批次 A，P0）；皮肤机制与视觉定稿是品质项（批次 B，P2.5）。
 
 ### 能力盘点（已实测，勿重复调研）
@@ -242,13 +251,14 @@ Theme tokens ─┼─ MarkdownStyle + dark_mode   正文:标题/表格/引用/�
 
 token 只做**语义级**：背景层级（surface / surface_alt）、前景两级、accent、边框、选区、链接色 + 字号阶梯 + 间距阶梯 + 圆角半径。不做每控件粒度的样式树。
 
+
 ### 分批交付
 
-| 批次 | 内容 | 落点 | 周期 | 验收 |
-|---|---|---|---|---|
-| A | Light/Dark 双内置皮肤全量联动；切换入口（Settings，P0 交付时 Settings 面板顺带落地）；选择持久化用 **eframe 内建 persistence**（`App::save`，不加新依赖）；切换走 `Message::ThemeChanged` 归约（adr-005 logic/ui 二分） | **并入 P0**（主题条目 1 → 1.5 周） | 1.5 周 | 切主题时外壳/正文/代码块**同帧**换肤无闪变；重启保持；两套皮肤下正文与代码对比度均可读（含中文） |
-| B | 三态：亮 / 暗 / 跟随系统（`dark-light` 检测，Linux 失灵则回退手动两态）；自定义皮肤文件（`Theme` serde 导出 RON 至用户配置目录 `themes/`，内置皮肤可导出为模板）；现代化视觉打磨：间距/圆角统一 token、滚动条、hover/active 态、编辑器行距与 gutter | **阶段 4.5 打磨窗口** | +1.5-2 周 | 复制皮肤文件改一个颜色重启生效；跟随系统在 Win11/macOS 14 实测联动；Linux 记录检测行为进文档 |
-| C | 皮肤分享/市场、CSS 式主题引擎、每控件自定义、True WYSIWYG 排版自由 | **明确不做** | — | — |
+| 批次 | 内容                                                                                                                                                                 | 落点                        | 周期       | 验收                                                        |
+| -- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------- | -------- | --------------------------------------------------------- |
+| A  | Light/Dark 双内置皮肤全量联动；切换入口（Settings，P0 交付时 Settings 面板顺带落地）；选择持久化用 **eframe 内建 persistence**（`App::save`，不加新依赖）；切换走 `Message::ThemeChanged` 归约（adr-005 logic/ui 二分） | **并入 P0**（主题条目 1 → 1.5 周） | 1.5 周    | 切主题时外壳/正文/代码块**同帧**换肤无闪变；重启保持；两套皮肤下正文与代码对比度均可读（含中文）       |
+| B  | 三态：亮 / 暗 / 跟随系统（`dark-light` 检测，Linux 失灵则回退手动两态）；自定义皮肤文件（`Theme` serde 导出 RON 至用户配置目录 `themes/`，内置皮肤可导出为模板）；现代化视觉打磨：间距/圆角统一 token、滚动条、hover/active 态、编辑器行距与 gutter | **阶段 4.5 打磨窗口**           | +1.5-2 周 | 复制皮肤文件改一个颜色重启生效；跟随系统在 Win11/macOS 14 实测联动；Linux 记录检测行为进文档 |
+| C  | 皮肤分享/市场、CSS 式主题引擎、每控件自定义、True WYSIWYG 排版自由                                                                                                                         | **明确不做**                  | —        | —                                                         |
 
 ### 明确不做
 
@@ -278,32 +288,33 @@ token 只做**语义级**：背景层级（surface / surface_alt）、前景两�
 
 ## 周期汇总
 
-| 阶段 | 周期 | 累计 |
-|---|---|---|
-| Vendor 适配 | 3-5 工作日 | ~1 周 |
-| M0 验证 | 2 周 | ~3 周 |
-| P0 骨架 | 8-10 周 | ~13 周 |
-| P1 差异化 | +7.5-9.5 周 | ~22 周 |
-| P2 版本层 | +4.5-6.5 周 | ~28 周 |
-| P2.5 界面打磨 | +1.5-2 周 | ~30 周 |
-| P3 深水区 | +8-10 周 | ~40 周 |
+| 阶段        | 周期         | 累计    |
+| --------- | ---------- | ----- |
+| Vendor 适配 | 3-5 工作日    | ~1 周  |
+| M0 验证     | 2 周        | ~3 周  |
+| P0 骨架     | 8-10 周     | ~13 周 |
+| P1 差异化    | +7.5-9.5 周 | ~22 周 |
+| P2 版本层    | +4.5-6.5 周 | ~28 周 |
+| P2.5 界面打磨 | +1.5-2 周   | ~30 周 |
+| P3 深水区    | +8-10 周    | ~40 周 |
 
 约 **9.5 个月**（单人，全职）。仅供规划参考 —— 实际会随 M0 结论调整。
 
 ---
 
+
 ## 风险登记册
 
-| # | 风险 | 等级 | 缓解 | 触发信号 | 应对 |
-|---|---|---|---|---|---|
-| 1 | **IME 缺陷**（吞字 / 候选框不跟随 / 抢焦点） | 高 | M0 第 1 条验证;Linux 已首测(2026-09-25,X11 + fcitx5):输入可用、候选框不跟随 —— 非放行线失败,故障排查中(m0-report.md 验证 1) | M0 实测不过 | 停止或换 iced 备选（ADR-001 §2.5），不硬修 egui |
-| 2 | **单人 9 个月工期** | 高 | 每阶段出口评审；P0 完成即有自用价值 | 连续两阶段超期 50% | 砍 P2/P3 范围，P1 收敛为「流式写作」单功能 |
-| 3 | **无签名的信任门槛**（Gatekeeper「已损坏」/ SmartScreen 警告） | 低 | brew cask `postflight` 去 quarantine；README 写明 Windows「仍要运行」指引 | 非 brew 用户首次打开受阻 | 已是 lscreen 验证过的成熟路径，不新增投入 |
-| 4 | **上游 egui_markdown 停更** | 中 | 已 vendor（subtree），不受上游发布节奏约束 | 上游 6 个月无提交 | fork 并公开维护；升级决策权完全在我们 |
-| 5 | **CharIndex 强类型重构引入 off-by-one** | 中 | vendor 升级后 `cargo test` 必跑（checklist §8 第 4 步） | tests/cache、indent、truncate 回归 | 以测试为准逐个修，不带病合并 |
-| 6 | **egui 上游 churn**（季度级破坏性发版） | 中 | 钉 0.36.2；升级是显式 ADR 决策，不追新 | 安全公告 / 必需 bugfix | 单独开升级 ADR，走 vendor-upgrade-checklist 流程 |
-| 7 | **cask 停更**（lscreen 曾因 dmg 资产命名变化导致 cask 停在旧版） | 中 | `livecheck :github_latest` + tap 的 auto-bump 流水线；Release 资产命名在 cargo-dist 配置中钉死，不随版本改格式 | 用户 brew 拿不到新版本 | 命名变化时同步改 cask URL 模板（一次 5 分钟） |
-| 8 | **Linux 跟随系统主题无统一规范**（GNOME gsettings / KDE / Wayland portal 各异，检测库可能失灵或滞后） | 低 | 跟随系统默认关闭，亮/暗/跟随三态中手动优先；Win/mac 是主要实测对象 | 皮肤批次 B 在 Deepin/Linux 实测检测失败 | 该平台回退手动两态，不阻塞交付 |
+| # | 风险                                                                          | 等级 | 缓解                                                                                           | 触发信号                           | 应对                                      |
+| - | --------------------------------------------------------------------------- | -- | -------------------------------------------------------------------------------------------- | ------------------------------ | --------------------------------------- |
+| 1 | **IME 缺陷**（吞字 / 候选框不跟随 / 抢焦点）                                               | 高  | M0 第 1 条验证;Linux 已首测(2026-09-25,X11 + fcitx5):输入可用、候选框不跟随 —— 非放行线失败,故障排查中(m0-report.md 验证 1) | M0 实测不过                        | 停止或换 iced 备选（ADR-001 §2.5），不硬修 egui     |
+| 2 | **单人 9 个月工期**                                                               | 高  | 每阶段出口评审；P0 完成即有自用价值                                                                          | 连续两阶段超期 50%                    | 砍 P2/P3 范围，P1 收敛为「流式写作」单功能              |
+| 3 | **无签名的信任门槛**（Gatekeeper「已损坏」/ SmartScreen 警告）                               | 低  | brew cask `postflight` 去 quarantine；README 写明 Windows「仍要运行」指引                                | 非 brew 用户首次打开受阻                | 已是 lscreen 验证过的成熟路径，不新增投入               |
+| 4 | **上游 egui_markdown 停更**                                                     | 中  | 已 vendor（subtree），不受上游发布节奏约束                                                                 | 上游 6 个月无提交                     | fork 并公开维护；升级决策权完全在我们                   |
+| 5 | **CharIndex 强类型重构引入 off-by-one**                                            | 中  | vendor 升级后 `cargo test` 必跑（checklist §8 第 4 步）                                               | tests/cache、indent、truncate 回归 | 以测试为准逐个修，不带病合并                          |
+| 6 | **egui 上游 churn**（季度级破坏性发版）                                                 | 中  | 钉 0.36.2；升级是显式 ADR 决策，不追新                                                                    | 安全公告 / 必需 bugfix               | 单独开升级 ADR，走 vendor-upgrade-checklist 流程 |
+| 7 | **cask 停更**（lscreen 曾因 dmg 资产命名变化导致 cask 停在旧版）                              | 中  | `livecheck :github_latest` + tap 的 auto-bump 流水线；Release 资产命名在 cargo-dist 配置中钉死，不随版本改格式      | 用户 brew 拿不到新版本                 | 命名变化时同步改 cask URL 模板（一次 5 分钟）           |
+| 8 | **Linux 跟随系统主题无统一规范**（GNOME gsettings / KDE / Wayland portal 各异，检测库可能失灵或滞后） | 低  | 跟随系统默认关闭，亮/暗/跟随三态中手动优先；Win/mac 是主要实测对象                                                       | 皮肤批次 B 在 Deepin/Linux 实测检测失败   | 该平台回退手动两态，不阻塞交付                         |
 
 ---
 
