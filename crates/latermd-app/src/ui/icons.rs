@@ -74,6 +74,12 @@ pub enum Icon {
     /// 规格 §6.1 原本写的是 Unicode `¶`;这里改自绘:文首「图标是矢量自绘,
     /// 不是字体字符」(ui-polish §1.1)对 Gecko/缺字环境的顾虑同样适用。
     Paragraph,
+    /// 图片(docs/image-plan.md A 段):外框 + 山 + 日(右上小圆)。
+    ///
+    /// 与 `Table`(网格)的区分靠「框内是折线不是横竖分割线」;与 `Open`
+    /// (文件夹)的区分靠右上角那个实心日 —— 都是「外框 + 内部图形」,少了
+    /// 太阳就退化成文件夹。
+    Image,
     /// 无序列表:三点 + 三线。
     BulletList,
     /// 有序列表:三条竖短线(序号笔画抽象)+ 三线。
@@ -289,6 +295,13 @@ impl Icon {
                 seg((-0.42, -0.08), (0.42, -0.08));
                 seg((0.0, -0.32), (0.0, 0.32));
             }
+            Self::Image => {
+                frame((-0.44, -0.34), (0.44, 0.34));
+                // 山:一折到底的两段线,落在框的下半部
+                path(&[(-0.32, 0.18), (-0.08, -0.16), (0.14, 0.18)]);
+                // 日:右上实心小圆(半径取线宽量级,大了会糊成一坨)
+                dot((0.28, -0.16), 0.06);
+            }
             Self::Paragraph => {
                 for (row, stop) in [(-0.30_f32, 0.42), (-0.10, 0.42), (0.10, 0.42), (0.30, 0.20)] {
                     seg((-0.42, row), (stop, row));
@@ -439,6 +452,19 @@ mod tests {
             Icon::Maximize,
             Icon::Restore,
             Icon::Close,
+            // 格式工具条(新增图标务必加进来:本测试是「每条绘制分支都不
+            // panic」的唯一守卫)
+            Icon::CodeInline,
+            Icon::CodeBlock,
+            Icon::Link,
+            Icon::Quote,
+            Icon::Divider,
+            Icon::Table,
+            Icon::Image,
+            Icon::Paragraph,
+            Icon::BulletList,
+            Icon::OrderedList,
+            Icon::TaskList,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
