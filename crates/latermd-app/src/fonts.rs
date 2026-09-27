@@ -64,6 +64,10 @@ const CANDIDATES: &[(&str, u32, u32)] = &[
 pub fn install(ctx: &egui::Context) -> Option<String> {
     let mut defs = FontDefinitions::default();
     install_inter(&mut defs);
+    // phosphor 图标字体(2026-09-27 U2)。它把自己插到 Proportional 链的
+    // **第 1 位**(紧跟 Inter 之后),私有区码位(U+E0xx)落到它身上;
+    // 拉丁/CJK/emoji 各自在链上别的字体里,互不抢。
+    egui_phosphor::add_to_fonts(&mut defs, egui_phosphor::Variant::Regular);
     let cjk = install_cjk(&mut defs);
     ctx.set_fonts(defs);
     cjk.map(|desc| format!("Inter(latin 子集,内置) + {desc}"))
