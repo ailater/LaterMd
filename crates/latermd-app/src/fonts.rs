@@ -1,13 +1,35 @@
-//! CJK 系统字体注入(M0 附加验证 5「中文渲染」的载体)。
+//! 字体注入:Inter(内置)+ CJK 系统字体(回退)。
 //!
-//! egui 内置字体只有拉丁字符,中文默认渲染为方块(tofu)。此处按候选路径表读
-//! 系统字体,以回退形式追加到 Proportional / Monospace 两个族:拉丁字符仍走
-//! 内置字体,CJK 落到系统字体。候选全失配时如实返回 `None`,界面显示警告,
-//! 不静默吞掉。方案定案(不引入 fontdb / font-kit)见 docs/m0-report.md。
+//! 两段各有各的必要性:
+//! - **Inter**:egui 出厂的比例字体是 Ubuntu-Light,只有拉丁字符且观感偏
+//!   「开发者工具」。Inter 编译期内联(2026-09-27 U1),拉丁字形走它。
+//! - **CJK**:egui 内置字体与 Inter 都**没有中文字形**,中文一律方块。此处
+//!   按候选路径表读系统字体,以回退形式追加到各个族(M0 附加验证 5 的载体)。
+//!   候选全失配时如实返回 `None`,终端告警,不静默吞掉。
+//!
+//! 方案定案(不引入 fontdb / font-kit)见 docs/m0-report.md。
+//!
+//! **为什么 Inter 只内联 latin 子集**:完整字重会带上西里尔/希腊等字形,
+//! 体积翻几倍,而中文反正要靠系统字体、多出来的那部分一个也用不上。
+//! 代价是 `→` `…` 这类符号它也没有 —— 会沿回退链落到 CJK 字体那边
+//! (Noto Sans CJK 覆盖这些符号),不出现方块,只是字形跟着中文走。
 
 use std::sync::Arc;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
+
+/// Inter 正文(latin 子集,Regular 400)。
+///
+/// **只内联 Regular 一档,不做 SemiBold**。曾试过「SemiBold 单开一个
+/// `FontFamily::Name` 族、把 `TextStyle::Heading` 指过去」(egui 没有字重概念,
+/// 族就是字重的载体),验证时撞上 `epaint/src/text/fonts.rs:1025`:
+/// **未绑定的族是 `panic`,不是回退**,任何没先跑 `install` 的 Context(无头
+/// 测试正是如此)一画标题就崩。为「标题略粗」这点收益背上全局 panic 风险不
+/// 值,标题层级改由字号(`FONT_LG`)承担。
+const INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+
+/// 字体数据键名。
+const NAME_REGULAR: &str = "latermd-inter-regular";
 
 /// 候选 (字体文件, 比例字体 face index, 等宽字体 face index),按序取第一个存在的文件。
 /// face index 是 .ttc 字体集合内的第 N 个字型,Linux 两条由 `fc-query` 枚举得出;
@@ -34,7 +56,38 @@ const CANDIDATES: &[(&str, u32, u32)] = &[
 ];
 
 /// 注入 CJK 回退字体,返回加载来源描述(用户可见)。
+/// 注入 Inter 与 CJK 回退,返回加载来源描述(用户可见)。
+///
+/// 返回值沿用 M0 的口径:**`None` = 没找到 CJK 字体**(调用方据此告警)。
+/// Inter 是编译期内联的、必然成功,所以它不影响返回值 —— CJK 缺失时仍然要
+/// `set_fonts` 把 Inter 装上,只是如实报 `None`。
 pub fn install(ctx: &egui::Context) -> Option<String> {
+    let mut defs = FontDefinitions::default();
+    install_inter(&mut defs);
+    let cjk = install_cjk(&mut defs);
+    ctx.set_fonts(defs);
+    cjk.map(|desc| format!("Inter(latin 子集,内置) + {desc}"))
+}
+
+/// Inter:正文插到 Proportional 链**首**,标题另起一个 SemiBold 族。
+fn install_inter(defs: &mut FontDefinitions) {
+    defs.font_data.insert(
+        NAME_REGULAR.to_owned(),
+        Arc::new(FontData::from_static(INTER_REGULAR)),
+    );
+    // 链首:拉丁字符先命中 Inter,命中不了的(CJK / emoji)沿链继续回落。
+    // egui 出厂的 Proportional 链是 [Ubuntu-Light, NotoEmoji, emoji-icon],
+    // 这里插到它前面,不改它已有的回退。
+    defs.families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, NAME_REGULAR.to_owned());
+}
+
+/// CJK 系统字体:按候选表取第一个存在的文件,追加到**每个**比例族的链尾。
+///
+/// 返回来源描述;`None` = 全部候选失配(中文会显示方块)。
+fn install_cjk(defs: &mut FontDefinitions) -> Option<String> {
     for &(path, prop_idx, mono_idx) in CANDIDATES {
         if !std::path::Path::new(path).is_file() {
             continue;
@@ -50,7 +103,6 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
 
         let proportional = "latermd-cjk-proportional";
         let monospace = "latermd-cjk-monospace";
-        let mut defs = FontDefinitions::default();
         defs.font_data
             .insert(proportional.into(), Arc::new(face(prop_idx)));
         defs.font_data
@@ -59,10 +111,9 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
             (FontFamily::Proportional, proportional),
             (FontFamily::Monospace, monospace),
         ] {
-            // push 到末尾 = 回退:拉丁字符命中内置字体后不再往下走
+            // push 到末尾 = 回退:拉丁字符命中 Inter 后不再往下走
             defs.families.entry(family).or_default().push(name.into());
         }
-        ctx.set_fonts(defs);
         return Some(format!(
             "{path} (比例 face {prop_idx} / 等宽 face {mono_idx})"
         ));
@@ -72,13 +123,34 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CANDIDATES;
+    use super::*;
     use std::collections::HashSet;
 
     /// `Path::is_absolute` 按宿主平台判定(Linux 上 `C:\...` 是相对路径),
     /// 故按目标平台语义判前缀:Unix 以 `/` 开头,Windows 为盘符路径。
     fn is_absolute_on_target_platform(path: &str) -> bool {
         path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
+    }
+
+    /// Inter 装进去了(2026-09-27 U1 的守卫)。
+    ///
+    /// 只断言**族注册**不断言「渲染结果」:后者依赖宿主有没有 CJK 字体
+    /// (CI 的 ubuntu 镜像未必装了 Noto CJK),会 flaky。族是 Inter 内联的、
+    /// 与系统无关,这条在任何机器上都是确定性的。
+    /// 装完之后中英混排与标题都能排版,不 panic(2026-09-27 U1 的守卫)。
+    ///
+    /// 不断言「某个字形来自哪个字体」 —— 那依赖宿主装没装 CJK 字体(CI 的
+    /// ubuntu 镜像未必有 Noto CJK),会 flaky。这条守的是回退链的**组装**本身:
+    /// Inter 在链首、CJK 在链尾、emoji 在默认链里,三者缺一都会在这里炸。
+    #[test]
+    fn mixed_cjk_and_latin_layouts_after_install() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label(egui::RichText::new("LaterMD 混排标题").heading());
+            ui.label("正文 abc 123 — 中文");
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
