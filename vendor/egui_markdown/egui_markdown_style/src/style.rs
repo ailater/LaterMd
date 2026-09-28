@@ -462,11 +462,24 @@ pub struct TableStyle {
   /// Inner cell padding `[left, top, right, bottom]`.
   #[cfg_attr(feature = "serde", serde(default = "default_cell_padding"))]
   pub cell_padding: [f32; 4],
+  /// Fill the header row with [`egui::Visuals::faint_bg_color`], behind the cell text.
+  #[cfg_attr(feature = "serde", serde(default))]
+  pub header_fill: bool,
+  /// Zebra-stripe the body rows using `egui_extras`' built-in striped rows,
+  /// which paint the same [`egui::Visuals::faint_bg_color`].
+  #[cfg_attr(feature = "serde", serde(default))]
+  pub zebra_fill: bool,
 }
 
 impl Default for TableStyle {
   fn default() -> Self {
-    Self { stroke_width: 0.0, corner_radius: 0.0, cell_padding: default_cell_padding() }
+    Self {
+      stroke_width: 0.0,
+      corner_radius: 0.0,
+      cell_padding: default_cell_padding(),
+      header_fill: false,
+      zebra_fill: false,
+    }
   }
 }
 
@@ -477,6 +490,8 @@ impl Hash for TableStyle {
     for v in &self.cell_padding {
       v.to_bits().hash(state);
     }
+    self.header_fill.hash(state);
+    self.zebra_fill.hash(state);
   }
 }
 
@@ -505,6 +520,14 @@ impl TableStyle {
 
       ui.label("Cell padding bottom:");
       ui.add(DragValue::new(&mut self.cell_padding[3]).range(0.0..=30.0).speed(0.5));
+      ui.end_row();
+
+      ui.label("Header fill:");
+      ui.checkbox(&mut self.header_fill, "");
+      ui.end_row();
+
+      ui.label("Zebra fill:");
+      ui.checkbox(&mut self.zebra_fill, "");
       ui.end_row();
     });
   }

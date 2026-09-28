@@ -150,13 +150,30 @@ pub struct ThemeSettings {
     pub skin: Option<String>,
     /// 界面密度。
     pub density: Density,
-    /// 正文样式覆盖;`None` = vendored 默认(P0 批次 A 不覆盖)。
+    /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
     /// 当前皮肤的**内容**:由 `skin` 名字从磁盘载入,**不落盘**
     /// (避免同一份样式在 settings.json 与皮肤文件里各存一份、改了一处另一处
     /// 不跟着变)。
     #[serde(skip)]
     pub skin_style: Option<MarkdownStyle>,
+}
+
+/// 出厂默认正文样式:vendored 默认之上开表格边框与底色(#30)。
+///
+/// vendored `TableStyle` 的默认 `stroke_width = 0.0` 直接不画线、两底色
+/// 开关默认关(能力在、默认关),预览表格因此长期无边框无底色。这是 app
+/// 侧的默认取值决策,不动 vendored:线宽 1px,圆角与控件圆角同源
+/// (`tokens::RADIUS_MD`);线色由 vendored 渲染时取
+/// `widgets.noninteractive.bg_stroke.color`,表头/隔行底色取
+/// `visuals.faint_bg_color`,明暗两套 visuals 自动适配,app 不另配颜色。
+pub fn default_markdown_style() -> MarkdownStyle {
+    let mut style = MarkdownStyle::default();
+    style.table.stroke_width = 1.0;
+    style.table.corner_radius = tokens::RADIUS_MD;
+    style.table.header_fill = true;
+    style.table.zebra_fill = true;
+    style
 }
 
 impl ThemeSettings {
@@ -198,7 +215,7 @@ impl ThemeSettings {
         }
     }
 
-    /// 生效的正文样式:皮肤 > `overrides` > vendored 默认。
+    /// 生效的正文样式:皮肤 > `overrides` > 出厂默认([`default_markdown_style`])。
     ///
     /// 皮肤优先的理由:皮肤是用户显式选的「这一整套」,手改 settings.json 的
     /// `overrides` 是兜底通道(旧配置与手工微调),两者都出现时以显式选择为准。
@@ -206,7 +223,7 @@ impl ThemeSettings {
         self.skin_style
             .clone()
             .or_else(|| self.overrides.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(default_markdown_style)
     }
 
     /// 装上选中的皮肤内容;名字不在目录里时清空(皮肤被删/改名后自动回落
@@ -308,7 +325,9 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
             accent: Color32::from_rgb(0x6C, 0x9F, 0xFF),
             border: Color32::from_rgb(0x3C, 0x40, 0x43),
             code_bg: Color32::from_rgb(0x23, 0x24, 0x27),
-            faint: Color32::from_rgb(0x2A, 0x2B, 0x2E),
+            // 与 content 每通道差 ~10:对齐导出 CSS 暗色表头口径(#161b22
+            // vs #0d1117)。曾取 content+1,表头/斑马底人眼不可辨。
+            faint: Color32::from_rgb(0x32, 0x34, 0x38),
         }
     } else {
         ShellTokens {
@@ -321,7 +340,9 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
             accent: Color32::from_rgb(0x33, 0x70, 0xFF),
             border: Color32::from_rgb(0xE5, 0xE6, 0xEB),
             code_bg: Color32::from_rgb(0xF5, 0xF6, 0xF7),
-            faint: Color32::from_rgb(0xFA, 0xFB, 0xFC),
+            // 与导出 HTML 的 th 底同值(latermd-export CSS #f6f8fa):
+            // 预览与导出同观感,预览不再弱于导出。
+            faint: Color32::from_rgb(0xF6, 0xF8, 0xFA),
         }
     }
 }
@@ -742,14 +763,69 @@ mod tests {
         assert!(!ctx.global_style().visuals.dark_mode);
         assert_eq!(egui_markdown_style::global_style(&ctx).block_spacing, 11.0);
 
-        // 无 overrides 时装的就是 vendored 默认;重复 apply 幂等
+        // 无 overrides 时装的就是出厂默认;重复 apply 幂等
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.theme(), egui::Theme::Dark);
         assert_eq!(
             *egui_markdown_style::global_style(&ctx),
-            MarkdownStyle::default()
+            default_markdown_style()
         );
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+    }
+
+    /// #30 回归防线:出厂默认正文样式的表格边框与底色可见 —— vendored 渲染
+    /// 只在 `stroke_width > 0.0` 时画线、`header_fill`/`zebra_fill` 为 true
+    /// 时铺底色,字段被 reset 回 vendored 默认(如改回
+    /// `MarkdownStyle::default()`)时此测试红。圆角与控件圆角同源 token。
+    #[test]
+    fn default_markdown_style_draws_table_borders() {
+        let style = ThemeSettings::default().markdown_style();
+        assert!(style.table.stroke_width > 0.0, "0.0 = vendored 不画线");
+        assert_eq!(
+            style.table.corner_radius,
+            tokens::RADIUS_MD,
+            "与控件圆角同源"
+        );
+        assert!(style.table.header_fill, "表头行底色开启");
+        assert!(style.table.zebra_fill, "数据区隔行底色开启");
+    }
+
+    /// #30 评审修复回归:表头/斑马底(faint)必须**看得见**,不只是画得出
+    /// ——与 content 每通道差 ≥5(评审实测旧深色值差 1/通道,亮度差 ~0.4%,
+    /// 低于均匀大色块的感知阈,底色事实上隐形;浅色旧值 Δ=(5,4,3) 也弱于
+    /// 导出 CSS 的 th 底)。浅色并与导出 HTML 的 th 底同值,预览不弱于导出。
+    /// 取色源 `visuals.faint_bg_color`(vendored `paint_header_fill` 与
+    /// `egui_extras` striped 都从它取)随投影一并钉住。
+    #[test]
+    fn faint_table_fill_is_visible_against_content() {
+        for dark in [true, false] {
+            let token = shell_tokens(dark);
+            let faint = token.faint.to_array();
+            let content = token.content.to_array();
+            for channel in 0..3 {
+                let delta = (i16::from(faint[channel]) - i16::from(content[channel])).abs();
+                assert!(
+                    delta >= 5,
+                    "dark={dark} 通道 {channel}:faint {faint:?} vs content {content:?},Δ={delta},底色不可辨"
+                );
+            }
+        }
+        assert_eq!(
+            shell_tokens(false).faint,
+            Color32::from_rgb(0xF6, 0xF8, 0xFA),
+            "浅色与导出 CSS 的 th 底(#f6f8fa)同源"
+        );
+
+        let ctx = egui::Context::default();
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let visuals = ctx.style_of(theme).visuals.clone();
+            assert_eq!(
+                visuals.faint_bg_color,
+                shell_tokens(visuals.dark_mode).faint,
+                "{theme:?}: 投影后的取色源与 token 一致"
+            );
+        }
     }
 
     /// 三态解析:定向选择原样返回;`System` 取检测结果,检测不到回落
@@ -809,7 +885,7 @@ mod tests {
         assert_eq!(settings.markdown_style().block_spacing, 17.0);
         settings.select_skin(Some("不存在"), &catalog);
         assert_eq!(settings.skin, None);
-        assert_eq!(settings.markdown_style(), MarkdownStyle::default());
+        assert_eq!(settings.markdown_style(), default_markdown_style());
 
         // 坏文件与空目录都不 panic
         std::fs::write(dir.join(THEMES_DIR).join("bad.ron"), b"(((").unwrap();

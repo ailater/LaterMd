@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size, replacing the fixed `17px` height. Rows now derive their height from their own font
   size, so headings grow into the rhythm instead of being clipped by a height tuned for
   body-size glyphs.
+- `TableStyle::header_fill` and `TableStyle::zebra_fill` (both default `false`): fill the
+  header row with `Visuals::faint_bg_color`, and zebra-stripe the body rows via
+  `egui_extras`' built-in striped rows (same color). Both adapt to light and dark visuals.
 
 ### Changed
 
