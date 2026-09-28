@@ -115,6 +115,29 @@ fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);
 >
 > 禅定模式是**另一套 panel 组合**（titlebar + 限宽 720 的 `CentralPanel`），不是给
 > 三栏各加可见性开关（规格 §7）。§3.3 的 `show_collapsible` 结论不变，直接复用。
+>
+> **2026-09-28 补记（源码编辑区的滚动与光标跟随 —— UI 关注点口径，auto-plan #29 落地，
+> `fe3ee00`+`49634d6`）**：
+> - 表中第 6 行「源码编辑区」内部现为 `egui::ScrollArea::vertical()
+>   .auto_shrink([false, false])`（id 挂 editor_id，**每标签一套滚动位置**）包住
+>   multiline `TextEdit`。egui 0.36.2 的 multiline TextEdit **无内建滚动**（内部无
+>   ScrollArea，widget 随内容长高，builder.rs 自述「always show everything in
+>   multiline」），`desired_rows` 是**下限**而非上限——没有外层 ScrollArea 时超出面板
+>   的内容被 CentralPanel 裁掉（a3f760f 起即如此，#29 补上）。`desired_rows` 取视口
+>   行数，空文档铺满、长文档自然长高不被压扁。
+> - **光标跟随是 UI 关注点，app 侧自管**：实测 0.36.2 的 TextEdit 内建跟随
+>   `scroll_to_rect` 发生在 **Atom paint 阶段**，晚于外层 `ScrollArea::end` 的消费点，
+>   请求永不落地（Ctrl+End 后光标到文末但 `offset_target=None` 实证）。因此在
+>   ScrollArea 闭包内自管：仅 ① `format_result`/`jump_to` **写回帧**（取写回目标，
+>   不等下一帧光标状态）与 ② 键盘导航键（ArrowUp/Down/Home/End/PageUp/PageDown）
+>   **且编辑器持焦点**时，对该帧 galley 光标行 rect（含折行）调 `scroll_to_rect`，
+>   标志帧内即焚——滚轮/拖滚动条/空闲帧一概不触发，**不抢用户徒手滚动**（首版
+>   「每帧 diff 光标」方案曾引入「滚动后自动滚回鼠标位置」回归，`49634d6` 整段重写）。
+> - **状态归属（呼应 §2.3 logic/ui 二分）**：滚动偏移留 ScrollArea 内建 state（id
+>   每标签一套），跟随标志是闭包内帧局部变量、无跨帧存储，均**不进 State 归约**。
+>   Live 模式（live.rs 自有 ScrollArea `"live-preview"`）不共用此路径；其活动块打字
+>   跟随、pending_caret 跨块路由与大纲 jump_to 不被消费（留存到切回 Source 才应用）
+>   存在同款时序缺口，为既有现状，留后续任务（见 auto-plan #29 收官记录）。
 
 ```rust
 // 初版记录（2026-09-24；已被上方 2026-09-27 修订取代，保留作历史对照）。

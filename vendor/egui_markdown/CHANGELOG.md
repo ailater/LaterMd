@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableStyle::cell_padding` (`[left, top, right, bottom]`) for the inset inside each cell.
 - Overflow chrome on tables: a matching stroke on the visible cut edge, and a
   light inner shadow when the table does not fit horizontally or vertically.
+- `MarkdownStyle::line_height_ratio` (default `1.30`): row height as a multiple of the font
+  size, replacing the fixed `17px` height. Rows now derive their height from their own font
+  size, so headings grow into the rhythm instead of being clipped by a height tuned for
+  body-size glyphs.
 
 ### Changed
 

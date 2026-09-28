@@ -1,0 +1,222 @@
+# 预览排版与键位调整规划（2026-09-28）
+
+> 坤哥 2026-09-28 提的三件事：① 预览行高重叠；② UI 更协调好看；③ 主题快捷键让出 `Ctrl+Shift+T`。
+> **本文是规划，不是完工记录。** 已完成的部分在文末「已完成」一节，其余按 §5 的执行顺序待办。
+
+---
+
+## 1. 已完成：预览行高（根因 + 修复）
+
+### 1.1 根因
+
+vendored 层把**所有行**的行高写死成一个像素常量：
+
+```rust
+// vendor/egui_markdown/src/layout.rs（修改前）
+pub(crate) const MARKDOWN_LINE_HEIGHT_POINTS: Option<f32> = Some(17.0);
+```
+
+`text_format()` 把它塞进每个 `TextFormat`，而 `Token::Text` 处理标题时**只放大字号、不重算行高**：
+
+```rust
+format.font_id.size *= style_ref.heading.scales[idx];   // 20.8pt
+// 行高仍是上面那个 17.0 —— 没有跟着改
+```
+
+实测亏空（`rowprobe` 探针读数）：
+
+| 级别 | 字号 | 自然行高 | 写死行高 | 亏空 |
+|---|---|---|---|---|
+| 正文 | 13.0 | 15.0 | 17.0 | +2.0（余） |
+| H1 | 20.8 | 23.9 | 17.0 | **−6.9** |
+| H2 | 17.6 | 20.2 | 17.0 | **−3.2** |
+| H3 | 15.6 | 17.9 | 17.0 | **−0.9** |
+
+标题行拿到比字形所需的更矮的行框，换行后就互相压——这就是截图里的重叠。
+正文反倒是松的（17.0 对 15.0），所以观感是「正文散、标题挤」。
+
+### 1.2 改法
+
+行高改成**字号 × 倍率**，并把倍率提成 `MarkdownStyle` 字段让用户可调：
+
+| 位置 | 改动 |
+|---|---|
+| `egui_markdown_style/src/style.rs` | 新增 `line_height_ratio: f32`（默认 `1.30`，serde 兜底）、进 `Hash`、进样式编辑器 UI |
+| `vendor/egui_markdown/src/layout.rs` | 删 `MARKDOWN_LINE_HEIGHT_POINTS`；新增 `line_height_for(size, style) -> Option<f32>`；`text_format()` 加 `style` 实参；标题分支在放大字号后**重算** `format.line_height` |
+
+效果（同一探针）：
+
+| 级别 | 字号 | 旧行高 | 新行高 | 差额 |
+|---|---|---|---|---|
+| 正文 | 13.0 | 17.0 | 16.9 | −0.1（几乎不动，观感无缝） |
+| H1 | 20.8 | 17.0 | 27.0 | +10.0 |
+| H2 | 17.6 | 17.0 | 22.8 | +5.8 |
+| H3 | 15.6 | 17.0 | 20.3 | +3.3 |
+| H4 | 14.3 | 17.0 | 18.6 | +1.6 |
+
+`1.30` 这个值不是拍的：`13 × 1.30 = 16.9 ≈ 旧值 17.0`，**正文观感不变**、只有标题被解开。验收时这是第一条要看的：正文别跑版。
+
+### 1.3 分类与门禁
+
+按 AGENTS §6 三类拆分，属 **①上游可合**（对任何使用者通用，纯能力改进）：
+
+- 一个 setter 都不删给别人用；把「写死像素」换成「字号 × 倍率」并暴露为样式字段，是典型的通用改进。
+- 回 Lewin 提 PR 时的独立抓手：`git diff <基点> -- vendor/egui_markdown > /tmp/lh.patch` → fork 里 `git apply -p2`。
+
+已跑过的门禁：
+
+- vendor `check.sh` 六项：**fmt ✅ / clippy×3 ✅ / test 106 passed ✅ / doc ✅**
+- 主仓全量：`cargo test --workspace --all-features` **597 passed, 0 failed**
+
+---
+
+## 2. 待办 A：行距节奏 + 标题区分（UI 协调性）
+
+§1 解开的是**重叠**（bug）。让预览「好看」是另一件事，层次要靠两条一起调：**字号分级** + **块间距**。
+
+### 2.1 现状问题
+
+`HeadingStyle::scales` 默认是 `[1.6, 1.35, 1.2, 1.1, 1.05, 1.0]`。以 13pt 正文计：
+
+| | H1 | H2 | H3 | H4 | H5 | H6 |
+|---|---|---|---|---|---|---|
+| 字号 | 20.8 | 17.6 | 15.6 | 14.3 | 13.7 | 13.0 |
+| 与正文比 | 1.60 | 1.35 | 1.20 | 1.10 | 1.05 | **1.00** |
+
+问题在后三档：**H4–H6 挤在一起**（14.3 / 13.7 / 13.0），肉眼几乎分不出，H6 与正文完全同号。
+加上 `block_spacing = 8.0` 对所有块一视同仁，标题上下没得到比行间距更多的呼吸——视觉上「都是一串字」。
+
+### 2.2 计划改法
+
+**（1）拉开低阶标题的字号分级**
+
+```
+scales: [2.0, 1.55, 1.30, 1.15, 1.08, 1.0]   // 建议值，需真机目视后微调
+```
+
+| | H1 | H2 | H3 | H4 | H5 | H6 |
+|---|---|---|---|---|---|---|
+| 现 | 20.8 | 17.6 | 15.6 | 14.3 | 13.7 | 13.0 |
+| 改后 | 26.0 | 20.2 | 16.9 | 15.0 | 14.0 | 13.0 |
+
+H1 从 1.6 拉到 2.0 是中文排版常用档（英文正文常用 1.8–2.0，中文因字形密度建议偏上限）。
+
+**（2）块间距分级：标题前后比正文多留**
+
+现在 `before_block` / `after_block` 一律 `ui.add_space(style.block_spacing)`（`label.rs:745-761`）。标题应该比这个更宽。
+
+`MarkdownStyle` 加一个字段，例如：
+
+```rust
+/// Extra space above a heading, added on top of `block_spacing`. Default: `4.0`.
+pub heading_space_above: f32,
+```
+
+改 `render_token_range`：判断 token 是 heading 时 `add_space(block_spacing + heading_space_above)`。
+**注意 `skinsPresets` 也要同步**（`crates/latermd-app/src/theme_presets.rs` 的 `base()`），否则九套预设皮肤各自看着不一致。
+
+**（3）顺手校正的行距：** `line_height_ratio = 1.30` 已在 §1 落地，中文可读区间通常 1.5–1.8。
+**但改正文倍率会让正文跑版**（17.0 → 19.5+，一屏少看两三行），属于偏好不是 bug —— 建议留成用户在设置页自己调，出厂值维持 1.30，等坤哥目视后再定要不要出厂就调松。
+
+### 2.3 验收
+
+- 一篇含 H1–H6 + 列表 + 引用 + 表格 + 代码块的样例文档，明暗两套主题各截一张。
+- 逐条看：① 换行标题不再压字；② H4–H6 能分辨层级；③ 标题上下呼吸明显大于行间距；④ 正文密度不变（这是否决线）。
+- 对比基准＝当前 build 的同文档截图，`compare -metric AE` 只用于确认「确实变了」，真正判好看得靠眼睛。
+
+---
+
+## 3. 待办 B：快捷键重排
+
+### 3.1 现状
+
+`Command::default_shortcut`（`crates/latermd-app/src/command.rs:249`）现有这张表：
+
+| 命令 | 现键位 | 备注 |
+|---|---|---|
+| `ToggleTheme` | **Cmd/Ctrl+Shift+T** | ← 要让位 |
+| `TabNext` | Cmd/Ctrl+Tab | 与浏览器一致 ✅ |
+| `TabClose` | Cmd/Ctrl+W | 与浏览器一致 ✅ |
+| `ToggleSidebar` | Cmd/Ctrl+\\ | 与 VS Code 一致 ✅ |
+| `ToggleLivePreview` | Cmd/Ctrl+/ | VS Code「切换注释」同键 ✅ |
+| `ToggleRightPreview` | Cmd/Ctrl+Alt+R | 自定，无冲突 |
+| `ToggleZen` | F11 | 与浏览器全屏一致 ✅ |
+| `FormatLink` | Cmd/Ctrl+Shift+K | 注：VS Code 是裸 Ctrl+K |
+
+### 3.2 定案（坤哥已选）
+
+**① 主题 → `Alt+T`（Kun 选的选项 1）**
+
+选它的理由：避开 `Cmd/Ctrl+Shift+T`（要让位给恢复标签）与 `Cmd+K` 系列；VS Code 的「颜色主题」也是 Alt 系，习惯相通。
+**`Alt+T` 是无 Cmd/Ctrl 的组合**，`Shortcut::bindable()` 要求「至少一个修饰键或是功能键」—— Alt 算修饰键，**满足条件**，不用开后门。
+
+> ⚠️ 实现时要确认 `Modifiers::ALT` + `Key::T` 在三个平台都不被系统吞（Windows 上 Alt+字母常触发菜单栏助记键）。egui 走 winit 的 `received_character` + 物理键，一般拿得到，但**要在 Win/mac 真机上按一次确认**。这是本条唯一的实机验证点。
+
+**② `Cmd/Ctrl+Shift+T` → 留给 `TabRestore`（恢复刚关闭的标签）**
+
+浏览器（Chrome/Edge/Firefox）恢复关闭标签就是这个键，VS Code 同理。**现在是空位**：`default_shortcut` 里没人占 `Cmd+Shift+T`。
+
+**③ 其余键位不动** —— 已经与浏览器/VS Code 对齐了，没必要为改而改。
+
+### 3.3 TabRestore 的实现要点
+
+命令层一条龙，`Command` 是唯一清单：
+
+| 层 | 位置 | 做什么 |
+|---|---|---|
+| 枚举 | `Command::TabRestore` | 加进 `ALL`（放 `TabNext`/`TabClose` 之后），同步 `id()` = `"tab_restore"`、`label()` = `"恢复关闭的标签"` |
+| 快捷键 | `default_shortcut()` | `Modifiers::COMMAND \| Modifiers::SHIFT, Key::T` |
+| 消息 | `Message::TabRestore` | 新增 |
+| 归约 | `State::apply` | 从关闭栈弹出最近一条 → 按路径 `open_path()` 重开 |
+| 关闭栈 | `TabsState` | 新增 `recently_closed: Vec<PathBuf>` |
+
+几个要想清楚的点：
+
+- **存什么**：只存**已落盘**的路径（`TabState.document.path`）。未保存的新标签没有路径，重开拿不回内容——强行把正文文本也塞进栈会让这个结构变成「半个文档仓库」，超出范围。**未落盘的关了就找不回**，与「重开=重新读盘」的心智一致。
+- **栈多长**：浏览器无上限，建议 **封顶 20 条**（`Vec` 超了从头 `remove(0)`），防止长会话无限增长。
+- **已在别处打开的重开**：走现有 `open_path()` 语义——同名已开着就**激活它**，不开第二个。这是 `find_by_path` 的既有行为，不冲突。
+- **重开失败**（文件被外部删了/移了）：按既有口径写 `document.notice` 提示行，不静默吞，也不 panic。
+- **要不要清栈**：重开成功的那条要出栈。**连续按 Cmd+Shift+T 应能逐条往回要走完整条栈**（这才是浏览器的行为）。
+- **要不要落盘**（关了应用还能恢复）：**不做**。标签会话不持久化是现状，为了这一个命令破例不值。
+
+参考现状实现：`remove_tab()`（`state.rs:1711`）是唯一的摘除点，在那里面入栈就行，不用到处打补丁。
+九套皮肤是 `Vec`，没有 [dead_code]警告吗？看看对了写了个 skin。算了不重要
+
+### 3.4 验收
+
+- 单测：关 N 个标签后连续 restore N 次，顺序是**后进先出**且最终回到原状。
+- 单测：restore 未落盘标签（无路径）→ 栈里跳过它去取下一条，不 panic。
+- 真机：`Ctrl+Shift+T` 真按下能被 `poll_shortcuts` 接到（`keymap.rs` 的捕获测试会当它是「任意空闲键」，注意别撞那条回归）。
+
+---
+
+## 4. 待办 C：暂时的踝腕アイテム
+
+坤哥没点名，但在改 UI 时会顺带碰到的两个：
+
+- **` ThemeSettings::overrides` 出厂值**：现在是 `None`（全吃 vendored 默认）。要不要出厂就给一份调好的 `overrides`（含新的 `line_height_ratio` / `heading_space_above`），决定权环境问题——出厂给 == 所有人一致 + 用户可调（**, skin + overrides ）；出厂不给 == 全依赖皮肤文件。倾向**给一份**。
+- **`theme_presets.rs` 的九套预设**：新增了样式字段后，预设 ron 是**已存在的才不动**（`install_to` 语义），老安装的用户拿不到新字段（serde 走 `default` 兜底，值为 1.30/默认，不炸）。这是可接受行为，但要在 CHANGELOG 里写一句。
+
+---
+
+## 5. 建议执行顺序
+
+| # | 任务 | 交付物 | 门禁 |
+|---|---|---|---|
+| 1 | ✅ **预览行高修复**（已完成） | vendor 两文件 | vendor check.sh + 主仓 597 |
+| 2 | 键位改排（主题 → Alt+T，Cmd+Shift+T 空出） | `command.rs` | 主仓六项 |
+| 3 | TabRestore 完整实现 | `command.rs` / `state.rs` / `tabs.rs` | 主仓六项 + 新增单测 |
+| 4 | heading scales 拉开 + 标题块间距 | vendor + `theme_presets.rs` | vendor check.sh + 主仓六项 |
+| 5 | 明暗两套真机截图对比 | 截图 | 目视验收 |
+
+**分支纪律**（AGENTS §8）：上述分两条 commit 走——vendor 改动用 `vendor:` 前缀标 ①类；app 侧改动注明「非 vendor」。`main` 禁止直推，走 `feature/<主题>` + PR。
+
+---
+
+## 6. 已完成清单
+
+- [x] 预览行高根因定位（定量：H1 亏 6.9px / H2 亏 3.2 / H3 亏 0.9）
+- [x] `MarkdownStyle::line_height_ratio` 字段（serde + Hash + UI）
+- [x] `line_height_for()` 替换写死常量，标题重算行高
+- [x] vendor 六项门禁 + 主仓 597 测试全绿
+- [ ] 键位改排 / TabRestore / 标题字号分级 / 块间距 —— 按 §5 排期

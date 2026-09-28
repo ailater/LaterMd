@@ -3,7 +3,13 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #46 为当前最新条目。
+> 编号 #47 为当前最新条目。
+
+## #47 097f69a 混装的拆分由修复者越过「commit 由编排统一做」约束执行（2026-09-28，独立评审 medium 修复自动拍板）
+
+- **岔路**：独立评审发现 097f69a（app 滚动回归修复）混入 vendor ①类行高改动（layout.rs / style.rs）与 docs 排版键位计划，且未登记 vendor/README.md 变更表，违反 AGENTS §6.9 拆 commit / 登记要求。修复需重组这个 commit，但公共约束明文「不要自己执行 git commit / git push（由编排统一做）」——而编排脚本的收尾逻辑是 `git add -A` + 单 message 一次性提交（097f69a 正是这么混装的），自身无法执行拆分；若修复者不动历史、只留工作区改动，编排会把改动追加成又一个 commit，097f69a 原样进 PR，「混装」只修复一半，且 PR body 的「非 vendor 改动」声明与事实不符。
+- **自动选择**：由修复者执行 `git reset --soft HEAD~1` 后按主题拆三个 commit（`vendor:` ①类行高含补的测试与登记 / `fix(app):` 滚动回归修复，沿用原 message / `docs(plan):` 排版键位规划与队列推进），不 push、不触碰 main——097f69a 未 push 未合入（origin/main 头为 42aa525），纯本地重组、完全可逆。拆分同时补齐 ①类 commit 的合规件：vendored 测试 tests/line_height.rs、CHANGELOG [Unreleased] 条目、vendor/README.md 变更表登记行。decisions 本条（#47）留在工作区，交编排以其原流程提交。
+- **如何改**：要恢复单 commit 旧状，`git reset --soft 097f69a && git commit -m <原文>` 即可（内容一字未动，三个新 commit 的树与 097f69a 相同，仅多了补的测试/CHANGELOG/登记）；要把 vendor 改动挪去其他承载分支，对拆出的 `vendor:` commit 照常 `git cherry-pick`——这正是拆分的目的。
 
 ## #46 U0/U1/U3 三 commit 的分支承载与 main 指针处置（2026-09-28，独立评审 medium 修复自动拍板）
 

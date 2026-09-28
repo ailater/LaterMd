@@ -140,39 +140,63 @@ pub fn ui(
 
             // 进来:格式动作/大纲跳转产出的新选区,写回 TextEdit 持久 cursor
             // 并把焦点还给编辑器 —— 否则用户还得自己点回编辑区才能继续打字。
+            // 写回的是本帧已知目标,跟随直接取它(output.state 是写回前的
+            // 旧快照,新光标要到下一帧 load 才可见)。
+            let mut follow_char: Option<usize> = None;
             if let Some((start, end)) = format_result {
                 write_selection(ui, &output.response.response.id, &output.state, start, end);
+                follow_char = Some(start);
             }
 
-            // 光标跟随(大纲跳转/格式写回/Ctrl+End 等):egui 0.36 的内建
-            // 跟随在 Atom paint 阶段才发 scroll_to_rect,晚于本 ScrollArea
-            // 的 end,请求永不落地(实测 offset_target 不设置);这里在
-            // end 之前自己补。galley 是本帧文本,折行下的行位置是精确的。
-            // 只在光标变化的那一帧请求 —— 徒手滚动时光标不动,不被抢回。
-            // 上一帧光标是 UI 侧记忆(egui data),不进 State 归约。
-            let cursor_now = output
-                .state
-                .cursor
-                .char_range()
-                .map(|range| range.primary.index.0);
-            let cursor_key = editor_id.with("last-cursor-char");
-            let cursor_prev: Option<usize> = ui.ctx().data(|data| data.get_temp(cursor_key));
-            if cursor_now != cursor_prev {
-                if let Some(index) = cursor_now {
-                    let rect = output
-                        .galley
-                        .pos_from_cursor(egui::text::CCursor::new(index));
-                    ui.scroll_to_rect(
-                        egui::Rect::from_min_max(
-                            output.galley_pos + rect.min.to_vec2(),
-                            output.galley_pos + rect.max.to_vec2(),
-                        )
-                        .expand(1.5),
-                        None,
-                    );
-                }
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(cursor_key, cursor_now));
+            // 光标跟随只走**显式请求**,标志是帧内局部变量,当帧即焚 ——
+            // 不跨帧、不跨标签(每标签一次 `ui` 调用一套栈帧)。第二来源是
+            // 键盘导航:本帧输入出现行/页移动键且编辑器持焦点时,光标行
+            // 保持可见。滚轮、拖滚动条、空闲帧一概不跟随 —— 早期「每帧
+            // diff 光标」的方案在 TextEdit 重排帧会误报变化(egui 内部
+            // cursor 表示与 char 换算在重排帧不稳定),误判一次就把视口
+            // 抢回光标处,徒手滚几屏又弹回去(#29 回归,已整段删除)。
+            // egui 0.36 内建跟随在 Atom paint 阶段才发 scroll_to_rect,
+            // 晚于本 ScrollArea 的 end,永不落地,须在这里补。
+            let keyboard_nav = ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                                | egui::Key::Home
+                                | egui::Key::End
+                                | egui::Key::PageUp
+                                | egui::Key::PageDown,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            }) && ui
+                .ctx()
+                .memory(|mem| mem.has_focus(output.response.response.id));
+            if keyboard_nav {
+                follow_char = output
+                    .state
+                    .cursor
+                    .char_range()
+                    .map(|range| range.primary.index.0);
+            }
+
+            if let Some(index) = follow_char {
+                // galley 是本帧文本,折行下的行位置是精确的。
+                let rect = output
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(index));
+                ui.scroll_to_rect(
+                    egui::Rect::from_min_max(
+                        output.galley_pos + rect.min.to_vec2(),
+                        output.galley_pos + rect.max.to_vec2(),
+                    )
+                    .expand(1.5),
+                    None,
+                );
             }
             output
         })
@@ -837,9 +861,9 @@ mod tests {
             &mut preview,
             &mut cursor,
         );
-        // 光标在写回的下一帧才被检测为「变化」(0.1 帧渲染的还是旧光标),
-        // 滚动请求比写回晚一帧;其后动画完成(默认 ≤0.3s)、布局生效、响应
-        // 可读又各差一帧 —— 补三帧且时间跨过动画窗口
+        // 写回当帧即请求滚动(标志取写回目标,不等下一帧的光标状态);
+        // 其后动画完成(默认 ≤0.3s)、布局生效、响应可读又各差一帧 ——
+        // 补三帧且时间跨过动画窗口
         frame(
             &ctx,
             Vec::new(),
@@ -886,9 +910,9 @@ mod tests {
         );
     }
 
-    /// Ctrl+End 到文末:egui 内建的光标跟随(0.36 的 TextEdit 在光标
-    /// 变化的那一帧自己调 scroll_to_rect)把文末带进视口。这条路径不经
-    /// 我们的写回分支,验证的是「ScrollArea + 内建跟随」的组合本身。
+    /// Ctrl+End 到文末:键盘导航帧(End 属于跟随键表)当帧请求滚动,把
+    /// 文末带进视口。这条路径不经写回分支,验证的是「键盘导航标志 +
+    /// ScrollArea」的组合本身。
     #[test]
     fn ctrl_end_scrolls_to_document_tail() {
         let ctx = test_ctx();
@@ -957,8 +981,225 @@ mod tests {
         );
     }
 
+    /// ArrowDown 连按(键盘导航)时光标行保持可见:删掉每帧 diff 后,
+    /// 跟随并没有被一起删掉 —— 导航键当帧置标志,光标行滚入视口
+    /// (#29 回归修复的验收红线之二)。
+    #[test]
+    fn arrow_down_navigation_keeps_cursor_visible() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        ctx.memory_mut(|m| m.request_focus(id));
+
+        // 先把光标明确落到文档头:egui 的 `cursor_at_end` 默认 true,从未
+        // 落过光标的编辑器第一次吃导航键会把光标初始化到 `galley.end()`
+        // (builder.rs 的 default_cursor_range 分支),那样测的是 egui 的
+        // 初始化语义而不是逐行导航。走 pending 写回通道落光标到 0。
+        let mut selection = None;
+        let mut pending = Some((0, 0));
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+
+        // 光标从文档头逐行下移:约 45 行处越过 600px 视口底,跟随请求
+        // 应从那一帧起把光标行抬回视口
+        let down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for i in 0..45 {
+            frame(
+                &ctx,
+                vec![down.clone()],
+                0.2 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+        // 滚动动画完成、布局生效、响应可读,各差一帧
+        for i in 0..3 {
+            frame(
+                &ctx,
+                Vec::new(),
+                4.7 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+
+        let rect = editor_rect(&ctx, id);
+        assert!(
+            rect.top() < 0.0,
+            "键盘导航把视口推离文档顶部(实测 top {}px):跟随发生了",
+            rect.top()
+        );
+        // 光标行确实还在视口内(没被滚丢):caret 的字符偏移换算内容
+        // y ≈ 行号×行高,行高用「内容总高/总行数」从同一 rect 反推
+        let caret_char = TextEditState::load(&ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index.0)
+            .expect("光标已落位");
+        let total_lines = text.lines().count().max(1);
+        // caret_char 是字符偏移(中文下 ≠ 字节偏移),逐字符数换行
+        let caret_line = text.chars().take(caret_char).filter(|c| *c == '\n').count();
+        let line_height = rect.height() / total_lines as f32;
+        let caret_content_y = caret_line as f32 * line_height;
+        assert!(
+            rect.top() <= caret_content_y && caret_content_y <= rect.bottom(),
+            "光标行留在视口内(内容 y {caret_content_y}px,视口 [{}, {}])",
+            rect.top(),
+            rect.bottom()
+        );
+    }
+
+    /// 滚轮帧/空闲帧绝不触发光标跟随(#29 回归的验收红线:坤哥实测
+    /// 「滚动后会自动滚回鼠标的位置」)。
+    ///
+    /// 早期的每帧 diff 光标方案(及其中间版本的 temp 记忆类型错位)都会
+    /// 在非跳转帧误判「光标变了」→ 请求滚回光标。现在跟随只由显式标志
+    /// (写回帧/键盘导航帧)触发,滚轮与空闲帧无标志可烧。
+    ///
+    /// 构造:先滚进文档中部并在那里落光标,再往上滚到光标**下方**之外 ——
+    /// 视口应当停在光标上方远处,而不是被拽回。
+    #[test]
+    fn wheel_scroll_is_not_yanked_back_to_cursor() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let click = egui::pos2(editor_rect(&ctx, id).left() + 40.0, 300.0);
+        let wheel = |delta: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        };
+
+        // ① 向下滚进文档中部,并在视口中央落下光标
+        for i in 0..10 {
+            frame(
+                &ctx,
+                vec![Event::PointerMoved(click), wheel(-120.0)],
+                0.1 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+        frame(
+            &ctx,
+            vec![
+                Event::PointerMoved(click),
+                Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            0.6,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(
+            TextEditState::load(&ctx, id)
+                .and_then(|s| s.cursor.char_range())
+                .is_some(),
+            "点击后光标落在文档中部"
+        );
+
+        // ② 再向上滚:视口退回文档上部,光标被甩到视口下方
+        for i in 0..4 {
+            frame(
+                &ctx,
+                vec![Event::PointerMoved(click), wheel(120.0)],
+                0.7 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+        // 滚动是带动画的:先空转几帧让它落到最终偏移
+        for i in 0..3 {
+            frame(
+                &ctx,
+                vec![Event::PointerMoved(click)],
+                1.6 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+        let settled = editor_rect(&ctx, id).top();
+        assert!(settled < 0.0, "视口确实滚离了文档顶部(实测 top {settled})");
+
+        // ③ 继续空转:光标仍被甩在视口外,但视口一步也不许动
+        for i in 0..6 {
+            frame(
+                &ctx,
+                vec![Event::PointerMoved(click)],
+                2.0 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+        }
+        let after = editor_rect(&ctx, id).top();
+        assert!(
+            (after - settled).abs() < 1.0,
+            "空闲帧不得把视口拽回光标(稳定于 {settled}px,现在 {after}px)"
+        );
+    }
+
     /// 防每帧抢滚动:没有跳转请求、没有输入的空闲帧,内容的屏幕坐标
-    /// 原样不动 —— 光标跟随只在写回那一帧请求,手写滚动不会被抢回去。
+    /// 原样不动 —— 光标跟随只在写回/键盘导航帧由显式标志触发,手写
+    /// 滚动不会被抢回去。
     #[test]
     fn idle_frames_do_not_steal_scroll() {
         let ctx = test_ctx();
