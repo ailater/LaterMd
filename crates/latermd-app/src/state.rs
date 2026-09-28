@@ -2248,7 +2248,7 @@ mod tests {
         assert_eq!(state.theme.skin, None);
         assert_eq!(
             state.theme.markdown_style(),
-            egui_markdown_style::MarkdownStyle::default()
+            crate::theme::default_markdown_style()
         );
 
         // 选一个目录里没有的皮肤:回落默认而不是留在「选了不存在的」
