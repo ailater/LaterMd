@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #43 为当前最新条目。
+> 编号 #44 为当前最新条目。
+
+## #44 U1「工具条/标题用 SemiBold」的接线范围与 Medium 的消费者（2026-09-28，ui-modernization §3 U1 自动拍板）
+
+- **岔路一：任务说「工具条/标题用 SemiBold」，但仓库里没有叫「标题」的单一控件**。候选接线性有三处：①自绘标题栏的文档标题（ui/titlebar.rs）；②格式工具条六个形态按钮 B/I/S/H1-H2-H3（ui/format_bar.rs，此前用 `RichText::strong()` 的人造粗）；③Markdown 预览的 H1-H6 标题 —— 而 ③ 在 vendored 层，`egui_markdown_style::HeadingStyle` 只有 `scales`（字号）**没有字体族字段**，接线必须改 vendor（新增字段 + serde + 渲染分支），动的是 §6 的 vendor 改动纪律，超出「只动观感层 token/主题/字体」的本棒边界。
+- **自动选择**：本棒只接 ①②（外壳侧，纯 latermd-app 改动）；③ 不做，预览标题字重留待后续需要时按 vendor ①类（上游可合）补丁单独提案。同时把 B/H1-H3 的 `strong()` 换成 SemiBold 真实字重（真实字形的精致度正是 ui-modernization §2.2「精致度最便宜的来源」的本意；人造粗与 SemiBold 叠加会双重加粗，故去 strong 留 family）。`fonts::semibold_family(ctx)` 带回落：`FontFamily::Name` 未注册时 epaint 直接 panic（epaint 0.36.2 `Font::font` 无 fallback），而大量无头 UI 测试不走 main 的 install——探测不到安装标志回落 Proportional。
+- **岔路二：Medium 字重注册给谁**。任务要求三字重都注册，但只点名了 SemiBold（工具条/标题）与 Regular（正文）两个消费者。
+- **自动选择**：Medium 注册为 `FontFamily::Name("Inter-Medium")`（链结构与 SemiBold 同构：出厂 emoji 链 + CJK 回退挂尾），**暂不接线**——等一个自然的强调档位消费者（如侧栏选中行、页签活动态）再用，避免为找消费者而扩散 UI 改动面。
+- **如何改**：①要预览 H1-H6 也用 SemiBold，走 vendor 补丁：`HeadingStyle` 加 `family: Option<FontFamily>`（egui 0.36 的 FontFamily 无 serde derive，需要自定义序列化）+ 渲染侧 `text_format` 取用，按 AGENTS §6 ①类（上游可合）单独拆 commit/PR；②要 Medium 立即有消费者，改 ui/tabs.rs 活动页签或 ui/menubar.rs 顶层项的 FontId.family 后把本条「暂不接线」划掉；③要换字重档位（如标题用 Medium 而非 SemiBold），改 ui/titlebar.rs 与 ui/format_bar.rs 两处 `semibold_family` 调用即可，fonts.rs 注册结构不变。
 
 ## #43 U0 出厂色板的分发形态与「亮色侧数值」的来源口径（2026-09-28，ui-modernization §3 U0 自动拍板）
 

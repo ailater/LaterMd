@@ -208,3 +208,20 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
   `sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app`。
 - ad-hoc 签名(codesign -s -,macos-dmg.yml)**不解决** Gatekeeper,只为避免
   无签名 bundle 的启动异常;信任门槛完全靠 cask postflight / 手动 xattr。
+
+## 6. 第三方组件许可声明
+
+发布产物携带的第三方组件与资源在此登记(依赖版本清单见
+[adr-004](adr-004-technical-stack.md);仅记**随二进制分发**的东西,
+build 期工具不在此列):
+
+| 组件 | 形态 | 许可 | 源内位置 |
+|---|---|---|---|
+| Inter 4.1(Regular/Medium/SemiBold,rsms/inter) | 嵌入字体资源(`include_bytes`,U1) | SIL Open Font License 1.1 | crates/latermd-app/src/fonts.rs;字文件与许可文本 [assets/fonts/](../assets/fonts/) |
+
+**OFL 1.1 的分发合规口径(2026-09-28 定)**:OFL 要求字体再分发时随附许可
+文本。LaterMD 的 Release 产物是单一二进制(TTF 以 `include_bytes` 打进
+去,不是独立文件),安装包内**没有**独立的 license 文件;合规依赖两条:
+许可文本随源码仓库分发(assets/fonts/LICENSE-Inter.txt,仓库公开可取),
+且本表即是产物级的许可声明。若后续要更严格的随包合规,可在 Release 资产
+附 `licenses.zip` 或在应用内加「关于/开源许可」页 —— 现阶段按上述口径执行。

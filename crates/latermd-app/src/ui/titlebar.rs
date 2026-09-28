@@ -190,10 +190,12 @@ pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
     }
 
     // 左段:应用图标 + 「LaterMD — 文档名*」。文案取 `window_title()`,
-    // 与原生窗口标题同一数据源,不另立一份状态。
+    // 与原生窗口标题同一数据源,不另立一份状态。字重取 Inter SemiBold
+    // (U1);未装 LaterMD 字体的无头测试回落 Proportional,不 panic。
     if ui.is_rect_visible(bar) {
         let painter = ui.painter();
-        let font = egui::TextStyle::Button.resolve(ui.style());
+        let mut font = egui::TextStyle::Button.resolve(ui.style());
+        font.family = crate::fonts::semibold_family(&ctx);
         let text_pos = Pos2::new(bar.left() + SPACE_SM + ICON_SM + SPACE_SM, bar.center().y);
         Icon::Files.draw(
             painter,
