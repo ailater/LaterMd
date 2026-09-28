@@ -32,6 +32,8 @@
 > `SPACE_LG` / `STATUSBAR_H` / `RADIUS_MD` 从未落地进 `tokens.rs`（git `-S` 全历史
 > 只命中本文件），删划线标注；`ACCENT` 已随 WorkBuddy 风外壳改为飞书蓝
 > （decisions-pending #30，2026-09-26）。外壳重构新增 token 见 §2.1。
+> **2026-09-28 更新（UI 现代化 U0）**：`RADIUS_MD` 已落地进 `tokens.rs`（=6，
+> 本表下方原划线状态随之解除）；U0 另扩五个新 token，见 §2.2。
 
 | 类别 | token | 值 | 用途 |
 |---|---|---|---|
@@ -44,7 +46,7 @@
 | | `TOOLBAR_H` | 28 | 工具栏按钮高度（原文误记 32，2026-09-26 订正，与 tokens.rs 对齐） |
 | | ~~`STATUSBAR_H`~~ | ~~24~~ | 未落地：状态栏高度由行高自然决定（实测 22px，[m5-acceptance.md](m5-acceptance.md) §0） |
 | 圆角 | `RADIUS_SM` | 4 | 按钮 |
-| | ~~`RADIUS_MD`~~ | ~~6~~ | 未落 tokens 常量：控件圆角 6 由 `theme::shell_tokens` 投影进 egui Style（decisions-pending #30） |
+| | `RADIUS_MD` | 6 | 控件圆角（2026-09-28 U0 落进 `tokens.rs`，此前仅由 `theme::shell_tokens` 投影，#30；见 §2.2） |
 | 语义色 | `ACCENT`（`accent(ui)` 函数） | 飞书蓝 `#3370FF`（明）/ `#6C9FFF`（暗） | 页签选中、选中态下划线、主按钮（2026-09-26 WorkBuddy 定，#30） |
 | | `WARN` | `#EBB43C` | 可行动降级（沿用回滚 dirty 警示黄） |
 | | `DANGER` | `#EB6060` | 不可逆警示（沿用回滚文案红） |
@@ -69,6 +71,20 @@
 | `ZEN_TEXT_W` | 720 | M4 | 禅定正文限宽（ui-design.md §1.2「沉浸」参数） |
 | `ZEN_EXIT_MARGIN` | 10 | M4 | 「退出禅定」浮层到内容区右上角留白 |
 | `ZEN_GUTTER` | 24 | M4 | 禅定内容区四周留白（**必须整数**：`Margin` 是 i8，f32 被 round 吞小数） |
+
+### 2.2 UI 现代化 U0 token 增补（2026-09-28 回写；出处 [ui-modernization.md](ui-modernization.md) §3 U0，数值来源 shadcn/armas，`tokens.rs` 带来源注释与 `u0_tokens_match_sourced_values` 数值断言）
+
+| token | 值 | 用途 |
+|---|---|---|
+| `RADIUS_MD` | 6 | 控件圆角（从 §2 划线状态解除，落进 `tokens.rs`；经 `theme.rs::apply_shell_to` 投影五组控件圆角） |
+| `INPUT_H` | 36 | 输入类控件高度（投影 `interact_size`；紧凑档按设计值 ×0.7 缩放，不再从 egui 出厂值出发） |
+| `INPUT_PAD_X` / `INPUT_PAD_Y` | 12 / 8 | 输入类控件内边距（投影 `button_padding`） |
+| `FONT_SM` | 14 | Small 字号（投影进明暗两套 Style） |
+
+> U0 另将九套预设色板（Dracula / Nord / Gruvbox Dark / Solarized Dark·Light / Tokyo Night /
+> One Dark·One Light / Rosé Pine）以纯数据字面量编进 `theme_presets.rs`，启动铺成
+> `themes/*.ron`（仅文件不存在才写，用户改动不被顶掉）。色板影响面 = 行内代码四色 +
+> 块级圆角 + 引用条几何；外壳不随皮肤换色仍是批次 C 既定口径（decisions-pending #43）。
 
 **不引入 CSS 式主题引擎、不做每控件自定义**（roadmap 专题「明确不做」）。token 是
 Rust 常量而非 serde 结构 —— 皮肤文件（批次 B）才需要序列化，本轮不需要。
