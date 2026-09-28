@@ -108,18 +108,75 @@ pub fn ui(
         let font = egui::FontSelection::Style(egui::TextStyle::Monospace).resolve(panel.style());
         panel.fonts_mut(|f| f.row_height(&font)) + panel.spacing().extra_text_line_spacing
     };
-    // 面板剩余高度铺满编辑区(TextEdit 无 fill-height 选项,换算成行数)。
+    // 面板剩余高度换算成最低行数(空文档也铺满编辑区)。0.36 的 multiline
+    // `TextEdit` 高度 = max(desired_rows 行高, 内容高度),内容更长时按
+    // 内容自然长高 —— 长出来的部分交给外层 ScrollArea 滚动(#29 之前
+    // 没有任何滚动容器,超过一屏的内容既看不见也滚不动)。
     let rows = (panel.available_height() / line_height).floor().max(1.0) as usize;
 
-    let mut buffer = EditorText(editor);
-    let output = egui::TextEdit::multiline(&mut buffer)
-        // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
-        .id(editor_id)
-        .font(egui::TextStyle::Monospace)
-        .desired_width(f32::INFINITY)
-        .desired_rows(rows)
-        .lock_focus(true)
-        .show(panel);
+    // 跳转/格式写回挪进 ScrollArea 闭包:与下面的光标跟随同处一个作用域,
+    // scroll_to_rect 在闭包内调用才会被本 ScrollArea 的 end 同帧消费(egui
+    // 把滚动目标记在帧级 pass state,ScrollArea 结束时取走折算成偏移)。
+    let mut format_result = pending.take();
+    if let Some(jump) = cursor.jump_to.take() {
+        format_result = Some((jump, jump));
+    }
+
+    let output = egui::ScrollArea::vertical()
+        // 每标签一套滚动位置,与 TextEdit 持久状态的口径一致;id 不含内容
+        // 长度/hash(AGENTS §6.7)。
+        .id_salt(editor_id.with("source-editor-scroll"))
+        .auto_shrink([false, false])
+        .show(panel, |ui| {
+            let mut buffer = EditorText(editor);
+            let output = egui::TextEdit::multiline(&mut buffer)
+                // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
+                .id(editor_id)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .desired_rows(rows)
+                .lock_focus(true)
+                .show(ui);
+
+            // 进来:格式动作/大纲跳转产出的新选区,写回 TextEdit 持久 cursor
+            // 并把焦点还给编辑器 —— 否则用户还得自己点回编辑区才能继续打字。
+            if let Some((start, end)) = format_result {
+                write_selection(ui, &output.response.response.id, &output.state, start, end);
+            }
+
+            // 光标跟随(大纲跳转/格式写回/Ctrl+End 等):egui 0.36 的内建
+            // 跟随在 Atom paint 阶段才发 scroll_to_rect,晚于本 ScrollArea
+            // 的 end,请求永不落地(实测 offset_target 不设置);这里在
+            // end 之前自己补。galley 是本帧文本,折行下的行位置是精确的。
+            // 只在光标变化的那一帧请求 —— 徒手滚动时光标不动,不被抢回。
+            // 上一帧光标是 UI 侧记忆(egui data),不进 State 归约。
+            let cursor_now = output
+                .state
+                .cursor
+                .char_range()
+                .map(|range| range.primary.index.0);
+            let cursor_key = editor_id.with("last-cursor-char");
+            let cursor_prev: Option<usize> = ui.ctx().data(|data| data.get_temp(cursor_key));
+            if cursor_now != cursor_prev {
+                if let Some(index) = cursor_now {
+                    let rect = output
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(index));
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_max(
+                            output.galley_pos + rect.min.to_vec2(),
+                            output.galley_pos + rect.max.to_vec2(),
+                        )
+                        .expand(1.5),
+                        None,
+                    );
+                }
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(cursor_key, cursor_now));
+            }
+            output
+        })
+        .inner;
 
     // 快照只在修订号前进时重建(文本 + 大纲同源);这是"避免每帧重解析"
     // 的第一层,vendored 层的 text hash 缓存是第二层。
@@ -147,21 +204,6 @@ pub fn ui(
         .char_range()
         .map(|range| (range.primary.index.0, range.secondary.index.0));
 
-    // 进来:格式动作产出的新选区,写回 TextEdit 持久 cursor 并把焦点还给
-    // 编辑器 —— 否则用户还得自己点回编辑区才能继续打字。
-    let mut format_result = pending.take();
-    if let Some(jump) = cursor.jump_to.take() {
-        format_result = Some((jump, jump));
-    }
-    if let Some((start, end)) = format_result {
-        write_selection(
-            panel,
-            &output.response.response.id,
-            &output.state,
-            start,
-            end,
-        );
-    }
     output.response.response
 }
 
@@ -228,12 +270,16 @@ mod tests {
         pending: &mut Option<(usize, usize)>,
         cursor: &mut OutlineCursor,
     ) -> egui::Id {
+        // 真实窗口尺度的视口:滚不滚得动取决于「内容是否高过一屏」,
+        // 默认 10000×10000 的测试视口永远装得下,滚动路径测不到。
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut live = LiveState::default();
         let id = std::cell::Cell::new(egui::Id::NULL);
         let output = ctx.run_ui(
             RawInput {
                 events,
                 time: Some(now),
+                screen_rect: Some(screen),
                 ..Default::default()
             },
             |ui| {
@@ -656,5 +702,303 @@ mod tests {
         );
         assert!(editor.text().contains("\n\n!## 乙"), "从新光标处插入");
         assert_eq!(cursor.byte, Some(heading_byte + 1), "光标随输入前进");
+    }
+
+    /// 读回编辑器 TextEdit 的屏幕矩形。ScrollArea 的持久 id 经
+    /// `make_persistent_id` 与 root ui id 链混合,测试里不便推导;但滚动
+    /// 偏移会直接平移内容的屏幕坐标,量 rect 比量内部 state 更黑盒。
+    fn editor_rect(ctx: &egui::Context, id: egui::Id) -> egui::Rect {
+        ctx.read_response(id).expect("TextEdit 响应已记录").rect
+    }
+
+    /// 超长文档(≥500 行)在源码模式下:TextEdit 按内容自然长高(不被
+    /// ScrollArea 压扁成一行)—— 「看得见也滚得动」的前提(#29)。
+    #[test]
+    fn long_document_grows_a_scrollable_editor() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行:足够普通的 Markdown 段落。\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        let rect = editor_rect(&ctx, id);
+        assert!(
+            rect.height() > 600.0,
+            "TextEdit 按内容长高(实测 {height}px),而不是被视口压扁",
+            height = rect.height()
+        );
+    }
+
+    /// 滚轮真的滚得动:指针悬在编辑区上滚一格,内容屏幕坐标上移。#29 的
+    /// 症状就是「超过一屏的内容看不见也滚不动」;rect 会动 = ScrollArea
+    /// 真的在承载滚动(没有它,widget 永远钉在面板顶部)。
+    #[test]
+    fn mouse_wheel_scrolls_the_long_document() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let top_before = editor_rect(&ctx, id).top();
+
+        frame(
+            &ctx,
+            vec![
+                Event::PointerMoved(egui::pos2(400.0, 200.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        // 偏移在 end 里落账、指针 hover 判定又滞后一帧,屏幕坐标要再等
+        // 一帧布局才反映 —— 补两帧再读
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let top_after = editor_rect(&ctx, id).top();
+        assert!(
+            top_after < top_before,
+            "滚轮把内容推离顶部(实测 top {top_before} → {top_after})"
+        );
+    }
+
+    /// 大纲跳转(消费 jump_to 的那一帧)请求滚动到光标行:写回光标后,
+    /// 滚动动画把文末光标带进视口。再渲一帧让动画完成(默认 0.1-0.3s)。
+    #[test]
+    fn outline_jump_scrolls_cursor_into_view() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        // 跳到文末(远在首屏之外)
+        cursor.jump_to = Some(editor.len_chars());
+        frame(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        // 光标在写回的下一帧才被检测为「变化」(0.1 帧渲染的还是旧光标),
+        // 滚动请求比写回晚一帧;其后动画完成(默认 ≤0.3s)、布局生效、响应
+        // 可读又各差一帧 —— 补三帧且时间跨过动画窗口
+        frame(
+            &ctx,
+            Vec::new(),
+            1.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            2.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            2.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            2.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        let rect = editor_rect(&ctx, id);
+        assert!(
+            rect.bottom() <= 600.0,
+            "文末光标滚入视口:内容底部已抬进 600px 视口(实测 {bottom}px)",
+            bottom = rect.bottom()
+        );
+        assert!(
+            rect.top() < 0.0,
+            "视口确实离开了文档顶部(实测 top {}px)",
+            rect.top()
+        );
+    }
+
+    /// Ctrl+End 到文末:egui 内建的光标跟随(0.36 的 TextEdit 在光标
+    /// 变化的那一帧自己调 scroll_to_rect)把文末带进视口。这条路径不经
+    /// 我们的写回分支,验证的是「ScrollArea + 内建跟随」的组合本身。
+    #[test]
+    fn ctrl_end_scrolls_to_document_tail() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(
+            &ctx,
+            vec![Event::Key {
+                key: Key::End,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        // 光标写回/变化 → 请求滚动 → 动画完成 → 布局生效 → 响应可读,各差一帧
+        frame(
+            &ctx,
+            Vec::new(),
+            0.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.6,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.7,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        let rect = editor_rect(&ctx, id);
+        assert!(
+            rect.bottom() <= 600.0,
+            "Ctrl+End 后文末滚入视口(实测 bottom {bottom}px)",
+            bottom = rect.bottom()
+        );
+    }
+
+    /// 防每帧抢滚动:没有跳转请求、没有输入的空闲帧,内容的屏幕坐标
+    /// 原样不动 —— 光标跟随只在写回那一帧请求,手写滚动不会被抢回去。
+    #[test]
+    fn idle_frames_do_not_steal_scroll() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let top = editor_rect(&ctx, id).top();
+        frame(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            editor_rect(&ctx, id).top(),
+            top,
+            "空闲帧不请求滚动,内容纹丝不动"
+        );
     }
 }
