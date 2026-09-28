@@ -32,6 +32,11 @@ image = { version = "0.25", default-features = false, features = [
 # 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内);images =
 # 预览出图(B 段),上游 feature,未改 vendor
 egui_markdown = { path = "../../vendor/egui_markdown", features = ["images"] }
+# 剪贴板图片读取(D 段):egui 0.36 内建剪贴板只出不进(get_text 有、
+# get_image 无),Ctrl+V 的图片字节直接用 arboard 取。3.6.1 已在依赖树
+# (eframe → egui-winit/clipboard → arboard/image-data),此处把传递依赖
+# 提升为直接依赖,零新增编译面;登记见 ADR-004
+arboard = "3.6"
 # 主题:开启 vendor 子 crate 自带的 serde feature(MarkdownStyle 派生,ThemeSettings 持久化)
 egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
 # 主题设置(ThemeSettings/ThemeMode)的序列化 derive

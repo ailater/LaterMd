@@ -24,6 +24,7 @@ use crate::ai::AiState;
 use crate::ai_config::AiConfig;
 use crate::ai_key::AiKeyState;
 use crate::bed::{BedState, BedUploadPurpose};
+use crate::clipboard::ClipboardState;
 use crate::command::Command;
 use crate::export;
 use crate::file::{self, FileCmd};
@@ -214,6 +215,9 @@ pub struct State {
     /// 归约只置 `open` 与消费插入,UI 经 `&mut` 改草稿 —— 与 `SettingsState`
     /// 持草稿同款分工(`TextEdit` 是立即模式控件,草稿必须能就地 `&mut`)。
     pub image_dialog: ImageDialogState,
+    /// 剪贴板图片读取(docs/image-plan.md D 段):后台线程 + channel 的
+    /// 接收端,生命周期与 `BedState` 同构(发起/收流/收尾三原语)。
+    pub clipboard: ClipboardState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -316,6 +320,7 @@ impl Default for State {
             settings: SettingsState::default(),
             bed: BedState::default(),
             image_dialog: ImageDialogState::default(),
+            clipboard: ClipboardState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
             skins: SkinCatalog::default(),
@@ -383,6 +388,23 @@ pub enum Message {
     /// UI 不卡)。取消选择则一切不动。收尾见
     /// [`Message::ImageUploadFinished`]。
     ImageUploadRequested,
+    /// Ctrl+V 且剪贴板无文本(docs/image-plan.md D 段):发起后台剪贴板
+    /// 图片读取(arboard,X11 握手是阻塞 IO,不进归约)。收尾见
+    /// [`Message::ImagePasteFinished`]。
+    ImagePasteRequested,
+    /// 剪贴板读取收尾(后台线程经 channel 回传):`Ok(png 字节)` 落
+    /// `.assets/` 并在当前光标处插相对路径引用(alt 空,粘贴图无可推断的
+    /// 说明);`Err` 只落提示行,文档与选区绝不动(与图床上传失败同口径,
+    /// image-plan §4.3)。
+    ImagePasteFinished {
+        /// 成功 = PNG 字节(解码与重编码已在后台线程完成);失败 = 面向
+        /// 用户的错误文案。
+        result: Result<Vec<u8>, String>,
+    },
+    /// 拖入图片文件(docs/image-plan.md D 段):归约里读文件、过白名单与
+    /// 5MB 上限、落 `.assets/` 并在光标处插引用。文件读取是本地磁盘
+    /// (毫秒级),同步做,不上后台线程 —— 与文件树打开文件同口径。
+    ImageFileDropped(PathBuf),
     /// 后台上传收尾(后台线程经 channel 回传,每帧归约收流翻成此消息):
     /// **只接受最新序号**(`seq` 与当前序号相等才处理,防旧请求覆盖 ——
     /// 照抄 AI 流式防重入手法,旧结果静默丢弃)。`Ok(url)` 按发起时的用途
@@ -543,6 +565,9 @@ impl State {
             Message::ImageFilePickRequested => self.pick_image_file(),
             Message::ImageUploadRequested => self.request_image_upload(),
             Message::ImageUploadFinished { seq, result } => self.finish_image_upload(seq, result),
+            Message::ImagePasteRequested => self.request_image_paste(),
+            Message::ImagePasteFinished { result } => self.finish_image_paste(result),
+            Message::ImageFileDropped(path) => self.drop_image_file(&path),
             Message::BedProfileSaved { profile, token } => self.save_bed_profile(profile, token),
             Message::BedProfileDeleted { id } => self.delete_bed_profile(id),
             Message::BedTestUploadRequested { profile_id } => self.test_bed_upload(profile_id),
@@ -910,6 +935,11 @@ impl State {
         self.ai.poll()
     }
 
+    /// 剪贴板图片读取的收流(与 [`Self::poll_bed`] 同分工)。
+    pub fn poll_clipboard(&mut self) -> Vec<Message> {
+        self.clipboard.poll()
+    }
+
     /// 当前应渲染的明暗:`System` 已在 [`ThemeMode::resolve`] 里落到确定值,
     /// 绘制前一律用它,不直接读 `theme.mode`。
     pub fn resolved_theme(&self) -> ThemeMode {
@@ -1249,6 +1279,82 @@ impl State {
                 self.bed.last_test = Some((profile_name, result));
             }
             None => {}
+        }
+    }
+
+    /// 发起剪贴板图片读取(`Message::ImagePasteRequested` 的归约,
+    /// docs/image-plan.md D 段):spawn 后台线程,立即返回。防重入不拦 ——
+    /// 新读取直接换接收端,旧线程的结果无处可去(与图床上传同手法)。
+    fn request_image_paste(&mut self) {
+        self.clipboard.start();
+    }
+
+    /// 剪贴板读取收尾(`Message::ImagePasteFinished` 的归约):PNG 字节过
+    /// 5MB 上限 → 落 `.assets/`(剪贴板没有原名,合成 `粘贴图片-<时间戳>`)
+    /// → 当前光标处插相对路径引用(alt 空 —— 粘贴图没有可推断的说明,
+    /// 用户回头补)。失败只落提示行,文档与选区绝不动(image-plan §4.3
+    /// 同口径:失败的唯一后果是不插入文本)。
+    fn finish_image_paste(&mut self, result: Result<Vec<u8>, String>) {
+        self.clipboard.finish();
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.tabs.current_mut().document.notice = Some(error);
+                return;
+            }
+        };
+        let Some(doc) = self.tabs.current().document.path.clone() else {
+            self.tabs.current_mut().document.notice =
+                Some("请先保存文档再粘贴图片 —— 图片要存到文档旁的 .assets/ 目录".to_owned());
+            return;
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let name = crate::assets::pasted_image_name(nanos);
+        match crate::assets::store_pasted_image(&doc, &name, &bytes) {
+            Ok(stored) => {
+                let index = self.tabs.active;
+                self.insert_image_at(index, "", &stored.url);
+            }
+            // 归约侧先建目录再写盘,超限在写盘之前就拒了,不会留半个 .assets/
+            Err(error) => self.tabs.current_mut().document.notice = Some(error),
+        }
+    }
+
+    /// 拖入图片文件(`Message::ImageFileDropped` 的归约,docs/image-plan.md
+    /// D 段):读文件 → 白名单 + 5MB 判定 → 落 `.assets/`(原名,撞名 -1
+    /// 后缀)→ 光标处插引用。读的是本地磁盘(毫秒级,与文件树打开文件
+    /// 同口径),同步做;白名单外或超限**只弹 notice,不改文档**。
+    fn drop_image_file(&mut self, path: &Path) {
+        let Some(doc) = self.tabs.current().document.path.clone() else {
+            self.tabs.current_mut().document.notice =
+                Some("请先保存文档再拖入图片 —— 图片要复制到文档旁的 .assets/ 目录".to_owned());
+            return;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.tabs.current_mut().document.notice =
+                    Some(format!("读取拖入文件失败 {}: {error}", path.display()));
+                return;
+            }
+        };
+        if let Err(notice) = crate::assets::check_dropped_file(path, bytes.len() as u64) {
+            self.tabs.current_mut().document.notice = Some(notice);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match crate::assets::store(&doc, &name, &bytes) {
+            Ok(stored) => {
+                let index = self.tabs.active;
+                self.insert_image_at(index, "", &stored.url);
+            }
+            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
     }
 
@@ -4121,5 +4227,228 @@ mod tests {
         assert!(notice.contains("设置 → 图片"), "指路设置:{notice}");
         assert!(state.image_dialog.open, "对话框不动");
         assert!(!state.bed.is_uploading());
+    }
+
+    // —— D 段归约(docs/image-plan.md §3.D)——
+
+    /// 剪贴板粘贴收尾(D 段归约层):PNG 字节落 `.assets/`(合成名
+    /// `粘贴图片-<时间戳>`),光标处插**空 alt** 的相对路径引用;剪贴板
+    /// 读取线程由 clipboard.rs 单测覆盖,这里钉归约对结果的处置。
+    #[test]
+    fn paste_finish_stores_bytes_and_inserts_relative_reference() {
+        let dir = temp_path("paste-finish");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("笔记.md");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc.clone());
+        state.tabs.current_mut().editor.replace_all("正文");
+        state.tabs.current_mut().selection = Some((2, 2));
+        // 手动造在途态:finish 只收口接收端
+        state.clipboard.rx = Some(std::sync::mpsc::channel::<Result<Vec<u8>, String>>().1);
+
+        state.apply(Message::ImagePasteFinished {
+            result: Ok(b"png-bytes".to_vec()),
+        });
+
+        let text = state.tabs.current().editor.text();
+        let expected = "正文![](./笔记.assets/粘贴图片-";
+        assert!(
+            text.starts_with(expected),
+            "空 alt + 合成名相对引用插在光标处:{text}"
+        );
+        assert!(text.ends_with(".png)"), "扩展名恒 png:{text}");
+        // 文件真的落了盘,字节原样
+        let stored = std::fs::read_dir(dir.join("笔记.assets")).unwrap();
+        let files: Vec<_> = stored
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "恰一份落盘:{files:?}");
+        let saved = std::fs::read(dir.join("笔记.assets").join(&files[0])).unwrap();
+        assert_eq!(saved, b"png-bytes".to_vec());
+        assert!(!state.clipboard.is_reading(), "收尾后空闲");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 剪贴板读取失败:只落 notice,文档、选区、pending_selection 一字不动
+    /// (image-plan §4.3 同口径:失败的唯一后果是不插入文本)。
+    #[test]
+    fn paste_failure_only_notices() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("原样");
+        state.tabs.current_mut().selection = Some((0, 2));
+        state.clipboard.rx = Some(std::sync::mpsc::channel::<Result<Vec<u8>, String>>().1);
+
+        state.apply(Message::ImagePasteFinished {
+            result: Err("剪贴板里没有可用的图片".to_owned()),
+        });
+
+        assert_eq!(state.tabs.current().editor.text(), "原样");
+        assert_eq!(state.tabs.current().selection, Some((0, 2)), "选区不动");
+        assert_eq!(state.tabs.current().pending_selection, None);
+        assert_eq!(
+            state.tabs.current().document.notice.as_deref(),
+            Some("剪贴板里没有可用的图片")
+        );
+        assert!(!state.clipboard.is_reading());
+    }
+
+    /// 超过 5MB 的剪贴板图片:拒绝并提示,不落盘(字节入口的上限判定)。
+    #[test]
+    fn oversized_paste_is_rejected_without_writing() {
+        let dir = temp_path("paste-oversize");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("d.md");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc.clone());
+        state.tabs.current_mut().editor.replace_all("内容");
+        state.clipboard.rx = Some(std::sync::mpsc::channel::<Result<Vec<u8>, String>>().1);
+
+        let big = vec![0u8; crate::assets::MAX_IMAGE_BYTES as usize + 1];
+        state.apply(Message::ImagePasteFinished { result: Ok(big) });
+
+        assert_eq!(state.tabs.current().editor.text(), "内容", "不插");
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("超过 5 MB"), "{notice}");
+        assert!(!dir.join("d.assets").exists(), "不留半个资产目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未落盘文档粘贴图片:提示先保存(`.assets/` 要与文档同目录),
+    /// 不插入、不落盘。剪贴板读取照常收口(下次粘贴不受卡)。
+    #[test]
+    fn paste_on_unsaved_doc_only_notices() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("草稿");
+        state.clipboard.rx = Some(std::sync::mpsc::channel::<Result<Vec<u8>, String>>().1);
+
+        state.apply(Message::ImagePasteFinished {
+            result: Ok(b"png".to_vec()),
+        });
+
+        assert_eq!(state.tabs.current().editor.text(), "草稿");
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("保存"), "{notice}");
+        assert!(!state.clipboard.is_reading());
+    }
+
+    /// 拖入图片文件(D 段归约层):白名单内 → 读盘 → 复制进 `.assets/`
+    /// (原名)→ 光标处插空 alt 相对引用;文件在资产目录里时直接复用
+    /// (import_file 的既有语义,拖拽不该堆副本)。
+    #[test]
+    fn dropped_image_stores_and_inserts_reference() {
+        let dir = temp_path("drop-image");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("笔记.md");
+        std::fs::write(&doc, "# x").unwrap();
+        let source = dir.join("拖入图.png");
+        std::fs::write(&source, b"dropped-bytes").unwrap();
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc.clone());
+        state.tabs.current_mut().editor.replace_all("行尾");
+        state.tabs.current_mut().selection = Some((2, 2));
+
+        state.apply(Message::ImageFileDropped(source.clone()));
+
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "行尾![](./笔记.assets/拖入图.png)"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("笔记.assets/拖入图.png")).unwrap(),
+            b"dropped-bytes".to_vec()
+        );
+        assert_eq!(state.tabs.current().document.notice, None, "成功不弹提示");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拖入白名单外文件(归约侧兜底:layout 过滤在 extension 层,这里钉
+    /// 归约对扩展名判定失败路径的行为):提示点名格式,不读盘不落盘。
+    #[test]
+    fn dropped_non_image_only_notices() {
+        let dir = temp_path("drop-nonimage");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("d.md");
+        let stray = dir.join("说明.txt");
+        std::fs::write(&stray, b"text").unwrap();
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc);
+        state.tabs.current_mut().editor.replace_all("原文");
+
+        state.apply(Message::ImageFileDropped(stray));
+
+        assert_eq!(state.tabs.current().editor.text(), "原文");
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("txt"), "{notice}");
+        assert!(!dir.join("d.assets").exists(), "不留半个资产目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拖入超 5MB 图片:提示带实际大小,不落盘不插入。
+    #[test]
+    fn dropped_oversized_image_only_notices() {
+        let dir = temp_path("drop-oversize");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("d.md");
+        let big = dir.join("大图.png");
+        std::fs::write(&big, vec![0u8; crate::assets::MAX_IMAGE_BYTES as usize + 1]).unwrap();
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc);
+        state.tabs.current_mut().editor.replace_all("原文");
+
+        state.apply(Message::ImageFileDropped(big));
+
+        assert_eq!(state.tabs.current().editor.text(), "原文");
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("超过 5 MB"), "{notice}");
+        assert!(!dir.join("d.assets").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未落盘文档拖入图片:提示先保存,不弹别的。
+    #[test]
+    fn drop_on_unsaved_doc_only_notices() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("草稿");
+
+        state.apply(Message::ImageFileDropped(PathBuf::from("/tmp/x.png")));
+
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("保存"), "{notice}");
+        assert_eq!(state.tabs.current().editor.text(), "草稿");
     }
 }

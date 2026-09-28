@@ -2521,6 +2521,7 @@ dependencies = [
 name = "latermd-app"
 version = "0.0.1"
 dependencies = [
+ "arboard",
  "criterion",
  "dark-light",
  "eframe",

@@ -16,6 +16,7 @@ mod ai_key;
 mod ai_link;
 mod assets;
 mod bed;
+mod clipboard;
 mod command;
 mod compose;
 mod export;

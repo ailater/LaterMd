@@ -25,6 +25,61 @@ impl LaterMdApp {
         // 图床上传收流:同一手法(channel → Message → 归约),结果只在归约
         // 落地(插入或回显),后台线程不碰 UI 状态
         outbox.extend(state.poll_bed());
+        // 剪贴板图片读取收流:同上(D 段,arboard 的阻塞 IO 在后台线程)
+        outbox.extend(state.poll_clipboard());
+        // 图片拖入落盘(D 段):dropped_files 由 egui-winit 汇进 raw input,
+        // `RawInput::take` 每帧清空,这里取走即消费。白名单外的不进归约
+        // (egui 全窗口收文件,非图片文件的拖入不该弹图片提示);大小上限
+        // 在归约里读文件后才判。读文件与落盘是本地磁盘(毫秒级),同步在
+        // 归约做 —— 与文件树打开文件同口径。
+        let dropped: Vec<std::path::PathBuf> = ctx
+            .input_mut(|input| std::mem::take(&mut input.raw.dropped_files))
+            .iter()
+            .filter(|file| {
+                file.path().extension().is_some_and(|ext| {
+                    crate::assets::is_allowed_extension(&ext.to_string_lossy().to_lowercase())
+                })
+            })
+            .map(|file| file.path().to_path_buf())
+            .collect();
+        for path in dropped {
+            state.apply(Message::ImageFileDropped(path));
+        }
+        // Ctrl+V 的图片兑底(D 段):egui-winit 在 Ctrl+V 时同步读**文本**
+        // 剪贴板,有文本才有 Event::Paste(egui-winit/lib.rs 的
+        // is_paste_command 分支);剪贴板只有图片时什么都不发生 —— 本帧
+        // V 键按下而无 Paste 事件,就是「剪贴板没文本」的可观察形态,此刻
+        // 发起后台图片读取。文本粘贴(Paste 事件存在)与图片读取互斥:
+        // 前者让 TextEdit 照常插字,本分支不触发。
+        //
+        // 用「V 无 Paste 兑底」而不是拦 V 键:拦键会在剪贴板有文本时抢在
+        // egui-winit 之前消费按键,文本粘贴被劫持;Paste 事件由 egui-winit
+        // 生成,拿它当「剪贴板有文本」的信号天然无竞态。V 键不消费(留
+        // 给输入控件,只读不拿走),Ctrl 的判定用事件自带的 modifiers 字段
+        // —— 帧级 `input.modifiers` 是「本帧开始时按着的修饰键」,winit
+        // 在 ModifiersChanged 事件之后才推进它,首帧裸键序列下可能滞后。
+        let pasted_text = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+        });
+        let pressed_v = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.command
+                )
+            })
+        });
+        if pressed_v && !pasted_text {
+            state.apply(Message::ImagePasteRequested);
+        }
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
@@ -96,6 +151,11 @@ impl LaterMdApp {
         // 图床上传的重绘驱动同理:结果到达要在下一帧收流归约(空闲不来帧,
         // 不显式要帧结果会悬到下一次无关重绘);收尾清接收端后自然停。
         if state.bed.is_uploading() {
+            ctx.request_repaint();
+        }
+        // 剪贴板图片读取的重绘驱动同理(D 段):结果到达要在下一帧收流
+        // 归约;收尾清接收端后自然停。
+        if state.clipboard.is_reading() {
             ctx.request_repaint();
         }
 
@@ -824,6 +884,42 @@ mod tests {
         titles
     }
 
+    /// [`reduce`] 的拖拽版:带 dropped_files 的原始输入跑一帧归约。
+    /// egui 0.36 的 `DroppedFile` 是集成侧实现的 trait 对象,测试里用
+    /// 路径直读的最小实现喂给 `raw.dropped_files`(与 egui-winit 的
+    /// 原生实现同语义:native 路径下 `bytes()` 就是 `fs::read`)。
+    fn reduce_with_dropped(app: &mut LaterMdApp, files: Vec<std::path::PathBuf>) -> Vec<String> {
+        struct TestDropped(std::path::PathBuf);
+        impl std::fmt::Debug for TestDropped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "TestDropped({:?})", self.0)
+            }
+        }
+        impl egui::DroppedFile for TestDropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|error| error.to_string())
+            }
+        }
+        let ctx = egui::Context::default();
+        let dropped: Vec<egui::DroppedFileHandle> = files
+            .into_iter()
+            .map(|path| std::sync::Arc::new(TestDropped(path)) as egui::DroppedFileHandle)
+            .collect();
+        let output = ctx.run_ui(
+            RawInput {
+                dropped_files: dropped,
+                ..Default::default()
+            },
+            |ui| app.reduce(ui.ctx()),
+        );
+        let titles = title_commands(&output);
+        output.drop_without_applying_deltas();
+        titles
+    }
+
     fn title_commands(output: &FullOutput) -> Vec<String> {
         output
             .viewport_output
@@ -836,12 +932,80 @@ mod tests {
             .collect()
     }
 
+    /// 拖入图片文件的**帧级**链路(D 段):`raw.dropped_files` 里白名单内的
+    /// 图片进归约(`ImageFileDropped`),白名单外的(.md)不进 —— egui 是
+    /// 全窗口收文件,拖 .md 的语义是「打开文件」而不是插图,过滤发生在
+    /// layout 侧。归约之后的落盘与插入由 state::tests 钉住。
+    #[test]
+    fn dropped_whitelisted_image_enters_reduction_others_do_not() {
+        let dir = std::env::temp_dir().join(format!("latermd-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("笔记.md");
+        std::fs::write(&doc, "# x").unwrap();
+        let image = dir.join("图.png");
+        std::fs::write(&image, b"png").unwrap();
+        let markdown = dir.join("别的.md");
+        std::fs::write(&markdown, b"# y").unwrap();
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(doc.clone());
+
+        // 白名单外的 .md:被 layout 过滤,文档不动(拖 .md 开文件属
+        // 将来的拖开标签,不是本段语义)
+        reduce_with_dropped(&mut app, vec![markdown]);
+        assert_eq!(
+            app.state.tabs.current().editor.text(),
+            state::State::default().tabs.current().editor.text(),
+            "非图片不进归约"
+        );
+        assert_eq!(app.state.tabs.current().document.notice, None);
+
+        // 白名单内的图片:进归约 → 落盘 → 插相对引用
+        reduce_with_dropped(&mut app, vec![image]);
+        assert!(
+            app.state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .contains("![](./笔记.assets/图.png)"),
+            "插入相对引用"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl+V 的图片兑底(D 段帧级):V 键按下而本帧**无** Paste 事件
+    /// (= egui-winit 读文本剪贴板为空)→ 发起剪贴板图片读取;有 Paste
+    /// 事件(文本粘贴)则不发起,文本粘贴照常。
+    #[test]
+    fn ctrl_v_without_text_paste_starts_clipboard_read() {
+        let mut app = LaterMdApp::default();
+        let v_key = Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        // 无 Paste 事件:发起后台读取(读取中标志置位;真实读数在后台
+        // 线程,无头环境起线程也能跑通,这里只钉「发起了」)
+        reduce(&mut app, vec![v_key.clone()]);
+        assert!(app.state.clipboard.is_reading(), "剪贴板无文本时兑底发起");
+
+        // 有 Paste 事件:文本粘贴优先,不发起图片读取
+        app.state.clipboard.finish();
+        reduce(&mut app, vec![v_key, Event::Paste("粘贴的文本".to_owned())]);
+        assert!(
+            !app.state.clipboard.is_reading(),
+            "文本粘贴不被劫持成图片流程"
+        );
+    }
+
     /// 标题随文件名与 dirty 变化;无变化帧不重复下发(避免每帧 set_title)。
     #[test]
     fn title_tracks_document_and_dirty() {
         let mut app = LaterMdApp::default();
         assert_eq!(reduce(&mut app, Vec::new()), vec!["LaterMD — 未命名"]);
-
         app.state.tabs.current_mut().editor.insert_chars(0, "改动");
         assert_eq!(reduce(&mut app, Vec::new()), vec!["LaterMD — 未命名*"]);
 

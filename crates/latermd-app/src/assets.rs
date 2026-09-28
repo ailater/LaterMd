@@ -1,4 +1,4 @@
-//! 本地图片落 `<doc名>.assets/`(docs/image-plan.md B 段)。
+//! 本地图片落 `<doc名>.assets/`(docs/image-plan.md B 段 + D 段纯函数层)。
 //!
 //! 目录约定:文档 `foo.md` 的图片都住它旁边的 `foo.assets/`。文档里存
 //! **相对**路径(`./foo.assets/x.png`),文档目录整体搬走、换机器、进 Git
@@ -8,6 +8,9 @@
 //! 命名:保留原名,撞名时 `x.png` → `x-1.png` → `x-2.png`(永不覆盖既有
 //! 文件)。落文档的地址遇空格/括号以 `<…>` 包裹 —— CommonMark 的目标语法
 //! 允许其中的空格,与 `latermd_md::expand_wikilinks` 同一手法。
+//!
+//! D 段(粘贴/拖拽)共用同一套落盘:白名单 PNG/JPEG/WebP/GIF、5MB 上限、
+//! 剪贴板文件名合成见下方纯函数区。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -154,6 +157,77 @@ impl fmt::Display for StoreError {
     }
 }
 
+// —— D 段纯函数层(docs/image-plan.md §3.D)——
+// 粘贴与拖拽共用一张「白名单 + 大小上限 + 文件名合成」表:判定全部是
+// 纯函数,UI 侧只负责取字节与调它们,单测因此能穷尽。
+
+/// 图片大小上限:**5 MB**(auto-plan #21 既定口径,超限弹提示不落盘)。
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 扩展名(小写、无点)是否在 D 段白名单内。
+///
+/// 与 [`crate::file::IMAGE_EXTENSIONS`](rfd 对话框的同一张清单)同源:
+/// 对话框能选到的 = 粘贴/拖拽肯收的 = 预览 `image` feature 解得了码的。
+/// 清单本身全小写,入参先归一(大写扩展名 `X.PNG` 是 Windows 常态)。
+pub fn is_allowed_extension(ext: &str) -> bool {
+    let ext = ext.to_lowercase();
+    crate::file::IMAGE_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// 路径的小写扩展名(无点);无扩展名返回空串。
+pub fn extension_of(path: &Path) -> String {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// 拖入文件的收货判定:`Ok(())` 收下,`Err(文案)` 是弹给用户的提示。
+///
+/// 扩展名不在白名单 / 超过 [`MAX_IMAGE_BYTES`] 都**不改文档**,只弹
+/// notice(image-plan §3.D「白名单外或超 5MB 弹 notice」)。大小在拿到
+/// 字节之前先问(拖拽场景 UI 侧有元数据,能提前拒),字节入口
+/// ([`store_pasted_image`])在拿到字节后再核一次。
+pub fn check_dropped_file(path: &Path, size: u64) -> Result<(), String> {
+    let ext = extension_of(path);
+    if !is_allowed_extension(&ext) {
+        return Err(format!(
+            "不支持的图片格式 .{ext}(仅 PNG/JPEG/WebP/GIF),未插入"
+        ));
+    }
+    if size > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "图片超过 5 MB 上限({:.1} MB),未插入",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    Ok(())
+}
+
+/// 剪贴板图片的默认文件名:`粘贴图片-<纳秒时间戳>.png`(十六进制)。
+///
+/// 剪贴板字节没有原名可保留;arboard 的 Linux 后端只认 `image/png`
+/// (x11.rs get_image 固定按 PNG 解码),Windows 的 CF_DIB/CF_BITMAP
+/// 也是转成 RGBA 像素回来 —— 出口统一重编码成 PNG(见
+/// `clipboard.rs`),扩展名因此恒 `png`。时间戳防同秒多次粘贴撞名
+/// (撞名本身也有 -1 后缀兜底,这里是让名字本身就散开)。
+pub fn pasted_image_name(nanos: u128) -> String {
+    format!("粘贴图片-{nanos:x}.png")
+}
+
+/// 剪贴板字节的落盘入口:先过大小上限,再走 [`store`](撞名后缀、
+/// `<…>` 包裹等语义与本地文件同一条路径)。
+///
+/// 失败文案面向提示行:超限 / 名字不合法 / 写盘失败,调用方只弹 notice。
+pub fn store_pasted_image(doc_path: &Path, name: &str, bytes: &[u8]) -> Result<Stored, String> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "剪贴板图片超过 5 MB 上限({:.1} MB),未插入",
+            bytes.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    store(doc_path, name, bytes).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +347,64 @@ mod tests {
             .to_string();
         assert!(error.contains("图片存入失败"), "{error}");
         assert!(error.contains("x.assets"), "{error}");
+    }
+
+    // —— D 段纯函数层单测(docs/image-plan.md §3.D 验收)——
+
+    /// 白名单判定:扩展名大小写不敏感;白名单外(含可解码但不在清单的
+    /// bmp/tiff、无扩展名)一律拒。清单与 rfd 对话框同一张,两者不会漂移。
+    #[test]
+    fn whitelist_accepts_png_jpeg_webp_gif_case_insensitively() {
+        for ok in ["png", "PNG", "Jpg", "jpeg", "webp", "GIF"] {
+            assert!(is_allowed_extension(ok), "{ok} 应在白名单");
+        }
+        for bad in ["", "bmp", "tiff", "svg", "avif", "heic", "md"] {
+            assert!(!is_allowed_extension(bad), "{bad:?} 应被拒");
+        }
+    }
+
+    /// 大小上限判定:恰好 5MB 收下,超一个字节拒;拒的文案带「5 MB」
+    /// 与实际大小,弹出的提示能自查。
+    #[test]
+    fn size_limit_is_five_mebibytes() {
+        let file = Path::new("x.png");
+        assert!(
+            check_dropped_file(file, MAX_IMAGE_BYTES).is_ok(),
+            "恰好 5MB 收下"
+        );
+        let rejected = check_dropped_file(file, MAX_IMAGE_BYTES + 1).unwrap_err();
+        assert!(rejected.contains("5 MB"), "{rejected}");
+        assert!(rejected.contains("5.0 MB"), "{rejected} 实际大小入文案");
+        // 字节入口同一条上限(剪贴板场景拿不到元数据,只能在拿到字节后核)
+        let big = vec![0u8; MAX_IMAGE_BYTES as usize + 1];
+        let error = store_pasted_image(Path::new("d.md"), "p.png", &big).unwrap_err();
+        assert!(error.contains("超过 5 MB"), "{error}");
+    }
+
+    /// 白名单外的扩展名:提示点名格式与清单,不落盘也不改文档。
+    #[test]
+    fn non_whitelisted_extension_is_named_in_notice() {
+        let error = check_dropped_file(Path::new("图.bmp"), 128).unwrap_err();
+        assert!(error.contains("bmp"), "{error}");
+        assert!(error.contains("PNG/JPEG/WebP/GIF"), "{error}");
+    }
+
+    /// 剪贴板文件名:十六进制时间戳防同秒撞名,扩展名恒 png;落盘后 URL
+    /// 走相对路径,与本地文件同一条通道。撞名时 -1 后缀照常生效。
+    #[test]
+    fn pasted_names_are_unique_and_conflicts_get_suffix() {
+        let a = pasted_image_name(0x1234);
+        let b = pasted_image_name(0x5678);
+        assert_eq!(a, "粘贴图片-1234.png");
+        assert_ne!(a, b, "时间戳不同即不同名");
+
+        let dir = temp_dir("paste");
+        let doc = doc(&dir, "d.md");
+        let first = store_pasted_image(&doc, &a, b"png").unwrap();
+        assert_eq!(first.url, "./d.assets/粘贴图片-1234.png");
+        // 同名第二份:撞名后缀在粘贴入口照常生效
+        let second = store_pasted_image(&doc, &a, b"png2").unwrap();
+        assert_eq!(second.file_name, "粘贴图片-1234-1.png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

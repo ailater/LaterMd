@@ -3,7 +3,14 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #41 为当前最新条目。
+> 编号 #42 为当前最新条目。
+
+## #42 剪贴板图片的取图通道与「文本粘贴优先」的触发口径（2026-09-28，#26 D 段自动拍板）
+
+- **岔路**：image-plan §3.D 写「取图通道优先 egui 内建；若实测 0.36 的内建剪贴板不支持图片，引 arboard 并按 decisions-pending #4 口径登记 ADR-004」。实测结论：**egui 0.36.2 内建剪贴板只出不进**——`Context` 有 `copy_text`/`copy_image`，读侧只有 egui-winit 在 Ctrl+V 时同步 `Clipboard::get()` 查**文本**翻成 `Event::Paste(String)`（egui-winit/src/clipboard.rs 的 `get` 只走 `get_text`；`set_image` 有、`get_image` 无）。因此必须引 arboard；而**怎么触发读取**是第二个岔路：拦 Ctrl+V 按键 vs 只在「V 按下而本帧无 Paste 事件」时兜底。
+- **自动选择**：①直接依赖 `arboard` 3.6.1（eframe → egui-winit/clipboard → arboard/image-data 本就在依赖树，`cargo tree -i arboard` 核实；提升为直接依赖零新增编译面，ADR-004 已登记）；②**读不走 egui**，在 `clipboard.rs` 自建「后台线程 + mpsc」三原语（X11 取剪贴板要跟宿主进程握手，是阻塞 IO，不能进归约——与 AI 流式/图床上传同纪律）；③**触发口径**：`ui::layout::reduce` 每帧看 `input.events`——有 `Event::Paste` 说明 egui-winit 已从剪贴板读到文本（文本粘贴，TextEdit 照常插字，图片流程不启动）；V 键按下而**无** Paste 事件 = 剪贴板无文本的可观察形态，此刻才发起图片读取。V 键只读不消费，不给文本粘贴劫持留任何窗口。
+- **理由**：拦 V 键（`consume_key`）会抢在 egui-winit 的粘贴判定之前，剪贴板有文本时文本粘贴被劫持成「读图失败」的空弹窗——文本粘贴是编辑器高频路径，图片粘贴是低频路径，低频必须给高频让路。「无 Paste 事件才兜底」利用了 egui-winit 自己生成的信号，两个通道天然互斥、无竞态。另两条已定口径：arboard 返回 RGBA 像素统一**重编码 PNG** 落盘（Linux X11 后端读进来本就是 PNG；扩展名因此恒 png）；剪贴板字节没有原名，合成 `粘贴图片-<纳秒时间戳>.png`（`assets.rs::pasted_image_name`）。
+- **如何改**：要「Ctrl+V 一律先问图片」（部分编辑器把剪贴板图片优先级放得更高），把 `reduce` 里的判定改成「V 按下即发起读取，Paste 事件与图片结果同帧到达时丢弃图片结果」——需要给 `ImagePasteFinished` 加发起帧标记，代价是文本粘贴场景多一次无谓的剪贴板读取；要改成 macOS 上读系统剪贴板的文件列表（截图工具落的是文件而非像素），在 `read_clipboard_image` 前先试 `clipboard.get().file_list()`，命中且为白名单扩展名时改走拖拽同款路径。
 
 ## #39 图床上传的「成功即自动插入」与上传后关框（2026-09-28，#26 C 段自动拍板）
 
