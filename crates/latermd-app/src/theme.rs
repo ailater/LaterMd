@@ -159,17 +159,20 @@ pub struct ThemeSettings {
     pub skin_style: Option<MarkdownStyle>,
 }
 
-/// 出厂默认正文样式:vendored 默认之上开表格边框(#30)。
+/// 出厂默认正文样式:vendored 默认之上开表格边框与底色(#30)。
 ///
-/// vendored `TableStyle` 的默认 `stroke_width = 0.0` 直接不画线(边框能力
-/// 在、默认关),预览表格因此长期无边框。这是 app 侧的默认取值决策,不动
-/// vendored:线宽 1px,圆角与控件圆角同源(`tokens::RADIUS_MD`);线色由
-/// vendored 渲染时取 `widgets.noninteractive.bg_stroke.color`,明暗两套
-/// visuals 自动适配,app 不另配颜色。
+/// vendored `TableStyle` 的默认 `stroke_width = 0.0` 直接不画线、两底色
+/// 开关默认关(能力在、默认关),预览表格因此长期无边框无底色。这是 app
+/// 侧的默认取值决策,不动 vendored:线宽 1px,圆角与控件圆角同源
+/// (`tokens::RADIUS_MD`);线色由 vendored 渲染时取
+/// `widgets.noninteractive.bg_stroke.color`,表头/隔行底色取
+/// `visuals.faint_bg_color`,明暗两套 visuals 自动适配,app 不另配颜色。
 pub fn default_markdown_style() -> MarkdownStyle {
     let mut style = MarkdownStyle::default();
     style.table.stroke_width = 1.0;
     style.table.corner_radius = tokens::RADIUS_MD;
+    style.table.header_fill = true;
+    style.table.zebra_fill = true;
     style
 }
 
@@ -766,8 +769,9 @@ mod tests {
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
     }
 
-    /// #30 回归防线:出厂默认正文样式的表格边框可见 —— vendored 渲染只在
-    /// `stroke_width > 0.0` 时画线,字段被 reset 回 0(如改回
+    /// #30 回归防线:出厂默认正文样式的表格边框与底色可见 —— vendored 渲染
+    /// 只在 `stroke_width > 0.0` 时画线、`header_fill`/`zebra_fill` 为 true
+    /// 时铺底色,字段被 reset 回 vendored 默认(如改回
     /// `MarkdownStyle::default()`)时此测试红。圆角与控件圆角同源 token。
     #[test]
     fn default_markdown_style_draws_table_borders() {
@@ -778,6 +782,8 @@ mod tests {
             tokens::RADIUS_MD,
             "与控件圆角同源"
         );
+        assert!(style.table.header_fill, "表头行底色开启");
+        assert!(style.table.zebra_fill, "数据区隔行底色开启");
     }
 
     /// 三态解析:定向选择原样返回;`System` 取检测结果,检测不到回落

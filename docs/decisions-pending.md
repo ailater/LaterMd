@@ -3,7 +3,13 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #47 为当前最新条目。
+> 编号 #48 为当前最新条目。
+
+## #48 预览表头/加粗文字呈 accent 蓝的成因与修复面（2026-09-29，#30 T3 像素验收自动拍板）
+
+- **岔路**：#30 T3 像素取证发现预览的表格表头与 `**加粗**` 文字呈 accent 蓝（#6C9FFF），标题 H1–H6 亦然。根因链：vendored 渲染在未注册 `"bold"` 字族时对表头/加粗回落 `Visuals::strong_text_color()`（layout.rs `apply_bold`、table.rs `apply_bold_to_format`），而 egui 0.36 的 `strong_text_color()` = `widgets.active.fg_stroke.color`（egui style.rs），#27 的 `apply_shell_to` 把 active 控件前景设为 accent（theme.rs，按下态按钮用）——三者叠加把正文强调位全部染成链接同款蓝（还与超链接色撞车，强调位看起来像链接）。app 实际已随 U1 装入 Inter SemiBold，只是族名叫 `Inter-SemiBold`，vendored 探测的字面量 `"bold"` 未注册。修复岔路：A 只登记不动（表头底色验收不受文字色影响）；B 注册 `"bold"` 族名别名（挂 SemiBold 同链），表头/加粗按字重渲染、恢复正文色；C 再加 vendor 改动连标题一起改色。
+- **自动选择**：B。两行改动落在 app 侧 `fonts.rs`（零 vendor、零新依赖），正是 vendored 设计文档写明的路径（"Use the bold font family when it is registered"）；表头观感与导出 HTML 对齐（`<th>`/`<strong>` 均为正常色加粗字重）；`**加粗**` 恢复 markdown 语义。标题色不动：vendored 标题路径（layout.rs）无条件设 `strong_text_color`，改它属上游行为变更（需走 ①类 vendor commit + 上游论证），且「标题=accent 强调色」本身是可辩护的样式选择，单独立项不与 #30 混装。
+- **如何改**：要标题也恢复正常色，在 vendored layout.rs 标题分支去掉 `format.color = strong_text_color()`（①类 vendor 改动，登记 vendor/README.md 变更表）；要回到「强调位全蓝」旧状，删掉 `fonts.rs` 里 `"bold"` 族名注册两行即可。
 
 ## #47 097f69a 混装的拆分由修复者越过「commit 由编排统一做」约束执行（2026-09-28，独立评审 medium 修复自动拍板）
 

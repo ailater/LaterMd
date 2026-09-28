@@ -57,8 +57,8 @@ pub fn install_to(dir: &std::path::Path) -> Vec<String> {
 // —— 构造辅助 ——
 
 /// 块级默认:代码块/表格圆角 4(与 `RADIUS_SM` 同档,shadcn rounded-sm);
-/// 表格边框 1px(#30,与出厂默认同宽,线色渲染时自动取
-/// `widgets.noninteractive.bg_stroke`,明暗自适应)。
+/// 表格边框 1px + 表头/隔行底色(#30,与出厂默认同口径,线色/底色渲染时
+/// 自动取 `widgets.noninteractive.bg_stroke` / `faint_bg_color`,明暗自适应)。
 fn base() -> MarkdownStyle {
     let mut style = MarkdownStyle::default();
     style.code_block = CodeBlockStyle {
@@ -68,6 +68,8 @@ fn base() -> MarkdownStyle {
     style.table = TableStyle {
         stroke_width: 1.0,
         corner_radius: 4.0,
+        header_fill: true,
+        zebra_fill: true,
         ..style.table
     };
     style
@@ -199,8 +201,8 @@ fn skins() -> Vec<BuiltinSkin> {
 mod tests {
     use super::*;
 
-    /// #30 回归防线:九套预设的表格边框可见(stroke_width ≥ 0.5;被 reset
-    /// 回 vendored 默认 0.0 时不画线,此测试红)。
+    /// #30 回归防线:九套预设的表格边框与底色可见(stroke_width ≥ 0.5 且
+    /// 两底色开关开;被 reset 回 vendored 默认(0.0 / false × 2)时此测试红)。
     #[test]
     fn builtins_draw_table_borders() {
         for skin in builtins() {
@@ -210,6 +212,12 @@ mod tests {
                 skin.name,
                 skin.style.table.stroke_width
             );
+            assert!(
+                skin.style.table.header_fill,
+                "{}: 表头行底色开启",
+                skin.name
+            );
+            assert!(skin.style.table.zebra_fill, "{}: 隔行底色开启", skin.name);
         }
     }
 

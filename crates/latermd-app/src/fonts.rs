@@ -28,6 +28,10 @@ static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiB
 const NAME_REGULAR: &str = "Inter-Regular";
 /// Inter SemiBold 的族名:工具条 / 标题等强调位用(正文 Regular)。
 pub const FAMILY_SEMIBOLD: &str = "Inter-SemiBold";
+/// vendored `egui_markdown` 探测的字面量族名:注册后表头/加粗走 SemiBold
+/// 字重而非 `strong_text_color` 回落(后者 = active 控件前景,投影后是 accent
+/// 蓝,会把 `**加粗**` 染成链接色;decisions-pending #48)。
+pub const FAMILY_BOLD: &str = "bold";
 /// Inter Medium 的族名:介于正文与强调之间,U1 注册备用、暂无消费者。
 pub const FAMILY_MEDIUM: &str = "Inter-Medium";
 
@@ -103,12 +107,17 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
         .insert(0, NAME_REGULAR.to_owned());
     // Medium/SemiBold 独立族:链头是对应字重,其余与 Proportional 同构 ——
     // emoji 链照旧,CJK 回退也挂尾(工具条/标题是中文,链尾无 CJK 会变方块)
+    // `bold` 是 SemiBold 的别名族(vendored 渲染按字面量探测,decisions #48)
     for name in [FAMILY_MEDIUM, FAMILY_SEMIBOLD] {
         let mut chain = vec![name.to_owned()];
         chain.extend(fallback_tail.iter().cloned());
         defs.families
             .insert(FontFamily::Name(Arc::from(name)), chain);
     }
+    let mut bold_chain = vec![FAMILY_SEMIBOLD.to_owned()];
+    bold_chain.extend(fallback_tail.iter().cloned());
+    defs.families
+        .insert(FontFamily::Name(Arc::from(FAMILY_BOLD)), bold_chain);
     if let Some((bytes, prop_idx, mono_idx)) = cjk {
         let face = |index: u32| FontData {
             index,
