@@ -20,6 +20,7 @@
 | [image-plan.md](image-plan.md) | 图片插入与图床规划：图片框对话框（URL / 本地 / 上传）+ 自定义图床 + 新 crate `latermd-bed` | **待坤哥放行**（2026-09-27，A–D 四段共 4d） |
 | [ui-modernization.md](ui-modernization.md) | UI 现代化路径评估：外部 P0–P4 五条建议逐条查证后裁决（1 采纳 / 1 待决 / 3 否决） | 已裁决（2026-09-27） |
 | [emoji-plan.md](emoji-plan.md) | Emoji 插入规划：工具条自绘笑脸按钮 + Emoji 面板（搜索 / 分类 / 最近使用），拆 E1–E4 约 1.3d | **待坤哥放行**（2026-09-27，数据源选型待拍板） |
+| [preview-typography-and-keymap-plan.md](preview-typography-and-keymap-plan.md) | 预览行高重叠的根因与修复 + 标题分级 / 块间距规划 + 快捷键重排（主题让出 `Ctrl+Shift+T` 给 TabRestore） | **部分落地**（2026-09-28：行高已修，vendor 六项门禁 + 主仓 597 测试全绿；键位与美化见文末待办清单） |
 
 ## 决策总表（一句话版）
 
