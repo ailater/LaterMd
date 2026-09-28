@@ -9,10 +9,18 @@ use crate::link::LinkHandler;
 use crate::style::{InlineCodeStyle, MarkdownStyle};
 use crate::types::Token;
 
-/// Override for markdown body/table cell row height (`TextFormat::line_height`).
+/// Resolve the row height for a given font size under the user's
+/// [`MarkdownStyle::line_height_ratio`](style::MarkdownStyle::line_height_ratio).
 ///
-/// `None` uses egui’s default (font metrics).
-pub(crate) const MARKDOWN_LINE_HEIGHT_POINTS: Option<f32> = Some(17.0);
+/// A single fixed pixel height cannot serve both sizes in one document: at the
+/// default 13pt body font, 13pt * 1.30 is about 17px, but H1 renders at 20.8pt and
+/// needs about 24px. Pinning every row to the body's height clipped every heading
+/// row by 1–7px, so wrapped heading lines drew on top of each other. Scaling by the
+/// font size instead keeps one rhythm that headings grow into rather than outgrow.
+#[inline]
+fn line_height_for(size: f32, style: &MarkdownStyle) -> Option<f32> {
+  Some(size * style.line_height_ratio)
+}
 
 /// List markers are right-aligned in a slot as wide as this string, measured in the body font,
 /// so bullets and numbers of the same nesting level all start their text at the same x.
@@ -66,8 +74,9 @@ pub fn apply_inline_code_bg(format: &mut TextFormat, dark_mode: bool, inline_sty
 }
 
 #[inline]
-fn text_format(font_id: FontId, color: Color32) -> TextFormat {
-  TextFormat { font_id, color, valign: Align::BOTTOM, line_height: MARKDOWN_LINE_HEIGHT_POINTS, ..Default::default() }
+fn text_format(font_id: FontId, color: Color32, style: &MarkdownStyle) -> TextFormat {
+  let line_height = line_height_for(font_id.size, style);
+  TextFormat { font_id, color, valign: Align::BOTTOM, line_height, ..Default::default() }
 }
 
 /// Outcome of appending a Link token to a [`LayoutJob`].
@@ -285,7 +294,7 @@ pub fn build_layout(
   let mut inline_widget_spans: Vec<(usize, usize, usize)> = Vec::new();
 
   // Pre-build common formats to avoid repeated font_id.clone().
-  let base_format = text_format(font_id.clone(), color);
+  let base_format = text_format(font_id.clone(), color, style);
   let transparent_format = TextFormat { color: Color32::TRANSPARENT, ..base_format.clone() };
 
   // Disable egui's paragraph-splitting optimization (see egui #5411).
@@ -331,6 +340,11 @@ pub fn build_layout(
           apply_bold(&mut format, ui, bold_available);
           let idx = (level as usize).saturating_sub(1).min(5);
           format.font_id.size *= style_ref.heading.scales[idx];
+          // Re-derive the row height from the enlarged size. Headings are the visible
+          // failure of a shared fixed line height: at 13pt body an H1 is 20.8pt and
+          // needs ~24px rows, so borrowing the body's 17px clipped every heading row
+          // and made wrapped heading lines overlap.
+          format.line_height = line_height_for(format.font_id.size, style_ref);
         }
 
         job.append(text.as_ref(), 0.0, format);
@@ -402,7 +416,7 @@ pub fn build_layout(
         }
       }
       Token::Link { text, href, .. } => {
-        let link_base = text_format(font_id.clone(), color);
+        let link_base = text_format(font_id.clone(), color, style_ref);
         let info = append_link_to_job(ui, &mut job, text, href, &font_id, &link_base, hyperlink_color, link_handler);
         if info.is_block_widget {
           segment_breaks.push(token_index);

@@ -43,8 +43,21 @@ pub struct MarkdownStyle {
   pub block_spacing: f32,
   /// Font size for code blocks. Default: `10.0`.
   pub code_font_size: f32,
+  /// Row height as a multiple of the font size. Default: `1.30`.
+  ///
+  /// Applied to body text and headings alike, so headings scale into the rhythm
+  /// instead of being clipped by a height tuned for body-size glyphs.
+  #[cfg_attr(feature = "serde", serde(default = "default_line_height_ratio"))]
+  pub line_height_ratio: f32,
   /// Language used for syntax highlighting when no language is specified.
   pub default_code_language: String,
+}
+
+/// Serde default for [`MarkdownStyle::line_height_ratio`]: ~17px at the 13pt
+/// body size, matching the previous hardcoded row height.
+#[cfg(feature = "serde")]
+fn default_line_height_ratio() -> f32 {
+  1.30
 }
 
 impl Default for MarkdownStyle {
@@ -59,6 +72,7 @@ impl Default for MarkdownStyle {
       table: TableStyle::default(),
       block_spacing: 8.0,
       code_font_size: 10.0,
+      line_height_ratio: 1.30,
       default_code_language: String::new(),
     }
   }
@@ -75,6 +89,7 @@ impl Hash for MarkdownStyle {
     self.table.hash(state);
     self.block_spacing.to_bits().hash(state);
     self.code_font_size.to_bits().hash(state);
+    self.line_height_ratio.to_bits().hash(state);
     self.default_code_language.hash(state);
   }
 }
@@ -104,6 +119,11 @@ impl MarkdownStyle {
   pub fn render_style(&mut self, ui: &mut Ui) {
     ui.label("Block spacing:");
     ui.add(DragValue::new(&mut self.block_spacing).range(0.0..=40.0).speed(0.5));
+
+    ui.horizontal(|ui| {
+      ui.label("Line height:");
+      ui.add(DragValue::new(&mut self.line_height_ratio).range(1.0..=3.0).speed(0.01));
+    });
 
     ui.separator();
 
