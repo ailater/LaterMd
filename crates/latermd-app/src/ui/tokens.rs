@@ -59,10 +59,38 @@ pub const ZEN_EXIT_MARGIN: f32 = 10.0;
 /// 会被 `round()` 静默吃掉小数。
 pub const ZEN_GUTTER: f32 = 24.0;
 
+// —— 控件几何(输入框档,U0 新增)——
+//
+// 来源:Armas / shadcn 的 h-9 / px-3 / py-2(docs/ui-modernization.md §2.4)。
+// 只经 `theme::apply_shell` 投影进 egui 的两套 `Style`,不散落调用点。
+
+/// 输入框(TextEdit)高度。投影为 `spacing.interact_size.y` 的高度语义:
+/// egui 里 TextEdit 没有独立高度字段,点击类控件(按钮/输入框/滑条)的最小
+/// 高度统一取 `interact_size.y`。
+pub const INPUT_H: f32 = 36.0;
+/// 输入框内边距(水平)。投影为 `spacing.button_padding.x`,TextEdit 与按钮
+/// 共用该字段作为框内文字到边框的留白。
+pub const INPUT_PAD_X: f32 = 12.0;
+/// 输入框内边距(垂直)。
+pub const INPUT_PAD_Y: f32 = 8.0;
+
+// —— 字号(U0 新增)——
+
+/// 小一号正文(提示行、状态栏、次要标签)。shadcn `text-sm = 14px` 的 pt 值。
+/// 投影为 `TextStyle::Small` 的字号;Body 13 不动(字号用户设置另行排队,
+/// docs/roadmap 专题 #23,与本棒解耦)。
+pub const FONT_SM: f32 = 14.0;
+
 // —— 圆角 ——
 
-/// 按钮圆角。
+/// 按钮圆角(shadcn rounded-sm 档)。
 pub const RADIUS_SM: f32 = 4.0;
+/// 控件圆角(shadcn rounded-md 档)。2026-09-27 起为 `theme::apply_shell`
+/// 投影的数字真源(此前硬编码 6,ui-polish §2 的划线注记随之作废)。
+///
+/// 来源:Armas / shadcn 的 `rounded-md = 6px`(docs/ui-modernization.md
+/// §2.4「白拿它产出的办法」——抄数值不引库)。
+pub const RADIUS_MD: f32 = 6.0;
 
 // —— 语义色 ——
 
@@ -89,6 +117,17 @@ pub const OK: Color32 = Color32::from_rgb(0x60, 0xC8, 0x78);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U0 新 token 的数值口径:抄自 armas/shadcn 的公开设计值
+    /// (docs/ui-modernization.md §2.4),改这里必须同步改该表。
+    #[test]
+    fn u0_tokens_match_sourced_values() {
+        assert_eq!(RADIUS_MD, 6.0, "shadcn rounded-md");
+        assert_eq!(INPUT_H, 36.0, "shadcn h-9");
+        assert_eq!(INPUT_PAD_X, 12.0, "shadcn px-3");
+        assert_eq!(INPUT_PAD_Y, 8.0, "shadcn py-2");
+        assert_eq!(FONT_SM, 14.0, "shadcn text-sm");
+    }
 
     /// 两套 visuals 下强调色不同(明暗各一档),且都非空色。
     #[test]

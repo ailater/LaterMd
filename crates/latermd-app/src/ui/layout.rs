@@ -2131,6 +2131,10 @@ mod tests {
             )
             .drop_without_applying_deltas();
         };
+        // 预热一帧再取坐标:panel 首帧按出厂/回退尺寸演算,第二帧起才是
+        // 收敛后的稳定布局(U0 把 interact_size.y 从 18 抬到 36 后,菜单栏
+        // 首帧回退值与收敛值的差被放大,首帧坐标差 33px,点击会落空)
+        frame(&mut app, Vec::new());
         frame(&mut app, Vec::new());
         app.format_probe = None;
         let center = *center.borrow();

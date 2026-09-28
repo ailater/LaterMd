@@ -3,7 +3,17 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #42 为当前最新条目。
+> 编号 #43 为当前最新条目。
+
+## #43 U0 出厂色板的分发形态与「亮色侧数值」的来源口径（2026-09-28，ui-modernization §3 U0 自动拍板）
+
+- **岔路一：九套预设色板怎么「随包分发」**。任务原文写「转成 themes/*.ron 皮肤文件…作为出厂预设随包分发」，但 `themes/` 是**用户配置目录**（`~/.config/latermd/themes/`），安装包（cargo-dist 产物）没有「往用户目录铺文件」的机制；把 .ron 当安装期资源打进 `assets/` 也只是把问题挪了个位置——应用启动仍要把它们落进用户目录才能被 `SkinCatalog` 扫到。
+- **自动选择**：色值以**字面量编进二进制**（`theme_presets.rs` 的 `builtins()`），启动时 `install_to(config_dir)` 把每套写成 `themes/<name>.ron`——**仅当该文件不存在**（`state.rs::load_preferences` 与 `main.rs` 各一次，测试注入目录由前者兜住）。用户目录里同名文件永远优先：预设是「出厂底稿」不是锁死资产，用户改过的 Nord.ron 不会被出厂值顶掉。
+- **理由**：皮肤系统（#8）的一切能力（扫描、选择、导出、分享）都建在「目录里的普通 .ron 文件」上；铺盘让预设零成本复用整条链路，且「不存在才写」保证幂等与用户改动不可侵犯。代价是每套预设进二进制约 1KB（九套合计 <10KB），可忽略。
+- **岔路二：MarkdownStyle 的颜色字段是 dark/light 成对，egui-thematic 只给了一套**。它的 9 套预设里 8 套是纯暗色（`dark_mode: true`），仅 Solarized Light 是亮色；而任务点名的九套（Dracula/Nord/Gruvbox/Solarized×2/Tokyo Night/One Dark/One Light/Rosé Pine）与 egui-thematic 的九套（多 Monokai/Catppuccin Mocha、少 One Light/Rosé Pine）**不是同一集合**。
+- **自动选择**：暗色侧照抄 egui-thematic 0.1.1 `config.rs` 各 preset 的色值（2026-09-28 从 crates.io 下载源码逐套核对）；亮色侧按各色板的**公开官方浅色变体**配对（如 Dracula 官方 light、Solarized Light 官方值）；One Light 与 Rosé Pine egui-thematic 没有，按各官方 palette 补齐。九套里 7 套暗 2 套亮，每套的两套明暗值都在同一皮肤文件里，外壳主题切换时皮肤自动跟随（`MarkdownStyle` 的成对字段本就为此设计）。
+- **附带拍板：色板只覆盖行内代码四色 + 块级圆角/引用条几何**。`MarkdownStyle` 没有「正文底色/标题色/链接色」字段（那是外壳 `theme.rs::shell_tokens` 的领域，批次 C 已定「外壳不随皮肤换色」）；色板对正文的实际影响面 = 行内代码 + 代码块圆角 + 表格圆角 + 引用条形状。任务说「九套预设色板」时若期待的是整套外壳变色，那是批次 C 的口径问题，不是本棒能扩的。
+- **如何改**：①要「安装包带文件而非运行时铺盘」，把 `builtins()` 的数据改为 `include_str!` 的 `assets/themes/*.ron`（dist.toml 需追加资源条目），`install_to` 逻辑不变；②要外壳也跟色板变色，等批次 C 重启「外壳随皮肤」讨论，改 `ThemeSettings::apply` 让 shell_tokens 吃皮肤色；③某套色值想换，直接改 `theme_presets.rs::skins` 对应行，**删掉用户目录里的旧文件**再启动即可重新铺盘（或手动改用户目录那份，效果相同）。
 
 ## #42 剪贴板图片的取图通道与「文本粘贴优先」的触发口径（2026-09-28，#26 D 段自动拍板）
 

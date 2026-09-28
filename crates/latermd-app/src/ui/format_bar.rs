@@ -98,7 +98,14 @@ fn rich(
     glyph: &str,
     style: impl Fn(egui::RichText) -> egui::RichText,
 ) -> egui::Response {
-    let width = ui.spacing().interact_size.y.max(tokens::ICON + 8.0);
+    // 原先取 `interact_size.y`(egui 出厂 18)当宽度;U0 投影后它涨到
+    // INPUT_H=36,六个形态按钮共宽 108px,把 Task 挤过 horizontal_wrapped
+    // 的换行点(实测按钮挪到第二行,task_button_cycling 测试点击落空)。
+    // 形态按钮的宽度是**字形的排版需求**(ICON+8),不是「可交互最小高度」,
+    // 后者只该作用于按钮高度 —— 高度这排恒取 FORMAT_BAR_H,本就与
+    // interact_size 无关。改成只按排版宽度取值,U0 的高度投影不再外溢成
+    // 宽度副作用。
+    let width = tokens::ICON + 8.0;
     let size = egui::vec2(width, tokens::FORMAT_BAR_H);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let enabled = ui.is_enabled();
