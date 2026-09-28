@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #45 为当前最新条目。
+> 编号 #46 为当前最新条目。
+
+## #46 U0/U1/U3 三 commit 的分支承载与 main 指针处置（2026-09-28，独立评审 medium 修复自动拍板）
+
+- **岔路一**：独立评审发现 U0/U1/U3 三个 commit（f3a8435/7460651/499de06）直坐本地 main（领先 origin/main 3 个 commit），违反 AGENTS §8「main 受保护、feature 分支 + PR」流程——后续一次常规 push 即直推受保护分支。修复时这批 commit 装进**一个** feature 分支开一个 PR，还是按主题拆三个分支各开 PR。
+- **自动选择**：单分支单 PR（`feature/ui-modernization` 指向 499de06 承载全部三个 commit，本地 main 指针 `git branch -f main origin/main` 重置回 d0c6a13）。理由：三个 commit 本就按主题分开（U0 token / U1 字体 / U3 动效），PR 内逐 commit 可审；U1 依赖 U0 的 token、U3 叠在其后（`ui/format_bar.rs` 被 U0/U1 先后改动），拆 PR 须按依赖串行合并，编排成本翻三倍而无审查收益；AGENTS §6.9「按主题拆 commit」约束的是 vendor 改动，本批零 vendor 文件（三 commit 的 stat：crates/latermd-app、assets/fonts、docs）。
+- **岔路二**：本地 main 领先的处置——保留现状（等推送时再处理）vs 立即重置指针。
+- **自动选择**：立即重置（在 feature 分支上操作，工作区零变动）。理由：「领先 3」多存在一刻，误 push 直推受保护分支的窗口就多开一刻；指针重置不丢任何 commit（三个 commit 由 feature 分支引用），完全可逆。
+- **如何改**：要拆三个 PR，从 d0c6a13 依次 `git branch feature/ui-u0 f3a8435`、`git branch feature/ui-u1 7460651`、`git branch feature/ui-u3 499de06`，按序各开 PR 合并；要恢复「main 领先」旧状，`git branch -f main 499de06` 即可（commit 都还在）。
 
 ## #45 U3 动效的两个落点里，浮层淡入由 egui 内建承接 + 切换淡入的时长公式（2026-09-28，ui-modernization §3 U3 自动拍板）
 
