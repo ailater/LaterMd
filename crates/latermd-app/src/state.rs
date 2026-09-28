@@ -23,6 +23,7 @@
 use crate::ai::AiState;
 use crate::ai_config::AiConfig;
 use crate::ai_key::AiKeyState;
+use crate::bed::{BedState, BedUploadPurpose};
 use crate::command::Command;
 use crate::export;
 use crate::file::{self, FileCmd};
@@ -203,8 +204,12 @@ pub struct State {
     /// 编辑器渲染模式(P3 Live Preview 的那个标志;源码 ↔ Live 共用同一
     /// rope buffer,切换无恢复逻辑)。
     pub render_mode: RenderMode,
-    /// 设置对话框(外观 / 快捷键 / AI / MCP 四页)。
+    /// 设置对话框(外观 / 快捷键 / AI / MCP / 图片 五页)。
     pub settings: SettingsState,
+    /// 图床(docs/image-plan.md C 段):profile 列表(`beds.json`)与在途
+    /// 上传的接收端;发起/收流的归约见 [`State::request_image_upload`] /
+    /// [`State::finish_image_upload`]。
+    pub bed: BedState,
     /// 图片框对话框(docs/image-plan.md A 段):草稿 alt/url 归它持有,
     /// 归约只置 `open` 与消费插入,UI 经 `&mut` 改草稿 —— 与 `SettingsState`
     /// 持草稿同款分工(`TextEdit` 是立即模式控件,草稿必须能就地 `&mut`)。
@@ -309,6 +314,7 @@ impl Default for State {
             render_mode: RenderMode::default(),
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
+            bed: BedState::default(),
             image_dialog: ImageDialogState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
@@ -372,6 +378,36 @@ pub enum Message {
     /// 落盘只落提示不复制(`.assets/` 必须与文档同目录,没有目录就没有
     /// 锚点)。对话框保持打开等用户点「插入」—— 插入仍是唯一的文本写入。
     ImageFilePickRequested,
+    /// 图片框点「选文件并上传…」(docs/image-plan.md C 段图床来源):归约里
+    /// 弹图片选择框,选中即**关框**并发起后台上传(阻塞的 ureq 在后台线程,
+    /// UI 不卡)。取消选择则一切不动。收尾见
+    /// [`Message::ImageUploadFinished`]。
+    ImageUploadRequested,
+    /// 后台上传收尾(后台线程经 channel 回传,每帧归约收流翻成此消息):
+    /// **只接受最新序号**(`seq` 与当前序号相等才处理,防旧请求覆盖 ——
+    /// 照抄 AI 流式防重入手法,旧结果静默丢弃)。`Ok(url)` 按发起时的用途
+    /// 落地:插入型把 URL 写进**发起标签**(新选区落 alt 位),测试型只在
+    /// 设置页回显;`Err` 只落提示行,**绝不动文档与选区**(image-plan §4.3)。
+    ImageUploadFinished {
+        /// 发起时分配的序号。
+        seq: u64,
+        /// 成功 = 可直接落 Markdown 的 URL;失败 = 面向用户的错误文案。
+        result: Result<String, String>,
+    },
+    /// 保存图床 profile(设置「图片」页「保存」):归一化 → 新 profile 分配
+    /// id → token(若填)写系统凭据(service=latermd-bed / account=id)→
+    /// 落 `beds.json`。token 不落任何文件;落盘失败不改内存列表。
+    BedProfileSaved {
+        /// 草稿定稿的 profile。
+        profile: latermd_bed::BedProfile,
+        /// 新 token;`None`/空白 = 不改已存凭据。
+        token: Option<String>,
+    },
+    /// 删除图床 profile:`beds.json` 移除 + 系统凭据删除(幂等)。
+    BedProfileDeleted { id: String },
+    /// 设置页「测试上传」:弹图片选择框,选中即后台上传,结果回显在该页
+    /// (不插入任何文档)。
+    BedTestUploadRequested { profile_id: String },
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -505,6 +541,11 @@ impl State {
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
             Message::ImageFilePickRequested => self.pick_image_file(),
+            Message::ImageUploadRequested => self.request_image_upload(),
+            Message::ImageUploadFinished { seq, result } => self.finish_image_upload(seq, result),
+            Message::BedProfileSaved { profile, token } => self.save_bed_profile(profile, token),
+            Message::BedProfileDeleted { id } => self.delete_bed_profile(id),
+            Message::BedTestUploadRequested { profile_id } => self.test_bed_upload(profile_id),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
@@ -916,6 +957,9 @@ impl State {
         let key = self.ai_key.creds.ai_api_key();
         self.ai.set_provider(config, key.as_deref());
         self.keymap = Keymap::load_from(&dir);
+        // 图床 profile 列表(beds.json);token 在钥匙串,启动不读(上传时
+        // 后台线程按需取)
+        self.bed.profiles = BedState::load_from(&dir);
         // 皮肤目录(`themes/*.rom`)与选中的皮肤内容:皮肤文件是唯一事实源,
         // 内存里只留载入后的样式
         self.skins = SkinCatalog::load_from(&dir);
@@ -1036,6 +1080,12 @@ impl State {
             open: true,
             alt,
             url: String::new(),
+            // 图床选择沿用上次(关框时保留),没有则由 UI 默认选第一个
+            bed: self
+                .image_dialog
+                .bed
+                .clone()
+                .or_else(|| self.bed.profiles.first().map(|profile| profile.id.clone())),
         };
     }
 
@@ -1048,7 +1098,14 @@ impl State {
         if url.trim().is_empty() {
             return;
         }
-        let tab = self.tabs.current_mut();
+        let index = self.tabs.active;
+        self.insert_image_at(index, alt, url);
+    }
+
+    /// 把 `![alt](url)` 写进**指定标签**(图床上传收尾的写入路径:目标按
+    /// 发起标签定位而非当前标签,与 [`Self::append_ai_delta`] 同不变量)。
+    fn insert_image_at(&mut self, index: usize, alt: &str, url: &str) {
+        let tab = &mut self.tabs.tabs[index];
         let selection = tab.selection.unwrap_or((0, 0));
         let start = selection.0.min(selection.1);
         let stop = selection.0.max(selection.1);
@@ -1061,9 +1118,14 @@ impl State {
         }
     }
 
-    /// 关闭图片框并清空草稿(插入与取消共用;下次打开重新按选区预填)。
+    /// 关闭图片框并清空草稿(插入与取消共用);图床下拉的选择**保留** ——
+    /// 换个位置插图时大概率还是同一个图床,不该每次重选。
     fn close_image_dialog(&mut self) {
-        self.image_dialog = ImageDialogState::default();
+        let bed = self.image_dialog.bed.clone();
+        self.image_dialog = ImageDialogState {
+            bed,
+            ..ImageDialogState::default()
+        };
     }
 
     /// 「浏览…」(`Message::ImageFilePickRequested` 的归约):弹图片选择框,
@@ -1106,6 +1168,178 @@ impl State {
             }
             Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
+    }
+
+    /// 图片框「选文件并上传…」(`Message::ImageUploadRequested` 的归约,
+    /// docs/image-plan.md C 段):选文件 → 关框 → 发起后台上传。alt 在此刻
+    /// 定格(空则补文件名,与「浏览…」同口径);上传绑定当前标签,收尾时
+    /// 无论用户切到哪个标签都写回发起标签。未选图床 / 未配置 profile 只落
+    /// 提示,不开文件框。
+    fn request_image_upload(&mut self) {
+        if self.bed.is_uploading() {
+            return; // UI 已禁用按钮,防御旧消息重放
+        }
+        let Some(profile_id) = self.image_dialog.bed.clone() else {
+            self.tabs.current_mut().document.notice =
+                Some("请先在 设置 → 图片 里配置图床".to_owned());
+            return;
+        };
+        let Some(profile) = self.bed.profile(&profile_id).cloned() else {
+            self.tabs.current_mut().document.notice =
+                Some("所选图床不存在,请在 设置 → 图片 里检查".to_owned());
+            return;
+        };
+        let start = file::start_dir(self.tabs.current().document.path.as_deref());
+        let Some(picked) = file::pick_image_dialog(&start) else {
+            return; // 取消:框不关、状态不动
+        };
+        let alt = {
+            let dialog = &self.image_dialog;
+            let fallback = picked
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let alt = dialog.alt.trim().to_owned();
+            if alt.is_empty() {
+                fallback
+            } else {
+                alt
+            }
+        };
+        // 关框:上传成功即自动插入,这里没有留给用户点的「插入」;图床选择
+        // 由 close 的保留语义带走
+        self.close_image_dialog();
+        self.tabs.current_mut().document.notice =
+            Some(format!("正在上传到 {}…", profile.display_name()));
+        let tab_id = self.tabs.current().id;
+        self.bed.start(
+            profile,
+            picked,
+            BedUploadPurpose::Insert { alt },
+            Some(tab_id),
+        );
+    }
+
+    /// 上传收尾(`Message::ImageUploadFinished` 的归约):序号不匹配(旧
+    /// 请求的结果)静默丢弃;匹配则按用途分流 —— 插入型写**发起标签**
+    /// (标签已被关则丢弃),测试型回显设置页。失败只落提示行,文档与
+    /// 选区绝不动(image-plan §4.3:失败的唯一后果是不插入文本)。
+    fn finish_image_upload(&mut self, seq: u64, result: Result<String, String>) {
+        if !self.bed.finish(seq) {
+            return; // 旧结果:已被更新的请求取代,丢弃
+        }
+        match self.bed.take_purpose() {
+            Some(BedUploadPurpose::Insert { alt }) => {
+                let index = self
+                    .bed
+                    .take_upload_tab()
+                    .and_then(|id| self.tabs.index_by_id(id));
+                let Some(index) = index else {
+                    return; // 发起标签已关:无处可写,丢弃(与 AI 流式同款)
+                };
+                match result {
+                    Ok(url) => {
+                        self.insert_image_at(index, &alt, &url);
+                        self.tabs.tabs[index].document.notice = None;
+                    }
+                    Err(error) => self.tabs.tabs[index].document.notice = Some(error),
+                }
+            }
+            Some(BedUploadPurpose::Test { profile_name }) => {
+                self.bed.last_test = Some((profile_name, result));
+            }
+            None => {}
+        }
+    }
+
+    /// 保存图床 profile(`Message::BedProfileSaved` 的归约):token 先写
+    /// 系统凭据(失败落提示但**继续** —— profile 本身无秘密,存下来用户
+    /// 稍后重存 token 即可),再 upsert 进 `beds.json`(落盘失败不改内存
+    /// 列表,与 AI/MCP 配置同哲学)。
+    fn save_bed_profile(&mut self, mut profile: latermd_bed::BedProfile, token: Option<String>) {
+        profile.normalize();
+        if profile.id.is_empty() {
+            profile.id = crate::bed::new_profile_id();
+        }
+        if let Some(token) = token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if let Err(error) =
+                latermd_creds::set_secret(crate::bed::CREDS_SERVICE, &profile.id, token)
+            {
+                self.tabs.current_mut().document.notice = Some(format!(
+                    "token 未保存({error});图床配置仍已保存,请重试 token"
+                ));
+            }
+        }
+        let mut profiles = self.bed.profiles.clone();
+        match profiles.iter_mut().find(|slot| slot.id == profile.id) {
+            Some(slot) => *slot = profile.clone(),
+            None => profiles.push(profile.clone()),
+        }
+        if let Some(dir) = self.config_dir() {
+            if let Err(error) = BedState::save_to(&profiles, &dir) {
+                self.tabs.current_mut().document.notice = Some(format!("图床配置保存失败:{error}"));
+                return;
+            }
+        }
+        self.bed.profiles = profiles;
+    }
+
+    /// 删除图床 profile(`Message::BedProfileDeleted` 的归约):凭据删除
+    /// 幂等(失败只提示,token 留在钥匙串无害);`beds.json` 落盘失败不改
+    /// 内存列表。
+    fn delete_bed_profile(&mut self, id: String) {
+        if let Err(error) = latermd_creds::delete_secret(crate::bed::CREDS_SERVICE, &id) {
+            self.tabs.current_mut().document.notice =
+                Some(format!("图床 token 删除失败({error}),配置继续删除"));
+        }
+        let profiles: Vec<latermd_bed::BedProfile> = self
+            .bed
+            .profiles
+            .iter()
+            .filter(|profile| profile.id != id)
+            .cloned()
+            .collect();
+        if let Some(dir) = self.config_dir() {
+            if let Err(error) = BedState::save_to(&profiles, &dir) {
+                self.tabs.current_mut().document.notice = Some(format!("图床配置保存失败:{error}"));
+                return;
+            }
+        }
+        self.bed.profiles = profiles;
+    }
+
+    /// 测试上传(`Message::BedTestUploadRequested` 的归约):选文件并发起
+    /// 后台上传,结果回显设置页(不插入任何文档)。上传中忽略(UI 已禁用
+    /// 按钮,防御)。
+    fn test_bed_upload(&mut self, profile_id: String) {
+        if self.bed.is_uploading() {
+            return;
+        }
+        let Some(profile) = self.bed.profile(&profile_id).cloned() else {
+            return;
+        };
+        let start = file::start_dir(self.tabs.current().document.path.as_deref());
+        let Some(picked) = file::pick_image_dialog(&start) else {
+            return;
+        };
+        self.bed.last_test = None; // 清旧回显,避免误读为本次结果
+        let profile_name = profile.display_name().to_owned();
+        self.bed.start(
+            profile,
+            picked,
+            BedUploadPurpose::Test { profile_name },
+            None,
+        );
+    }
+
+    /// 图床上传收流(每帧归约调用一次):channel 里的结果翻成消息,由调用
+    /// 方并入本帧归约队列(与 [`Self::poll_ai`] 同分工)。
+    pub fn poll_bed(&mut self) -> Vec<Message> {
+        self.bed.poll()
     }
 
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
@@ -3614,6 +3848,7 @@ mod tests {
             open: true,
             alt: "示意图".to_owned(),
             url: "https://x/y.png".to_owned(),
+            bed: Some("p-1".to_owned()),
         };
 
         state.apply(Message::ImageDialogClosed);
@@ -3621,6 +3856,11 @@ mod tests {
         assert!(!state.image_dialog.open);
         assert_eq!(state.image_dialog.alt, "");
         assert_eq!(state.tabs.current().editor.text(), "甲乙丙");
+        assert_eq!(
+            state.image_dialog.bed,
+            Some("p-1".to_owned()),
+            "关框保留图床选择,下次开框沿用"
+        );
     }
 
     /// 浏览本地图片(B 段):复制进 `<doc名>.assets/`,url 回填相对地址,
@@ -3692,5 +3932,194 @@ mod tests {
         assert!(notice.contains("保存"), "提示指路先保存:{notice}");
         assert_eq!(state.image_dialog.url, "", "草稿未被回填");
         assert!(state.image_dialog.open, "对话框保持打开");
+    }
+
+    /// 图床上传收尾(C 段归约层,免网络):成功按 Insert 用途把 URL 写进
+    /// **发起标签**(选区落 alt 位),失败只落 notice、文档与选区一字不动
+    /// (image-plan §4.3)。发起标签已关则结果丢弃。
+    #[test]
+    fn upload_finish_inserts_on_success_and_only_notices_on_failure() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("正文");
+        let tab_id = state.tabs.current().id;
+        // 伪造收尾消息:bed 层(发起线程/seq/channel)已由 bed.rs 单测覆盖,
+        // 这里钉归约侧对结果的处置 —— 直接调归约入口
+        let url = "https://cdn.example/x.png".to_owned();
+        state.bed.upload_seq = 1;
+        state.bed.purpose = Some(crate::bed::BedUploadPurpose::Insert {
+            alt: "示意".to_owned(),
+        });
+        state.bed.upload_tab = Some(tab_id);
+        // 手动造在途态(rx 空壳),finish 只看 seq
+        state.bed.rx = Some(std::sync::mpsc::channel::<crate::bed::UploadResult>().1);
+
+        state.apply(Message::ImageUploadFinished {
+            seq: 1,
+            result: Ok(url.clone()),
+        });
+        assert!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .contains("![示意](https://cdn.example/x.png)"),
+            "成功插入发起标签"
+        );
+        assert!(!state.bed.is_uploading());
+
+        // 失败路径:新标签、新请求,失败 → 文档不动,只 notice
+        state.tabs.current_mut().editor.replace_all("干净文档");
+        state.bed.upload_seq = 2;
+        state.bed.purpose = Some(crate::bed::BedUploadPurpose::Insert {
+            alt: "x".to_owned(),
+        });
+        state.bed.upload_tab = Some(state.tabs.current().id);
+        state.bed.rx = Some(std::sync::mpsc::channel::<crate::bed::UploadResult>().1);
+        state.apply(Message::ImageUploadFinished {
+            seq: 2,
+            result: Err("图床返回 HTTP 401:bad token".to_owned()),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "干净文档",
+            "失败不改文档"
+        );
+        assert_eq!(state.tabs.current().selection, None, "选区不动");
+        assert_eq!(
+            state.tabs.current().document.notice.as_deref(),
+            Some("图床返回 HTTP 401:bad token")
+        );
+        assert!(!state.bed.is_uploading(), "失败同样收尾");
+    }
+
+    /// 旧 seq 的结果静默丢弃(防旧覆盖,归约层):文档、notice、在途状态
+    /// 一概不动 —— 旧结果连提示都不该弹。
+    #[test]
+    fn stale_upload_result_is_silently_dropped() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("旧");
+        state.bed.upload_seq = 2; // 当前最新序号是 2(第 1 次的结果迟到)
+        state.bed.purpose = None;
+        state.apply(Message::ImageUploadFinished {
+            seq: 1,
+            result: Ok("https://cdn/late.png".to_owned()),
+        });
+        assert_eq!(state.tabs.current().editor.text(), "旧");
+        assert_eq!(state.tabs.current().document.notice, None, "不弹提示");
+    }
+
+    /// 发起标签已关:结果无处可写,丢弃且不 panic、不留 notice。
+    #[test]
+    fn upload_result_for_closed_tab_is_dropped() {
+        let mut state = State::default();
+        state.bed.upload_seq = 1;
+        state.bed.purpose = Some(crate::bed::BedUploadPurpose::Insert {
+            alt: "a".to_owned(),
+        });
+        state.bed.upload_tab = Some(9999); // 不存在的标签 id
+        state.bed.rx = Some(std::sync::mpsc::channel::<crate::bed::UploadResult>().1);
+        state.apply(Message::ImageUploadFinished {
+            seq: 1,
+            result: Ok("https://cdn/x.png".to_owned()),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            SAMPLE_MD,
+            "写不进任何别的标签"
+        );
+        assert!(!state.bed.is_uploading(), "在途状态照常收口");
+    }
+
+    /// 测试上传收尾:结果回显设置页(last_test),不插入任何文档。
+    #[test]
+    fn test_upload_result_only_echoes_in_settings() {
+        let mut state = State::default();
+        state.bed.upload_seq = 3;
+        state.bed.purpose = Some(crate::bed::BedUploadPurpose::Test {
+            profile_name: "我的 SM.MS".to_owned(),
+        });
+        state.bed.upload_tab = None;
+        state.bed.rx = Some(std::sync::mpsc::channel::<crate::bed::UploadResult>().1);
+        let before = state.tabs.current().editor.text().to_owned();
+        state.apply(Message::ImageUploadFinished {
+            seq: 3,
+            result: Ok("https://cdn/t.png".to_owned()),
+        });
+        assert_eq!(state.tabs.current().editor.text(), before, "文档不动");
+        assert_eq!(
+            state.bed.last_test,
+            Some(("我的 SM.MS".to_owned(), Ok("https://cdn/t.png".to_owned())))
+        );
+    }
+
+    /// 图床配置保存/删除(归约层):upsert 落 beds.json,token 从不落盘;
+    /// 删除同步移除条目。落盘目录用注入的 settings_dir(无头可测)。
+    #[test]
+    fn bed_profile_save_and_delete_persist_without_tokens() {
+        let dir = temp_path("beds-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+
+        // 新增:归一化生效(名次空白被 trim),id 由归约分配
+        let mut profile = latermd_bed::BedProfile::preset_smms();
+        profile.id = String::new();
+        profile.name = "  我的 SM.MS  ".to_owned();
+        state.apply(Message::BedProfileSaved {
+            profile: profile.clone(),
+            token: Some("placeholder-token".to_owned()),
+        });
+        assert_eq!(state.bed.profiles.len(), 1);
+        let saved = state.bed.profiles[0].clone();
+        assert_eq!(saved.name, "我的 SM.MS");
+        assert!(!saved.id.is_empty(), "新 profile 分配了 id");
+        let raw = std::fs::read_to_string(dir.join("beds.json")).unwrap();
+        assert!(!raw.contains("placeholder-token"), "token 绝不落盘:{raw}");
+        assert!(!raw.contains("token"), "没有 token 字段:{raw}");
+        assert!(raw.contains("${TOKEN}"), "占位符原样保留");
+
+        // 修改:同名 id upsert,不新增条目
+        let mut edited = saved.clone();
+        edited.name = "改名".to_owned();
+        state.apply(Message::BedProfileSaved {
+            profile: edited,
+            token: None,
+        });
+        assert_eq!(state.bed.profiles.len(), 1, "upsert 不新增");
+        assert_eq!(state.bed.profiles[0].name, "改名");
+
+        // 删除:条目移除,beds.json 同步
+        state.apply(Message::BedProfileDeleted {
+            id: state.bed.profiles[0].id.clone(),
+        });
+        assert!(state.bed.profiles.is_empty());
+        let raw = std::fs::read_to_string(dir.join("beds.json")).unwrap();
+        assert_eq!(raw, "[]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未配图床就点上传:指路设置页的提示,文档与对话框不动。
+    #[test]
+    fn upload_without_profile_only_notices() {
+        let mut state = State::default();
+        state.image_dialog.open = true;
+        state.image_dialog.bed = None;
+
+        state.apply(Message::ImageUploadRequested);
+
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("设置 → 图片"), "指路设置:{notice}");
+        assert!(state.image_dialog.open, "对话框不动");
+        assert!(!state.bed.is_uploading());
     }
 }

@@ -47,6 +47,9 @@ latermd-ai = { path = "../latermd-ai" }
 # AI API key 的系统凭据存取(P2「凭据管理」):设置浮窗保存/清除 + AI 命令
 # key 闸门的优先后端;同 workspace 内部 crate,不属 ADR-004 外部依赖清单
 latermd-creds = { path = "../latermd-creds" }
+# 图床配置与上传(docs/image-plan.md C 段):设置「图片」页与图片框的
+# 上传链路;纯配置+契约 crate,不依赖 egui(铁律 2)
+latermd-bed = { path = "../latermd-bed" }
 # HTML 导出(ADR-004 清单内,P0 验收项)
 latermd-export = { path = "../latermd-export" }
 # Git 只读集成(P2 版本层):状态角标、Git 面板与确认式单文件回滚

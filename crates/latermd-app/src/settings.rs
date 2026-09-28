@@ -35,11 +35,19 @@ pub enum SettingsTab {
     Ai,
     /// MCP server(规划态)。
     Mcp,
+    /// 图片(图床 profile 列表 / 增删改 / 测试上传,docs/image-plan.md C 段)。
+    Image,
 }
 
 impl SettingsTab {
     /// 左侧分页顺序。
-    pub const ALL: [SettingsTab; 4] = [Self::Appearance, Self::Keymap, Self::Ai, Self::Mcp];
+    pub const ALL: [SettingsTab; 5] = [
+        Self::Appearance,
+        Self::Keymap,
+        Self::Ai,
+        Self::Mcp,
+        Self::Image,
+    ];
 
     /// 分页显示名。
     pub fn label(self) -> &'static str {
@@ -48,6 +56,7 @@ impl SettingsTab {
             Self::Keymap => "快捷键",
             Self::Ai => "AI",
             Self::Mcp => "MCP",
+            Self::Image => "图片",
         }
     }
 
@@ -58,6 +67,7 @@ impl SettingsTab {
             Self::Keymap => icons::Icon::Reset,
             Self::Ai => icons::Icon::Ai,
             Self::Mcp => icons::Icon::Git,
+            Self::Image => icons::Icon::Image,
         }
     }
 }
@@ -79,6 +89,60 @@ pub struct SettingsState {
     pub mcp_draft: McpConfig,
     /// 外观页「导出皮肤」的名字输入框(纯 UI 关注点,导出动作走消息)。
     pub skin_export_name: String,
+    /// 图片页的图床编辑草稿;`None` = 不在编辑。保存才发消息落盘。
+    pub bed_draft: Option<BedDraft>,
+}
+
+/// 图床页的编辑草稿:profile 本体 + 两个只属编辑期的字段(`headers` 的
+/// 多行文本形态与 token 输入)。保存时合并成 [`Message::BedProfileSaved`]。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BedDraft {
+    /// 正在编辑的 profile(新增时来自预置模板,id 为空)。
+    pub profile: latermd_bed::BedProfile,
+    /// 请求头的多行文本形态,每行 `名: 值`(值可含 `${TOKEN}`)。
+    pub headers_text: String,
+    /// 新 token 输入;留空 = 不改已存凭据。已存值**不回显**(读都不读)。
+    pub token: String,
+}
+
+impl BedDraft {
+    /// 从既有 profile 建编辑草稿(「编辑」入口)。
+    fn from_profile(profile: &latermd_bed::BedProfile) -> Self {
+        Self {
+            profile: profile.clone(),
+            headers_text: headers_to_text(&profile.headers),
+            token: String::new(),
+        }
+    }
+}
+
+/// 请求头对 → 多行文本(每行 `名: 值`)。
+fn headers_to_text(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 多行文本 → 请求头对;空行跳过,缺 `:` 或名字为空的行报行号。
+fn headers_from_text(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(format!("第 {} 行请求头缺少「:」(格式:名: 值)", index + 1));
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("第 {} 行请求头名字为空", index + 1));
+        }
+        headers.push((name.to_owned(), value.trim().to_owned()));
+    }
+    Ok(headers)
 }
 
 impl Default for SettingsState {
@@ -91,6 +155,7 @@ impl Default for SettingsState {
             ai_draft: AiConfig::default(),
             mcp_draft: McpConfig::default(),
             skin_export_name: String::new(),
+            bed_draft: None,
         }
     }
 }
@@ -110,6 +175,7 @@ pub fn dialog(
     ai: &AiState,
     ai_key: &mut AiKeyState,
     mcp: &McpState,
+    bed: &mut crate::bed::BedState,
     outbox: &mut Vec<Message>,
 ) -> Option<egui::Response> {
     let mut open = settings.open;
@@ -171,6 +237,7 @@ pub fn dialog(
                             SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
                             SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
                             SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
+                            SettingsTab::Image => image_page(ui, settings, bed, outbox),
                         });
                 });
         });
@@ -534,6 +601,234 @@ fn mcp_page(
     ui.weak("完整设计:docs/mcp-plan.md(路径不得越出文件树根、无写工具)。");
 }
 
+/// 图片页:图床 profile 列表 / 新增 / 编辑 / 删除 / 测试上传
+/// (docs/image-plan.md C 段)。
+///
+/// 与 AI/MCP 页同款「草稿 + 保存」分工:编辑期改动全在 [`BedDraft`],点
+/// 「保存」才发 [`Message::BedProfileSaved`](token 一并写系统凭据,绝不落
+/// beds.json)。「测试上传」选文件后走与图片框同一条后台上传链路,结果
+/// 回显在本页,不插入任何文档。
+fn image_page(
+    ui: &mut egui::Ui,
+    settings: &mut SettingsState,
+    bed: &mut crate::bed::BedState,
+    outbox: &mut Vec<Message>,
+) {
+    ui.heading("图片 · 图床");
+    ui.weak(
+        "图片框里的「上传」把图片发给图床,返回的 URL 插进文档。\
+         token 存系统凭据,配置文件里只有 ${TOKEN} 占位符。",
+    );
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+
+    if let Some(notice) = settings.notice.as_deref() {
+        ui.colored_label(crate::ui::tokens::WARN, notice);
+    }
+
+    if bed.profiles.is_empty() {
+        ui.weak("还没有图床,从下面的模板新增一个。");
+    }
+    // 克隆迭代:循环体只发消息不改列表,列表变更在归约
+    for profile in bed.profiles.clone() {
+        ui.horizontal(|ui| {
+            ui.strong(profile.display_name());
+            ui.weak(profile.body.label());
+            if ui.small_button("编辑").clicked() {
+                settings.bed_draft = Some(BedDraft::from_profile(&profile));
+                settings.notice = None;
+            }
+            let testing = bed.is_uploading();
+            let test = ui.add_enabled(!testing, egui::Button::new("测试上传"));
+            if testing {
+                test.on_disabled_hover_text("有上传进行中,稍候");
+            } else if test.clicked() {
+                outbox.push(Message::BedTestUploadRequested {
+                    profile_id: profile.id.clone(),
+                });
+            }
+            if ui.small_button("删除").clicked() {
+                outbox.push(Message::BedProfileDeleted {
+                    id: profile.id.clone(),
+                });
+            }
+        });
+    }
+
+    // 测试上传回显:成功给可复制的 URL,失败给警示色原因
+    if let Some((name, result)) = &bed.last_test {
+        match result {
+            Ok(url) => {
+                ui.label(format!("测试上传({name})成功:"));
+                ui.horizontal(|ui| {
+                    ui.monospace(url);
+                    if ui.small_button("复制").clicked() {
+                        ui.ctx().copy_text(url.clone());
+                    }
+                });
+            }
+            Err(error) => {
+                ui.colored_label(
+                    crate::ui::tokens::WARN,
+                    format!("测试上传({name})失败:{error}"),
+                );
+            }
+        }
+    }
+    if bed.is_uploading() {
+        ui.colored_label(crate::ui::tokens::accent(ui), "上传中…");
+    }
+
+    ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.separator();
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    if settings.bed_draft.is_none() {
+        ui.label("新增图床:");
+        ui.horizontal(|ui| {
+            for (label, preset) in [
+                ("SM.MS", latermd_bed::BedProfile::preset_smms()),
+                ("GitHub", latermd_bed::BedProfile::preset_github()),
+                ("自定义", latermd_bed::BedProfile::preset_custom()),
+            ] {
+                if ui.button(label).clicked() {
+                    settings.bed_draft = Some(BedDraft {
+                        headers_text: headers_to_text(&preset.headers),
+                        profile: preset,
+                        token: String::new(),
+                    });
+                    settings.notice = None;
+                }
+            }
+        });
+    }
+
+    if let Some(draft) = settings.bed_draft.as_mut() {
+        ui.add_space(crate::ui::tokens::SPACE_SM);
+        if bed_editor(ui, &mut settings.notice, draft, outbox) {
+            settings.bed_draft = None;
+        }
+    }
+}
+
+/// 图床编辑器(新增与编辑共用;`draft.profile.id` 空 = 新增)。`notice` 是
+/// 页内提示槽(校验失败留在编辑器里改);返回 `true` = 保存成功或取消,
+/// 调用方据此收起编辑器。
+fn bed_editor(
+    ui: &mut egui::Ui,
+    notice: &mut Option<String>,
+    draft: &mut BedDraft,
+    outbox: &mut Vec<Message>,
+) -> bool {
+    let profile = &mut draft.profile;
+    ui.strong(if profile.id.is_empty() {
+        "新增图床"
+    } else {
+        "编辑图床"
+    });
+    // 关闭编辑器(保存成功/取消)由闭包外的 result 带回 —— 闭包里借不出 settings
+    let mut result = Option::<bool>::None;
+    egui::Grid::new("settings-bed-grid")
+        .num_columns(2)
+        .spacing([crate::ui::tokens::SPACE_MD, crate::ui::tokens::SPACE_XS])
+        .show(ui, |ui| {
+            ui.label("名称");
+            ui.add(
+                egui::TextEdit::singleline(&mut profile.name)
+                    .hint_text("如 我的 SM.MS")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.label("API 地址");
+            ui.add(
+                egui::TextEdit::singleline(&mut profile.api_url)
+                    .hint_text("https://…/upload;可用 ${NAME} 代替本次文件名")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.label("表单字段名");
+            ui.add(
+                egui::TextEdit::singleline(&mut profile.file_field)
+                    .hint_text("SM.MS=smfile,Lsky=file")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.label("URL 取值路径");
+            ui.add(
+                egui::TextEdit::singleline(&mut profile.url_path)
+                    .hint_text("返回 JSON 里的点分路径,如 data.url")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.label("URL 前缀");
+            let mut prefix = profile.url_prefix.clone().unwrap_or_default();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut prefix)
+                    .hint_text("返回路径而非完整 URL 时拼在前面;留空不拼")
+                    .desired_width(360.0),
+            );
+            if response.changed() {
+                profile.url_prefix = Some(prefix);
+            }
+            ui.end_row();
+            ui.label("编码方式");
+            egui::ComboBox::from_id_salt("bed-body-style")
+                .selected_text(profile.body.label())
+                .show_ui(ui, |ui| {
+                    for style in [
+                        latermd_bed::BedBody::Multipart,
+                        latermd_bed::BedBody::Base64Json,
+                    ] {
+                        ui.selectable_value(&mut profile.body, style, style.label());
+                    }
+                });
+            ui.end_row();
+            ui.label("请求头");
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.headers_text)
+                    .hint_text("每行一条「名: 值」,值可写 ${TOKEN}")
+                    .desired_rows(3)
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.label("Token");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.token)
+                    .password(true)
+                    .hint_text("保存时写入系统凭据;留空 = 不改已存值")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+        });
+
+    ui.horizontal(|ui| {
+        let mut close = false;
+        if ui.button("保存").clicked() {
+            // 先把多行文本并进 profile 再校验;失败留在编辑器里改
+            match headers_from_text(&draft.headers_text) {
+                Ok(headers) => {
+                    let mut final_profile = profile.clone();
+                    final_profile.headers = headers;
+                    final_profile.normalize();
+                    if final_profile.api_url.is_empty() || final_profile.url_path.is_empty() {
+                        *notice = Some("API 地址与 URL 取值路径必填".to_owned());
+                    } else {
+                        outbox.push(Message::BedProfileSaved {
+                            profile: final_profile,
+                            token: Some(draft.token.clone()),
+                        });
+                        close = true;
+                    }
+                }
+                Err(error) => *notice = Some(error),
+            }
+        }
+        if ui.button("取消").clicked() {
+            close = true;
+        }
+        result.replace(close);
+    });
+    result.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,12 +838,13 @@ mod tests {
 
     fn render(state: &mut State) {
         let ctx = egui::Context::default();
-        // 借用拆分:settings / ai_key 可变,其余只读(与 draw 的口径一致)
+        // 借用拆分:settings / ai_key / bed 可变,其余只读(与 draw 的口径一致)
         let State {
             settings,
             ai_key,
             ai,
             mcp,
+            bed,
             keymap,
             theme,
             skins,
@@ -567,21 +863,32 @@ mod tests {
                 ai,
                 ai_key,
                 mcp,
+                bed,
                 &mut outbox,
             );
         });
         output.drop_without_applying_deltas();
     }
 
-    /// 四个分页各渲一帧不 panic(含 AI 页的禁用态与 MCP 页的规划态)。
+    /// 五个分页各渲一帧不 panic(含 AI 页的禁用态、MCP 页的规划态与图片
+    /// 页的空列表/编辑草稿态)。
     #[test]
     fn every_tab_renders() {
         let mut state = State::default();
         state.settings.open = true;
         for tab in SettingsTab::ALL {
             state.settings.tab = tab;
+            state.settings.bed_draft = None;
             render(&mut state);
         }
+        // 图片页带草稿与已存 profile 的形态也渲一帧
+        state.settings.tab = SettingsTab::Image;
+        state.bed.profiles = vec![latermd_bed::BedProfile::preset_smms()];
+        state.bed.last_test = Some(("SM.MS".to_owned(), Err("HTTP 401:bad token".to_owned())));
+        state.settings.bed_draft = Some(BedDraft::from_profile(
+            &latermd_bed::BedProfile::preset_github(),
+        ));
+        render(&mut state);
     }
 
     /// 关闭时窗口不进入绘制路径(不 panic、不改 open 标志)。
@@ -681,5 +988,61 @@ mod tests {
             crate::keymap::parse_shortcut(&shortcut.platform_text()),
             Some(shortcut)
         );
+    }
+
+    /// 请求头多行文本 ↔ 结构对的往返:空行跳过、值里的 `${TOKEN}` 原样
+    /// 保留、缺 `:` 或空名字报行号。
+    #[test]
+    fn headers_text_round_trips() {
+        let headers = vec![
+            ("Authorization".to_owned(), "Bearer ${TOKEN}".to_owned()),
+            ("Accept".to_owned(), "application/json".to_owned()),
+        ];
+        let text = headers_to_text(&headers);
+        assert_eq!(
+            text,
+            "Authorization: Bearer ${TOKEN}\nAccept: application/json"
+        );
+        assert_eq!(headers_from_text(&text).unwrap(), headers);
+        // 空行与首尾空白宽容
+        assert_eq!(
+            headers_from_text("\n  A:  x  \n\n").unwrap(),
+            vec![("A".to_owned(), "x".to_owned())]
+        );
+        // 坏行报行号(1 起)
+        assert!(headers_from_text("A: 1\n没冒号的行")
+            .unwrap_err()
+            .contains("第 2 行"));
+        assert!(headers_from_text(": v").unwrap_err().contains("名字为空"));
+    }
+
+    /// 图片页整页渲染(空列表 / 有 profile + 测试回显两态)不 panic、不产
+    /// 消息;编辑草稿的 Grid 表单也在其中。
+    #[test]
+    fn image_page_renders_without_messages() {
+        let ctx = egui::Context::default();
+        let mut settings = SettingsState::default();
+        let mut bed = crate::bed::BedState::default();
+        let mut outbox = Vec::new();
+        ctx.run_ui(RawInput::default(), |ui| {
+            image_page(ui, &mut settings, &mut bed, &mut outbox);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "渲染不产出消息");
+
+        let mut smms = latermd_bed::BedProfile::preset_smms();
+        smms.id = "p-1".to_owned();
+        bed.profiles = vec![smms];
+        bed.last_test = Some(("SM.MS".to_owned(), Ok("https://cdn/x.png".to_owned())));
+        settings.bed_draft = Some(BedDraft {
+            profile: latermd_bed::BedProfile::preset_custom(),
+            headers_text: "Authorization: Bearer ${TOKEN}".to_owned(),
+            token: String::new(),
+        });
+        ctx.run_ui(RawInput::default(), |ui| {
+            image_page(ui, &mut settings, &mut bed, &mut outbox);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "回显态同样只渲染");
     }
 }

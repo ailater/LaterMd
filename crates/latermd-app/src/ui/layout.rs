@@ -22,6 +22,9 @@ impl LaterMdApp {
         // AI 后台流式收流:channel 里的 chunk 翻成 Message 并入本帧归约
         // (文本回编辑器只走 Message,后台线程不触碰 UI 状态)
         outbox.extend(state.poll_ai());
+        // 图床上传收流:同一手法(channel → Message → 归约),结果只在归约
+        // 落地(插入或回显),后台线程不碰 UI 状态
+        outbox.extend(state.poll_bed());
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
@@ -88,6 +91,11 @@ impl LaterMdApp {
         // AI 流式的重绘驱动:chunk 到达即要在下一帧收流归约,预览才跟得上
         // 100ms/chunk 的节奏;AiDone 归约清标志后自然停。
         if state.ai.is_streaming() {
+            ctx.request_repaint();
+        }
+        // 图床上传的重绘驱动同理:结果到达要在下一帧收流归约(空闲不来帧,
+        // 不显式要帧结果会悬到下一次无关重绘);收尾清接收端后自然停。
+        if state.bed.is_uploading() {
             ctx.request_repaint();
         }
 
@@ -311,7 +319,7 @@ impl LaterMdApp {
             }
         }
 
-        // 设置(外观 / 快捷键 / AI / MCP):凭据读写只在归约(Message),
+        // 设置(外观 / 快捷键 / AI / MCP / 图片):凭据读写只在归约(Message),
         // 对话框只持草稿与展示状态;关闭按钮原地翻转开关。
         if self.state.settings.open {
             let state = &mut self.state;
@@ -325,6 +333,7 @@ impl LaterMdApp {
                 &state.ai,
                 &mut state.ai_key,
                 &state.mcp,
+                &mut state.bed,
                 outbox,
             );
             if close.is_some_and(|close| close.clicked()) {
@@ -367,14 +376,17 @@ impl LaterMdApp {
             }
         }
 
-        // 图片框(docs/image-plan.md A 段 + B 段本地文件):只收 alt 与 url
-        // 两个草稿,插入在归约走 `compose::insert_image`;地址为空时「插入」
+        // 图片框(docs/image-plan.md A/B/C 三段):只收 alt 与 url 草稿及
+        // 图床选择,插入在归约走 `compose::insert_image`;地址为空时「插入」
         // 按钮在对话框里已被禁用。点击插入时草稿还在 state 上,克隆进消息
-        // 载荷。「浏览」只发消息:文件选择、复制进 `.assets/` 与地址回填
-        // 都在归约(对话框不碰 IO)。
+        // 载荷。「浏览」与「上传」只发消息:文件选择、复制进 `.assets/`、
+        // 后台上传都在归约(对话框不碰 IO)。
         if self.state.image_dialog.open {
-            let (insert, browse, cancel) =
-                crate::ui::image_dialog::dialog(ui, &mut self.state.image_dialog);
+            let (insert, browse, upload, cancel) = crate::ui::image_dialog::dialog(
+                ui,
+                &mut self.state.image_dialog,
+                &self.state.bed.profiles,
+            );
             if insert.clicked() {
                 let alt = self.state.image_dialog.alt.clone();
                 let url = self.state.image_dialog.url.clone();
@@ -382,6 +394,9 @@ impl LaterMdApp {
             }
             if browse.clicked() {
                 outbox.push(Message::ImageFilePickRequested);
+            }
+            if upload.clicked() {
+                outbox.push(Message::ImageUploadRequested);
             }
             if cancel.clicked() {
                 outbox.push(Message::ImageDialogClosed);

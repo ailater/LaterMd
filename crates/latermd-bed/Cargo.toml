@@ -1,0 +1,20 @@
+[package]
+name = "latermd-bed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Image bed (image host) upload profiles and uploader contract (no UI deps)"
+
+[dependencies]
+# 阻塞 HTTP(ADR-004 已登记,与 latermd-ai 同一版本同一 HTTP 栈,不引 reqwest):
+# multipart feature 为图床表单上传开启(docs/image-plan.md C 段)
+ureq = { version = "3.4.2", default-features = false, features = [
+  "rustls",
+  "multipart",
+] }
+# BedProfile 落 beds.json 的序列化 derive
+serde = { version = "1", features = ["derive"] }
+# 上传响应的 JSON 解析与点分路径抽取
+serde_json = "1"
+# GitHub Contents API 的 base64 内容编码;ureq 3.x 依赖树已有本 crate,零新增
+base64 = "0.23"
