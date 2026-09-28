@@ -2621,4 +2621,140 @@ mod tests {
             app.state.layout.right
         );
     }
+
+    /// U3:编辑/预览渲染模式切换的淡入。完整 draw 下切到 Live 后逐帧推进
+    /// 时间渲染不 panic(乘 opacity 的路径覆盖 Live 分支),淡入期间 egui
+    /// 要帧驱动动画、超过时长后收敛(不产帧);切回 Source 对称成立 ——
+    /// 双向都从透明渐入而不是只单向。
+    #[test]
+    fn render_mode_switch_crossfades_both_directions_and_settles() {
+        let ctx = egui::Context::default();
+        let mut app = LaterMdApp::default();
+        // Source 热身几帧(应用首帧即 Source:crossfade 首调直接端点,无闪变)
+        for step in 0..3u32 {
+            ctx.run_ui(
+                RawInput {
+                    time: Some(f64::from(step) * 0.016),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+
+        let run =
+            |app: &mut LaterMdApp, mode_live: bool, frames: u32| -> Vec<std::time::Duration> {
+                let mut delays = Vec::new();
+                for step in 0..frames {
+                    let t = 0.016 * f64::from(step);
+                    let output = ctx.run_ui(
+                        RawInput {
+                            time: Some(t),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.reduce(ui.ctx());
+                            app.draw(ui);
+                        },
+                    );
+                    delays.push(
+                        output
+                            .viewport_output
+                            .values()
+                            .map(|viewport| viewport.repaint_delay)
+                            .min()
+                            .unwrap(),
+                    );
+                    output.drop_without_applying_deltas();
+                    // 每次只切一次模式,切换后从下一帧起观察淡入
+                    if step == 0
+                        && mode_live != (app.state.render_mode == crate::live::RenderMode::Live)
+                    {
+                        app.state.apply(Message::ToggleLivePreview);
+                    }
+                }
+                delays
+            };
+
+        // 切到 Live:淡入期间要帧,0.32s(> FADE_S)后收敛
+        let delays = run(&mut app, true, 21);
+        assert_eq!(app.state.render_mode, crate::live::RenderMode::Live);
+        assert!(
+            delays
+                .iter()
+                .take(15)
+                .any(|d| *d < std::time::Duration::MAX),
+            "淡入期间 egui 要帧驱动:{delays:?}"
+        );
+        assert_eq!(
+            delays.last(),
+            Some(&std::time::Duration::MAX),
+            "收敛后不产帧:{delays:?}"
+        );
+
+        // 切回 Source:对称淡入后同样收敛
+        let delays = run(&mut app, false, 21);
+        assert_eq!(app.state.render_mode, crate::live::RenderMode::Source);
+        assert!(
+            delays
+                .iter()
+                .take(15)
+                .any(|d| *d < std::time::Duration::MAX),
+            "回切同样有淡入:{delays:?}"
+        );
+        assert_eq!(delays.last(), Some(&std::time::Duration::MAX));
+    }
+
+    /// U3:浮层(egui::Window → Area 内建 fade_in)出现时的淡入。明暗两套
+    /// 主题下,设置浮窗打开后逐帧推进时间渲染不 panic;淡入期间 egui 要帧,
+    /// 超过 `style.animation_time` 后收敛 —— 动画既真的在跑,也不会无限
+    /// 产帧(与搜索空转回归同口径的守护)。
+    #[test]
+    fn overlay_window_fades_in_both_themes_then_settles() {
+        for mode in [
+            crate::theme::ThemeMode::Light,
+            crate::theme::ThemeMode::Dark,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = LaterMdApp::default();
+            app.state.theme.mode = mode;
+            app.state.settings.open = true;
+
+            let mut delays = Vec::new();
+            for step in 0..=25u32 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        time: Some(0.016 * f64::from(step)),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.reduce(ui.ctx());
+                        app.draw(ui);
+                    },
+                );
+                delays.push(
+                    output
+                        .viewport_output
+                        .values()
+                        .map(|viewport| viewport.repaint_delay)
+                        .min()
+                        .unwrap(),
+                );
+                output.drop_without_applying_deltas();
+            }
+            assert!(app.state.settings.open, "渲染不翻转开关,不 panic({mode:?})");
+            assert!(
+                delays
+                    .iter()
+                    .take(15)
+                    .any(|d| *d < std::time::Duration::MAX),
+                "{mode:?}: 淡入期间 egui 要帧:{delays:?}"
+            );
+            assert_eq!(
+                delays.last(),
+                Some(&std::time::Duration::MAX),
+                "{mode:?}: 动画结束后收敛,不产帧"
+            );
+        }
+    }
 }

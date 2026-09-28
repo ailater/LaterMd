@@ -3,7 +3,16 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #44 为当前最新条目。
+> 编号 #45 为当前最新条目。
+
+## #45 U3 动效的两个落点里，浮层淡入由 egui 内建承接 + 切换淡入的时长公式（2026-09-28，ui-modernization §3 U3 自动拍板）
+
+- **岔路一：任务预期「自研约 20 行」覆盖两个落点（编辑/预览切换淡入 + 浮层淡入），但实测 egui 0.36.2 的 `Area` 已内建 fade-in**（egui-0.36.2 `containers/area.rs`：`fade_in` 默认 true，时长即 `style.animation_time`，opacity < 1 时自动 `request_repaint`；`Window` 关闭再打开时经 `visible_last_frame` 重置计时，重复淡入）。浮层侧再自研一份就是和 egui 打架。
+- **自动选择**：浮层淡入**零代码**直接吃 egui 内建（时长 0.2s，`style.animation_time` 调 0 即全局无动画，天然满足可访问性要求）；自研部分只落在编辑/预览切换（`ui/fade.rs::crossfade`，封装 `animate_bool_with_time` + `Ui::multiply_opacity`，约 10 行），并用无头测试把两条路径都钉住（要帧 → 收敛 MAX，明暗两套不 panic）。副作用是两处时长差 0.05s（0.15 vs 0.2），肉眼不可辨。
+- **岔路二：切换淡入的时长公式**。规格同时写「0.15s alpha 插值」（ui-modernization §2.6）与「时长与 `style.animation_time` 挂钩」，两者默认值不同（egui 默认 0.2s）。
+- **自动选择**：`crossfade` 传 `style.animation_time.clamp(0.0, FADE_S)`——默认得 0.15（规格钦定值），调 0 关动画（可访问性总闸），调得更小尊重更快的偏好；调大封顶 0.15（文本编辑器的模式切换超过 0.15s 显得拖沓，且 LaterMD 未暴露该设置的 UI，实际不存在调大的用户路径）。
+- **刻意不做**（任务明示 + 本棒确认）：面板开合动效（`show_collapsible` 已自带滑动）、列表项级动效、禅定进出动效（易晕收益低）。
+- **如何改**：①要浮层时长也压到 0.15，把 `style.animation_time` 全局设为 0.15（`theme.rs::apply_shell_to` 一行，影响所有 egui 内建动画）；②要切换淡入跟随全局时长（可大于 0.15），改 `ui/fade.rs::crossfade` 去掉 `FADE_S` 封顶；③要加缓动，`animate_bool_with_time` 换 `animate_bool_with_easing`（egui 0.36 提供，浮层侧 Area 用的是 quadratic_out）。
 
 ## #44 U1「工具条/标题用 SemiBold」的接线范围与 Medium 的消费者（2026-09-28，ui-modernization §3 U1 自动拍板）
 
