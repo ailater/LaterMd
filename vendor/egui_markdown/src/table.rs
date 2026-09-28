@@ -1,5 +1,6 @@
 //! Table rendering for markdown tables.
 
+use egui::emath::GuiRounding;
 use egui::text::LayoutJob;
 use egui::{
   Align, Color32, CornerRadius, FontFamily, FontId, Id, Layout, Margin, Rect, ScrollArea, Stroke, StrokeKind,
@@ -70,7 +71,7 @@ pub fn render_table(
         }
         let mut builder = TableBuilder::new(ui)
           .id_salt(id)
-          .striped(false)
+          .striped(table_style.zebra_fill)
           .vscroll(false)
           .min_scrolled_height(0.0)
           .cell_layout(Layout::left_to_right(Align::Center));
@@ -82,6 +83,9 @@ pub fn render_table(
             for (col_idx, cell_tokens) in data.headers.iter().enumerate() {
               let align = data.alignments.get(col_idx).copied().unwrap_or(Alignment::None);
               header.col(|ui| {
+                if table_style.header_fill {
+                  paint_header_fill(ui);
+                }
                 padded_cell(ui, cell_margin, align, |ui| {
                   render_cell(
                     ui,
@@ -206,6 +210,15 @@ fn paint_edge_shadow(painter: &egui::Painter, vis: Rect, side: OverflowSide, dar
     OverflowSide::Bottom => Rect::from_x_y_ranges(vis.x_range(), (vis.bottom() - SIZE)..=vis.bottom()),
   };
   painter.add(egui::epaint::RectShape::filled(strip, 0.0, color).with_blur_width(SIZE));
+}
+
+/// Header row background, painted behind the cell's text. Same gapless
+/// expansion `egui_extras` uses for its striped rows, so cell spacing leaves
+/// no gaps; the rect stays within the cell, so a horizontally scrolled table
+/// never fills past its viewport.
+fn paint_header_fill(ui: &Ui) {
+  let rect = ui.max_rect().expand2(0.5 * ui.spacing().item_spacing).round_ui();
+  ui.painter().rect_filled(rect, CornerRadius::ZERO, ui.visuals().faint_bg_color);
 }
 
 /// Internal separators only. The outer rectangle is painted by [`paint_table_chrome`].
