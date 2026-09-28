@@ -325,7 +325,9 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
             accent: Color32::from_rgb(0x6C, 0x9F, 0xFF),
             border: Color32::from_rgb(0x3C, 0x40, 0x43),
             code_bg: Color32::from_rgb(0x23, 0x24, 0x27),
-            faint: Color32::from_rgb(0x2A, 0x2B, 0x2E),
+            // 与 content 每通道差 ~10:对齐导出 CSS 暗色表头口径(#161b22
+            // vs #0d1117)。曾取 content+1,表头/斑马底人眼不可辨。
+            faint: Color32::from_rgb(0x32, 0x34, 0x38),
         }
     } else {
         ShellTokens {
@@ -338,7 +340,9 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
             accent: Color32::from_rgb(0x33, 0x70, 0xFF),
             border: Color32::from_rgb(0xE5, 0xE6, 0xEB),
             code_bg: Color32::from_rgb(0xF5, 0xF6, 0xF7),
-            faint: Color32::from_rgb(0xFA, 0xFB, 0xFC),
+            // 与导出 HTML 的 th 底同值(latermd-export CSS #f6f8fa):
+            // 预览与导出同观感,预览不再弱于导出。
+            faint: Color32::from_rgb(0xF6, 0xF8, 0xFA),
         }
     }
 }
@@ -784,6 +788,44 @@ mod tests {
         );
         assert!(style.table.header_fill, "表头行底色开启");
         assert!(style.table.zebra_fill, "数据区隔行底色开启");
+    }
+
+    /// #30 评审修复回归:表头/斑马底(faint)必须**看得见**,不只是画得出
+    /// ——与 content 每通道差 ≥5(评审实测旧深色值差 1/通道,亮度差 ~0.4%,
+    /// 低于均匀大色块的感知阈,底色事实上隐形;浅色旧值 Δ=(5,4,3) 也弱于
+    /// 导出 CSS 的 th 底)。浅色并与导出 HTML 的 th 底同值,预览不弱于导出。
+    /// 取色源 `visuals.faint_bg_color`(vendored `paint_header_fill` 与
+    /// `egui_extras` striped 都从它取)随投影一并钉住。
+    #[test]
+    fn faint_table_fill_is_visible_against_content() {
+        for dark in [true, false] {
+            let token = shell_tokens(dark);
+            let faint = token.faint.to_array();
+            let content = token.content.to_array();
+            for channel in 0..3 {
+                let delta = (i16::from(faint[channel]) - i16::from(content[channel])).abs();
+                assert!(
+                    delta >= 5,
+                    "dark={dark} 通道 {channel}:faint {faint:?} vs content {content:?},Δ={delta},底色不可辨"
+                );
+            }
+        }
+        assert_eq!(
+            shell_tokens(false).faint,
+            Color32::from_rgb(0xF6, 0xF8, 0xFA),
+            "浅色与导出 CSS 的 th 底(#f6f8fa)同源"
+        );
+
+        let ctx = egui::Context::default();
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let visuals = ctx.style_of(theme).visuals.clone();
+            assert_eq!(
+                visuals.faint_bg_color,
+                shell_tokens(visuals.dark_mode).faint,
+                "{theme:?}: 投影后的取色源与 token 一致"
+            );
+        }
     }
 
     /// 三态解析:定向选择原样返回;`System` 取检测结果,检测不到回落

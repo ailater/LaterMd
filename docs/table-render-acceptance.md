@@ -79,3 +79,26 @@ token:content `#FFFFFF`、faint `#FAFBFC`、border `#E5E6EB`。行带坐标与�
 - 出厂默认(`theme.rs::default_markdown_style`)与九套预设(`theme_presets.rs::base`)两开关为 true 由单测钉住(`default_markdown_style_draws_table_borders` / `builtins_draw_table_borders`)。
 - 旧皮肤文件的向后兼容:九套预设按「不存在才写」铺盘,已存在的旧 `.ron` 不含新字段、serde default false 回落(无底色但不报错);本验收用干净目录重铺,取的是含新字段的版本。
 - 遗留:① vendored 标题仍呈 accent(§5,#48「如何改」);② 横向滚动条仅悬停显形、合成滚轮事件不可用,真机触摸板横滑体验留人工清单;③ Win/mac 真机表格观感不在本机范围。
+
+## 8. 独立评审修复:底色可见性(2026-09-29 第二轮)
+
+> 独立评审(medium)指出:§2/§3 以「逐像素可分」判 PASS,**只证明画了,不证明看得见**——旧取色源 `theme.rs::shell_tokens().faint` 深色 `#2A2B2E` vs 正文底 `#292A2D` 每通道仅差 1(亮度差 ~0.4%,低于均匀大色块的感知阈,深色模式底色事实上隐形);浅色 `#FAFBFC` vs `#FFFFFF` Δ=(5,4,3) 也弱于导出 CSS 的 th 底 `#f6f8fa`(Δ=(9,7,5))。§2/§3 的数字保留为修复前取证。
+
+**修复**(取值对齐导出 CSS,零 vendor、零新配置面;取色链路不变,仍是 `faint` token → `visuals.faint_bg_color` → vendored `paint_header_fill` + `egui_extras striped`):
+
+| 主题 | faint 旧值 | faint 新值 | 与 content 差 | 取值依据 |
+|---|---|---|---|---|
+| 浅色 | `#FAFBFC` | **`#F6F8FA`** | Δ=(9,7,5) | 与导出 HTML th 底同值([latermd-export CSS](../crates/latermd-export/src/lib.rs) `th { background: #f6f8fa }`),预览不弱于导出 |
+| 深色 | `#2A2B2E` | **`#323438`** | Δ=(9,10,11) | 对齐导出 CSS 暗色分支口径(th `#161b22` vs 正文 `#0d1117`,Δ=(9,10,11)) |
+
+回归防线:单测 `theme::tests::faint_table_fill_is_visible_against_content`——明暗两套 faint 与 content **每通道 |Δ|≥5**(判据从「像素可分」升级为「可感知」)、浅色与导出 th 底同值、投影后 `visuals.faint_bg_color` 与 token 一致。
+
+**像素取证重跑**(同 §1 样例与行带几何,`/tmp/t30-dark.png` / `/tmp/t30-light.png` 覆盖为修复后截图):
+
+| 断言 | 深色实测 | 浅色实测 | 结论 |
+|---|---|---|---|
+| ① 表头行底色可见 | 窄表表头带 y88–105:faint `#323438` 3041px + 右侧 content 3636px;宽表表头带同构 | 表头带 faint `#F6F8FA` 3044px + content 3636px;宽表 6820px | PASS |
+| ② 数据区隔行交替 | alpha faint=3846 / beta faint=**0** / gamma faint=3763 / delta faint=**0**(faint 带精确匹配新值) | alpha 3846 / beta **0** / gamma 3763 / delta **0**;宽表 r1=6268 | PASS |
+| ③ 边框线可检出 | 顶 y85=200px、分隔 y112/140/168/196=211px、底 y224=200px;宽表 240/267/295/323=382–389px | 顶/底 200px、分隔 211px;宽表 383–389px | PASS |
+
+深色底色对比:新值 Δ=(9,10,11)/通道(sRGB 线性化后相对 content 亮度 ~+53%),对比旧值 Δ=1/通道(~+5%,恰在 Weber 阈下沿、实测不可辨)——底色在深色模式恢复可见。取证环境备注:锁屏 `dde-lock` 复现两次(kill 后恢复,同 §0.1);另踩一坑——窗口落在 (550,241) 时被其它顶层窗口遮挡,`import -window` 抓帧不受影响但 XTEST 点击被顶层吃掉(表现为输入全无效、帧间零差),`windowmove 0 0` + `windowraise` 后恢复。

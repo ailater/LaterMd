@@ -3,7 +3,13 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #48 为当前最新条目。
+> 编号 #49 为当前最新条目。
+
+## #49 表格底色「不可辨」的修复取值口径与影响面（2026-09-29，独立评审 medium 修复自动拍板）
+
+- **岔路**：独立评审指出 #30 T3 的表头/斑马底色在深色主题事实上隐形（faint `#2A2B2E` vs 正文底 `#292A2D` 每通道差 1，亮度差 ~0.4%；浅色 Δ=(5,4,3) 也弱于导出 CSS th 底 `#f6f8fa` 的 Δ=(9,7,5)），而旧验收判据「逐像素可分」只证明画了、不证明看得见。修复岔路：A 只调 `theme.rs::shell_tokens().faint` 一个 token 的取值（取色链路不动：token → `visuals.faint_bg_color` → vendored `paint_header_fill` + `egui_extras striped` 同源）；B 为表格单独取色（`TableStyle` 加颜色字段或 header/zebra 各配一色），底色对比可独立调但引入新配置面；C 降级为「表格自带边框就够了」直接关底色。
+- **自动选择**：A。公共约束明文「不发明新配置面、底色统一取 `faint_bg_color`」；且取值不必发明——**对齐导出 CSS 的既有口径**：浅色直接取导出 th 底同值 `#F6F8FA`（预览与导出同观感，消「预览弱于导出」的不一致），深色按导出暗色分支的对比度口径（th `#161b22` vs 正文 `#0d1117`，Δ=(9,10,11)）得 `#323438`。**连带影响**：`faint` token 的另两个消费方同步变可见——AI 指令卡底（`preview.rs` 的 Frame fill，卡自带 border，底色变清晰是改善非回归）与 egui `Grid.striped`（app 内无使用，已核）。回归防线 `theme::tests::faint_table_fill_is_visible_against_content` 把判据从「像素可分」升级为「每通道 |Δ|≥5 + 浅色与导出同值 + 投影一致」。
+- **如何改**：想要更弱/更强的底色，改 `theme.rs::shell_tokens` 两处 `faint` 并同步测试阈值（重跑像素取证见 [table-render-acceptance.md](table-render-acceptance.md) §8）；要给表头与斑马各自独立于 faint 的颜色，属 vendor ①类补丁（`TableStyle` 增可选颜色字段 + 上游论证），单独立项不与本修复混装；要彻底关底色，`default_markdown_style` 与九套预设把 `header_fill`/`zebra_fill` 置 false 即可（能力保留）。
 
 ## #48 预览表头/加粗文字呈 accent 蓝的成因与修复面（2026-09-29，#30 T3 像素验收自动拍板）
 
