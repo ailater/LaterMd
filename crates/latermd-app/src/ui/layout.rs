@@ -192,10 +192,16 @@ impl LaterMdApp {
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
             .show_collapsible(ui, right, |ui| {
+                let tab = self.state.tabs.current_mut();
                 crate::ui::preview::ui(
                     ui,
-                    &mut self.state.tabs.current_mut().preview,
+                    &mut tab.preview,
                     &self.state.ai,
+                    // 相对图片以文档所在目录为锚拼 file://(未落盘为 None)
+                    tab.document
+                        .path
+                        .as_deref()
+                        .and_then(std::path::Path::parent),
                     &mut self.outbox,
                 );
             });
@@ -361,16 +367,21 @@ impl LaterMdApp {
             }
         }
 
-        // 图片框(docs/image-plan.md A 段):只收 alt 与 url 两个草稿,插入
-        // 在归约走 `compose::insert_image`;地址为空时「插入」按钮在对话框
-        // 里已被禁用。点击插入时草稿还在 state 上,克隆进消息载荷。
+        // 图片框(docs/image-plan.md A 段 + B 段本地文件):只收 alt 与 url
+        // 两个草稿,插入在归约走 `compose::insert_image`;地址为空时「插入」
+        // 按钮在对话框里已被禁用。点击插入时草稿还在 state 上,克隆进消息
+        // 载荷。「浏览」只发消息:文件选择、复制进 `.assets/` 与地址回填
+        // 都在归约(对话框不碰 IO)。
         if self.state.image_dialog.open {
-            let (insert, cancel) =
+            let (insert, browse, cancel) =
                 crate::ui::image_dialog::dialog(ui, &mut self.state.image_dialog);
             if insert.clicked() {
                 let alt = self.state.image_dialog.alt.clone();
                 let url = self.state.image_dialog.url.clone();
                 outbox.push(Message::ImageInserted { alt, url });
+            }
+            if browse.clicked() {
+                outbox.push(Message::ImageFilePickRequested);
             }
             if cancel.clicked() {
                 outbox.push(Message::ImageDialogClosed);
@@ -451,7 +462,16 @@ impl LaterMdApp {
                     // 是同一棵树上的不相交分支,挨着写会被借用检查器拦下。
                     let LaterMdApp { state, outbox, .. } = self;
                     let tab = state.tabs.current_mut();
-                    crate::ui::preview::ui(ui, &mut tab.preview, &state.ai, outbox);
+                    crate::ui::preview::ui(
+                        ui,
+                        &mut tab.preview,
+                        &state.ai,
+                        tab.document
+                            .path
+                            .as_deref()
+                            .and_then(std::path::Path::parent),
+                        outbox,
+                    );
                 });
             });
 

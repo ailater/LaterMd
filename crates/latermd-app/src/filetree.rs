@@ -129,7 +129,8 @@ pub struct TreeEntry {
 ///
 /// - 遵循 `.gitignore` 与隐藏文件过滤(`WalkBuilder` 默认;`require_git(false)`
 ///   让无 `.git` 的普通目录也吃到自己写的 `.gitignore`,符合知识库直觉);
-/// - 只保留目录与 `.md` / `.markdown` 文件;
+/// - 只保留目录与 `.md` / `.markdown` 文件;`*.assets` 目录(文档图片附件,
+///   docs/image-plan.md B 段)整个不出现;
 /// - 目录在前、名称不区分大小写字典序;超出 `cap` 的截断并计数。
 ///
 /// `cap` 参数化只为测试可注入小值;生产恒为 [`MAX_CHILDREN`]。
@@ -193,6 +194,16 @@ pub fn list_children(dir: &Path, cap: usize) -> DirChildren {
             continue;
         }
         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        // 图片资产目录(`foo.assets/`,docs/image-plan.md B 段)是文档的
+        // 私有附件区:树是文档导航,不是文件管理器,把它整个藏掉。
+        if is_dir
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(crate::assets::ASSETS_DIR_SUFFIX)
+        {
+            continue;
+        }
         if !is_dir && !is_markdown(entry.path()) {
             continue;
         }
@@ -360,7 +371,7 @@ mod tests {
 
     /// 过滤与排序:目录在前(不区分大小写字典序),文件只留 Markdown;
     /// `.gitignore` 条目与隐藏文件不出现(`require_git(false)` 让无 `.git`
-    /// 的目录同样吃 `.gitignore`)。
+    /// 的目录同样吃 `.gitignore`);`*.assets` 图片附件目录不出现。
     #[test]
     fn list_children_keeps_dirs_and_markdown_only() {
         let dir = temp_tree("list");
@@ -372,19 +383,27 @@ mod tests {
         touch(&dir.join("node_modules"), "inner.md");
         std::fs::create_dir(dir.join("docs")).unwrap();
         touch(&dir.join("docs"), "nested.md");
+        std::fs::create_dir(dir.join("笔记.assets")).unwrap();
+        touch(&dir.join("笔记.assets"), "截图.png");
+        std::fs::create_dir(dir.join("assets 汇总")).unwrap();
 
         let children = list_children(&dir, MAX_CHILDREN);
-        // 大小写不敏感字典序:a.markdown < A.MD("a" < "d" 于第 4 字符)
+        // 大小写不敏感字典序:a.markdown < A.MD("a" < "d" 于第 4 字符);
+        // `笔记.assets` 不出现,`assets 汇总`(不以 .assets 结尾)保留
         assert_eq!(
             entry_names(&children),
-            ["docs", "a.markdown", "A.MD", "b.md", "z.md"]
+            ["assets 汇总", "docs", "a.markdown", "A.MD", "b.md", "z.md"]
         );
         assert_eq!(children.truncated, 0);
+        assert!(
+            !children.entries.iter().any(|e| e.name.ends_with(".assets")),
+            "资产目录整个不出现"
+        );
         // 深层文件没有出现:确实只有一层
         assert!(!children.entries.iter().any(|e| e.name == "nested.md"));
-        // 目录与文件的分组标记供渲染区分点击行为
-        assert!(children.entries[0].is_dir);
-        assert!(!children.entries[1].is_dir);
+        // 目录与文件的分组标记供渲染区分点击行为(前两个是目录,文件在后)
+        assert!(children.entries[0].is_dir && children.entries[1].is_dir);
+        assert!(!children.entries[2].is_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

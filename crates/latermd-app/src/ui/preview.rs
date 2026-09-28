@@ -12,7 +12,10 @@ use crate::state::{Message, PreviewState};
 use eframe::egui;
 use egui_markdown::link::{LinkHandler, LinkStyle};
 use egui_markdown::MarkdownLabel;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
+use std::path::Path;
 
 /// ai:// 链接的样式色(紫罗兰,与默认超链接色区分),按明暗主题取两档。
 fn ai_link_color(dark_mode: bool) -> egui::Color32 {
@@ -65,6 +68,145 @@ fn truncate_instruction(instruction: &str) -> String {
         .collect();
     cut.push('…');
     cut
+}
+
+/// 把渲染文本里的**相对图片地址**改写成 `file://` 绝对 URI(docs/image-plan.md
+/// §4.1,B 段唯一硬骨头)。
+///
+/// 文档里存相对路径是对的(`./foo.assets/x.png` 随目录走,可移植),但
+/// vendored 层把 url 原样喂 `egui::Image::new`,egui 没有「文档目录」概念,
+/// 相对地址一律加载失败。改写发生在**喂给预览之前的字符串层**,源码与
+/// `PreviewState` 一字不动;vendored 一行不动(等上游 `Token::Image` 加
+/// `base_dir`,vendor/README.md 已登记待上游化)。
+///
+/// `base_dir` 为 `None`(文档未落盘)或空串(裸相对文件名,`Path::parent`
+/// 的产物)时原样借回:没有锚点可拼,交给加载器按失败处理,与改写前一致。
+pub(crate) fn resolve_relative_images<'a>(
+    text: &'a str,
+    base_dir: Option<&'a Path>,
+) -> Cow<'a, str> {
+    let Some(base_dir) = base_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Cow::Borrowed(text);
+    };
+    let rewrites: Vec<(Range<usize>, String)> = inline_image_dests(text)
+        .into_iter()
+        .filter(|(_, dest, _)| is_relative(dest))
+        .map(|(span, dest, wrapped)| {
+            let mut uri = file_uri(base_dir, &dest);
+            // 原 `<…>` 形式保持包裹;拼出来的 URI 含空格时裸目标语法会被
+            // 截断,也要包。目标本身就在 `(` 与 `)` 之间,替换串带尖括号
+            // 仍是合法 Markdown。
+            if wrapped || uri.chars().any(char::is_whitespace) {
+                uri = format!("<{uri}>");
+            }
+            (span, uri)
+        })
+        .collect();
+    if rewrites.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut cursor = 0;
+    for (span, uri) in rewrites {
+        out.push_str(&text[cursor..span.start]);
+        out.push_str(&uri);
+        cursor = span.end;
+    }
+    out.push_str(&text[cursor..]);
+    Cow::Owned(out)
+}
+
+/// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
+/// `(字节区间, 目标文本, 是否 <…> 包裹)`。区间含 `<>` 包裹(替换时原样
+/// 保持包裹形式),不含两侧圆括号。
+///
+/// 与 `latermd_md::wikilinks` 同款扫描纪律:围栏代码块内不认(代码里的
+/// `![](x)` 是字面文本);引用式图片 `![alt][ref]` 目标不在行内,不认;
+/// **链接** `[t](x)` 不是图片,不认(链接点击走浏览器,拼 file:// 反而坏)。
+/// alt 内嵌套 `![![a](u)](v)` 会把内层也扫出来 —— 内层本来就是独立图片,
+/// 正该改写。
+fn inline_image_dests(text: &str) -> Vec<(Range<usize>, String, bool)> {
+    let mut dests = Vec::new();
+    let mut in_code = false;
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &text[index..];
+        let line_start = index == 0 || bytes[index - 1] == b'\n';
+        if line_start {
+            let trimmed = rest.trim_start_matches([' ', '\t']);
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_code = !in_code;
+            }
+        }
+        if !in_code && rest.starts_with("![") {
+            // alt 到下一个 `]`(CommonMark 裸 alt 不含 `]`);其后紧跟 `(` 才是
+            // 内联图片,否则是引用式或残缺写法,跳过这两个字符继续。
+            if let Some(alt_len) = rest[2..].find(']') {
+                let paren = 2 + alt_len + 1;
+                if rest[paren..].starts_with('(') {
+                    if let Some((span, dest, wrapped)) = dest_span(rest, paren + 1) {
+                        dests.push((index + span.start..index + span.end, dest, wrapped));
+                        index += span.end;
+                        continue;
+                    }
+                }
+            }
+            index += 2;
+            continue;
+        }
+        let step = rest.chars().next().map_or(1, char::len_utf8);
+        index += step;
+    }
+    dests
+}
+
+/// `(` 之后的目标段:跳过前导空白;`<…>` 形式取尖括号内(区间**含**尖括号),
+/// 裸形式到首个空白或 `)`。空目标(`![]()`)返回 `None`。
+fn dest_span(text: &str, after_paren: usize) -> Option<(Range<usize>, String, bool)> {
+    let bytes = text.as_bytes();
+    let mut i = after_paren;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'<') => {
+            let close = i + 1 + text[i + 1..].find('>')?;
+            Some((i..close + 1, text[i + 1..close].to_owned(), true))
+        }
+        Some(_) => {
+            let stop = text[i..]
+                .find(|c: char| c.is_whitespace() || c == ')')
+                .map_or(text.len(), |offset| i + offset);
+            (stop > i).then(|| (i..stop, text[i..stop].to_owned(), false))
+        }
+        None => None,
+    }
+}
+
+/// 目标是否**相对**:无 scheme(含 `wiki://`、`data:`、`ai://`)、非 Windows
+/// 盘符、非 `/` 绝对路径、非纯锚点。首段含 `:` 即视为有 scheme ——
+/// `https:`、`wiki:`、`C:` 一网打尽。
+fn is_relative(dest: &str) -> bool {
+    !dest.is_empty()
+        && !dest.starts_with('#')
+        && !dest.starts_with('/')
+        && !dest.split('/').next().unwrap_or(dest).contains(':')
+}
+
+/// 相对目标 → `file://` URI:按文档目录拼绝对路径(词法拼接,不做
+/// canonicalize —— 那是磁盘 IO 且会解析符号链接,渲染定位不需要)。
+/// 路径分隔符统一 `/`,Windows 盘符路径补前导 `/`(`file:///C:/…`,
+/// egui FileLoader 的解析约定)。
+fn file_uri(base_dir: &Path, dest: &str) -> String {
+    let cleaned = dest.trim_start_matches("./");
+    let path = base_dir.join(cleaned);
+    let unified = path.to_string_lossy().replace('\\', "/");
+    if unified.starts_with('/') {
+        format!("file://{unified}")
+    } else {
+        format!("file:///{unified}")
+    }
 }
 
 /// 指令卡三态。判定与 `AiState::last_prompt` 绑定(见 [`AiLinkHandler::card_status`]),
@@ -256,11 +398,14 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
     }
 }
 
-/// 绘制预览面板。
+/// 绘制预览面板。`base_dir` 是当前文档所在目录:相对图片地址以它为锚
+/// 拼成 `file://` 绝对 URI(见 [`resolve_relative_images`]);`None` =
+/// 文档未落盘,原样渲染。
 pub fn ui(
     panel: &mut egui::Ui,
     preview: &mut PreviewState,
     ai: &AiState,
+    base_dir: Option<&Path>,
     outbox: &mut Vec<Message>,
 ) {
     egui::ScrollArea::vertical()
@@ -271,15 +416,18 @@ pub fn ui(
             // widget id 必须是常量:绝不含内容长度/hash,否则每次编辑都
             // 清空 vendored 层临时缓存,增量高亮与分段缓存全部失效
             // (AGENTS.md §6.7)。内容变化已在上游按修订号节流,这里每帧
-            // 拿到的都是"仅在变化时重建"的同一字符串。
+            // 拿到的都是"仅在变化时重建"的同一字符串;相对图片的改写也
+            // 是纯函数 —— 同样的输入永远产出同样的字符串,缓存照常命中。
             let handler = AiLinkHandler::new(
                 ai_link_color(ui.visuals().dark_mode),
                 ui.visuals().dark_mode,
                 ai,
             );
             // 渲染的是**展开过 wikilink 的**文本:源码里的 [[X]] 在这里已是
-            // [X](<wiki://X>) 链接,点击由下面的 handler 拦截
-            MarkdownLabel::new(egui::Id::new("preview-md"), &preview.rendered)
+            // [X](<wiki://X>) 链接,点击由下面的 handler 拦截;相对图片
+            // 地址在这里再换成 file:// URI(两层都是"只改渲染,源码不动")
+            let rendered = resolve_relative_images(&preview.rendered, base_dir);
+            MarkdownLabel::new(egui::Id::new("preview-md"), rendered.as_ref())
                 .wrap()
                 // heal:true = 每帧渲染前对整篇文本补闭合(vendored parser::heal),
                 // AI 流式输出的残缺帧(未闭合 fence/加粗)语法合法,完整文档
@@ -457,7 +605,7 @@ mod tests {
                 outline: Vec::new(),
                 scroll_target: None,
             };
-            ui(panel, &mut preview, &AiState::default(), &mut outbox);
+            ui(panel, &mut preview, &AiState::default(), None, &mut outbox);
         });
         let painted = painted_text(&output);
         output.drop_without_applying_deltas();
@@ -533,11 +681,169 @@ mod tests {
         };
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |panel| {
-            ui(panel, &mut preview, &AiState::default(), &mut outbox);
+            ui(panel, &mut preview, &AiState::default(), None, &mut outbox);
         });
         output.drop_without_applying_deltas();
         assert_eq!(preview.scroll_target, None, "滚动目标只消费一次");
         assert!(outbox.is_empty(), "滚动不产消息");
+    }
+
+    /// 相对图片地址解析(B 段验收的单测层):改写只发生在渲染字符串上,
+    /// 源码与 `PreviewState` 一字不动 —— 相对路径落盘,文档目录整体搬走
+    /// 仍有效(可移植验收)。
+    #[test]
+    fn relative_images_resolve_against_base_dir() {
+        use std::borrow::Cow;
+        let base = Path::new("/home/u/docs");
+        // B 段自产形态:`./foo.assets/中文.png`
+        let out = resolve_relative_images("![图](./foo.assets/中文.png)", Some(base));
+        assert_eq!(out, "![图](file:///home/u/docs/foo.assets/中文.png)");
+        // 上级目录与无 ./ 前缀
+        let out = resolve_relative_images("![a](../img/x.png)", Some(base));
+        assert_eq!(out, "![a](file:///home/u/docs/../img/x.png)");
+        // `<…>` 包裹保持包裹
+        let out = resolve_relative_images("![a](<./d/屏幕 截图.png>)", Some(base));
+        assert_eq!(out, "![a](<file:///home/u/docs/d/屏幕 截图.png>)");
+        // 多张图与周边文本逐字节保留
+        let doc = "前文\n\n![一](a.png)中间![二](<b c.png>)\n\n后文";
+        let out = resolve_relative_images(doc, Some(base));
+        assert_eq!(
+            out,
+            "前文\n\n![一](file:///home/u/docs/a.png)中间![二](<file:///home/u/docs/b c.png>)\n\n后文"
+        );
+        // 没有相对图片时原样**借回**(零分配,vendored 缓存键不变)
+        let clean = "![x](https://e.com/a.png) 与 [链](rel.md)";
+        assert!(matches!(
+            resolve_relative_images(clean, Some(base)),
+            Cow::Borrowed(_)
+        ));
+        // 未落盘(无锚点)原样借回
+        assert!(matches!(
+            resolve_relative_images("![x](a.png)", None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// 不该改写的一律不动:绝对 URL、`wiki://`(wikilink 展开产物)、
+    /// 绝对路径、锚点、空目标、围栏代码块内的 `![]()`、以及**链接**。
+    #[test]
+    fn non_relative_and_non_image_targets_stay_put() {
+        let base = Path::new("/home/u/docs");
+        let doc = "![a](https://e.com/x.png?w=1)\n![b](<wiki://架构决策>)\n\
+                   ![c](/abs/path.png)\n![d](#anchor)\n![]()\n[e 链](./rel.md)\n\
+                   ![f](data:image/png;base64,AAAA)\n![g](C:/win.png)\n\n\
+                   ```rust\nlet x = ![](inner.png);\n```\n\n![h](ok.png)";
+        let out = resolve_relative_images(doc, Some(base));
+        let expected = doc.replace("![h](ok.png)", "![h](file:///home/u/docs/ok.png)");
+        assert_eq!(out, expected);
+    }
+
+    /// B 段全链路(纯函数层):浏览复制产出的相对地址(含空格时包 `<>`)
+    /// 能被本函数还原成绝对 URI —— 存盘文本与预览改写两侧的约定互相咬合。
+    #[test]
+    fn stored_url_round_trips_into_file_uri() {
+        let base = Path::new("/home/u/docs");
+        // assets::store 的产物形态(含空格包 <>):crate::assets 单测钉落盘,
+        // 这里钉「这条地址进预览后能出图」
+        let stored = "<./笔记.assets/屏幕 截图 (1).png>";
+        let doc = format!("![alt]({stored})");
+        let out = resolve_relative_images(&doc, Some(base));
+        assert_eq!(
+            out,
+            "![alt](<file:///home/u/docs/笔记.assets/屏幕 截图 (1).png>)"
+        );
+    }
+
+    /// 带标题的内联图片:`![a](./x.png "标题")` 目标到空白即止,标题保留。
+    #[test]
+    fn titled_image_keeps_its_title() {
+        let base = Path::new("/d");
+        let out = resolve_relative_images("![a](./x.png \"题\")", Some(base));
+        assert_eq!(out, "![a](file:///d/x.png \"题\")");
+    }
+
+    /// B 段验收「预览出图」的无头全链路:真 PNG 落盘 → 生产渲染入口
+    /// [`ui`](相对地址在这里被 [`resolve_relative_images`] 拼成 file://)→
+    /// vendored `Token::Image` 分支(images feature)→ egui loader 装上后
+    /// 真的画出**图片纹理**。
+    ///
+    /// 断言依据:加载完成的图片画成**带纹理的 RectShape**(纯色矩形/文字/
+    /// spinner/⚠ 的纹理恒为默认值),出现即出图;加载在 loader 后台线程,
+    /// 轮询有限帧直到它出现。
+    #[test]
+    fn local_file_image_paints_through_loaders() {
+        let dir = std::env::temp_dir().join(format!("latermd-preview-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("foo.assets")).unwrap();
+        let png = dir.join("foo.assets/dot.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([200, 40, 40]))
+            .save(&png)
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+
+        let textured_rects = |output: &eframe::egui::FullOutput| -> usize {
+            fn collect(shape: &egui::epaint::Shape, out: &mut usize) {
+                match shape {
+                    egui::epaint::Shape::Rect(rect) => {
+                        // 0.36 起矩形纹理走 `brush`(纯色矩形/文字/spinner/⚠
+                        // 均为 None),带 brush 的矩形即图片
+                        if rect.brush.is_some() {
+                            *out += 1;
+                        }
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| collect(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = 0;
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            out
+        };
+        let render = |doc: &str| {
+            let mut preview = PreviewState {
+                rendered: doc.to_owned(),
+                text: doc.to_owned(),
+                synced_rev: 0,
+                outline: Vec::new(),
+                scroll_target: None,
+            };
+            let mut outbox = Vec::new();
+            ctx.run_ui(RawInput::default(), |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    Some(dir.as_path()),
+                    &mut outbox,
+                );
+            })
+        };
+
+        // 基线:无图文档出不了带纹理的矩形(防御断言),浮窗/滚动区首帧
+        // 只完成注册,与其它无头测试同节奏跑满三帧。
+        for _ in 0..3 {
+            let output = render("# 基线\n\n正文,没有图片。");
+            assert_eq!(textured_rects(&output), 0, "无图文档不应有图片纹理");
+            output.drop_without_applying_deltas();
+        }
+
+        let mut painted = false;
+        for _ in 0..200 {
+            let output = render("![红点](./foo.assets/dot.png)");
+            let textured = textured_rects(&output);
+            output.drop_without_applying_deltas();
+            if textured > 0 {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(painted, "相对路径图片应经 file:// 画出图片纹理(出图)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 卡片 widget id 的稳定性(AGENTS.md §6.7 的证据):id 由「块在文档中的

@@ -38,6 +38,7 @@ git subtree pull --prefix=vendor/egui_markdown \
 
 | 状态 | commit | 类别 | 说明 |
 |---|---|---|---|
+| 待上游化 | — | ① | 给 `Token::Image` 加 `base_dir`（相对图片路径解析）：Markdown 渲染器没有「文档目录」概念，相对地址一律加载失败。LaterMD 侧暂以 app 层字符串改写绕过（喂预览前把相对图片目标拼成 `file://` 绝对 URI，`crates/latermd-app/src/ui/preview.rs` 的 `resolve_relative_images`），vendored 一行未动；若上游采纳 base_dir，该绕过可整体删除 |
 | 已提交 | b9d5070 | ① | `LinkHandler` 新增围栏代码块级 block widget 扩展点：`is_block_code_widget` / `block_code_widget`（link.rs），`needs_segmentation` / `build_layout` / `render_token_range` 三处分段同步（layout.rs / label.rs），测试 tests/block_code_widget.rs。首个消费方是 app 侧 ```ai 指令卡：按 info string 判定，与既有链接 block widget 同构，上游可合（注：随 feat(app) commit 一并入库，未拆独立 `vendor:` 前缀 commit） |
 | 已提交 | 本轮 | ① | 新增 `SectionAnchor` 与 `section_anchors()`（label.rs）+ 在 `render_galley` 两条分支（可交互 / 不可交互）记录各 section 的顶部 y 到 `ui.data`，测试 tests/section_anchors.rs。动机：`MarkdownLabel` 把内容画进单个 galley，调用方（大纲面板）无从知道某一节落在哪，无法做「滚动到这一节」。纯新增能力，不改动既有渲染路径，上游可合 |
 | 待提交 | — | ① | egui 0.34 → 0.36.2：两个 Cargo.toml 的版本三件套 + pulldown-cmark 0.13.4 + `layout.rs` `ByteIndex`/`ByteRangeExt` 迁移 |

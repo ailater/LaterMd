@@ -366,6 +366,12 @@ pub enum Message {
     ImageInserted { alt: String, url: String },
     /// 图片框点「取消」:仅关闭对话框并清空草稿,文档与选区不动。
     ImageDialogClosed,
+    /// 图片框点「浏览…」(docs/image-plan.md B 段本地文件来源):归约里弹
+    /// 图片选择框,选中即**复制**进 `<doc名>.assets/`(撞名 -1/-2 改名,
+    /// 绝不覆盖),把相对地址回填 url 草稿;alt 为空时补文件名。文档未
+    /// 落盘只落提示不复制(`.assets/` 必须与文档同目录,没有目录就没有
+    /// 锚点)。对话框保持打开等用户点「插入」—— 插入仍是唯一的文本写入。
+    ImageFilePickRequested,
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -498,6 +504,7 @@ impl State {
             Message::ImageDialogOpened => self.open_image_dialog(),
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
+            Message::ImageFilePickRequested => self.pick_image_file(),
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
@@ -1057,6 +1064,48 @@ impl State {
     /// 关闭图片框并清空草稿(插入与取消共用;下次打开重新按选区预填)。
     fn close_image_dialog(&mut self) {
         self.image_dialog = ImageDialogState::default();
+    }
+
+    /// 「浏览…」(`Message::ImageFilePickRequested` 的归约):弹图片选择框,
+    /// 选中即复制进 `.assets/` 并回填草稿(docs/image-plan.md B 段)。对话框
+    /// 保持打开 —— 浏览只产地址,文本写入仍归「插入」。
+    ///
+    /// 复制发生在浏览时而非插入时:url 栏回填的是**真实落盘地址**(撞名
+    /// 后缀已定),用户所见即所插;代价是浏览后取消会在 `.assets/` 留一份
+    /// 未引用文件 —— 该目录本就是文档的附件区,孤儿文件不破坏任何引用,
+    /// 取舍已登记 decisions-pending #37。
+    fn pick_image_file(&mut self) {
+        let Some(doc) = self.tabs.current().document.path.clone() else {
+            self.tabs.current_mut().document.notice =
+                Some("请先保存文档再插入本地图片 —— 图片要复制到文档旁的 .assets/ 目录".to_owned());
+            return;
+        };
+        let start = file::start_dir(Some(&doc));
+        if let Some(picked) = file::pick_image_dialog(&start) {
+            self.import_image_file(&picked);
+        }
+    }
+
+    /// 浏览结果落草稿(与 rfd 弹框拆开,便于无头单测直接喂路径)。
+    fn import_image_file(&mut self, picked: &Path) {
+        let Some(doc) = self.tabs.current().document.path.clone() else {
+            return; // pick 侧已提示过;这里是防御(两次点击之间文档被换)
+        };
+        match crate::assets::import_file(&doc, picked) {
+            Ok(stored) => {
+                let dialog = &mut self.image_dialog;
+                dialog.url = stored.url;
+                // alt 空着才补:用户手填(或选区预填)的优先
+                if dialog.alt.trim().is_empty() {
+                    dialog.alt = stored
+                        .file_name
+                        .rsplit_once('.')
+                        .map(|(stem, _)| stem.to_owned())
+                        .unwrap_or(stored.file_name);
+                }
+            }
+            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
+        }
     }
 
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
@@ -3572,5 +3621,76 @@ mod tests {
         assert!(!state.image_dialog.open);
         assert_eq!(state.image_dialog.alt, "");
         assert_eq!(state.tabs.current().editor.text(), "甲乙丙");
+    }
+
+    /// 浏览本地图片(B 段):复制进 `<doc名>.assets/`,url 回填相对地址,
+    /// 空.alt 补文件名(去扩展名);对话框保持打开,文档一字未动。
+    #[test]
+    fn image_file_import_copies_and_backfills_draft() {
+        let dir = temp_path("image-pick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("笔记.md");
+        std::fs::write(&doc, "# 笔记").unwrap();
+        let source = dir.join("截图.png");
+        std::fs::write(&source, b"png-bytes").unwrap();
+
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc.clone());
+        state.image_dialog.open = true;
+        state.import_image_file(&source);
+
+        assert_eq!(
+            std::fs::read(dir.join("笔记.assets/截图.png")).unwrap(),
+            b"png-bytes".to_vec(),
+            "文件复制进资产目录"
+        );
+        assert_eq!(state.image_dialog.url, "./笔记.assets/截图.png");
+        assert_eq!(state.image_dialog.alt, "截图", "空 alt 补文件名(去扩展名)");
+        assert!(state.image_dialog.open, "对话框保持打开等「插入」");
+        assert_eq!(state.tabs.current().editor.text(), SAMPLE_MD, "文档未动");
+
+        // 已有 alt(选区预填/手填)不被文件名覆盖
+        state.image_dialog.alt = "手填的说明".to_owned();
+        let second = dir.join("截图.png"); // 撞名 → -1
+        state.import_image_file(&second);
+        assert_eq!(state.image_dialog.url, "./笔记.assets/截图-1.png");
+        assert_eq!(state.image_dialog.alt, "手填的说明");
+
+        // 回填的相对地址走「插入」:全链路(浏览 → 复制 → 插入)落进文档
+        state.apply(Message::ImageInserted {
+            alt: state.image_dialog.alt.clone(),
+            url: state.image_dialog.url.clone(),
+        });
+        assert!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .contains("![手填的说明](./笔记.assets/截图-1.png)"),
+            "插入的是回填的相对地址"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未落盘文档点「浏览…」:只提示不弹框不复制(`.assets/` 与文档同目录,
+    /// 没有目录就没有锚点)—— 判定在 rfd 之前,无头环境可测完整消息。
+    #[test]
+    fn image_file_pick_on_unsaved_doc_only_notices() {
+        let mut state = State::default();
+        state.image_dialog.open = true;
+
+        state.apply(Message::ImageFilePickRequested);
+
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or("");
+        assert!(notice.contains("保存"), "提示指路先保存:{notice}");
+        assert_eq!(state.image_dialog.url, "", "草稿未被回填");
+        assert!(state.image_dialog.open, "对话框保持打开");
     }
 }

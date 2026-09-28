@@ -14,8 +14,24 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.2"
-# 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内)
-egui_markdown = { path = "../../vendor/egui_markdown" }
+# 图片渲染(docs/image-plan.md B 段):vendored 层把 Token::Image 画成
+# egui::Image 的分支在该 feature 之后(上游自带,未改 vendor 一行);
+# http 随之开启,ehttp 的原生后端就是依赖树里已有的 ureq,不是第二套 HTTP 栈
+egui_extras = { version = "0.36.2", default-features = false, features = [
+    "file",
+    "image",
+] }
+# 图片解码格式开到 D 段白名单口径(PNG/JPEG/WebP/GIF);egui_extras 只透传
+# png,其余格式由这里直接开(image 已在依赖树:eframe 截图用)
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+# 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内);images =
+# 预览出图(B 段),上游 feature,未改 vendor
+egui_markdown = { path = "../../vendor/egui_markdown", features = ["images"] }
 # 主题:开启 vendor 子 crate 自带的 serde feature(MarkdownStyle 派生,ThemeSettings 持久化)
 egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
 # 主题设置(ThemeSettings/ThemeMode)的序列化 derive
