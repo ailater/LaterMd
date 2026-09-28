@@ -25,7 +25,7 @@
 [x] P3 深水区    Live Preview v1 + [[wikilink]] + 大纲预览跳转 均已于 2026-09-26 落地;剩余增强 = Live Preview v2(内联半隐藏)、Live Preview 选区扩展、反向链接面板 → 2026-09-26 已入自动流水线(auto-plan #14/#15)
 多标签已落地(2026-09-26,用户追加需求)
 [x] 外壳重构      2026-09-27 全部落地(规格 2026-09-26 产出:[ui-shell-redesign.md](ui-shell-redesign.md),D1–D5 按默认拍板 decisions-pending #30;M1–M5 = auto-plan 13a–13e):M1 自绘标题栏+三栏重排 `389dafb`、M2 左栏三段式 `8f07cd5`、M3 格式工具条 `b7c918b`、M4 禅定 `7fd24a6`、M5 收口(修复三连 `d797451`/`bff7405` + 明暗像素采样验收 11 断言 [m5-acceptance.md](m5-acceptance.md))**均于 2026-09-27 合入 main**(此前本行曾记「M1 已落地 2026-09-26」,以 git 合入日期为准订正);真机遗留(无边框拖窗/resize 于 Win/mac)见 acceptance-checklist §8 三项
-[ ] 图片框 + 图床   规格 [image-plan.md](image-plan.md)(2026-09-27 坤哥指令),A–D 四段共 4d:**待放行**,未写 src/;A 段(插入骨架)代码已在 `feature/image-a` 写成但未提交、且差 state/layout 四处接线,此刻编不过
+[x] 图片框与图床已落地(2026-09-27)   A–D 四段全部合入 main:A 插入骨架 `ee694b6`(PR #46)、B 本地图片复制进 .assets/ 与相对路径预览出图 `1f96fb6`、C latermd-bed 图床 crate 与设置第五页 `eb9c38e`、D Ctrl+V/拖入图片直接落 .assets/ 插入 `c38084a`(均 2026-09-28 落盘);#21 随 D 段完结;真机验收项(自定义图床上传走通一次、Win/mac 剪贴板与拖入)留人工清单
 [ ] 表情符号(emoji)面板   规格 [emoji-plan.md](emoji-plan.md)(2026-09-27 坤哥指令),E1–E4 共 ~1.3d:**待放行**;E1(按钮 + 面板)0.5d 可独立先交付。**实测两条硬事实**:egui 0.36.2 默认字体链已含黑白 Noto Emoji(零新增依赖即可渲染);但**彩色 emoji 上游不支持**,应用内是黑白、导出 HTML 仍是彩色
 ```
 

@@ -14,8 +14,29 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.2"
-# 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内)
-egui_markdown = { path = "../../vendor/egui_markdown" }
+# 图片渲染(docs/image-plan.md B 段):vendored 层把 Token::Image 画成
+# egui::Image 的分支在该 feature 之后(上游自带,未改 vendor 一行);
+# http 随之开启,ehttp 的原生后端就是依赖树里已有的 ureq,不是第二套 HTTP 栈
+egui_extras = { version = "0.36.2", default-features = false, features = [
+    "file",
+    "image",
+] }
+# 图片解码格式开到 D 段白名单口径(PNG/JPEG/WebP/GIF);egui_extras 只透传
+# png,其余格式由这里直接开(image 已在依赖树:eframe 截图用)
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+# 默认开 syntax_highlighting:P0 代码块高亮(ADR-004 清单内);images =
+# 预览出图(B 段),上游 feature,未改 vendor
+egui_markdown = { path = "../../vendor/egui_markdown", features = ["images"] }
+# 剪贴板图片读取(D 段):egui 0.36 内建剪贴板只出不进(get_text 有、
+# get_image 无),Ctrl+V 的图片字节直接用 arboard 取。3.6.1 已在依赖树
+# (eframe → egui-winit/clipboard → arboard/image-data),此处把传递依赖
+# 提升为直接依赖,零新增编译面;登记见 ADR-004
+arboard = "3.6"
 # 主题:开启 vendor 子 crate 自带的 serde feature(MarkdownStyle 派生,ThemeSettings 持久化)
 egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
 # 主题设置(ThemeSettings/ThemeMode)的序列化 derive
@@ -31,6 +52,9 @@ latermd-ai = { path = "../latermd-ai" }
 # AI API key 的系统凭据存取(P2「凭据管理」):设置浮窗保存/清除 + AI 命令
 # key 闸门的优先后端;同 workspace 内部 crate,不属 ADR-004 外部依赖清单
 latermd-creds = { path = "../latermd-creds" }
+# 图床配置与上传(docs/image-plan.md C 段):设置「图片」页与图片框的
+# 上传链路;纯配置+契约 crate,不依赖 egui(铁律 2)
+latermd-bed = { path = "../latermd-bed" }
 # HTML 导出(ADR-004 清单内,P0 验收项)
 latermd-export = { path = "../latermd-export" }
 # Git 只读集成(P2 版本层):状态角标、Git 面板与确认式单文件回滚

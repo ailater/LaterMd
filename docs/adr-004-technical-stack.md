@@ -47,6 +47,8 @@
 | **LLM 接入** | OpenAI / Anthropic / Ollama | — | HTTP + SSE 流式；经 `latermd-ai` 以 std 线程 + mpsc 阻塞流实现，不经 tokio |
 | **凭据存取** | `keyring` | 4.2.0 | 三平台系统凭据统一封装（Windows Credential Manager / macOS Keychain / Linux Secret Service 的 zbus 实现，不链 libsecret C 库）；P2 `latermd-creds` 引入；4.x 维护线选择见 decisions-pending #20 |
 | **系统主题检测** | `dark-light` | 3.0.0 | P2.5 皮肤批次 B「跟随系统」：同步 `detect()`（Win 注册表 / macOS NSUserDefaults / Linux freedesktop portal）。Linux 无统一规范时返回 `Unspecified` 或 Err，一律折叠为「不知道」并回落手动值（roadmap 风险 #8）；只在跟随系统模式按 1s 节流轮询；口径见 decisions-pending #24 |
+| **图片解码/编码** | `image` | 0.25（lock 0.25.10，default-features=false，features=png/jpeg/gif/webp） | 图片框 B/D 段：B 段喂 `egui_extras` 图片 loader（预览出图），D 段把剪贴板 RGBA 像素重编码为 PNG 落盘。features 即 D 段白名单本身（PNG/JPEG/WebP/GIF）；eframe/arboard 依赖树里本就有它，B 段起提升为直接依赖 |
+| **剪贴板** | `arboard` | 3.6.1（lock，default-features 关闭，宿主 feature `image-data`） | 图片框 D 段：Ctrl+V 读取剪贴板图片字节。egui 0.36.2 的剪贴板**只出不进**（`copy_text`/`copy_image` 有，`get_image` 无——egui-winit 的 `Clipboard::get` 只查文本）；arboard 已在依赖树（eframe 默认开 `egui-winit/clipboard` → `arboard/image-data`），此处把传递依赖提升为直接依赖，**零新增编译面**。返回的 RGBA 像素重编码为 PNG 落盘（`image` 同条版本线）；通道选型实测与口径见 decisions-pending #42 |
 | **皮肤文件序列化** | `ron` | 0.12.2 | P2.5 皮肤批次 B：`themes/*.ron` 存 `MarkdownStyle`。选 RON 而非 JSON 是因为皮肤给人手写与分享（支持注释、键名无引号）；样式本体仍靠 `egui_markdown_style` 的 serde derive |
 | **打包编排** | **`axodotdev/cargo-dist`** | **v0.33.0** | ❌ 修正：不是已归档的 `astral-sh/cargo-dist` |
 | **打包（备选）** | `crabnebula-dev/cargo-packager` | 0.11.8 | ❌ 修正：不是 `tauri-apps/`（404） |
@@ -180,3 +182,4 @@ LaterMD/
 | 2026-09-25 | **依赖表补登**：P1 `ai://` 链接协议（`crates/latermd-app/src/ai_link.rs`）新增 `percent-encoding` 2.3.2，遵循 decisions-pending #4 口径；零传递依赖、Cargo.lock 原有条目提升为直接依赖。协议语义定稿见 decisions-pending #11 |
 | 2026-09-25 | **依赖表补登**：P2 凭据管理新建 `crates/latermd-creds`（roadmap 阶段 4「凭据管理」条目），新增 `keyring` 4.2.0（默认 feature `v1`）。选型：3.6.3 随原维护者移交已停更且无默认 features；4.2.0（open-source-cooperative 接管，2026-08 仍更新）默认 feature 即按平台选三平台 native store，Linux 走 zbus 纯 Rust 实现免 libsecret C 库，Cargo.lock 既有 zbus 条目复用；keyring-core `Error` 的 `Display` 不携带凭据字节，契合「凭据值不进错误信息」红线。岔路与签名口径登记见 decisions-pending #20 |
 | 2026-09-26 | **依赖表补登**：P2.5 皮肤批次 B（roadmap「专题：界面美化与皮肤系统」批次 B）新增 `dark-light` 3.0.0（跟随系统主题检测）与 `ron` 0.12.2（`themes/*.ron` 皮肤文件），遵循 decisions-pending #4 口径；二者均为 app 侧依赖，不进 `latermd-mcp` / `latermd-search`（守铁律二）。取舍与回退口径见 decisions-pending #24 |
+| 2026-09-28 | **依赖表补登**：图片框 D 段（粘贴/拖拽插入，docs/image-plan.md §3.D）把 `arboard` 3.6.1 从传递依赖（eframe → egui-winit/clipboard）提升为 latermd-app 直接依赖。此前 B 段已把 `image` 0.25（default-features=false，png/jpeg/gif/webp 白名单 features）登记为直接依赖，本行补 arboard；剪贴板图片通道的实测依据（egui 0.36 无 `get_image`）与「文本粘贴优先、图片兑底」的触发口径见 decisions-pending #42 |

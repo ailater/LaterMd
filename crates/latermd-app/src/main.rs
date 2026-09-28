@@ -14,6 +14,9 @@ mod ai;
 mod ai_config;
 mod ai_key;
 mod ai_link;
+mod assets;
+mod bed;
+mod clipboard;
 mod command;
 mod compose;
 mod export;
@@ -98,6 +101,12 @@ fn main() -> eframe::Result<()> {
                 // M0 验证 UI 已退役,字体失配只在终端告警,不静默吞掉
                 eprintln!("LaterMD: 未找到候选 CJK 字体,中文将显示为方块");
             }
+            // 图片加载器(docs/image-plan.md B 段):vendored 层的 `images`
+            // feature 把 `Token::Image` 画成 `egui::Image`,egui 本体不带任何
+            // loader —— 不装这条,本地 file:// 与网络图片都只会是破图占位。
+            // file(读盘)+ image(解码)服务本地 .assets/,http 顺带让 A 段
+            // 的网络地址也出图(ehttp 原生后端复用已在依赖树里的 ureq)。
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             let theme = theme::ThemeSettings::load();
             // 首帧前装好主题,避免开场按默认深色闪一帧;此后每次切换由
             // `App::logic` 的投影维持。「跟随系统」在这里先探测一次,首帧

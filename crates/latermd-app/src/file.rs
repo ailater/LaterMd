@@ -23,6 +23,10 @@ pub use latermd_search::MARKDOWN_EXTENSIONS;
 /// 未落盘文档在另存为对话框里的预填文件名。
 pub const UNTITLED_FILE_NAME: &str = "未命名.md";
 
+/// 图片选择对话框接受的扩展名(docs/image-plan.md D 段白名单口径:预览
+/// 解码按这张清单开 `image` feature,对话框与解码同一张表)。
+pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+
 /// 文件命令。UI 只产出,执行(弹框 + IO + 状态变更)在 [`crate::state::State::apply`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileCmd {
@@ -63,6 +67,16 @@ fn markdown_dialog(start_dir: &Path) -> rfd::FileDialog {
     rfd::FileDialog::new()
         .add_filter("Markdown", &MARKDOWN_EXTENSIONS)
         .set_directory(start_dir)
+}
+
+/// 图片选择对话框(docs/image-plan.md B 段「本地文件」来源):取消返回
+/// `None`。选中后的复制进 `.assets/` 与地址回填在归约(见
+/// `State::pick_image_file`),对话框只负责选。
+pub fn pick_image_dialog(start_dir: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("图片", &IMAGE_EXTENSIONS)
+        .set_directory(start_dir)
+        .pick_file()
 }
 
 /// 目录选择对话框:文件树根目录用(`ui::sidebar` 发消息,归约里弹出)。

@@ -3,7 +3,64 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #36 为当前最新条目。
+> 编号 #42 为当前最新条目。
+
+## #42 剪贴板图片的取图通道与「文本粘贴优先」的触发口径（2026-09-28，#26 D 段自动拍板）
+
+- **岔路**：image-plan §3.D 写「取图通道优先 egui 内建；若实测 0.36 的内建剪贴板不支持图片，引 arboard 并按 decisions-pending #4 口径登记 ADR-004」。实测结论：**egui 0.36.2 内建剪贴板只出不进**——`Context` 有 `copy_text`/`copy_image`，读侧只有 egui-winit 在 Ctrl+V 时同步 `Clipboard::get()` 查**文本**翻成 `Event::Paste(String)`（egui-winit/src/clipboard.rs 的 `get` 只走 `get_text`；`set_image` 有、`get_image` 无）。因此必须引 arboard；而**怎么触发读取**是第二个岔路：拦 Ctrl+V 按键 vs 只在「V 按下而本帧无 Paste 事件」时兜底。
+- **自动选择**：①直接依赖 `arboard` 3.6.1（eframe → egui-winit/clipboard → arboard/image-data 本就在依赖树，`cargo tree -i arboard` 核实；提升为直接依赖零新增编译面，ADR-004 已登记）；②**读不走 egui**，在 `clipboard.rs` 自建「后台线程 + mpsc」三原语（X11 取剪贴板要跟宿主进程握手，是阻塞 IO，不能进归约——与 AI 流式/图床上传同纪律）；③**触发口径**：`ui::layout::reduce` 每帧看 `input.events`——有 `Event::Paste` 说明 egui-winit 已从剪贴板读到文本（文本粘贴，TextEdit 照常插字，图片流程不启动）；V 键按下而**无** Paste 事件 = 剪贴板无文本的可观察形态，此刻才发起图片读取。V 键只读不消费，不给文本粘贴劫持留任何窗口。
+- **理由**：拦 V 键（`consume_key`）会抢在 egui-winit 的粘贴判定之前，剪贴板有文本时文本粘贴被劫持成「读图失败」的空弹窗——文本粘贴是编辑器高频路径，图片粘贴是低频路径，低频必须给高频让路。「无 Paste 事件才兜底」利用了 egui-winit 自己生成的信号，两个通道天然互斥、无竞态。另两条已定口径：arboard 返回 RGBA 像素统一**重编码 PNG** 落盘（Linux X11 后端读进来本就是 PNG；扩展名因此恒 png）；剪贴板字节没有原名，合成 `粘贴图片-<纳秒时间戳>.png`（`assets.rs::pasted_image_name`）。
+- **如何改**：要「Ctrl+V 一律先问图片」（部分编辑器把剪贴板图片优先级放得更高），把 `reduce` 里的判定改成「V 按下即发起读取，Paste 事件与图片结果同帧到达时丢弃图片结果」——需要给 `ImagePasteFinished` 加发起帧标记，代价是文本粘贴场景多一次无谓的剪贴板读取；要改成 macOS 上读系统剪贴板的文件列表（截图工具落的是文件而非像素），在 `read_clipboard_image` 前先试 `clipboard.get().file_list()`，命中且为白名单扩展名时改走拖拽同款路径。
+
+## #39 图床上传的「成功即自动插入」与上传后关框（2026-09-28，#26 C 段自动拍板）
+
+- **岔路**：图片框「选文件并上传…」拿到图床 URL 后，是**回填 url 草稿等用户点「插入」**，还是**直接自动插入**。
+- **自动选择**：自动插入（`state.rs::request_image_upload` 关框并发起上传，`finish_image_upload` 成功即 `insert_image_at`）。
+- **理由**：上传动作本身就是用户的明确插入意图（选了文件、选了图床、点了按钮），回填后再要一次点击是多余步骤；而失败路径已有硬约束「绝不动文档」（image-plan §4.3），自动插入的代价只剩「成功那一下没法反悔」——Ctrl+Z 可回退（compose 写入的 undo 粒度是既定已知项 §4.2）。上传中切换标签时结果写回**发起标签**（照抄 AI 流式 `ai_active_tab` 的绑定手法）。
+- **如何改**：想改回「回填等确认」，`finish_image_upload` 的 `Insert` 分支改为重开图片框并回填 `image_dialog.url`，插入仍走「插入」按钮。
+
+## #40 图床 profile id 用时间戳而非 uuid v4 形态（2026-09-28，#26 C 段自动拍板）
+
+- **岔路**：image-plan §3.C 规格写 `id: String, // uuid`。是否引 uuid crate 生成 RFC 4122 形态。
+- **自动选择**：不引 uuid;`bed.rs::new_profile_id` 用纳秒时间戳 + 进程内计数（`bed-<nanos>-<seq>`）。
+- **理由**：id 的全部用途是「beds.json 里的键 + latermd-creds 的 account 键」，需要的是**唯一且稳定**，不是任何特定格式;可读性（能从 id 看出创建顺序）反而是排查凭据条目时的加分项。为此引一个新依赖违反「小表面积」纪律（AGENTS §8）。
+- **如何改**：想要 uuid 形态，把 `new_profile_id` 换成 `uuid::Uuid::new_v4()` 并在 latermd-app 加依赖（已在依赖树内，代价很小）;存量 beds.json 的 id 无需迁移（两种形态都是不透明字符串）。
+
+## #41 图床 token 在「无钥匙串环境」的行为（2026-09-28，#26 C 段自动拍板）
+
+- **岔路**：latermd-creds 在无 Secret Service（Linux 裸环境/CI）下读写都失败。图床页「保存」写了 token 但钥匙串不可用时，是**拒绝保存整个 profile**还是**照存 profile、只提示 token 未落**。
+- **自动选择**：照存 profile,token 失败只落提示（`state.rs::save_bed_profile`）。上传时凭据读不到 → `${TOKEN}` 替换失败 → `BedError::MissingToken` 明确提示「请在 设置 → 图片 里保存该图床的 token」。
+- **理由**：profile 本身无秘密（只有 URL/字段名/占位符），拒绝保存会让无钥匙串用户连「免 token 的自建图床」都配不了（SM.MS 之外的匿名上传端点真实存在）;失败延迟到上传时才暴露，且错误文案已指路。AI key 的处理是同款先例（保存失败降级环境变量，不阻断其它配置）。
+- **如何改**：想更严格，`save_bed_profile` 在 token 写失败时回滚 profile 落盘（不进 beds.json），提示「先修好系统凭据再配图床」。
+
+## #37 本地图片「浏览即复制」的孤儿文件取舍（2026-09-28，#26 B 段自动拍板）
+
+- **岔路**：图片框「浏览…」选中的本地图片，复制进 `<doc名>.assets/` 发生在**浏览时**还是**点插入时**。
+- **自动选择**：浏览时（`state.rs::pick_image_file`：rfd 选中即复制并回填地址栏）。
+- **理由**：url 栏回填的是真实落盘地址（撞名 `-1` 后缀已定），用户所见即所插；插入消息
+  `ImageInserted{alt,url}` 保持零改动，三条来源的汇流点不被破坏。代价：浏览后点「取消」会在
+  `.assets/` 留一份未引用文件。
+- **如何改**：想消灭孤儿，改 `pick_image_file` 只记源路径（`ImageDialogState` 加 `picked` 字段），
+  把复制挪进 `Message::ImageInserted` 的归约（复制失败只弹 notice 不插文本）；另需处理「显示的
+  url 与实际落盘名不一致」（浏览与插入之间又进了一张同名图）的提示。孤儿文件本身也可用一条
+  「清理 .assets 未引用文件」命令兜底（首期不做）。
+
+## #38 机器生成的图片地址遇空格/括号自动包 `<…>`（2026-09-28，#26 B 段自动拍板）
+
+- **岔路**：image-plan A 段定过「URL 含空格或中文时不转义、不自动 `<>` 包裹」；但 B 段复制本地
+  文件**保留原名**（规格明文），文件名含空格/括号（`屏幕 截图 (1).png`）时裸目标语法会被
+  CommonMark 截断，图片直接不出。
+- **自动选择**：A 段口径**只约束用户手填的网络地址**；B 段机器生成的相对地址在含空格/括号时
+  自动包 `<…>`（`assets.rs::relative_url`，中文仍裸放），预览侧改写函数同款处理
+  （`ui/preview.rs::resolve_relative_images`）。与 `expand_wikilinks` 包 `<>` 是同一先例。
+- **理由**：A 段的「不包裹」是为了不替用户改写输入；B 段的地址是我们自己生成的，语法合法是
+  生成方的责任。
+- **如何改**：若坤哥希望连本地文件也保持裸写，删 `relative_url` 与 `resolve_relative_images`
+  两处的包裹分支，并把复制时的改名策略换成「空格/括号替换为 `-`」（改名比留语法残骸干净）。
+- **附记（现状冲突，非取舍）**：image-plan §1 写「图片渲染走 vendored 层 label.rs:844」，
+  实况是该分支整体在 vendored 的 `images` feature 之后且上游默认关——B 段已在 latermd-app 侧
+  启用该 feature 并装 `egui_extras` 图片 loader（file/image，解码格式开到 D 段白名单
+  PNG/JPEG/GIF/WebP）；vendor 文件一行未动。
 
 ## #35 图标体系是否整体迁移到 egui-phosphor（2026-09-27，坤哥转来外部建议，**待拍板**）
 
