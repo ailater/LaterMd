@@ -3,7 +3,42 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #42 为当前最新条目。
+> 编号 #46 为当前最新条目。
+
+## #46 U0/U1/U3 三 commit 的分支承载与 main 指针处置（2026-09-28，独立评审 medium 修复自动拍板）
+
+- **岔路一**：独立评审发现 U0/U1/U3 三个 commit（f3a8435/7460651/499de06）直坐本地 main（领先 origin/main 3 个 commit），违反 AGENTS §8「main 受保护、feature 分支 + PR」流程——后续一次常规 push 即直推受保护分支。修复时这批 commit 装进**一个** feature 分支开一个 PR，还是按主题拆三个分支各开 PR。
+- **自动选择**：单分支单 PR（`feature/ui-modernization` 指向 499de06 承载全部三个 commit，本地 main 指针 `git branch -f main origin/main` 重置回 d0c6a13）。理由：三个 commit 本就按主题分开（U0 token / U1 字体 / U3 动效），PR 内逐 commit 可审；U1 依赖 U0 的 token、U3 叠在其后（`ui/format_bar.rs` 被 U0/U1 先后改动），拆 PR 须按依赖串行合并，编排成本翻三倍而无审查收益；AGENTS §6.9「按主题拆 commit」约束的是 vendor 改动，本批零 vendor 文件（三 commit 的 stat：crates/latermd-app、assets/fonts、docs）。
+- **岔路二**：本地 main 领先的处置——保留现状（等推送时再处理）vs 立即重置指针。
+- **自动选择**：立即重置（在 feature 分支上操作，工作区零变动）。理由：「领先 3」多存在一刻，误 push 直推受保护分支的窗口就多开一刻；指针重置不丢任何 commit（三个 commit 由 feature 分支引用），完全可逆。
+- **如何改**：要拆三个 PR，从 d0c6a13 依次 `git branch feature/ui-u0 f3a8435`、`git branch feature/ui-u1 7460651`、`git branch feature/ui-u3 499de06`，按序各开 PR 合并；要恢复「main 领先」旧状，`git branch -f main 499de06` 即可（commit 都还在）。
+
+## #45 U3 动效的两个落点里，浮层淡入由 egui 内建承接 + 切换淡入的时长公式（2026-09-28，ui-modernization §3 U3 自动拍板）
+
+- **岔路一：任务预期「自研约 20 行」覆盖两个落点（编辑/预览切换淡入 + 浮层淡入），但实测 egui 0.36.2 的 `Area` 已内建 fade-in**（egui-0.36.2 `containers/area.rs`：`fade_in` 默认 true，时长即 `style.animation_time`，opacity < 1 时自动 `request_repaint`；`Window` 关闭再打开时经 `visible_last_frame` 重置计时，重复淡入）。浮层侧再自研一份就是和 egui 打架。
+- **自动选择**：浮层淡入**零代码**直接吃 egui 内建（时长 0.2s，`style.animation_time` 调 0 即全局无动画，天然满足可访问性要求）；自研部分只落在编辑/预览切换（`ui/fade.rs::crossfade`，封装 `animate_bool_with_time` + `Ui::multiply_opacity`，约 10 行），并用无头测试把两条路径都钉住（要帧 → 收敛 MAX，明暗两套不 panic）。副作用是两处时长差 0.05s（0.15 vs 0.2），肉眼不可辨。
+- **岔路二：切换淡入的时长公式**。规格同时写「0.15s alpha 插值」（ui-modernization §2.6）与「时长与 `style.animation_time` 挂钩」，两者默认值不同（egui 默认 0.2s）。
+- **自动选择**：`crossfade` 传 `style.animation_time.clamp(0.0, FADE_S)`——默认得 0.15（规格钦定值），调 0 关动画（可访问性总闸），调得更小尊重更快的偏好；调大封顶 0.15（文本编辑器的模式切换超过 0.15s 显得拖沓，且 LaterMD 未暴露该设置的 UI，实际不存在调大的用户路径）。
+- **刻意不做**（任务明示 + 本棒确认）：面板开合动效（`show_collapsible` 已自带滑动）、列表项级动效、禅定进出动效（易晕收益低）。
+- **如何改**：①要浮层时长也压到 0.15，把 `style.animation_time` 全局设为 0.15（`theme.rs::apply_shell_to` 一行，影响所有 egui 内建动画）；②要切换淡入跟随全局时长（可大于 0.15），改 `ui/fade.rs::crossfade` 去掉 `FADE_S` 封顶；③要加缓动，`animate_bool_with_time` 换 `animate_bool_with_easing`（egui 0.36 提供，浮层侧 Area 用的是 quadratic_out）。
+
+## #44 U1「工具条/标题用 SemiBold」的接线范围与 Medium 的消费者（2026-09-28，ui-modernization §3 U1 自动拍板）
+
+- **岔路一：任务说「工具条/标题用 SemiBold」，但仓库里没有叫「标题」的单一控件**。候选接线性有三处：①自绘标题栏的文档标题（ui/titlebar.rs）；②格式工具条六个形态按钮 B/I/S/H1-H2-H3（ui/format_bar.rs，此前用 `RichText::strong()` 的人造粗）；③Markdown 预览的 H1-H6 标题 —— 而 ③ 在 vendored 层，`egui_markdown_style::HeadingStyle` 只有 `scales`（字号）**没有字体族字段**，接线必须改 vendor（新增字段 + serde + 渲染分支），动的是 §6 的 vendor 改动纪律，超出「只动观感层 token/主题/字体」的本棒边界。
+- **自动选择**：本棒只接 ①②（外壳侧，纯 latermd-app 改动）；③ 不做，预览标题字重留待后续需要时按 vendor ①类（上游可合）补丁单独提案。同时把 B/H1-H3 的 `strong()` 换成 SemiBold 真实字重（真实字形的精致度正是 ui-modernization §2.2「精致度最便宜的来源」的本意；人造粗与 SemiBold 叠加会双重加粗，故去 strong 留 family）。`fonts::semibold_family(ctx)` 带回落：`FontFamily::Name` 未注册时 epaint 直接 panic（epaint 0.36.2 `Font::font` 无 fallback），而大量无头 UI 测试不走 main 的 install——探测不到安装标志回落 Proportional。
+- **岔路二：Medium 字重注册给谁**。任务要求三字重都注册，但只点名了 SemiBold（工具条/标题）与 Regular（正文）两个消费者。
+- **自动选择**：Medium 注册为 `FontFamily::Name("Inter-Medium")`（链结构与 SemiBold 同构：出厂 emoji 链 + CJK 回退挂尾），**暂不接线**——等一个自然的强调档位消费者（如侧栏选中行、页签活动态）再用，避免为找消费者而扩散 UI 改动面。
+- **如何改**：①要预览 H1-H6 也用 SemiBold，走 vendor 补丁：`HeadingStyle` 加 `family: Option<FontFamily>`（egui 0.36 的 FontFamily 无 serde derive，需要自定义序列化）+ 渲染侧 `text_format` 取用，按 AGENTS §6 ①类（上游可合）单独拆 commit/PR；②要 Medium 立即有消费者，改 ui/tabs.rs 活动页签或 ui/menubar.rs 顶层项的 FontId.family 后把本条「暂不接线」划掉；③要换字重档位（如标题用 Medium 而非 SemiBold），改 ui/titlebar.rs 与 ui/format_bar.rs 两处 `semibold_family` 调用即可，fonts.rs 注册结构不变。
+
+## #43 U0 出厂色板的分发形态与「亮色侧数值」的来源口径（2026-09-28，ui-modernization §3 U0 自动拍板）
+
+- **岔路一：九套预设色板怎么「随包分发」**。任务原文写「转成 themes/*.ron 皮肤文件…作为出厂预设随包分发」，但 `themes/` 是**用户配置目录**（`~/.config/latermd/themes/`），安装包（cargo-dist 产物）没有「往用户目录铺文件」的机制；把 .ron 当安装期资源打进 `assets/` 也只是把问题挪了个位置——应用启动仍要把它们落进用户目录才能被 `SkinCatalog` 扫到。
+- **自动选择**：色值以**字面量编进二进制**（`theme_presets.rs` 的 `builtins()`），启动时 `install_to(config_dir)` 把每套写成 `themes/<name>.ron`——**仅当该文件不存在**（`state.rs::load_preferences` 与 `main.rs` 各一次，测试注入目录由前者兜住）。用户目录里同名文件永远优先：预设是「出厂底稿」不是锁死资产，用户改过的 Nord.ron 不会被出厂值顶掉。
+- **理由**：皮肤系统（#8）的一切能力（扫描、选择、导出、分享）都建在「目录里的普通 .ron 文件」上；铺盘让预设零成本复用整条链路，且「不存在才写」保证幂等与用户改动不可侵犯。代价是每套预设进二进制约 1KB（九套合计 <10KB），可忽略。
+- **岔路二：MarkdownStyle 的颜色字段是 dark/light 成对，egui-thematic 只给了一套**。它的 9 套预设里 8 套是纯暗色（`dark_mode: true`），仅 Solarized Light 是亮色；而任务点名的九套（Dracula/Nord/Gruvbox/Solarized×2/Tokyo Night/One Dark/One Light/Rosé Pine）与 egui-thematic 的九套（多 Monokai/Catppuccin Mocha、少 One Light/Rosé Pine）**不是同一集合**。
+- **自动选择**：暗色侧照抄 egui-thematic 0.1.1 `config.rs` 各 preset 的色值（2026-09-28 从 crates.io 下载源码逐套核对）；亮色侧按各色板的**公开官方浅色变体**配对（如 Dracula 官方 light、Solarized Light 官方值）；One Light 与 Rosé Pine egui-thematic 没有，按各官方 palette 补齐。九套里 7 套暗 2 套亮，每套的两套明暗值都在同一皮肤文件里，外壳主题切换时皮肤自动跟随（`MarkdownStyle` 的成对字段本就为此设计）。
+- **附带拍板：色板只覆盖行内代码四色 + 块级圆角/引用条几何**。`MarkdownStyle` 没有「正文底色/标题色/链接色」字段（那是外壳 `theme.rs::shell_tokens` 的领域，批次 C 已定「外壳不随皮肤换色」）；色板对正文的实际影响面 = 行内代码 + 代码块圆角 + 表格圆角 + 引用条形状。任务说「九套预设色板」时若期待的是整套外壳变色，那是批次 C 的口径问题，不是本棒能扩的。
+- **如何改**：①要「安装包带文件而非运行时铺盘」，把 `builtins()` 的数据改为 `include_str!` 的 `assets/themes/*.ron`（dist.toml 需追加资源条目），`install_to` 逻辑不变；②要外壳也跟色板变色，等批次 C 重启「外壳随皮肤」讨论，改 `ThemeSettings::apply` 让 shell_tokens 吃皮肤色；③某套色值想换，直接改 `theme_presets.rs::skins` 对应行，**删掉用户目录里的旧文件**再启动即可重新铺盘（或手动改用户目录那份，效果相同）。
 
 ## #42 剪贴板图片的取图通道与「文本粘贴优先」的触发口径（2026-09-28，#26 D 段自动拍板）
 

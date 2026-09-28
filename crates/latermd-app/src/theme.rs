@@ -31,6 +31,8 @@ use eframe::egui::Color32;
 use egui_markdown_style::MarkdownStyle;
 use serde::{Deserialize, Serialize};
 
+use crate::ui::tokens;
+
 /// 配置文件名,落在平台配置目录下。
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -362,8 +364,21 @@ fn apply_shell_to(style: &mut egui::Style) {
     // 前景也取它),设成 NONE 会让选中文字全透明——蓝底上看不见字。
     v.selection.bg_fill = c.selected_bg;
     v.selection.stroke = egui::Stroke::new(1.0, c.text);
-    // 圆角:控件 6(WorkBuddy 的圆润感)。0.36 的窗口/菜单圆角字段已不在
-    // Visuals/Spacing 的公开面,浮窗圆角走 egui 出厂值,不做覆盖
+    // 圆角/输入框几何:U0 token 投影(tokens.rs 是唯一数字真源)。
+    // 控件圆角 RADIUS_MD;输入框高度 = interact_size.y(egui 里 TextEdit
+    // 无独立高度字段,点击类控件的最小高度统一取它),内边距 =
+    // button_padding(TextEdit 与按钮共用)。紧凑密度的缩放在
+    // `apply_density` 里以同一组 token 为基准,两处不散落。
+    let radius = egui::CornerRadius::same(tokens::RADIUS_MD as u8);
+    style.spacing.interact_size = egui::vec2(tokens::INPUT_H, tokens::INPUT_H);
+    style.spacing.button_padding = egui::vec2(tokens::INPUT_PAD_X, tokens::INPUT_PAD_Y);
+    // 小字号(FONT_SM)落 Small 档:提示行/状态栏取它,Body 13 不动
+    // (字号用户设置是 roadmap 专题 #23,与本投影解耦)
+    if let Some(small) = style.text_styles.get_mut(&egui::TextStyle::Small) {
+        small.size = tokens::FONT_SM;
+    }
+    // 0.36 的窗口/菜单圆角字段已不在 Visuals/Spacing 的公开面,浮窗圆角
+    // 走 egui 出厂值,不做覆盖
     // 滚动条:出厂 12px 偏粗,WorkBuddy 是细浅条
     style.spacing.scroll.bar_width = 8.0;
     style.spacing.scroll.bar_inner_margin = 4.0;
@@ -371,7 +386,7 @@ fn apply_shell_to(style: &mut egui::Style) {
     // 分隔线弱化:panel 之间靠底色分区,线只在必要时出现
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
-    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+    v.widgets.noninteractive.corner_radius = radius;
     let widgets = [
         (&mut v.widgets.inactive, c.text, Color32::TRANSPARENT),
         (&mut v.widgets.hovered, c.text, c.hover),
@@ -382,7 +397,7 @@ fn apply_shell_to(style: &mut egui::Style) {
         widget.fg_stroke = egui::Stroke::new(1.0, fg);
         widget.bg_fill = bg;
         widget.weak_bg_fill = bg;
-        widget.corner_radius = egui::CornerRadius::same(6);
+        widget.corner_radius = radius;
         widget.bg_stroke = egui::Stroke::NONE;
     }
     // 输入框/按钮内的弱文字(占位符)用次要色
@@ -414,9 +429,14 @@ fn apply_density(ctx: &egui::Context, density: Density) {
     let base = egui::Style::default();
     let margin = base.spacing.window_margin;
     ctx.all_styles_mut(|style| {
+        // U0 token 系(控件高度/内边距/圆角)的缩放基准是**设计值**而非
+        // egui 出厂值:`apply_shell_to` 已把两套 style 投影成 INPUT_H/PAD/
+        // RADIUS_MD,若这里从出厂值(18/4/1/5)缩放,标准档会把投影顶回去,
+        // 两处投影互相打架。紧凑档 = 设计值 × 0.7(圆角 × 0.8)。
+        let radius = egui::CornerRadius::same((tokens::RADIUS_MD * rounding_scale) as u8);
+        style.spacing.interact_size = egui::vec2(tokens::INPUT_H, tokens::INPUT_H) * scale;
+        style.spacing.button_padding = egui::vec2(tokens::INPUT_PAD_X, tokens::INPUT_PAD_Y) * scale;
         style.spacing.item_spacing = base.spacing.item_spacing * scale;
-        style.spacing.button_padding = base.spacing.button_padding * scale;
-        style.spacing.interact_size = base.spacing.interact_size * scale;
         style.spacing.indent = base.spacing.indent * scale;
         // 滚动条:紧凑模式下收窄,让出的宽度归正文(egui 0.36 的滚动条
         // 参数在 `spacing.scroll` 里,不再是单个 bar_width 字段)
@@ -430,24 +450,17 @@ fn apply_density(ctx: &egui::Context, density: Density) {
             top: scaled(margin.top),
             bottom: scaled(margin.bottom),
         };
-        // 只取基准圆角的数值(WidgetVisuals 不是 Copy,整块搬不进闭包)
-        let base_widgets = &base.visuals.widgets;
-        let radii = [
-            base_widgets.noninteractive.corner_radius,
-            base_widgets.inactive.corner_radius,
-            base_widgets.hovered.corner_radius,
-            base_widgets.active.corner_radius,
-            base_widgets.open.corner_radius,
-        ];
+        // 圆角:同上,紧凑档直接从 RADIUS_MD 缩放(标准档投影见
+        // apply_shell_to;WidgetVisuals 不是 Copy,逐个赋值)
         let widgets = &mut style.visuals.widgets;
-        for (widget, radius) in [
-            (&mut widgets.noninteractive, radii[0]),
-            (&mut widgets.inactive, radii[1]),
-            (&mut widgets.hovered, radii[2]),
-            (&mut widgets.active, radii[3]),
-            (&mut widgets.open, radii[4]),
+        for widget in [
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
         ] {
-            widget.corner_radius = radius * rounding_scale;
+            widget.corner_radius = radius;
         }
     });
 }
@@ -847,6 +860,122 @@ mod tests {
             assert_ne!(
                 text, visuals.selection.bg_fill,
                 "{theme:?}: 选中文字与选区底色不同"
+            );
+        }
+    }
+
+    /// U0 token 投影:明暗两套 style 的控件圆角/输入框高度与内边距都取
+    /// `tokens` 常量(tokens.rs 是唯一数字真源,`apply_shell` 后不再有
+    /// 硬编码 6/18/4/1 的影子)。两套必须**同值** —— token 不分明暗。
+    #[test]
+    fn u0_tokens_project_into_both_styles() {
+        let ctx = egui::Context::default();
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            assert_eq!(
+                style.spacing.interact_size.y,
+                tokens::INPUT_H,
+                "{theme:?}: 输入框高度 = interact_size.y"
+            );
+            assert_eq!(
+                style.spacing.button_padding.x,
+                tokens::INPUT_PAD_X,
+                "{theme:?}: 输入框水平内边距"
+            );
+            assert_eq!(
+                style.spacing.button_padding.y,
+                tokens::INPUT_PAD_Y,
+                "{theme:?}: 输入框垂直内边距"
+            );
+            for widget in [
+                style.visuals.widgets.inactive.corner_radius,
+                style.visuals.widgets.hovered.corner_radius,
+                style.visuals.widgets.active.corner_radius,
+                style.visuals.widgets.open.corner_radius,
+            ] {
+                assert_eq!(
+                    widget,
+                    egui::CornerRadius::same(tokens::RADIUS_MD as u8),
+                    "{theme:?}: 控件圆角 = RADIUS_MD"
+                );
+            }
+            let small = style
+                .text_styles
+                .get(&egui::TextStyle::Small)
+                .expect("出厂 Small 档存在");
+            assert_eq!(small.size, tokens::FONT_SM, "{theme:?}: Small 字号");
+        }
+    }
+
+    /// 密度档不被 U0 token 破坏(#24 口径):紧凑档的控件高度/内边距/
+    /// 圆角仍按 0.7/0.7/0.8 缩放——但基准从「egui 出厂值」改为「U0 设计值」
+    /// (36/12/8/6),切换回标准恢复设计值本身,来回切不累积。
+    #[test]
+    fn u0_tokens_survive_density_round_trip() {
+        let ctx = egui::Context::default();
+        let compact = ThemeSettings {
+            density: Density::Compact,
+            ..ThemeSettings::default()
+        };
+        compact.apply(&ctx, ThemeMode::Dark);
+        let style = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(style.spacing.interact_size.y, tokens::INPUT_H * 0.7);
+        assert_eq!(style.spacing.button_padding.x, tokens::INPUT_PAD_X * 0.7);
+        assert_eq!(style.spacing.button_padding.y, tokens::INPUT_PAD_Y * 0.7);
+        assert_eq!(
+            style.visuals.widgets.inactive.corner_radius,
+            egui::CornerRadius::same((tokens::RADIUS_MD * 0.8) as u8)
+        );
+
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        let style = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(
+            style.spacing.interact_size.y,
+            tokens::INPUT_H,
+            "回标准不累积"
+        );
+        assert_eq!(style.spacing.button_padding.x, tokens::INPUT_PAD_X);
+    }
+
+    /// 明暗两套 visuals 下,工具条按钮与输入框在真帧里渲染不 panic,且
+    /// **按钮**实测高度不低于 `INPUT_H`(egui 的 Button 显式以
+    /// `interact_size.y` 为最小高度;TextEdit 的高度公式是「行高+内边距」,
+    /// 不走 `interact_size`,其高度由此单独断言:不低于其自然行高,证明
+    /// 投影没有把布局压坏)。
+    #[test]
+    fn toolbar_and_textedit_render_in_both_visuals() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let ctx = egui::Context::default();
+            ThemeSettings::default().apply(
+                &ctx,
+                if theme == egui::Theme::Light {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                },
+            );
+            let mut edit = String::from("预览文本");
+            let mut button_height = 0.0;
+            let mut edit_height = 0.0;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(crate::ui::tokens::TOOLBAR_H);
+                    let response = ui.button("工具条按钮");
+                    button_height = response.rect.height();
+                    let response = ui.add(egui::TextEdit::singleline(&mut edit).hint_text("占位"));
+                    edit_height = response.rect.height();
+                });
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                button_height >= tokens::INPUT_H,
+                "{theme:?}: 按钮高 {button_height} >= INPUT_H {}",
+                tokens::INPUT_H
+            );
+            assert!(
+                edit_height > 0.0 && edit_height.is_finite(),
+                "{theme:?}: 输入框高度有效(实际 {edit_height})"
             );
         }
     }

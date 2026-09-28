@@ -34,6 +34,7 @@ mod settings;
 mod state;
 mod tabs;
 mod theme;
+mod theme_presets;
 mod ui;
 
 use eframe::egui;
@@ -118,6 +119,13 @@ fn main() -> eframe::Result<()> {
                     .mode
                     .resolve(system, system.unwrap_or(theme::ThemeMode::Dark)),
             );
+            // 出厂预设色板(U0):铺进皮肤目录一次(已存在的同名文件不动),
+            // 皮肤扫描由此拿到普通 .ron;用户改过的预设永远是用户那份。
+            // `LaterMdApp::new → load_preferences` 里同款调用兜测试注入目录,
+            // 这里只管真实平台目录
+            if let Some(dir) = theme::config_dir() {
+                theme_presets::install_to(&dir);
+            }
             // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
             let file_tree = filetree::FileTreeSettings::load();
             // 外壳布局(左右两栏开着与否 + 左栏停在哪个视图)同上,M1 起持久化

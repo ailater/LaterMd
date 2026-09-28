@@ -12,8 +12,9 @@
 //!
 //! 加粗/斜体/删除线/H1-H3 用 **RichText**(`B` / `I` / `S` / `H1` 等)
 //! 而不是自绘图标:这三个是「形态」抽象概念,线段自绘只能画出没有辨识度
-//! 的矩形;而 `RichText::strong()/italics()/strikethrough()` 是 egui 内建
-//! 富文本能力,零字形依赖风险(§6.1)。
+//! 的矩形;而 `RichText::italics()/strikethrough()` 与 Inter SemiBold
+//! 字重(U1,`fonts::semibold_family`)是 egui 内建富文本能力,零字形
+//! 依赖风险(§6.1)。
 //! 其余用自绘线段图标,遵守 ui-polish §1.1「图标是矢量自绘,不是字体字符」。
 //!
 //! ## 为什么要单独一条
@@ -78,27 +79,38 @@ pub fn ui_with_probe(
 /// 单个按钮。返回响应以便测试定位(与 `ui::menubar::item` 同款手法)。
 fn button(ui: &mut egui::Ui, action: FormatAction, keymap: &Keymap) -> egui::Response {
     match action {
-        // 形态类走富文本:B / I / S 是抽象概念的自解释字形,H1-H3 用同名
-        // 数字。其余一律自绘线段图标。
-        FormatAction::Bold => rich(ui, action, "B", |text| text.strong()),
-        FormatAction::Italic => rich(ui, action, "I", |text| text.italics()),
-        FormatAction::Strike => rich(ui, action, "S", |text| text.strikethrough()),
-        FormatAction::H1 => rich(ui, action, "H1", |text| text.strong()),
-        FormatAction::H2 => rich(ui, action, "H2", |text| text.strong()),
-        FormatAction::H3 => rich(ui, action, "H3", |text| text.strong()),
+        // 形态类走富文本:B / H1-H3 是抽象概念的自解释字形,字重取 Inter
+        // SemiBold(U1,真实字重替代 strong() 的人造粗);I / S 叠加斜体 /
+        // 删除线。其余一律自绘线段图标。
+        FormatAction::Bold => rich(ui, action, "B", Glyph::Weight),
+        FormatAction::Italic => rich(ui, action, "I", Glyph::Italic),
+        FormatAction::Strike => rich(ui, action, "S", Glyph::Strike),
+        FormatAction::H1 => rich(ui, action, "H1", Glyph::Weight),
+        FormatAction::H2 => rich(ui, action, "H2", Glyph::Weight),
+        FormatAction::H3 => rich(ui, action, "H3", Glyph::Weight),
         _ => icon_button(ui, action, keymap),
     }
 }
 
+/// 形态按钮的附加富文本形态(SemiBold 字重是 `rich` 内统一施加的底座)。
+enum Glyph {
+    /// 无附加形态:视觉重量全靠 SemiBold 字形。
+    Weight,
+    Italic,
+    Strike,
+}
+
 /// 富文本按钮:`B` / `I` / `S` / `H1` 等。tooltip 带当前键位 —— 形态字形
 /// 本身不解释自己,靠 tooltip 兜可读性(ui-polish §1.1 的同款要求)。
-fn rich(
-    ui: &mut egui::Ui,
-    action: FormatAction,
-    glyph: &str,
-    style: impl Fn(egui::RichText) -> egui::RichText,
-) -> egui::Response {
-    let width = ui.spacing().interact_size.y.max(tokens::ICON + 8.0);
+fn rich(ui: &mut egui::Ui, action: FormatAction, glyph: &str, shape: Glyph) -> egui::Response {
+    // 原先取 `interact_size.y`(egui 出厂 18)当宽度;U0 投影后它涨到
+    // INPUT_H=36,六个形态按钮共宽 108px,把 Task 挤过 horizontal_wrapped
+    // 的换行点(实测按钮挪到第二行,task_button_cycling 测试点击落空)。
+    // 形态按钮的宽度是**字形的排版需求**(ICON+8),不是「可交互最小高度」,
+    // 后者只该作用于按钮高度 —— 高度这排恒取 FORMAT_BAR_H,本就与
+    // interact_size 无关。改成只按排版宽度取值,U0 的高度投影不再外溢成
+    // 宽度副作用。
+    let width = tokens::ICON + 8.0;
     let size = egui::vec2(width, tokens::FORMAT_BAR_H);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let enabled = ui.is_enabled();
@@ -112,14 +124,21 @@ fn rich(
             );
         }
         // 走 `WidgetText::into_galley` 而不是 `painter.text`:后者签名的
-        // `impl ToString` 会把 RichText 降级成纯字符串,strong / italics /
-        // strikethrough 在这一个转换里全丢 —— 加粗按钮于是长得跟普通按钮没
-        // 两样,删除线干脆看不见。
-        let mut text = egui::RichText::new(glyph).size(tokens::ICON_SM);
+        // `impl ToString` 会把 RichText 降级成纯字符串,字重 / 斜体 /
+        // 删除线在这一个转换里全丢 —— 加粗按钮于是长得跟普通按钮没两
+        // 样,删除线干脆看不见。
+        let mut text = egui::RichText::new(glyph)
+            .size(tokens::ICON_SM)
+            .family(crate::fonts::semibold_family(ui.ctx()));
+        match shape {
+            Glyph::Weight => {}
+            Glyph::Italic => text = text.italics(),
+            Glyph::Strike => text = text.strikethrough(),
+        }
         if !enabled {
             text = text.color(ui.visuals().weak_text_color());
         }
-        let galley = egui::WidgetText::from(style(text)).into_galley(
+        let galley = egui::WidgetText::from(text).into_galley(
             ui,
             Some(egui::TextWrapMode::Extend),
             f32::INFINITY,

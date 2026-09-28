@@ -990,6 +990,10 @@ impl State {
         // 图床 profile 列表(beds.json);token 在钥匙串,启动不读(上传时
         // 后台线程按需取)
         self.bed.profiles = BedState::load_from(&dir);
+        // 出厂预设色板(U0,theme_presets):铺进皮肤目录一次(同名文件
+        // 不存在才写,用户改过的预设不被顶掉),再扫描 —— 首次安装即可
+        // 在设置页看到九套预设,不需要先手动导出一次皮肤
+        crate::theme_presets::install_to(&dir);
         // 皮肤目录(`themes/*.rom`)与选中的皮肤内容:皮肤文件是唯一事实源,
         // 内存里只留载入后的样式
         self.skins = SkinCatalog::load_from(&dir);
