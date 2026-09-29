@@ -746,6 +746,7 @@ fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &m
 }
 
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · 渲染后端 · AI · MCP。
+/// 底部状态栏:路径 · 行列 · 字数 · 主题 · AI · MCP。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
     ui.horizontal_wrapped(|ui| {
         ui.weak(state.tabs.current().document.display_name());
@@ -757,10 +758,6 @@ fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
         ui.weak(format!("{} 字", text.chars().count()));
         separator(ui);
         ui.weak(state.theme.mode.label());
-        ui.weak(state.render_mode.label());
-        ui.weak(crate::renderer_label(
-            std::env::var("LATERMD_RENDERER").ok().as_deref(),
-        ));
         separator(ui);
         let ai = if state.ai.is_streaming() {
             format!("{} · 生成中", state.ai.provider_label())

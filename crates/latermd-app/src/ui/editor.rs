@@ -86,19 +86,12 @@ pub fn ui(
         selection,
         pending,
     } = channel;
-    // U3 模式切换淡入(ui::fade):当前模式的整块内容(含顶部模式行)从
-    // 透明渐入,Source↔Live 双向对称;`style.animation_time` 为 0 时 egui
-    // 直接落端点,无动画。id 挂在标签稳定的 editor_id 上,一标签一套动画
-    // 状态,切标签互不惊扰。
+    // U3 模式切换淡入(ui::fade):当前模式的整块内容从透明渐入,Source↔Live
+    // 双向对称;`style.animation_time` 为 0 时 egui 直接落端点,无动画。id 挂
+    // 在标签稳定的 editor_id 上,一标签一套动画状态,切标签互不惊扰。
     let is_live = mode == RenderMode::Live;
     let alpha = crate::ui::fade::crossfade(panel.ctx(), editor_id.with("render-mode"), is_live);
     panel.multiply_opacity(if is_live { alpha } else { 1.0 - alpha });
-    panel.horizontal(|ui| {
-        ui.weak(mode.label());
-        if editor.is_dirty() {
-            ui.weak("· 已修改");
-        }
-    });
     // 两种模式共用同一个 rope buffer 与同一套撤销语义(roadmap 铁律):这里
     // 只是分派,没有任何「把光标/文本从一种模式搬到另一种」的恢复逻辑。
     if is_live {
