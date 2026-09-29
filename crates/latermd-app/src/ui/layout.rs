@@ -686,7 +686,11 @@ fn draw_find_overlay(
     outbox: &mut Vec<Message>,
 ) {
     let margin = 8.0;
-    let anchor = source_rect.right_top() + egui::vec2(-margin, margin);
+    // 源码区 rect 包含格式工具条下方的编辑器宿主;再向下留一段
+    // 工具条高度+间距,避免浮层贴住工具条底边。Window 的 pivot 是
+    // RIGHT_TOP,所以 y 正值就是向下。
+    let anchor =
+        source_rect.right_top() + egui::vec2(-margin, crate::ui::tokens::TOOLBAR_H + margin * 2.0);
     egui::Window::new("文档内查找")
         .id(egui::Id::new("editor-find-overlay"))
         .title_bar(false)
@@ -728,8 +732,9 @@ fn find_bar_contents(
                     egui::Event::Key {
                         key: egui::Key::Enter,
                         pressed: true,
+                        modifiers,
                         ..
-                    }
+                    } if !modifiers.shift
                 )
             })
         });
@@ -737,8 +742,12 @@ fn find_bar_contents(
             i.events.iter().any(|e| {
                 matches!(
                     e,
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
-                        if modifiers.shift
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.shift
                 )
             })
         });
