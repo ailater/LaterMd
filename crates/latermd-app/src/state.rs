@@ -171,6 +171,16 @@ pub struct OutlineCursor {
 }
 
 /// 应用根状态。
+/// 文档内查找条状态(#17 最小版):`hits` 是当前 query 的大小写不敏感
+/// 全量命中(字符区间);`hit` 是当前停在第几个(0-based,`None` 未定位)。
+#[derive(Debug, Default, PartialEq)]
+pub struct FindBarState {
+    pub open: bool,
+    pub query: String,
+    pub hits: Vec<Range<usize>>,
+    pub hit: Option<usize>,
+}
+
 pub struct State {
     /// 外壳布局(左右两栏展开与否 + 左栏视图 + `layout.json` 存档,
     /// docs/ui-shell-redesign.md §10)。`left` / `right` 直接喂给各自
@@ -182,6 +192,10 @@ pub struct State {
     layout_written: LayoutSettings,
     /// 多标签(每个标签持有自己的缓冲/预览/大纲光标/落盘身份,#11)。
     pub tabs: TabsState,
+    /// 文档内查找条(#17 最小版,Ctrl+F):全局一条(不随标签),命中
+    /// 缓存随 query/文档变化重扫;跳转经 `pending_selection`(字符偏移,
+    /// 与格式动作同一契约)。
+    pub find: FindBarState,
     /// 在途 AI 流的发起标签 id;`None` = 无流。发起时锁定,收尾
     /// (成功/失败/作废)清除 —— [`Message::AiChunk`] / [`Message::AiDone`]
     /// 的写入目标由它决定,与 `tabs.active` 无关:切标签不中断也不改道。
@@ -308,6 +322,7 @@ impl Default for State {
             layout: LayoutSettings::default(),
             layout_written: LayoutSettings::default(),
             tabs: TabsState::new(SAMPLE_MD),
+            find: FindBarState::default(),
             ai_active_tab: None,
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
@@ -374,7 +389,10 @@ pub enum Message {
     /// 图片框点「插入」:归约里走 [`crate::compose::insert_image`] 写入活动
     /// 标签,新选区落在 alt 位;对话框关闭并清空草稿。url 为空是防御分支
     /// (UI 已禁用按钮),不动文档只关框。
-    ImageInserted { alt: String, url: String },
+    ImageInserted {
+        alt: String,
+        url: String,
+    },
     /// 图片框点「取消」:仅关闭对话框并清空草稿,文档与选区不动。
     ImageDialogClosed,
     /// 图片框点「浏览…」(docs/image-plan.md B 段本地文件来源):归约里弹
@@ -426,10 +444,14 @@ pub enum Message {
         token: Option<String>,
     },
     /// 删除图床 profile:`beds.json` 移除 + 系统凭据删除(幂等)。
-    BedProfileDeleted { id: String },
+    BedProfileDeleted {
+        id: String,
+    },
     /// 设置页「测试上传」:弹图片选择框,选中即后台上传,结果回显在该页
     /// (不插入任何文档)。
-    BedTestUploadRequested { profile_id: String },
+    BedTestUploadRequested {
+        profile_id: String,
+    },
     /// 请求为文件树选择新根目录(归约里弹目录对话框)。
     FileTreeRootPick,
     /// 把文件树根目录切到最近列表中的某一项(不经对话框)。
@@ -440,6 +462,14 @@ pub enum Message {
     FileSelected(PathBuf),
     /// 搜索输入变化(文本/大小写开关由 `ui` 原地写入 `SearchState`,消息
     /// 本身无载荷):归约里取消旧搜索并顺延去抖。
+    /// 查找条开/关(Ctrl+F / ✕ / Esc)。开时预填当前选区文字(编辑器惯例)。
+    FindBarToggled(bool),
+    /// 查找词变化:重扫命中并跳第一个。
+    FindQueryChanged(String),
+    /// 跳上/下一个命中(Enter / Shift+Enter,环绕)。
+    FindNext {
+        backwards: bool,
+    },
     SearchQueryChanged,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
@@ -450,13 +480,17 @@ pub enum Message {
     OutlineItemClicked(Range<usize>),
     /// 点击预览里的 `[[wikilink]]`,载荷为目标文档名:归约里在文档库内找同名
     /// 文档并打开(找不着落提示行,不静默无反应)。
-    WikilinkClicked { target: String },
+    WikilinkClicked {
+        target: String,
+    },
     /// 发起 AI Mock 流式续写(命令层入口);流式进行中在归约里被忽略
     /// (防重入,见 [`AiState::start`])。
     AiStart,
     /// AI 流式的一个增量块,载荷为要追加到文档末尾的原文。后台线程产出,
     /// 每帧由归约侧从 channel 收流翻成本消息(见 `State::poll_ai`)。
-    AiChunk { delta: String },
+    AiChunk {
+        delta: String,
+    },
     /// AI 流式成功收尾。
     AiDone,
     /// AI 流式失败,载荷为面向用户的错误描述(provider 契约:done 且
@@ -465,7 +499,9 @@ pub enum Message {
     /// 点击 ai:// 链接,载荷为 [`crate::ai_link::parse`] 的结果:`Ok` 为解码
     /// 后的提示词,归约走与 [`Message::AiStart`] 同一条流式启动路径(防重入
     /// 同样生效);`Err` 为未实现动作 / 解析失败的提示语,落状态栏不执行。
-    AiLinkClicked { prompt: Result<String, String> },
+    AiLinkClicked {
+        prompt: Result<String, String>,
+    },
     /// 请求生成 commit message(命令层入口):staged diff 优先、无 staged
     /// 用 working tree diff,喂 provider 合成单行 subject。流式进行中在
     /// 归约里被忽略(防重入,与 [`Message::AiStart`] 同一道闸)。
@@ -475,7 +511,9 @@ pub enum Message {
     /// 忽略(防重入,同一道闸)。
     AiSummaryRequested,
     /// commit message 建议就绪,载荷为单行 subject;置入 state 供浮窗展示。
-    AiCommitSuggestion { subject: String },
+    AiCommitSuggestion {
+        subject: String,
+    },
     /// 关闭 commit message 建议浮窗。
     AiCommitDismissed,
     /// 保存 AI API key 草稿到系统凭据(设置浮窗「保存」):归约里经
@@ -493,7 +531,10 @@ pub enum Message {
     AiConfigSaved(AiConfig),
     /// 给某命令绑定新键位(快捷键页捕获到按键后由归约侧产出)。撞键时
     /// **拒绝**并落提示 —— 不静默抢占另一个命令的键位。
-    KeymapAssign { cmd: Command, shortcut: Shortcut },
+    KeymapAssign {
+        cmd: Command,
+        shortcut: Shortcut,
+    },
     /// 清除某命令的键位(此后只能从菜单 / 工具栏触发)。
     KeymapCleared(Command),
     /// 某命令的键位恢复出厂。
@@ -533,7 +574,9 @@ pub enum Message {
     /// 选择皮肤(设置页外观页下拉);`None` = 出厂默认正文样式。
     ThemeSkinSelected(Option<String>),
     /// 把当前正文样式导出成皮肤文件(`themes/<name>.ron`)并选中它。
-    ThemeSkinExported { name: String },
+    ThemeSkinExported {
+        name: String,
+    },
     /// 切换界面密度(宽松 / 标准)。
     ThemeDensityChanged(Density),
 }
@@ -559,6 +602,9 @@ impl State {
             Message::RightPanelToggled => self.toggle_right_panel(),
             Message::ZenToggled => self.toggle_zen(),
             Message::FormatRequested(action) => self.apply_format(action),
+            Message::FindBarToggled(open) => self.toggle_find(open),
+            Message::FindQueryChanged(query) => self.find_query_changed(query),
+            Message::FindNext { backwards } => self.find_next(backwards),
             Message::ImageDialogOpened => self.open_image_dialog(),
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
@@ -1091,6 +1137,105 @@ impl State {
         if let Some(byte) = tab.cursor.byte {
             tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
         }
+    }
+
+    /// 查找条开/关:开时按当前选区预填查找词(选中即所要找的,编辑器
+    /// 惯例)并重扫;关时清定位。
+    fn toggle_find(&mut self, open: bool) {
+        self.find.open = open;
+        if open {
+            let tab = self.tabs.current();
+            if let Some((start, stop)) = tab.selection {
+                let (start, stop) = (start.min(stop), start.max(stop));
+                if start < stop {
+                    let text: String = tab
+                        .editor
+                        .text()
+                        .chars()
+                        .skip(start)
+                        .take(stop - start)
+                        .collect();
+                    self.find.query = text;
+                }
+            }
+            self.find_rescan();
+        } else {
+            self.find.hit = None;
+        }
+    }
+
+    /// 查找词变化:重扫 + 跳第一个命中(有命中才写 pending_selection,
+    /// 空命中只清定位,不动光标)。
+    fn find_query_changed(&mut self, query: String) {
+        self.find.query = query;
+        self.find_rescan();
+    }
+
+    /// 重扫命中:大小写不敏感的子串全量扫描,命中是**字符区间**
+    /// (`pending_selection` 的契约单位)。query 为空只清结果。
+    fn find_rescan(&mut self) {
+        let query = self.find.query.clone();
+        self.find.hits.clear();
+        self.find.hit = None;
+        if query.is_empty() {
+            return;
+        }
+        let text: String = self.tabs.current().editor.text().to_owned();
+        let haystack: String = text.to_lowercase();
+        let needle = query.to_lowercase();
+        let mut byte_hits = Vec::new();
+        let mut from = 0;
+        while let Some(idx) = haystack[from..].find(&needle) {
+            byte_hits.push(from + idx);
+            from += idx + needle.len().max(1);
+        }
+        // 字节起点 → 字符区间(lowercase 后长度可能变,如 İ → i̇,故
+        // 字节命中映射回原文用 char_indices 累计换算)
+        let mut char_of_byte = std::collections::HashMap::new();
+        for (char_idx, (byte, _)) in text.char_indices().enumerate() {
+            char_of_byte.insert(byte, char_idx);
+        }
+        let needle_chars = needle.chars().count();
+        for byte_start in byte_hits {
+            // 命中字节起点必须落在原文边界上;极端 Unicode 折叠错位时跳过
+            // 该命中(大小写折叠改变长度,边界对不齐),宁可少报不错报
+            if let Some(&start) = char_of_byte.get(&byte_start) {
+                self.find.hits.push(start..start + needle_chars);
+            }
+        }
+        if !self.find.hits.is_empty() {
+            self.find.hit = Some(0);
+            let first = self.find.hits[0].clone();
+            self.tabs.current_mut().pending_selection = Some((first.start, first.end));
+        }
+    }
+
+    /// 跳上/下一个命中(环绕),经 `pending_selection` 把选区(光标)搬
+    /// 过去,下一帧编辑器写回并滚入视口(#29 的跟随链路)。
+    fn find_next(&mut self, backwards: bool) {
+        let len = self.find.hits.len();
+        if len == 0 {
+            return;
+        }
+        let next = match self.find.hit {
+            None => {
+                if backwards {
+                    len - 1
+                } else {
+                    0
+                }
+            }
+            Some(h) => {
+                if backwards {
+                    (h + len - 1) % len
+                } else {
+                    (h + 1) % len
+                }
+            }
+        };
+        self.find.hit = Some(next);
+        let range = self.find.hits[next].clone();
+        self.tabs.current_mut().pending_selection = Some((range.start, range.end));
     }
 
     /// 打开图片框(docs/image-plan.md A 段):alt 按当前选区预填 —— 选中

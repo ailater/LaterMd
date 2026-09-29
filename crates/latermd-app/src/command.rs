@@ -89,6 +89,12 @@ pub enum Command {
     /// 归约是「开对话框」而不是「执行格式」。它也没有
     /// [`Self::format_action`]:真正的文本动作由 `compose::insert_image` 承担。
     ImageInsert,
+    /// 复制选中(无选中复制当前行)——编辑器语义,坤哥 2026-09-29 指令。
+    DuplicateSelection,
+    /// 复制当前行(选区多行时复制全部涉及行)。
+    DuplicateLine,
+    /// 打开文档内查找条(Ctrl+F)。
+    FindInDoc,
     /// 右侧只读预览栏展开/折叠(§3.1)。
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
@@ -103,7 +109,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 31] = [
+    pub const ALL: [Command; 34] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -133,6 +139,9 @@ impl Command {
         Self::FormatOrdered,
         Self::FormatTask,
         Self::ImageInsert,
+        Self::DuplicateSelection,
+        Self::DuplicateLine,
+        Self::FindInDoc,
         Self::ToggleRightPreview,
         Self::ToggleZen,
     ];
@@ -155,6 +164,8 @@ impl Command {
             Self::FormatBullet => FormatAction::Bullet,
             Self::FormatOrdered => FormatAction::Ordered,
             Self::FormatTask => FormatAction::Task,
+            Self::DuplicateSelection => FormatAction::DuplicateSelection,
+            Self::DuplicateLine => FormatAction::DuplicateLine,
             _ => return None,
         })
     }
@@ -192,6 +203,9 @@ impl Command {
             Self::FormatOrdered => "format_ordered",
             Self::FormatTask => "format_task",
             Self::ImageInsert => "image_insert",
+            Self::DuplicateSelection => "duplicate_selection",
+            Self::DuplicateLine => "duplicate_line",
+            Self::FindInDoc => "find_in_doc",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
         }
@@ -232,6 +246,9 @@ impl Command {
             // 「图片」,命令层要的是动作名「插入图片」(快捷键设置页里
             // 「图片」两个字说不清是干什么的)
             Self::ImageInsert => "插入图片",
+            Self::DuplicateSelection => "复制选中(Ctrl+D)",
+            Self::DuplicateLine => "复制当前行",
+            Self::FindInDoc => "查找",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
         }
@@ -303,6 +320,13 @@ impl Command {
             Self::ImageInsert => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::I)
             }
+            Self::DuplicateSelection => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::D)
+            }
+            Self::DuplicateLine => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::D)
+            }
+            Self::FindInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F),
             Self::ToggleRightPreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
@@ -349,6 +373,7 @@ impl Command {
             Self::FormatOrdered => Icon::OrderedList,
             Self::FormatTask => Icon::TaskList,
             Self::ImageInsert => Icon::Image,
+            Self::DuplicateSelection | Self::DuplicateLine | Self::FindInDoc => Icon::Search,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
         }
@@ -389,7 +414,10 @@ impl Command {
             | Self::FormatTable
             | Self::FormatBullet
             | Self::FormatOrdered
-            | Self::FormatTask => Message::FormatRequested(self.format_action().unwrap()),
+            | Self::FormatTask
+            | Self::DuplicateSelection
+            | Self::DuplicateLine => Message::FormatRequested(self.format_action().unwrap()),
+            Self::FindInDoc => Message::FindBarToggled(true),
         }
     }
 }

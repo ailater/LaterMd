@@ -55,6 +55,10 @@ pub enum FormatAction {
     /// [`insert_image`]。列在动作枚举里,是为了让「图标 / 提示 / 键位 /
     /// 分组」四处与别的动作同构。
     Image,
+    /// 复制选中内容(无选中=复制当前行),Ctrl+D。
+    DuplicateSelection,
+    /// 复制当前行,Ctrl+Shift+D。
+    DuplicateLine,
     /// `- `
     Bullet,
     /// `1. `
@@ -82,6 +86,8 @@ impl FormatAction {
             Divider => "分割线",
             Table => "表格",
             Image => "图片",
+            DuplicateSelection => "复制选中",
+            DuplicateLine => "复制当前行",
             Bullet => "无序列表",
             Ordered => "有序列表",
             Task => "任务列表",
@@ -182,6 +188,8 @@ pub fn apply(action: FormatAction, text: &str, sel: Range<usize>) -> (String, Ra
         Divider => view.insert_block("", "---\n"),
         Table => view.insert_block("", TABLE_SKELETON),
         Image => view.image(IMAGE_URL, None),
+        DuplicateSelection => view.duplicate_selection(),
+        DuplicateLine => view.duplicate_line(),
     }
 }
 
@@ -340,6 +348,43 @@ impl<'a> View<'a> {
         let start = left.chars().count() + 2;
         let end = start + alt.chars().count();
         (out, start..end)
+    }
+
+    /// 复制选中内容:选区副本插到选区尾,光标落副本尾(编辑器惯例)。
+    /// 无选中时回落复制当前行(VSCode Ctrl+D 同款语义)。
+    fn duplicate_selection(self) -> (String, Range<usize>) {
+        if self.caret_only() {
+            return self.duplicate_line();
+        }
+        let (a, b) = (self.byte_of(self.start), self.byte_of(self.stop));
+        let (left, mid, right) = (&self.text[..a], &self.text[a..b], &self.text[b..]);
+        let cursor = left.chars().count() + mid.chars().count() * 2;
+        (format!("{left}{mid}{mid}{right}"), cursor..cursor)
+    }
+
+    /// 复制当前行:光标/选区涉及的行整体复制一份插到下方(含行尾换行,
+    /// 末行无换行则补一个让副本独立成行);光标落副本区同列。多行选区
+    /// 按 VSCode 语义复制全部涉及行。
+    fn duplicate_line(self) -> (String, Range<usize>) {
+        let (a, b) = (self.byte_of(self.start), self.byte_of(self.stop));
+        let line_start = self.text[..a].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = self
+            .text
+            .get(b..)
+            .and_then(|rest| rest.find('\n').map(|i| b + i + 1))
+            .unwrap_or(self.text.len());
+        let block = &self.text[line_start..line_end];
+        let tail_is_eol = block.ends_with('\n');
+        let mut out = String::with_capacity(self.text.len() + block.len() + 1);
+        out.push_str(&self.text[..line_end]);
+        out.push_str(block);
+        if !tail_is_eol {
+            out.push('\n');
+        }
+        out.push_str(&self.text[line_end..]);
+        let inserted = block.chars().count() + usize::from(!tail_is_eol);
+        let cursor = self.stop + inserted;
+        (out, cursor..cursor)
     }
 
     /// **行前缀类**:作用于选区覆盖的所有整行。已是该前缀 → 去掉
@@ -680,5 +725,19 @@ mod tests {
             .flat_map(|group| group.actions().iter().copied())
             .collect();
         assert_eq!(flat, FormatAction::ALL.to_vec());
+    }
+
+    #[test]
+    fn duplicate_selection_inserts_copy_after_selection() {
+        let (text, sel) = apply(FormatAction::DuplicateSelection, "甲乙丙", 1..2);
+        assert_eq!(text, "甲乙乙丙");
+        assert_eq!(sel, 3..3);
+    }
+
+    #[test]
+    fn duplicate_line_handles_cjk_and_final_line() {
+        let (text, sel) = apply(FormatAction::DuplicateLine, "甲行\n乙行", 1..1);
+        assert_eq!(text, "甲行\n甲行\n乙行");
+        assert_eq!(sel, 4..4);
     }
 }
