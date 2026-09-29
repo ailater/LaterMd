@@ -380,7 +380,34 @@ impl Keymap {
             return Self::builtin();
         };
         match serde_json::from_slice::<Keymap>(&bytes) {
-            Ok(keymap) => keymap,
+            Ok(mut keymap) => {
+                // 新命令加入后要向旧 keymap.json 增量补默认,但绝不能覆盖
+                // 用户已有绑定(包括主动清除后缺项的旧语义)。只有「命令 id
+                // 完全不存在」才补;这样 Ctrl+D/Ctrl+Shift+D/Ctrl+F 随升级
+                // 自动可用,旧配置不需要手动点「全部恢复默认」。
+                let mut changed = false;
+                for cmd in Command::ALL {
+                    if !keymap.bindings.contains_key(cmd.id()) {
+                        if let Some(shortcut) = cmd.default_shortcut() {
+                            keymap.bindings.insert(
+                                cmd.id().to_owned(),
+                                Shortcut {
+                                    modifiers: shortcut.modifiers,
+                                    key: shortcut.logical_key,
+                                }
+                                .platform_text(),
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    if let Err(error) = keymap.save_to(dir) {
+                        eprintln!("LaterMD: 新快捷键默认值写回失败: {error}");
+                    }
+                }
+                keymap
+            }
             Err(source) => {
                 eprintln!("LaterMD: 快捷键配置解析失败,已回落默认: {source}");
                 Self::builtin()
@@ -509,6 +536,18 @@ mod tests {
         assert_eq!(loaded.get(Command::ExportHtml), Some(shortcut(Key::K)));
         // 缺项(手改删掉一行)回落默认
         assert_eq!(loaded.get(Command::Save), Some(shortcut(Key::S)));
+        assert_eq!(
+            loaded.get(Command::DuplicateSelection),
+            Some(shortcut(Key::D))
+        );
+        assert_eq!(
+            loaded.get(Command::DuplicateLine),
+            Some(Shortcut {
+                modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+                key: Key::D,
+            })
+        );
+        assert_eq!(loaded.get(Command::FindInDoc), Some(shortcut(Key::F)));
 
         std::fs::write(dir.join(KEYMAP_FILE), b"{oops").unwrap();
         assert_eq!(Keymap::load_from(&dir), Keymap::builtin());
