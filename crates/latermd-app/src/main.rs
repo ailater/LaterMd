@@ -86,12 +86,16 @@ fn main() -> eframe::Result<()> {
     // 系统标题栏,其余(含未设)去装饰、由 `ui::titlebar` 自绘接管。
     let native_chrome =
         native_decorations(std::env::var("LATERMD_NATIVE_DECORATIONS").ok().as_deref());
+    // 布局提前装载:窗口最大化状态(上次退出时)要在 NativeOptions 里就位,
+    // 进 run_native 闭包就晚了 —— 窗口创建后再改尺寸会闪一次窗口态切换。
+    let boot_layout = layout::LayoutSettings::load();
     let opts = eframe::NativeOptions {
         renderer,
         // 三栏的最小可用宽度:侧边栏下限 160 + 编辑器 500 + 预览余量(docs/adr-005)
         viewport: egui::ViewportBuilder::default()
             .with_min_inner_size([900.0, 600.0])
-            .with_decorations(native_chrome),
+            .with_decorations(native_chrome)
+            .with_maximized(boot_layout.maximized),
         ..Default::default()
     };
     eframe::run_native(
@@ -128,8 +132,9 @@ fn main() -> eframe::Result<()> {
             }
             // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
             let file_tree = filetree::FileTreeSettings::load();
-            // 外壳布局(左右两栏开着与否 + 左栏停在哪个视图)同上,M1 起持久化
-            let layout = layout::LayoutSettings::load();
+            // 外壳布局(左右两栏开着与否 + 左栏停在哪个视图)同上,M1 起持久化;
+            // maximized 已在 opts 装载过(boot_layout),这里复用同一份
+            let layout = boot_layout.clone();
             let mut app = LaterMdApp::new(theme, file_tree, layout);
             app.frameless = !native_chrome;
             app.state.system_theme = system;

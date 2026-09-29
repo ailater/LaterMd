@@ -165,6 +165,16 @@ impl LaterMdApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             *window_title = title;
         }
+
+        // 窗口最大化状态帧内同步(双击标题栏/⤢/系统键全走这):viewport
+        // info 的 maximized 在窗口就绪前是 None,跳过;与记录不同才写
+        // layout.maximized —— 落盘由 end_of_logic 的比对写接管(与左右
+        // 栏把手同一口径,闲置帧零 IO)。
+        if let Some(maximized) = ctx.input(|i| i.viewport().maximized) {
+            if maximized != state.layout.maximized {
+                state.layout.maximized = maximized;
+            }
+        }
     }
 
     /// `App::ui` 的面板主体。独立成函数是为了测试能在同一 run_ui 帧里按

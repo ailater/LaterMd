@@ -57,6 +57,11 @@ pub struct LayoutSettings {
     /// 进入禅定前的面板快照(§7)。同上口径:`skip`,不落盘。
     #[serde(skip)]
     pub pre_zen: PreZen,
+    /// 上次退出时窗口是否最大化(2026-09-29 坤哥指令「记住上次是全屏还是
+    /// 窗口」)。字段级 `default`:旧 layout.json 没有它,缺项回落 false
+    /// 而不是整表 Corrupt 丢弃 left/right。
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 /// 出厂布局:三栏全开(旧行为),停文件树。
@@ -68,6 +73,7 @@ impl Default for LayoutSettings {
             zen: false,
             left_view: SidebarTab::Files,
             pre_zen: None,
+            maximized: false,
         }
     }
 }
@@ -212,6 +218,39 @@ mod tests {
     ///
     /// `zen` 取 false:`Zen` 不落盘(见下一个用例),带着 `zen: true` 进往返
     /// 必然不相等 —— 那是设计如此,不是 bug。
+    /// 旧 layout.json 没有 maximized 字段(2026-09-29 新增):缺项必须回落
+    /// false 且**不整表 Corrupt** —— 否则用户升级后 left/right 偏好被静默
+    /// 清掉,比丢 maximized 严重得多。
+    #[test]
+    fn legacy_json_without_maximized_still_loads() {
+        let dir = dir("legacy-no-max");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"left":false,"right":true,"left_view":"outline"}"#,
+        )
+        .unwrap();
+        let loaded = LayoutSettings::load_from(&dir).unwrap();
+        assert!(!loaded.left, "旧字段不受影响");
+        assert!(loaded.right);
+        assert!(!loaded.maximized, "缺项 maximized 回落 false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// maximized 往返:保存后重读不丢(端到端的落盘在 state 侧走
+    /// end_of_logic 比对写,与本模块的 save_to/load_from 同链路)。
+    #[test]
+    fn maximized_roundtrips() {
+        let dir = dir("max-roundtrip");
+        let settings = LayoutSettings {
+            maximized: true,
+            ..Default::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        assert!(LayoutSettings::load_from(&dir).unwrap().maximized);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn roundtrip_preserves_every_field() {
         let dir = dir("roundtrip");
