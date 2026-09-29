@@ -141,6 +141,7 @@ git tag v0.0.1 && git push origin v0.0.1   # 人工 tag push 直接触发 releas
 - [ ] `latermd-x86_64-pc-windows-msvc.zip`(+`.sha256`)
 - [ ] `latermd-aarch64-pc-windows-msvc.zip`(+`.sha256`)
 - [ ] `latermd-v0.1.0-universal2-apple-darwin.dmg`(macos-dmg job 完成)
+      —— **回传资产不在 dist 生成的下载表里**,需在 Release 正文手工补一行(见 §4 第 5 步)
 - [ ] `sha256.sum`、`source.tar.gz` 及 `dist-manifest.json`(dist 附带)
 - [ ] 「macOS dmg」job 的 **step summary** 里有 dmg 的 sha256 —— 首次填入
       cask 模板用(macos-dmg.yml:96-106)。
@@ -190,6 +191,9 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
 
 1. PR 里把 `workspace.package.version` 提到新版本号(workspace 内 dist-able
    crate 版本必须一致,lockstep),CHANGELOG.md 顶部加对应小节,合入 main。
+   **CHANGELOG.md 小节与版本号 bump 同等重要**:dist 拿它当 Release 正文,
+   漏了 Release 页面就只剩一张下载表(v0.0.2 踩过一次,事后 `gh release edit`
+   才补上)。
 2. 链路全自动(§3.2),无需打 tag。
 3. **发版后必做**:更新 tap 的 `Casks/latermd.rb`(version + sha256,取新
    Release 的 dmg step summary 值;见 §3.4 的 auto-bump 空档)。
@@ -197,6 +201,12 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
    manifest 校验,再 `dist generate` 重新生成 release.yml —— 重新生成会
    **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上;allow-dirty 见 §1
    的前置条件说明。
+5. **发版后核对 Release 正文**:①标题下面有本版本的 Release Notes(来自
+   CHANGELOG.md);②下载表之外另有 macOS universal2 dmg 一行 —— dmg 是
+   macos-dmg.yml 事后 `gh release upload` 回传的,dist 建 Release 时它还不存在,
+   因此**永远不在 dist 自动生成的下载表里**。缺任一项用 `gh release edit <tag>`
+   补:`gh release edit v0.0.2 --notes-file <(cat <<'EOF' ... EOF)`,正文注意
+   保留 dist 生成的原下载表。
 
 ## 5. 无签名路线的用户侧影响(README「安装」节的依据)
 
