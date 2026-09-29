@@ -426,16 +426,7 @@ fn files_panel(
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
                     for dir in &tree.recents {
-                        if ui
-                            .selectable_label(
-                                tree.root.as_deref() == Some(dir.as_path()),
-                                dir.display().to_string(),
-                            )
-                            .clicked()
-                        {
-                            // ComboBox 默认 CloseOnClick:点击项后弹层自动收起
-                            outbox.push(Message::FileTreeRootSelected(dir.clone()));
-                        }
+                        recent_row(ui, tree, dir, outbox);
                     }
                 })
                 .response;
@@ -467,13 +458,46 @@ fn files_panel(
         });
 }
 
+/// recents 下拉项:显示名只取末级文件夹名(`recent_label`,与 root_label
+/// 同口径)——路径中间段不进 UI,用户目录名可能含个人信息(#32 I2);
+/// 全路径下沉到该项的 hover tooltip,重名末级名靠 tooltip 区分。独立成
+/// 函数与 tree_row 等同例,便于无头测试直接驱动(ComboBox 弹层交互不在
+/// 无头覆盖范围,根目录选择走 state::tests)。
+fn recent_row(
+    ui: &mut egui::Ui,
+    tree: &FileTreeState,
+    dir: &Path,
+    outbox: &mut Vec<Message>,
+) -> egui::Response {
+    let selected = tree.root.as_deref() == Some(dir);
+    let response = ui
+        .selectable_label(selected, recent_label(dir))
+        .on_hover_text(dir.display().to_string());
+    if response.clicked() {
+        // ComboBox 默认 CloseOnClick:点击项后弹层自动收起
+        outbox.push(Message::FileTreeRootSelected(dir.to_owned()));
+    }
+    response
+}
+
 /// 根目录行的显示名。
 fn root_label(tree: &FileTreeState) -> String {
     tree.root
         .as_deref()
-        .and_then(Path::file_name)
-        .map(|name| name.to_string_lossy().into_owned())
+        .and_then(last_segment)
         .unwrap_or_else(|| "未选择根目录".to_owned())
+}
+
+/// 路径末级名(文件夹名);根路径 `/` 等无末段时为 None。
+fn last_segment(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// recents 项显示名:末级文件夹名;末段拿不到(如根路径 `/`)时回退
+/// 全路径——此时路径本身无中间段,不构成泄漏。
+fn recent_label(dir: &Path) -> String {
+    last_segment(dir).unwrap_or_else(|| dir.display().to_string())
 }
 
 /// 一组子项的各行 + 截断提示行。
@@ -998,6 +1022,142 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(outbox, vec![Message::FileTreeToggled(docs)]);
+    }
+
+    /// 一帧里全部文本 shape 的字符串:可见文本与 tooltip 都算(断言按
+    /// 内容区分,不区分层)。
+    fn shape_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// recents 项显示名(#32 I2):只取末级文件夹名——注入带个人称谓
+    /// 中间段的假路径,「坤哥」不得进显示名;重名末级在显示层不消歧
+    /// (靠 tooltip 区分);根路径无末段时回退全路径(自身无中间段)。
+    #[test]
+    fn recent_label_uses_last_segment() {
+        assert_eq!(recent_label(Path::new("/home/坤哥/工作/vault")), "vault");
+        assert_eq!(
+            recent_label(Path::new("/data/坤哥/备份/vault")),
+            "vault",
+            "重名末级在显示层不做消歧"
+        );
+        assert_eq!(recent_label(Path::new("/")), "/");
+    }
+
+    /// recents 下拉项的可见文本与 hover tooltip(#32 I2):无指针帧的
+    /// 文本层只有末级名,路径中间段(坤哥/工作/备份)不得出现;悬停并
+    /// 推过 egui 的 tooltip 延迟(默认 0.5s 且指针须静止,`RawInput.time`
+    /// 逐帧推进)后,全路径只以 tooltip 文本出现,重名末级由此区分。
+    #[test]
+    fn recents_show_last_segment_with_full_path_on_hover() {
+        let tree = FileTreeState {
+            recents: vec![
+                PathBuf::from("/home/坤哥/工作/vault"),
+                PathBuf::from("/data/坤哥/备份/vault"),
+            ],
+            ..FileTreeState::default()
+        };
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rects = [Cell::new(Rect::NOTHING), Cell::new(Rect::NOTHING)];
+        let render = |ui: &mut egui::Ui, outbox: &mut Vec<Message>| {
+            for dir in &tree.recents {
+                recent_row(ui, &tree, dir, outbox);
+            }
+        };
+
+        // 帧 1(t=0,无指针):可见文本层只有末级名
+        let output = ctx.run_ui(
+            RawInput {
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ui| {
+                for (dir, rect) in tree.recents.iter().zip(&rects) {
+                    rect.set(recent_row(ui, &tree, dir, &mut outbox).rect);
+                }
+            },
+        );
+        let texts = shape_texts(&output);
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+        assert!(
+            texts.iter().filter(|t| t.contains("vault")).count() >= 2,
+            "两条 recents 都显示末级名:{texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains('坤')),
+            "路径中间段不得进可见文本:{texts:?}"
+        );
+
+        // 帧 2(t=1):指针移入第一条;tooltip 有静止延迟,本帧不显示
+        let center = rects[0].get().center();
+        ctx.run_ui(
+            RawInput {
+                time: Some(1.0),
+                events: vec![Event::PointerMoved(center)],
+                ..Default::default()
+            },
+            |ui| render(ui, &mut outbox),
+        )
+        .drop_without_applying_deltas();
+
+        // 帧 3-4(t=2,3):静止超延迟,悬停项的全路径只在 tooltip 里出现
+        let mut tooltip_texts = Vec::new();
+        for time in [2.0, 3.0] {
+            let output = ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| render(ui, &mut outbox),
+            );
+            tooltip_texts.extend(shape_texts(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            tooltip_texts
+                .iter()
+                .any(|t| t.contains("/home/坤哥/工作/vault")),
+            "悬停项的全路径进 tooltip:{tooltip_texts:?}"
+        );
+
+        // 帧 5-7:指针移到第二条(重名末级),tooltip 换成它自己的全路径
+        let center = rects[1].get().center();
+        ctx.run_ui(
+            RawInput {
+                time: Some(4.0),
+                events: vec![Event::PointerMoved(center)],
+                ..Default::default()
+            },
+            |ui| render(ui, &mut outbox),
+        )
+        .drop_without_applying_deltas();
+        let mut second_texts = Vec::new();
+        for time in [5.0, 6.0] {
+            let output = ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| render(ui, &mut outbox),
+            );
+            second_texts.extend(shape_texts(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            second_texts
+                .iter()
+                .any(|t| t.contains("/data/坤哥/备份/vault")),
+            "重名末级靠各自 tooltip 区分:{second_texts:?}"
+        );
     }
 
     /// 当前小节判定:光标在正文里高亮所属标题,首个标题之前/无光标不高亮。
