@@ -116,25 +116,28 @@ pub fn detect_system_mode() -> Option<ThemeMode> {
     }
 }
 
-/// 界面密度(批次 B 的视觉打磨项之一)。
+/// 界面密度(批次 B 的视觉打磨项之一;2026-09-29 坤哥指令改名换档:
+/// 原「紧凑」升格为新「标准」并成为默认,原「标准」改叫「宽松」)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Density {
-    /// 标准:出厂间距与控件高度。
-    #[default]
+    /// 宽松:原「标准」档,1.0 间距与控件高度。serde 值沿用 `standard`,
+    /// 已落盘的 settings.json 无需迁移(语义映射:旧标准→宽松,观感不变)。
     Standard,
-    /// 紧凑:更窄的项间距、更小的按钮内边距与圆角,长文档一屏多看几行。
+    /// 标准:原「紧凑」档,更窄的项间距、更小的按钮内边距与圆角,
+    /// 长文档一屏多看几行 —— 现在的出厂默认。
+    #[default]
     Compact,
 }
 
 impl Density {
-    /// 设置页可选项顺序。
+    /// 设置页可选项顺序(显示顺序:宽松 → 标准)。
     pub const ALL: [Density; 2] = [Self::Standard, Self::Compact];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Standard => "标准",
-            Self::Compact => "紧凑",
+            Self::Standard => "宽松",
+            Self::Compact => "标准",
         }
     }
 }
@@ -409,7 +412,12 @@ fn apply_shell_to(style: &mut egui::Style) {
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
     v.widgets.noninteractive.corner_radius = radius;
     let widgets = [
-        (&mut v.widgets.inactive, c.text, Color32::TRANSPARENT),
+        // inactive 底色不能全透明:egui 的 Slider 轨道硬绑
+        // `widgets.inactive.bg_fill`(slider.rs rect_filled),透明 = 轨道
+        // 隐形、只剩手柄漂浮(坤哥 2026-09-29 截图「AI 页滑块错乱」实锤)。
+        // 取 border 档:轨道=分隔线语义可辨,按钮静止底色从全透明变极淡
+        // 分隔线色,与 hover 同量级,平面观感保留。
+        (&mut v.widgets.inactive, c.text, c.border),
         (&mut v.widgets.hovered, c.text, c.hover),
         (&mut v.widgets.active, c.accent, c.selected_bg),
         (&mut v.widgets.open, c.text, c.hover),
@@ -903,6 +911,16 @@ mod tests {
     }
 
     /// 密度:切到紧凑后间距真变小,切回标准恢复出厂值(不累积缩放)。
+    /// 宽松(原「标准」1.0)档配置:U0 token 投影类测试的设计值基准。
+    /// #34 后 `ThemeSettings::default()` = Compact(新「标准」),凡断言
+    /// 「token 全量投影」的测试须显式取 1.0 档,勿再依赖 default。
+    fn spacious_settings() -> ThemeSettings {
+        ThemeSettings {
+            density: Density::Standard,
+            ..ThemeSettings::default()
+        }
+    }
+
     #[test]
     fn density_compacts_spacing_and_restores() {
         let ctx = egui::Context::default();
@@ -916,7 +934,7 @@ mod tests {
         let compacted = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
         assert!(compacted.y < standard.y, "{compacted:?} vs {standard:?}");
 
-        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        spacious_settings().apply(&ctx, ThemeMode::Dark);
         let restored = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
         assert_eq!(restored, standard, "来回切换不累积缩放");
     }
@@ -946,7 +964,7 @@ mod tests {
     #[test]
     fn u0_tokens_project_into_both_styles() {
         let ctx = egui::Context::default();
-        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        spacious_settings().apply(&ctx, ThemeMode::Dark);
         for theme in [egui::Theme::Light, egui::Theme::Dark] {
             let style = ctx.style_of(theme);
             assert_eq!(
@@ -1004,7 +1022,7 @@ mod tests {
             egui::CornerRadius::same((tokens::RADIUS_MD * 0.8) as u8)
         );
 
-        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        spacious_settings().apply(&ctx, ThemeMode::Dark);
         let style = ctx.style_of(egui::Theme::Dark);
         assert_eq!(
             style.spacing.interact_size.y,
@@ -1023,7 +1041,7 @@ mod tests {
     fn toolbar_and_textedit_render_in_both_visuals() {
         for theme in [egui::Theme::Light, egui::Theme::Dark] {
             let ctx = egui::Context::default();
-            ThemeSettings::default().apply(
+            spacious_settings().apply(
                 &ctx,
                 if theme == egui::Theme::Light {
                     ThemeMode::Light
