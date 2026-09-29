@@ -347,6 +347,14 @@ impl LaterMdApp {
                     outbox,
                     self.format_probe.as_deref_mut(),
                 );
+                // min_rect 包括标签与可换行的工具条,浮层只能锚定它们之后的视口。
+                source_rect = Some(ui.available_rect_before_wrap());
+                let keep_find_focus = state.find.open
+                    && state.render_mode == crate::live::RenderMode::Source
+                    && pending_selection.is_some()
+                    && cursor.jump_to.is_none()
+                    && ui.memory(|memory| memory.has_focus(find_input_id()))
+                    && !ui.input(|input| input.pointer.any_pressed());
                 crate::ui::editor::ui(
                     ui,
                     editor,
@@ -360,7 +368,10 @@ impl LaterMdApp {
                     state.render_mode,
                     crate::ui::editor::tab_editor_id(*id),
                 );
-                source_rect = Some(ui.min_rect());
+                // 命中回填沿用编辑器的选区/滚动通道,但不能终止查找框的连续输入。
+                if keep_find_focus {
+                    ui.memory_mut(|memory| memory.request_focus(find_input_id()));
+                }
             });
 
         // ⑤ 查找卡是源码区专属浮层:不参与 CentralPanel 普通布局,因此
@@ -686,9 +697,7 @@ fn draw_find_overlay(
     outbox: &mut Vec<Message>,
 ) {
     let margin = 8.0;
-    // 源码区 rect 包含格式工具条下方的编辑器宿主;再向下留一段
-    // 工具条高度+间距,避免浮层贴住工具条底边。Window 的 pivot 是
-    // RIGHT_TOP,所以 y 正值就是向下。
+    // source_rect 从可换行的工具条之后开始,不能用包含工具条的面板 min_rect。
     let anchor =
         source_rect.right_top() + egui::vec2(-margin, crate::ui::tokens::TOOLBAR_H + margin * 2.0);
     egui::Window::new("文档内查找")
@@ -704,6 +713,10 @@ fn draw_find_overlay(
         .show(ctx, |ui| find_bar_contents(ui, find, outbox));
 }
 
+fn find_input_id() -> egui::Id {
+    egui::Id::new("editor-find-input")
+}
+
 /// 查找卡内容与状态无关,可在 Window/无头测试中复用。
 fn find_bar_contents(
     ui: &mut egui::Ui,
@@ -717,7 +730,8 @@ fn find_bar_contents(
         let mut query_buf = find.query.clone();
         let response = ui.add(
             egui::TextEdit::singleline(&mut query_buf)
-                .id(egui::Id::new("editor-find-input"))
+                .id(find_input_id())
+                .return_key(None::<egui::KeyboardShortcut>)
                 .desired_width(220.0)
                 .hint_text("输入即跳转;Enter 下一个"),
         );
@@ -987,6 +1001,232 @@ mod tests {
     };
     use std::cell::Cell;
     use std::rc::Rc;
+
+    fn find_test_app(name: &str) -> (LaterMdApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("latermd-find-{name}-{}", std::process::id()));
+        let mut app = LaterMdApp::default();
+        app.state.settings_dir = Some(dir.clone());
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("needle one\nneedle two\nneedle three");
+        (app, dir)
+    }
+
+    fn find_test_frame(
+        app: &mut LaterMdApp,
+        ctx: &egui::Context,
+        screen: Rect,
+        now: f64,
+        events: Vec<Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(now),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.reduce(ui.ctx());
+                app.draw(ui);
+            },
+        );
+        let shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        shapes
+    }
+
+    fn find_key(key: Key, modifiers: Modifiers) -> Vec<Event> {
+        [true, false]
+            .into_iter()
+            .map(|pressed| Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn find_enter_repeats_without_losing_query_focus_or_editing_source() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("enter");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        app.state.apply(Message::FindBarToggled(true));
+        app.state
+            .apply(Message::FindQueryChanged("needle".to_owned()));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let input = egui::Id::new("editor-find-input");
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        for (step, (modifiers, expected)) in [
+            (Modifiers::NONE, 1),
+            (Modifiers::NONE, 2),
+            (Modifiers::NONE, 0),
+            (Modifiers::SHIFT, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = 1.0 + step as f64;
+            find_test_frame(&mut app, &ctx, screen, now, find_key(Key::Enter, modifiers));
+            assert_eq!(
+                app.outbox,
+                vec![Message::FindNext {
+                    backwards: modifiers.shift
+                }]
+            );
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert_eq!(app.state.find.hit, Some(expected));
+            assert!(
+                ctx.memory(|memory| memory.has_focus(input)),
+                "跳转后仍可连续按回车"
+            );
+            let selection = egui::TextEdit::load_state(
+                &ctx,
+                crate::ui::editor::tab_editor_id(app.state.tabs.current().id),
+            )
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+            let hit = &app.state.find.hits[expected];
+            assert_eq!(
+                (
+                    selection.primary.index.0.min(selection.secondary.index.0),
+                    selection.primary.index.0.max(selection.secondary.index.0),
+                ),
+                (hit.start, hit.end)
+            );
+            assert_eq!(app.state.tabs.current().editor.text(), original);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_query_typing_keeps_focus_and_empty_results_do_not_edit_source() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("typing");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        app.state.apply(Message::FindBarToggled(true));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let input = find_input_id();
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        let mut query = String::new();
+        for (step, text) in ["n", "e", "e", "d", "l", "e", "-absent"]
+            .into_iter()
+            .enumerate()
+        {
+            query.push_str(text);
+            let now = 1.0 + step as f64;
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Text(text.to_owned())],
+            );
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert_eq!(app.state.find.query, query);
+            assert!(ctx.memory(|memory| memory.has_focus(input)));
+            assert_eq!(app.state.tabs.current().editor.text(), original);
+        }
+        assert!(app.state.find.hits.is_empty());
+        for (step, modifiers) in [Modifiers::NONE, Modifiers::SHIFT].into_iter().enumerate() {
+            let now = 9.0 + step as f64;
+            find_test_frame(&mut app, &ctx, screen, now, find_key(Key::Enter, modifiers));
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert_eq!(app.state.find.hit, None);
+            assert_eq!(app.state.find.query, query);
+            assert!(ctx.memory(|memory| memory.has_focus(input)));
+            assert_eq!(app.state.tabs.current().editor.text(), original);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_overlay_does_not_intercept_enter_in_source_editor() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("source-focus");
+        app.state.apply(Message::FindBarToggled(true));
+        app.state
+            .apply(Message::FindQueryChanged("needle".to_owned()));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let editor_id = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+        let end = app.state.tabs.current().editor.text().chars().count();
+        let mut edit = egui::TextEdit::load_state(&ctx, editor_id).unwrap();
+        edit.cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(end),
+            )));
+        edit.store(&ctx, editor_id);
+        ctx.memory_mut(|memory| memory.request_focus(editor_id));
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.state.find.hit, Some(0));
+        assert_eq!(
+            app.state.tabs.current().editor.text(),
+            "needle one\nneedle two\nneedle three\n"
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(editor_id)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_overlay_stays_below_wrapped_toolbar_without_moving_source() {
+        for width in [1200.0, 1600.0] {
+            let ctx = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 850.0));
+            let (mut app, dir) = find_test_app(&format!("position-{width}"));
+            let toolbar_bottom = Rc::new(Cell::new(0.0_f32));
+            let sink = toolbar_bottom.clone();
+            app.format_probe = Some(Box::new(move |_, rect| {
+                sink.set(sink.get().max(rect.bottom()))
+            }));
+            let mut shapes = Vec::new();
+            for step in 0..4 {
+                shapes = find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+            }
+            let source_before = topmost_text(&shapes, "needle one");
+            app.state.apply(Message::FindBarToggled(true));
+            for step in 4..8 {
+                shapes = find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+            }
+            let overlay = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("editor-find-overlay")))
+                .unwrap();
+            assert!(
+                overlay.top() > toolbar_bottom.get() + 4.0,
+                "查找框必须在工具栏下方: {overlay:?}, toolbar={}",
+                toolbar_bottom.get()
+            );
+            assert_eq!(
+                topmost_text(&shapes, "needle one").top(),
+                source_before.top(),
+                "悬浮查找框不推低正文"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 
     fn key_s(modifiers: Modifiers) -> Event {
         Event::Key {
