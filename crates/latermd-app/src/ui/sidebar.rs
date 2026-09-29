@@ -506,19 +506,20 @@ fn tree_row(
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let open = tree.expanded.get(&entry.path).copied().unwrap_or(false);
-    // 文件行留出箭头宽度的空白,与目录行的名字对齐
-    let arrow = match (entry.is_dir, open) {
-        (true, true) => "▾ ",
-        (true, false) => "▸ ",
-        (false, _) => "  ",
-    };
+    // 展开箭头不用文本字符:U+25B8/U+25BE 在 Inter 与出厂字体链上均无
+    // 字形,目录行名字前渲染成方框(用户实测)。行文本统一以两个空格缩进
+    // 占位(空格任何字体都有,目录/文件天然对齐),目录行的三角画在占位区,
+    // 纯绘制不依赖字体——与 #31 行号槽同思路。
     let selected = !entry.is_dir && current_file == Some(entry.path.as_path());
     let badge = if entry.is_dir {
         None
     } else {
         git.badge_for(&entry.path)
     };
-    let response = badged_row_label(ui, selected, format!("{arrow}{}", entry.name), badge);
+    let response = badged_row_label(ui, selected, format!("  {}", entry.name), badge);
+    if entry.is_dir {
+        paint_tree_arrow(ui, &response, open);
+    }
     if response.clicked() {
         if entry.is_dir {
             outbox.push(Message::FileTreeToggled(entry.path.clone()));
@@ -539,6 +540,43 @@ fn tree_row(
         });
     }
     response
+}
+
+/// 目录行的展开三角:画在行首两个空格占位区的中点上,收起朝右、展开
+/// 朝下。尺寸基准是空格 advance(随正文字号缩放,不随平台字体走样),
+/// 颜色取弱前景(与行号槽同源);纯 `Shape::convex_polygon`,零字形依赖。
+fn paint_tree_arrow(ui: &egui::Ui, row: &egui::Response, open: bool) {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let space_w = ui.fonts_mut(|f| {
+        f.layout_no_wrap(" ".to_owned(), font_id, egui::Color32::WHITE)
+            .rect
+            .width()
+    });
+    let center = egui::pos2(row.rect.left() + space_w, row.rect.center().y);
+    let r = space_w * 0.62;
+    ui.painter().add(egui::Shape::convex_polygon(
+        arrow_vertices(center, r, open),
+        ui.visuals().widgets.noninteractive.fg_stroke.color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// 三角顶点:展开朝下、收起朝右。独立成纯函数,无头单测锁两个朝向的
+/// 几何约定(箭头从无字形的文本字符改为纯绘制后的防回归)。
+fn arrow_vertices(center: egui::Pos2, r: f32, open: bool) -> Vec<egui::Pos2> {
+    if open {
+        vec![
+            center + egui::vec2(-r, -r * 0.8),
+            center + egui::vec2(r, -r * 0.8),
+            center + egui::vec2(0.0, r * 0.9),
+        ]
+    } else {
+        vec![
+            center + egui::vec2(-r * 0.8, -r),
+            center + egui::vec2(-r * 0.8, r),
+            center + egui::vec2(r * 0.9, 0.0),
+        ]
+    }
 }
 
 /// Git 页:降级提示,或「改动列表 + 选中文件 diff + 回滚按钮 + 历史
@@ -758,6 +796,25 @@ mod tests {
             },
         );
         (tree, root)
+    }
+
+    /// 展开三角几何:展开朝下、收起朝右。行首箭头原是文本字符
+    /// (U+25B8/U+25BE 在 Inter 与出厂字体链无字形,目录行渲染成方框),
+    /// 改为纯绘制后此测试锁住两个朝向的顶点约定。
+    #[test]
+    fn tree_arrow_vertices_point_in_direction() {
+        let c = egui::pos2(10.0, 10.0);
+        let r = 2.0;
+        let open = arrow_vertices(c, r, true);
+        let closed = arrow_vertices(c, r, false);
+        assert!(
+            open.iter().any(|p| p.y > c.y) && open.iter().all(|p| p.y <= c.y + r * 0.9 + 1e-6),
+            "展开三角下指:越过中心下方的顶点存在且不越过顶点"
+        );
+        assert!(
+            closed.iter().any(|p| p.x > c.x) && closed.iter().all(|p| p.x <= c.x + r * 0.9 + 1e-6),
+            "收起三角右指:越过中心右侧的顶点存在且不越过顶点"
+        );
     }
 
     /// 点击树行:文件行发打开消息、目录行发翻转展开消息;仅渲染不产生
