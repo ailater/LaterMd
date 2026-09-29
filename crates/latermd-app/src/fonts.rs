@@ -7,7 +7,8 @@
 //!   标题按字重取用(egui 无字重轴,权重即族名)。include_bytes 随包分发,
 //!   SIL OFL 1.1,许可文本在 assets/fonts/LICENSE-Inter.txt。
 //! - **CJK 系统回退**:按候选路径表读系统字体,追加到 Proportional /
-//!   Monospace 与两个 Inter 权重族的链尾。候选全失配时如实返回 `None`,
+//!   Monospace、两个 Inter 权重族与 `bold` 别名族(预览标题/加粗)的链尾。
+//!   候选全失配时如实返回 `None`,
 //!   界面显示警告,不静默吞掉;Inter 照装(嵌入资源不依赖系统)。
 //!   不引 fontdb / font-kit 的定案见 docs/m0-report.md。
 //!
@@ -135,6 +136,9 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
                 FontFamily::Name(Arc::from(FAMILY_SEMIBOLD)),
                 CJK_PROPORTIONAL,
             ),
+            // `bold` 别名族:预览标题(heading)与加粗文本经 vendored
+            // apply_bold 切到它,链尾无 CJK 会整行变方块
+            (FontFamily::Name(Arc::from(FAMILY_BOLD)), CJK_PROPORTIONAL),
         ] {
             // push 到末尾 = 回退:拉丁字符命中 Inter 后不再往下走
             defs.families
@@ -258,6 +262,8 @@ mod tests {
                 FontFamily::Name(Arc::from(FAMILY_SEMIBOLD)),
                 FAMILY_SEMIBOLD,
             ),
+            // bold 别名族链头也是 SemiBold,且必须吃到 CJK 回退(预览标题中文)
+            (FontFamily::Name(Arc::from(FAMILY_BOLD)), FAMILY_SEMIBOLD),
         ] {
             let weight = chain(&family);
             assert_eq!(weight.first().map(String::as_str), Some(head));
@@ -282,6 +288,7 @@ mod tests {
             FontFamily::Monospace,
             FontFamily::Name(Arc::from(FAMILY_MEDIUM)),
             FontFamily::Name(Arc::from(FAMILY_SEMIBOLD)),
+            FontFamily::Name(Arc::from(FAMILY_BOLD)),
         ] {
             assert!(
                 !defs.families[&family].iter().any(|n| n == CJK_PROPORTIONAL),
@@ -364,6 +371,13 @@ mod tests {
         assert!(
             ctx.fonts_mut(|f| f.has_glyphs(&semibold, "标题")),
             "SemiBold 族的 CJK 回退链生效"
+        );
+        // bold 别名族:预览 heading/加粗经 vendored apply_bold 切到它,
+        // 漏挂 CJK 曾让标题中文整行变方块
+        let bold = egui::FontId::new(14.0, FontFamily::Name(Arc::from(FAMILY_BOLD)));
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyphs(&bold, "标题加粗")),
+            "bold 别名族的 CJK 回退链生效"
         );
     }
 }

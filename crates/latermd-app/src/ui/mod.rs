@@ -3,6 +3,7 @@
 pub mod editor;
 pub mod fade;
 pub mod format_bar;
+pub mod gutter;
 pub mod icons;
 pub mod image_dialog;
 pub mod layout;

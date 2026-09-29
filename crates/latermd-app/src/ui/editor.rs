@@ -8,6 +8,7 @@
 
 use crate::live::{self, LiveState, RenderMode};
 use crate::state::{OutlineCursor, PreviewState};
+use crate::ui::gutter;
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
 
@@ -128,15 +129,43 @@ pub fn ui(
         .id_salt(editor_id.with("source-editor-scroll"))
         .auto_shrink([false, false])
         .show(panel, |ui| {
+            // 行号槽宽度先于 TextEdit 算好(总行数 = 1 + '\n' 数,与 galley
+            // 的逻辑行划分同构);位宽跨档才变,右对齐不抖。
+            let total_lines = 1 + editor.text().bytes().filter(|b| *b == b'\n').count();
+            let gutter_w = gutter::width(ui, total_lines);
             let mut buffer = EditorText(editor);
-            let output = egui::TextEdit::multiline(&mut buffer)
-                // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
-                .id(editor_id)
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY)
-                .desired_rows(rows)
-                .lock_focus(true)
-                .show(ui);
+            let (slot, output) = ui
+                .horizontal(|row| {
+                    // 槽位纯做布局让位(高度 0 不撑行),hover-only 不拦截
+                    // 指针;desired_width(INFINITY) 在槽位之后取剩余宽,
+                    // 即自动扣减行号槽与 token 间距。
+                    let (slot, _) =
+                        row.allocate_exact_size(egui::vec2(gutter_w, 0.0), egui::Sense::hover());
+                    let output = egui::TextEdit::multiline(&mut buffer)
+                        // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
+                        .id(editor_id)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows)
+                        .lock_focus(true)
+                        .show(row);
+                    (slot, output)
+                })
+                .inner;
+            // 行号画在同一闭包内:内容坐标随滚动平移,行 y 取 galley 逻辑
+            // 行首 visual row,光标行 accent 高亮(光标读持久化 state,与
+            // 大纲回填同源;换行计数走 galley 自带的全文本)。
+            let cursor_line = output.state.cursor.char_range().map(|range| {
+                output
+                    .galley
+                    .job
+                    .text
+                    .chars()
+                    .take(range.primary.index.0)
+                    .filter(|c| *c == '\n')
+                    .count()
+            });
+            gutter::paint(ui, &output, slot, cursor_line);
 
             // 进来:格式动作/大纲跳转产出的新选区,写回 TextEdit 持久 cursor
             // 并把焦点还给编辑器 —— 否则用户还得自己点回编辑区才能继续打字。

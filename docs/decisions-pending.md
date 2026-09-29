@@ -16,6 +16,7 @@
 - **岔路**：#30 T3 像素取证发现预览的表格表头与 `**加粗**` 文字呈 accent 蓝（#6C9FFF），标题 H1–H6 亦然。根因链：vendored 渲染在未注册 `"bold"` 字族时对表头/加粗回落 `Visuals::strong_text_color()`（layout.rs `apply_bold`、table.rs `apply_bold_to_format`），而 egui 0.36 的 `strong_text_color()` = `widgets.active.fg_stroke.color`（egui style.rs），#27 的 `apply_shell_to` 把 active 控件前景设为 accent（theme.rs，按下态按钮用）——三者叠加把正文强调位全部染成链接同款蓝（还与超链接色撞车，强调位看起来像链接）。app 实际已随 U1 装入 Inter SemiBold，只是族名叫 `Inter-SemiBold`，vendored 探测的字面量 `"bold"` 未注册。修复岔路：A 只登记不动（表头底色验收不受文字色影响）；B 注册 `"bold"` 族名别名（挂 SemiBold 同链），表头/加粗按字重渲染、恢复正文色；C 再加 vendor 改动连标题一起改色。
 - **自动选择**：B。两行改动落在 app 侧 `fonts.rs`（零 vendor、零新依赖），正是 vendored 设计文档写明的路径（"Use the bold font family when it is registered"）；表头观感与导出 HTML 对齐（`<th>`/`<strong>` 均为正常色加粗字重）；`**加粗**` 恢复 markdown 语义。标题色不动：vendored 标题路径（layout.rs）无条件设 `strong_text_color`，改它属上游行为变更（需走 ①类 vendor commit + 上游论证），且「标题=accent 强调色」本身是可辩护的样式选择，单独立项不与 #30 混装。
 - **如何改**：要标题也恢复正常色，在 vendored layout.rs 标题分支去掉 `format.color = strong_text_color()`（①类 vendor 改动，登记 vendor/README.md 变更表）；要回到「强调位全蓝」旧状，删掉 `fonts.rs` 里 `"bold"` 族名注册两行即可。
+- **实测回归（2026-09-29）**：B 方案落地时 CJK 回退循环只覆盖 Proportional / Monospace / Medium / SemiBold 四族，漏了 `bold` 别名族——预览标题（heading 经 `apply_bold` 同样切 `bold` 族）与 `**加粗**` 中文整行变方块，正文（Proportional 链尾有 CJK）正常。修复：CJK 回退循环补挂 `bold` 族 + `fonts.rs` 三处单测加断言（链头/emoji 顺序/`has_glyphs` 实测 CJK 命中）。
 
 ## #47 097f69a 混装的拆分由修复者越过「commit 由编排统一做」约束执行（2026-09-28，独立评审 medium 修复自动拍板）
 
