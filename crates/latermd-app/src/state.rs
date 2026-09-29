@@ -534,7 +534,7 @@ pub enum Message {
     ThemeSkinSelected(Option<String>),
     /// 把当前正文样式导出成皮肤文件(`themes/<name>.ron`)并选中它。
     ThemeSkinExported { name: String },
-    /// 切换界面密度(标准 / 紧凑)。
+    /// 切换界面密度(宽松 / 标准)。
     ThemeDensityChanged(Density),
 }
 
@@ -2280,7 +2280,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 密度切换落盘;重启(`load_preferences`)后仍是紧凑。
+    /// 密度切换落盘;重启(`load_preferences`)后仍是所选档。
     #[test]
     fn theme_density_persists_across_reload() {
         let dir = temp_path("density");
@@ -2288,6 +2288,8 @@ mod tests {
             settings_dir: Some(dir.clone()),
             ..State::default()
         };
+        // #34:默认档 = Compact(2026-09-29 改名换档后的新「标准」)
+        assert_eq!(Density::default(), Density::Compact);
         state.apply(Message::ThemeDensityChanged(Density::Compact));
         assert_eq!(state.theme.density, Density::Compact);
 

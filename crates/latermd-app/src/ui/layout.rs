@@ -383,12 +383,14 @@ impl LaterMdApp {
         // 对话框只持草稿与展示状态;关闭按钮原地翻转开关。
         if self.state.settings.open {
             let state = &mut self.state;
+            let resolved = state.resolved_theme();
             let close = crate::settings::dialog(
                 ui,
                 &mut state.settings,
                 &state.theme,
                 &state.skins,
                 state.system_theme_ok,
+                resolved,
                 &state.keymap,
                 &state.ai,
                 &mut state.ai_key,

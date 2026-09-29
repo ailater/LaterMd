@@ -171,6 +171,7 @@ pub fn dialog(
     theme: &ThemeSettings,
     skins: &SkinCatalog,
     system_theme_ok: bool,
+    resolved: ThemeMode,
     keymap: &Keymap,
     ai: &AiState,
     ai_key: &mut AiKeyState,
@@ -197,8 +198,10 @@ pub fn dialog(
             // 圈,直到横贯全屏(2026-09-26 实测弹窗被拉成 1920x200 的扁条,
             // 分页列被挤没)。Panel 定形后各区域尺寸与内容解耦,反馈消失。
             egui::Panel::bottom("settings-footer")
-                .exact_size(40.0)
-                .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8, 4)))
+                // 48:按钮(~24)+上下内边距+分隔线;此前 40 装下后呼吸感
+                // 全无(坤哥 2026-09-29「行高不够,看着不协调」)
+                .exact_size(48.0)
+                .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(12, 6)))
                 .show(ui, |ui| {
                     ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -234,9 +237,15 @@ pub fn dialog(
                         .id_salt("settings-body")
                         .auto_shrink([false, false])
                         .show(ui, |ui| match settings.tab {
-                            SettingsTab::Appearance => {
-                                appearance(ui, settings, theme, skins, system_theme_ok, outbox)
-                            }
+                            SettingsTab::Appearance => appearance(
+                                ui,
+                                settings,
+                                theme,
+                                skins,
+                                system_theme_ok,
+                                resolved,
+                                outbox,
+                            ),
                             SettingsTab::Keymap => keymap_page(ui, settings, keymap, outbox),
                             SettingsTab::Ai => ai_page(ui, settings, ai, ai_key, outbox),
                             SettingsTab::Mcp => mcp_page(ui, settings, mcp, outbox),
@@ -255,6 +264,7 @@ fn appearance(
     theme: &ThemeSettings,
     skins: &SkinCatalog,
     system_theme_ok: bool,
+    resolved: ThemeMode,
     outbox: &mut Vec<Message>,
 ) {
     ui.heading("外观");
@@ -267,6 +277,14 @@ fn appearance(
         {
             outbox.push(Message::ThemeChanged(mode));
         }
+    }
+    if theme.mode == ThemeMode::System {
+        // #33:跟随系统时明暗来自系统检测,把解析值显出来——否则用户以为
+        // 「我选的深色被重置了」(实际是系统侧变了/检测值与期望不符)
+        ui.weak(format!(
+            "跟随系统中:当前解析为「{}」;想固定明暗请直接选深色/浅色",
+            resolved.label()
+        ));
     }
     if theme.mode == ThemeMode::System && !system_theme_ok {
         // 检测不到就直说:Linux 无统一规范(roadmap 风险 #8),此时回落的
@@ -839,8 +857,15 @@ mod tests {
     use crate::state::State;
     use egui::RawInput;
 
+    /// 测试口径的 resolved(与 draw 一致);State 解构前调用。
+    fn resolved_theme_for_test(state: &State) -> ThemeMode {
+        state.resolved_theme()
+    }
+
     fn render(state: &mut State) {
         let ctx = egui::Context::default();
+        let system_theme_ok = state.system_theme_ok;
+        let resolved = state.resolved_theme();
         // 借用拆分:settings / ai_key / bed 可变,其余只读(与 draw 的口径一致)
         let State {
             settings,
@@ -854,7 +879,6 @@ mod tests {
             ..
         } = state;
         let mut outbox = Vec::new();
-        let system_theme_ok = state.system_theme_ok;
         let output = ctx.run_ui(RawInput::default(), |ui| {
             dialog(
                 ui,
@@ -862,6 +886,7 @@ mod tests {
                 theme,
                 skins,
                 system_theme_ok,
+                resolved,
                 keymap,
                 ai,
                 ai_key,
@@ -892,6 +917,195 @@ mod tests {
             &latermd_bed::BedProfile::preset_github(),
         ));
         render(&mut state);
+    }
+
+    /// #35:AI 页滑杆在两档密度下 handle 与 rail 几何对齐(handle 圆心在
+    /// rail 中心线上、x 落在 rail 区间内)。坤哥 2026-09-29 截图报「滑块
+    /// 圆圈脱离轨道悬浮」,此测试把滑杆几何钉进无头矩阵(两档密度)——
+    /// 复现则红,不复现则证明几何层正常(错乱另有环境成因)。
+    #[test]
+    fn ai_page_slider_geometry_aligned_across_densities() {
+        for density in Density::ALL {
+            let mut state = State::default();
+            state.theme.density = density;
+            state.settings.open = true;
+            state.settings.tab = SettingsTab::Ai;
+            // 滑杆区在 provider.requires_key() 时才可编辑(Mock 档整块灰显
+            // 不渲染交互态),切到 OpenAI 让四根滑杆真实渲出
+            state.settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
+            let ctx = egui::Context::default();
+            // 真机每帧先跑主题投影(apply_shell_to 把 widgets.inactive.bg_fill
+            // 投影成 border 色 —— egui Slider 轨道硬绑该字段),无头此前漏掉
+            // 这步,轨道隐形缺陷因此漏网
+            state.theme.apply(&ctx, state.theme.mode);
+            // 窗口打开有 fade-in,首帧内容整体 noop(无头测试的老坑),渲足
+            // 5 帧取末帧 shapes
+            let mut last_shapes = Vec::new();
+            let system_theme_ok = state.system_theme_ok;
+            let mut now = 0.0_f64;
+            let resolved = resolved_theme_for_test(&state);
+            for _ in 0..5 {
+                now += 0.1; // fade-in 动画时钟:不给 time 则窗口透明度冻结在中途
+                let State {
+                    settings,
+                    ai_key,
+                    ai,
+                    mcp,
+                    bed,
+                    keymap,
+                    theme,
+                    skins,
+                    ..
+                } = &mut state;
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        time: Some(now),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        dialog(
+                            ui,
+                            settings,
+                            theme,
+                            skins,
+                            system_theme_ok,
+                            resolved,
+                            keymap,
+                            ai,
+                            ai_key,
+                            mcp,
+                            bed,
+                            &mut outbox,
+                        );
+                    },
+                );
+                // shapes move 出前清 textures delta(直接 drop 带 delta 会 panic)
+                let mut output = output;
+                output.textures_delta.clear();
+                last_shapes = output.shapes;
+            }
+            // egui 0.36 默认 handle_shape = Rect{aspect 0.75}(竖圆角条),
+            // rail 是细长填充矩形;handle 宽高比 ~0.75 且不大于行高
+            use egui::epaint::Shape;
+            let shapes = &last_shapes;
+            let mut rails = Vec::new();
+            let mut handles = Vec::new();
+            for clipped in shapes {
+                let shape = &clipped.shape;
+                match shape {
+                    Shape::Rect(r) => {
+                        let rect = r.rect;
+                        let (w, h) = (rect.width(), rect.height());
+                        if h <= 12.0 && w > 40.0 {
+                            rails.push(rect); // rail:横向细长
+                        } else if (0.4..=1.2).contains(&(w / h)) && h <= 30.0 {
+                            handles.push(rect); // handle:小竖条
+                        }
+                    }
+                    Shape::Circle(c) => handles.push(egui::Rect::from_center_size(
+                        c.center,
+                        egui::vec2(c.radius, c.radius),
+                    )),
+                    _ => {}
+                }
+            }
+            if handles.len() < 4 || rails.len() < 4 {
+                let mut hist = std::collections::BTreeMap::new();
+                for c in shapes {
+                    let name = match &c.shape {
+                        Shape::Noop => "noop",
+                        Shape::Vec(_) => "vec",
+                        Shape::Circle(_) => "circle",
+                        Shape::Ellipse(_) => "ellipse",
+                        Shape::LineSegment { .. } => "line",
+                        Shape::Path(_) => "path",
+                        Shape::Rect(r) => {
+                            &format!("rect {}x{}", r.rect.width() as i32, r.rect.height() as i32)
+                        }
+                        Shape::Text(_) => "text",
+                        _ => "other",
+                    };
+                    *hist.entry(name.to_string()).or_insert(0) += 1;
+                }
+                panic!(
+                    "{density:?} 档滑杆形状不足 handle {} rail {}: {hist:?}",
+                    handles.len(),
+                    rails.len()
+                );
+            }
+            // handle 只认 rail 横向区间 ±20px 内的(分页列的小矩形不掺和)
+            let rail_x0 = rails.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min) - 20.0;
+            let rail_x1 = rails
+                .iter()
+                .map(|r| r.right())
+                .fold(f32::NEG_INFINITY, f32::max)
+                + 20.0;
+            let rail_yc: Vec<f32> = rails.iter().map(|r| r.center().y).collect();
+            let on_any_rail_y = |y: f32| rail_yc.iter().any(|rc| (y - rc).abs() <= 10.0);
+            let slider_handles: Vec<egui::Rect> = handles
+                .iter()
+                .copied()
+                .filter(|h| {
+                    let c = h.center();
+                    c.x >= rail_x0 && c.x <= rail_x1 && on_any_rail_y(c.y)
+                })
+                .collect();
+            assert!(
+                slider_handles.len() >= 4 && rails.len() >= 4,
+                "{density:?} 档滑杆形状不足: handle {} / rail {}",
+                slider_handles.len(),
+                rails.len()
+            );
+            // rail 可见性:egui 0.36 滑杆轨道 rect_filled 绑
+            // widgets.inactive.bg_fill;曾投影成 TRANSPARENT 致轨道隐形
+            // (手柄漂浮,坤哥 2026-09-29 截图)。断言每条 rail 的填充色
+            // 非透明、且与窗口 content 底色每通道差 ≥6(可辨下限)。
+            let content =
+                crate::theme::shell_tokens(state.theme.mode == crate::theme::ThemeMode::Dark)
+                    .content;
+            let mut rail_fills = Vec::new();
+            for clipped in shapes {
+                if let Shape::Rect(r) = &clipped.shape {
+                    let rect = r.rect;
+                    if rect.height() <= 12.0 && rect.width() > 40.0 {
+                        let [rr, gg, bb, _] = r.fill.to_array();
+                        assert!(
+                            r.fill != egui::Color32::TRANSPARENT,
+                            "{density:?} 档滑杆轨道填充透明(隐形回归)"
+                        );
+                        let [cr, cg, cb, _] = content.to_array();
+                        let delta = (rr as i32 - cr as i32)
+                            .abs()
+                            .max((gg as i32 - cg as i32).abs())
+                            .max((bb as i32 - cb as i32).abs());
+                        assert!(
+                            delta >= 6,
+                            "{density:?} 档滑杆轨道与窗口底不可辨: fill={:?} content={content:?}",
+                            r.fill
+                        );
+                        rail_fills.push(r.fill);
+                    }
+                }
+            }
+            assert_eq!(rail_fills.len(), 4, "四条轨道都取到填充色");
+            for handle in &slider_handles {
+                let center = handle.center();
+                let on_rail = rails.iter().any(|rail| {
+                    (center.y - rail.center().y).abs() <= 8.0
+                        && center.x >= rail.left() - 2.0
+                        && center.x <= rail.right() + 2.0
+                });
+                assert!(
+                    on_rail,
+                    "{density:?} 档滑杆 handle 中心 {center:?} 不在任何 rail 上: rails={rails:?}"
+                );
+            }
+        }
     }
 
     /// 关闭时窗口不进入绘制路径(不 panic、不改 open 标志)。
