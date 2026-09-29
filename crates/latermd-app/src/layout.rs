@@ -33,7 +33,7 @@ const SETTINGS_FILE: &str = "layout.json";
 pub type PreZen = Option<(bool, bool)>;
 
 /// 持久化的外壳布局。字段各自直接喂给 UI,不额外镜像。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutSettings {
     /// 左栏(导航)是否展开。
@@ -62,6 +62,13 @@ pub struct LayoutSettings {
     /// 而不是整表 Corrupt 丢弃 left/right。
     #[serde(default)]
     pub maximized: bool,
+    /// 左栏(导航)宽度。`None` = 从未拖过,用 egui 默认。恢复走首帧前
+    /// `insert_persisted` 塞 PanelState(egui 的 store 是私有的)。
+    #[serde(default)]
+    pub left_width: Option<f32>,
+    /// 右栏(预览)宽度,同上。
+    #[serde(default)]
+    pub right_width: Option<f32>,
 }
 
 /// 出厂布局:三栏全开(旧行为),停文件树。
@@ -74,6 +81,8 @@ impl Default for LayoutSettings {
             left_view: SidebarTab::Files,
             pre_zen: None,
             maximized: false,
+            left_width: None,
+            right_width: None,
         }
     }
 }

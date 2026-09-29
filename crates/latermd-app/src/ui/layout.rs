@@ -255,6 +255,11 @@ impl LaterMdApp {
                     &mut self.outbox,
                 );
             });
+        // PanelState 当前帧可读 outer_rect;只更新用户实际拖出的宽度,
+        // show_collapsible=false 或动画中不写 None。
+        if let Some(panel) = egui::PanelState::load(ui.ctx(), egui::Id::new("nav")) {
+            self.state.layout.left_width = Some(panel.size().x);
+        }
 
         // ④ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
         // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
@@ -283,6 +288,9 @@ impl LaterMdApp {
                     &mut self.outbox,
                 );
             });
+        if let Some(panel) = egui::PanelState::load(ui.ctx(), egui::Id::new("preview")) {
+            self.state.layout.right_width = Some(panel.size().x);
+        }
 
         // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条/提示行/格式工具条在其上。
         // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
@@ -338,6 +346,12 @@ impl LaterMdApp {
                     outbox,
                     self.format_probe.as_deref_mut(),
                 );
+                // 文档内查找条(#17 最小版):源码模式且开着才占一行;
+                // Live 模式不支持(源码栏功能,坤哥点名),开着切 Live 时
+                // 收起避免悬着一条无处跳转的死条。
+                if state.find.open && state.render_mode == crate::live::RenderMode::Source {
+                    find_bar(ui, &mut state.find, outbox);
+                }
                 crate::ui::editor::ui(
                     ui,
                     editor,
@@ -656,6 +670,79 @@ fn poll_capture(ctx: &egui::Context, state: &mut crate::state::State) {
             shortcut: crate::keymap::Shortcut { modifiers, key },
         }),
     }
+}
+
+/// 文档内查找条(#17 最小版,Ctrl+F):查找词输入 + 上一个/下一个 +
+/// 计数 + 关闭。输入变化即重扫并跳第一命中(归约侧),Enter/Shift+Enter
+/// 前后跳(环绕),Esc 关闭并把输入框交还。命中跳转经归约写
+/// `pending_selection`,下一帧编辑器写回光标并滚入视口(#29 链路)。
+fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &mut Vec<Message>) {
+    let total = find.hits.len();
+    let pos = find.hit.map(|h| h + 1).unwrap_or(0);
+    ui.horizontal(|ui| {
+        ui.label("查找");
+        let mut query_buf = find.query.clone();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut query_buf)
+                .desired_width(220.0)
+                .hint_text("输入即跳转;Enter 下一个"),
+        );
+        if query_buf != find.query {
+            find.query = query_buf.clone();
+            outbox.push(Message::FindQueryChanged(query_buf));
+        }
+        // Enter/Shift+Enter 在输入框聚焦时由这里消费(TextEdit 会吃普通
+        // 键事件,必须在 input 流里抢先)
+        let enter = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let shift_enter = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.shift
+                )
+            })
+        });
+        if response.has_focus() {
+            if shift_enter {
+                outbox.push(Message::FindNext { backwards: true });
+            } else if enter {
+                outbox.push(Message::FindNext { backwards: false });
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                outbox.push(Message::FindBarToggled(false));
+            }
+        }
+        if ui.button("↑").clicked() {
+            outbox.push(Message::FindNext { backwards: true });
+        }
+        if ui.button("↓").clicked() {
+            outbox.push(Message::FindNext { backwards: false });
+        }
+        ui.weak(if total == 0 {
+            "无结果".to_owned()
+        } else {
+            format!("{pos}/{total}")
+        });
+        if ui.button("✕").clicked() {
+            outbox.push(Message::FindBarToggled(false));
+        }
+    });
 }
 
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · 渲染后端 · AI · MCP。

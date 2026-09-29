@@ -28,6 +28,13 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
         ui.menu_button("导出", |ui| {
             item(ui, Command::ExportHtml, keymap, outbox);
         });
+        // 编辑:文档内动作(坤哥 2026-09-29 指令的 Ctrl+D/Ctrl+Shift+D/
+        // Ctrl+F 可发现性入口;undo/redo 是 TextEdit 内建,不列)
+        ui.menu_button("编辑", |ui| {
+            item(ui, Command::DuplicateSelection, keymap, outbox);
+            item(ui, Command::DuplicateLine, keymap, outbox);
+            item(ui, Command::FindInDoc, keymap, outbox);
+        });
         ui.menu_button("视图", |ui| {
             item(ui, Command::ToggleSidebar, keymap, outbox);
             item(ui, Command::ToggleTheme, keymap, outbox);

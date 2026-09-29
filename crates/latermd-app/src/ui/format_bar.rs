@@ -173,6 +173,9 @@ fn icon_of(action: FormatAction) -> Icon {
         FormatAction::Divider => Divider,
         FormatAction::Table => Table,
         FormatAction::Image => Image,
+        // duplicate 不上工具条(键盘动作,menu/快捷键层即可),这里只为
+        // match 穷尽;若将来要上,补自绘或映射既有图标
+        FormatAction::DuplicateSelection | FormatAction::DuplicateLine => SaveAs,
         FormatAction::Bullet => BulletList,
         FormatAction::Ordered => OrderedList,
         FormatAction::Task => TaskList,
@@ -209,6 +212,8 @@ fn command_of(action: FormatAction) -> Option<Command> {
         FormatAction::Divider => FormatDivider,
         FormatAction::Table => FormatTable,
         FormatAction::Image => ImageInsert,
+        FormatAction::DuplicateSelection => DuplicateSelection,
+        FormatAction::DuplicateLine => DuplicateLine,
         FormatAction::Bullet => FormatBullet,
         FormatAction::Ordered => FormatOrdered,
         FormatAction::Task => FormatTask,
