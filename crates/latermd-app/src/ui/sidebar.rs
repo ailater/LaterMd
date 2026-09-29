@@ -426,16 +426,7 @@ fn files_panel(
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
                     for dir in &tree.recents {
-                        if ui
-                            .selectable_label(
-                                tree.root.as_deref() == Some(dir.as_path()),
-                                dir.display().to_string(),
-                            )
-                            .clicked()
-                        {
-                            // ComboBox 默认 CloseOnClick:点击项后弹层自动收起
-                            outbox.push(Message::FileTreeRootSelected(dir.clone()));
-                        }
+                        recent_row(ui, tree, dir, outbox);
                     }
                 })
                 .response;
@@ -467,13 +458,46 @@ fn files_panel(
         });
 }
 
+/// recents 下拉项:显示名只取末级文件夹名(`recent_label`,与 root_label
+/// 同口径)——路径中间段不进 UI,用户目录名可能含个人信息(#32 I2);
+/// 全路径下沉到该项的 hover tooltip,重名末级名靠 tooltip 区分。独立成
+/// 函数与 tree_row 等同例,便于无头测试直接驱动(ComboBox 弹层交互不在
+/// 无头覆盖范围,根目录选择走 state::tests)。
+fn recent_row(
+    ui: &mut egui::Ui,
+    tree: &FileTreeState,
+    dir: &Path,
+    outbox: &mut Vec<Message>,
+) -> egui::Response {
+    let selected = tree.root.as_deref() == Some(dir);
+    let response = ui
+        .selectable_label(selected, recent_label(dir))
+        .on_hover_text(dir.display().to_string());
+    if response.clicked() {
+        // ComboBox 默认 CloseOnClick:点击项后弹层自动收起
+        outbox.push(Message::FileTreeRootSelected(dir.to_owned()));
+    }
+    response
+}
+
 /// 根目录行的显示名。
 fn root_label(tree: &FileTreeState) -> String {
     tree.root
         .as_deref()
-        .and_then(Path::file_name)
-        .map(|name| name.to_string_lossy().into_owned())
+        .and_then(last_segment)
         .unwrap_or_else(|| "未选择根目录".to_owned())
+}
+
+/// 路径末级名(文件夹名);根路径 `/` 等无末段时为 None。
+fn last_segment(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// recents 项显示名:末级文件夹名;末段拿不到(如根路径 `/`)时回退
+/// 全路径——此时路径本身无中间段,不构成泄漏。
+fn recent_label(dir: &Path) -> String {
+    last_segment(dir).unwrap_or_else(|| dir.display().to_string())
 }
 
 /// 一组子项的各行 + 截断提示行。
@@ -506,20 +530,23 @@ fn tree_row(
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let open = tree.expanded.get(&entry.path).copied().unwrap_or(false);
-    // 展开箭头不用文本字符:U+25B8/U+25BE 在 Inter 与出厂字体链上均无
-    // 字形,目录行名字前渲染成方框(用户实测)。行文本统一以两个空格缩进
-    // 占位(空格任何字体都有,目录/文件天然对齐),目录行的三角画在占位区,
-    // 纯绘制不依赖字体——与 #31 行号槽同思路。
+    // 行首装饰(展开三角 + folder/file 图标)都不用文本字符:
+    // U+25B8/U+25BE 在 Inter 与出厂字体链上均无字形,目录行名字前渲染成
+    // 方框(用户实测,PR #53 起纯绘制)。行文本以前导空格占位(空格任何
+    // 字体都有,目录/文件天然对齐):头两个空格给展开三角,其后空格数按
+    // 图标槽宽度折算,名字从图标右侧起;三角与图标画在占位区,纯绘制不
+    // 依赖字体——与 #31 行号槽同思路。
     let selected = !entry.is_dir && current_file == Some(entry.path.as_path());
     let badge = if entry.is_dir {
         None
     } else {
         git.badge_for(&entry.path)
     };
-    let response = badged_row_label(ui, selected, format!("  {}", entry.name), badge);
+    let response = badged_row_label(ui, selected, tree_row_text(ui, &entry.name), badge);
     if entry.is_dir {
         paint_tree_arrow(ui, &response, open);
     }
+    paint_tree_entry_icon(ui, &response, entry.is_dir, open);
     if response.clicked() {
         if entry.is_dir {
             outbox.push(Message::FileTreeToggled(entry.path.clone()));
@@ -542,16 +569,67 @@ fn tree_row(
     response
 }
 
+/// 文件树行的显示文本:前导空格数由「三角槽(两个空格)+ 图标槽 + 间隙」
+/// 与正文字体空格 advance 折算而来,再扣除 `selectable_label` 的框内边距
+/// (`button_padding.x`,出厂 style 4px / 外壳 style 12px 两套都成立),
+/// 保证名字首字不与图标重叠;下限两个空格保住三角的占位。
+fn tree_row_text(ui: &egui::Ui, name: &str) -> String {
+    let space_w = body_space_width(ui).max(0.1);
+    let inset = ui.style().spacing.button_padding.x.max(0.0);
+    let icon_right = 2.0 * space_w + crate::ui::tokens::SPACE_XS + crate::ui::tokens::ICON_SM;
+    let pad =
+        (((icon_right + crate::ui::tokens::SPACE_XS - inset) / space_w).ceil() as usize).max(2);
+    format!("{}{}", " ".repeat(pad), name)
+}
+
+/// 行首 folder/file 图标(自绘,ui-polish §1.1):目录行随开合切换闭合/
+/// 开口文件夹,文件行画折角纸页,槽位紧跟展开三角之后,目录/文件行纵向
+/// 对齐。尺寸取 `ICON_SM`(页签档,行高内留上下边);颜色取非交互前景
+/// (与三角同源随主题),hover/选中只改文本底色,图标几何不动。
+fn paint_tree_entry_icon(ui: &egui::Ui, row: &egui::Response, is_dir: bool, open: bool) {
+    if !ui.is_rect_visible(row.rect) {
+        return;
+    }
+    let space_w = body_space_width(ui);
+    let icon = if is_dir {
+        if open {
+            crate::ui::icons::Icon::FolderOpen
+        } else {
+            crate::ui::icons::Icon::FolderClosed
+        }
+    } else {
+        crate::ui::icons::Icon::File
+    };
+    icon.draw(
+        ui.painter(),
+        egui::pos2(
+            row.rect.left()
+                + 2.0 * space_w
+                + crate::ui::tokens::SPACE_XS
+                + crate::ui::tokens::ICON_SM / 2.0,
+            row.rect.center().y,
+        ),
+        crate::ui::tokens::ICON_SM,
+        ui.visuals().widgets.noninteractive.fg_stroke.color,
+    );
+}
+
+/// 正文空格的 advance(px)。展开三角与图标槽的定位基准:随正文字号
+/// 缩放,不随平台字体走样(egui 的 galley 缓存让重复测量只是查表)。
+fn body_space_width(ui: &egui::Ui) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts_mut(|f| {
+        f.layout_no_wrap(" ".to_owned(), font_id, egui::Color32::WHITE)
+            .rect
+            .width()
+    })
+}
+
 /// 目录行的展开三角:画在行首两个空格占位区的中点上,收起朝右、展开
 /// 朝下。尺寸基准是空格 advance(随正文字号缩放,不随平台字体走样),
 /// 颜色取弱前景(与行号槽同源);纯 `Shape::convex_polygon`,零字形依赖。
 fn paint_tree_arrow(ui: &egui::Ui, row: &egui::Response, open: bool) {
-    let font_id = egui::TextStyle::Body.resolve(ui.style());
-    let space_w = ui.fonts_mut(|f| {
-        f.layout_no_wrap(" ".to_owned(), font_id, egui::Color32::WHITE)
-            .rect
-            .width()
-    });
+    let space_w = body_space_width(ui);
     let center = egui::pos2(row.rect.left() + space_w, row.rect.center().y);
     let r = space_w * 0.62;
     ui.painter().add(egui::Shape::convex_polygon(
@@ -817,6 +895,71 @@ mod tests {
         );
     }
 
+    /// 快照层护栏(PR #53 之前的缺陷回归):行首的展开三角、folder/file
+    /// 图标必须是矢量 Shape,文本层只有名字(与 Git 角标);▸/▾ 之类图标
+    /// 字符一旦回流文本层,断言当场红。同帧顺带量几何:装饰(三角 + 图标)
+    /// 的右沿不得越过名字首字的墨迹左沿(`mesh_bounds` 不含前导空格,量
+    /// 的是真实墨迹)。明暗两套 visuals 各跑一遍。
+    #[test]
+    fn tree_row_decorations_are_painted_not_glyph_text() {
+        let (tree, root) = sample_tree();
+        let children = tree.children.get(&root).unwrap();
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            for entry in &children.entries {
+                let output = ctx.run_ui(RawInput::default(), |ui| {
+                    tree_row(
+                        ui,
+                        &tree,
+                        entry,
+                        None,
+                        &GitPanelState::default(),
+                        &mut Vec::new(),
+                    );
+                });
+                let mut texts = Vec::new();
+                let mut decor_right = f32::MIN;
+                let mut name_left = f32::MAX;
+                for clipped in &output.shapes {
+                    match &clipped.shape {
+                        egui::epaint::Shape::Text(text) => {
+                            texts.push(text.galley.job.text.clone());
+                            name_left = name_left.min(text.visual_bounding_rect().left());
+                        }
+                        shape => {
+                            decor_right = decor_right.max(shape.visual_bounding_rect().right())
+                        }
+                    }
+                }
+                assert!(
+                    texts.iter().any(|t| t.contains(&entry.name)),
+                    "{} 名字应仍在文本层:{texts:?}",
+                    entry.name
+                );
+                assert!(
+                    texts.iter().all(|t| {
+                        !t.contains('▸')
+                            && !t.contains('▾')
+                            && !t.contains('📁')
+                            && !t.contains('📄')
+                    }),
+                    "图标字符不得回流文本层:{texts:?}"
+                );
+                assert!(
+                    decor_right < name_left,
+                    "{} 行首装饰右沿 {decor_right} 不得压住名字墨迹左沿 {name_left}",
+                    entry.name
+                );
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
     /// 点击树行:文件行发打开消息、目录行发翻转展开消息;仅渲染不产生
     /// 消息。带 Git 角标的文件行走同一渲染路径(角标着色无断言,点击行为
     /// 与无角标一致是本测试的对象)。
@@ -879,6 +1022,142 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(outbox, vec![Message::FileTreeToggled(docs)]);
+    }
+
+    /// 一帧里全部文本 shape 的字符串:可见文本与 tooltip 都算(断言按
+    /// 内容区分,不区分层)。
+    fn shape_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// recents 项显示名(#32 I2):只取末级文件夹名——注入带个人称谓
+    /// 中间段的假路径,「坤哥」不得进显示名;重名末级在显示层不消歧
+    /// (靠 tooltip 区分);根路径无末段时回退全路径(自身无中间段)。
+    #[test]
+    fn recent_label_uses_last_segment() {
+        assert_eq!(recent_label(Path::new("/home/坤哥/工作/vault")), "vault");
+        assert_eq!(
+            recent_label(Path::new("/data/坤哥/备份/vault")),
+            "vault",
+            "重名末级在显示层不做消歧"
+        );
+        assert_eq!(recent_label(Path::new("/")), "/");
+    }
+
+    /// recents 下拉项的可见文本与 hover tooltip(#32 I2):无指针帧的
+    /// 文本层只有末级名,路径中间段(坤哥/工作/备份)不得出现;悬停并
+    /// 推过 egui 的 tooltip 延迟(默认 0.5s 且指针须静止,`RawInput.time`
+    /// 逐帧推进)后,全路径只以 tooltip 文本出现,重名末级由此区分。
+    #[test]
+    fn recents_show_last_segment_with_full_path_on_hover() {
+        let tree = FileTreeState {
+            recents: vec![
+                PathBuf::from("/home/坤哥/工作/vault"),
+                PathBuf::from("/data/坤哥/备份/vault"),
+            ],
+            ..FileTreeState::default()
+        };
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rects = [Cell::new(Rect::NOTHING), Cell::new(Rect::NOTHING)];
+        let render = |ui: &mut egui::Ui, outbox: &mut Vec<Message>| {
+            for dir in &tree.recents {
+                recent_row(ui, &tree, dir, outbox);
+            }
+        };
+
+        // 帧 1(t=0,无指针):可见文本层只有末级名
+        let output = ctx.run_ui(
+            RawInput {
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ui| {
+                for (dir, rect) in tree.recents.iter().zip(&rects) {
+                    rect.set(recent_row(ui, &tree, dir, &mut outbox).rect);
+                }
+            },
+        );
+        let texts = shape_texts(&output);
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+        assert!(
+            texts.iter().filter(|t| t.contains("vault")).count() >= 2,
+            "两条 recents 都显示末级名:{texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains('坤')),
+            "路径中间段不得进可见文本:{texts:?}"
+        );
+
+        // 帧 2(t=1):指针移入第一条;tooltip 有静止延迟,本帧不显示
+        let center = rects[0].get().center();
+        ctx.run_ui(
+            RawInput {
+                time: Some(1.0),
+                events: vec![Event::PointerMoved(center)],
+                ..Default::default()
+            },
+            |ui| render(ui, &mut outbox),
+        )
+        .drop_without_applying_deltas();
+
+        // 帧 3-4(t=2,3):静止超延迟,悬停项的全路径只在 tooltip 里出现
+        let mut tooltip_texts = Vec::new();
+        for time in [2.0, 3.0] {
+            let output = ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| render(ui, &mut outbox),
+            );
+            tooltip_texts.extend(shape_texts(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            tooltip_texts
+                .iter()
+                .any(|t| t.contains("/home/坤哥/工作/vault")),
+            "悬停项的全路径进 tooltip:{tooltip_texts:?}"
+        );
+
+        // 帧 5-7:指针移到第二条(重名末级),tooltip 换成它自己的全路径
+        let center = rects[1].get().center();
+        ctx.run_ui(
+            RawInput {
+                time: Some(4.0),
+                events: vec![Event::PointerMoved(center)],
+                ..Default::default()
+            },
+            |ui| render(ui, &mut outbox),
+        )
+        .drop_without_applying_deltas();
+        let mut second_texts = Vec::new();
+        for time in [5.0, 6.0] {
+            let output = ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| render(ui, &mut outbox),
+            );
+            second_texts.extend(shape_texts(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            second_texts
+                .iter()
+                .any(|t| t.contains("/data/坤哥/备份/vault")),
+            "重名末级靠各自 tooltip 区分:{second_texts:?}"
+        );
     }
 
     /// 当前小节判定:光标在正文里高亮所属标题,首个标题之前/无光标不高亮。

@@ -110,6 +110,7 @@ DPI 下不产生虚线）。
 | `Files` / `Search` / `Outline` / `Git` | 叠放文档 / 放大镜 / 三级缩进线 / 分支图 | 侧边栏页签 |
 | `Settings` | 齿轮（圆 + 4 辐条） | 工具栏右侧 |
 | `Reset` | 回环折线箭头 | 快捷键页「重置」 |
+| `FolderClosed` / `FolderOpen` / `File` | 闭合文件夹（与 `Open` 共用同一 match 分支几何，DRY 有意为之）/ 开口文件夹（一笔连画）/ 折角纸页 | 文件树行首（2026-09-29 #32 落地：目录行=三角+随开合切换的文件夹、文件行=纸页；前导空格按字体度量折算防重叠，快照层护栏锁死「图标字符不得回流文本」） |
 
 按钮形态 `icon_text_button(ui, icon, label, shortcut, enabled)`：手工
 `allocate_response` + 自绘（hover 底、按下态、圆角、图标、文字、右侧灰阶快捷键文本），
