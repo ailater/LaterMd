@@ -1110,6 +1110,88 @@ mod tests {
     }
 
     #[test]
+    fn find_query_typing_keeps_focus_and_empty_results_do_not_edit_source() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("typing");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        app.state.apply(Message::FindBarToggled(true));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let input = find_input_id();
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        let mut query = String::new();
+        for (step, text) in ["n", "e", "e", "d", "l", "e", "-absent"]
+            .into_iter()
+            .enumerate()
+        {
+            query.push_str(text);
+            let now = 1.0 + step as f64;
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Text(text.to_owned())],
+            );
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert_eq!(app.state.find.query, query);
+            assert!(ctx.memory(|memory| memory.has_focus(input)));
+            assert_eq!(app.state.tabs.current().editor.text(), original);
+        }
+        assert!(app.state.find.hits.is_empty());
+        for (step, modifiers) in [Modifiers::NONE, Modifiers::SHIFT].into_iter().enumerate() {
+            let now = 9.0 + step as f64;
+            find_test_frame(&mut app, &ctx, screen, now, find_key(Key::Enter, modifiers));
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert_eq!(app.state.find.hit, None);
+            assert_eq!(app.state.find.query, query);
+            assert!(ctx.memory(|memory| memory.has_focus(input)));
+            assert_eq!(app.state.tabs.current().editor.text(), original);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_overlay_does_not_intercept_enter_in_source_editor() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("source-focus");
+        app.state.apply(Message::FindBarToggled(true));
+        app.state
+            .apply(Message::FindQueryChanged("needle".to_owned()));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let editor_id = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+        let end = app.state.tabs.current().editor.text().chars().count();
+        let mut edit = egui::TextEdit::load_state(&ctx, editor_id).unwrap();
+        edit.cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(end),
+            )));
+        edit.store(&ctx, editor_id);
+        ctx.memory_mut(|memory| memory.request_focus(editor_id));
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.state.find.hit, Some(0));
+        assert_eq!(
+            app.state.tabs.current().editor.text(),
+            "needle one\nneedle two\nneedle three\n"
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(editor_id)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn find_overlay_stays_below_wrapped_toolbar_without_moving_source() {
         for width in [1200.0, 1600.0] {
             let ctx = egui::Context::default();
