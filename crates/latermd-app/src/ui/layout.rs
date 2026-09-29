@@ -346,6 +346,7 @@ impl LaterMdApp {
                     &state.keymap,
                     outbox,
                     self.format_probe.as_deref_mut(),
+                    None::<fn(egui::Rect)>,
                 );
                 // min_rect 包括标签与可换行的工具条,浮层只能锚定它们之后的视口。
                 source_rect = Some(ui.available_rect_before_wrap());
@@ -502,6 +503,14 @@ impl LaterMdApp {
             if cancel.clicked() {
                 outbox.push(Message::ImageDialogClosed);
             }
+        }
+
+        // Emoji 面板(docs/emoji-plan.md E1):搜索草稿与分类归 UI 原地
+        // 持有,点选插入在归约走 `compose::insert_emoji`;点选后关面板与
+        // Esc 关闭都经消息(Esc 优先级让位禅定出口,见 emoji_panel 模块
+        // 文档)。返回的单元响应只供面板自身测试定位,生产路径忽略。
+        if self.state.emoji.open {
+            let _cells = crate::ui::emoji_panel::panel(ui, &mut self.state.emoji, outbox);
         }
     }
 

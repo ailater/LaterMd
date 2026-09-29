@@ -93,6 +93,13 @@ pub enum Icon {
     FolderOpen,
     /// 文件树文件:折角纸页。
     File,
+    // —— Emoji 面板入口(docs/emoji-plan.md E1)——
+    /// 表情:外圆脸 + 两实心点眼 + 下弯弧嘴(自绘笑脸)。
+    ///
+    /// 这是**UI 图标**,不是文档内容 —— 插进文档的 emoji 是内容不受
+    /// ui-polish §1.1 约束,但工具条按钮本身必须是自绘,不是 `😀` 字符
+    /// (emoji-plan §3 的边界)。
+    Emoji,
 }
 
 impl Icon {
@@ -374,6 +381,20 @@ impl Icon {
                 ]);
                 path(&[(0.14, -0.44), (0.14, -0.32), (0.26, -0.32)]);
             }
+            // —— Emoji 面板入口:自绘笑脸(圆脸 + 两点眼 + 弧嘴,§3 边界)——
+            Self::Emoji => {
+                ring((0.0, 0.0), 0.42);
+                dot((-0.15, -0.13), 0.055);
+                dot((0.15, -0.13), 0.055);
+                // 嘴是下弯弧:弧心在脸上方,画圆的下半段 —— 两端高、中间
+                // 低,即经典笑口(egui 无 arc API,折线近似与 Reset 同款)
+                arc(
+                    (0.0, -0.10),
+                    0.22,
+                    std::f32::consts::PI * 0.25,
+                    std::f32::consts::PI * 0.75,
+                );
+            }
         }
     }
 }
@@ -511,6 +532,8 @@ mod tests {
             Icon::FolderClosed,
             Icon::FolderOpen,
             Icon::File,
+            // Emoji 面板入口(#28 E1)
+            Icon::Emoji,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
