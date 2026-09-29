@@ -68,12 +68,11 @@ pub enum Icon {
     Divider,
     /// 表格:2×2 网格外框 + 表头横线。
     Table,
-    /// 正文(去前缀):四条长短不一的文字线,**没有**左竖条 —— 与 `Quote`
-    /// 的唯一区别就是那根条,一眼能看出「退出引用」。
-    ///
-    /// 规格 §6.1 原本写的是 Unicode `¶`;这里改自绘:文首「图标是矢量自绘,
-    /// 不是字体字符」(ui-polish §1.1)对 Gecko/缺字环境的顾虑同样适用。
+    /// 正文(去前缀):phosphor `PARAGRAPH`(¶)。规格 §6.1 的原始指定,
+    /// 迁移后回归字面方案 —— 与 `Quote` 的区分交给 `Quote` 的竖条码位。
     Paragraph,
+    /// 插入图片(#26 图片框):山与日剪影。
+    Image,
     /// 无序列表:三点 + 三线。
     BulletList,
     /// 有序列表:三条竖短线(序号笔画抽象)+ 三线。
@@ -121,6 +120,7 @@ impl Icon {
             Self::Divider => ph::MINUS,
             Self::Table => ph::TABLE,
             Self::Paragraph => ph::PARAGRAPH,
+            Self::Image => ph::IMAGE,
             Self::BulletList => ph::LIST_BULLETS,
             Self::OrderedList => ph::LIST_NUMBERS,
             Self::TaskList => ph::LIST_CHECKS,

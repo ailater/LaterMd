@@ -116,20 +116,32 @@
   启用该 feature 并装 `egui_extras` 图片 loader（file/image，解码格式开到 D 段白名单
   PNG/JPEG/GIF/WebP）；vendor 文件一行未动。
 
-## #35 图标体系是否整体迁移到 egui-phosphor（2026-09-27，坤哥转来外部建议，**待拍板**）
+## #35 图标体系是否整体迁移到 egui-phosphor（2026-09-27 坤哥转来外部建议；2026-09-29 **拍板：乙，全量迁移**）
 
 - **岔路**：外部推荐 P1「集成 egui-phosphor，替换所有文字按钮为图标+文字组合，工作量低」。
   查证（2026-09-27）：库本身**健康** —— 0.14.0、14 天前 bump 到 egui **0.36**（与我们对齐）、
   ~2900 下载/月、**#65 in GUI**、MIT/Apache-2.0、字体 bundled（1.03 MiB，可 subset 裁剪）。
-- **本轮不做的理由（不是否决库，是否决时机）**：① 我们已有 **30+ 枚自绘图标**（`ui/icons.rs`：
+- **首轮不做的理由（不是否决库，是否决时机）**：① 我们已有 **30+ 枚自绘图标**（`ui/icons.rs`：
   文件组 / 格式组 17 枚 / 标题栏六钮 / 侧边栏四页 / 状态），且 LOGO 也自绘同源（`assets/logo/`），
   已过明暗双主题与像素验收；② **两套图标并存 = 视觉分裂**，是所有选项里最糟的，只能「全换」或「不换」；
   ③ 全量迁移要动工具条 + 文件栏 + 侧边栏 + 标题栏 ≈ **2–3 天**，不是外部估计的「低」。
-- **自动选择**：本轮**不换**。精致度走 `ui-modernization.md` 的 U0/U1（抄 armas 数值进 tokens +
+- **首轮选择**：本轮**不换**。精致度走 `ui-modernization.md` 的 U0/U1（抄 armas 数值进 tokens +
   Inter + CJK fallback），零依赖、约 1 天。
-- **如何改（两个选项，请坤哥挑）**：
-  - **甲（当前默认）**：不换。需新增图标时继续自绘。
-  - **乙**：单开一棒「图标全量迁移 phosphor」，`ui/icons.rs` 退役，与图片/图床主线**串行**做。
+- **拍板与执行（2026-09-29，坤哥指令「合并 feature/ui-modern-all，完成 egui-phosphor 整体图标迁移」）**：
+  选**乙**。`feature/ui-modern-all` 上的 ⑥（0327480，2026-09-27）cherry-pick 到 main 头上，落定要点：
+  ① 30 个变体人工映射 phosphor 码位（Save→FLOPPY_DISK、Theme→PALETTE 等名字对不上的逐个挑）；
+  ② 字形是 bundled TTF 的私有区码位（U+E0xx），三平台一致，「自绘不用字体」的旧论据只对系统字体成立，
+  对 bundled 字体库不成立（#34 已修订）；③ 绘制退化成排版一段文本，字体族走 **Proportional** 而非单开
+  `FontFamily::Name` —— 后者遇到没跑 `fonts::install` 的 Context 直接 panic，前者只是豆腐块；
+  ④ `build_definitions` 里 `add_to_fonts` 落位 **Inter 之后、NotoEmoji 之前**（实测 insert(1)，探针+单测
+  `inter_leads_and_emoji_order_survives` 双重锁定），与 CJK/emoji 互不抢；⑤ 补 `Icon::Image`（#26 图片框
+  在分支分叉后新增的变体）映射 `ph::IMAGE`；⑥ `egui-phosphor 0.14` 按惯例登记 ADR-004。
+  **分流记录**：该分支的 ①⑤（tokens/theme 自研版）、③（Inter 内联正文）、④（按钮 hover 淡入）分别被
+  main 已落地的 #27 U0/U1/U3 替代，不随本迁移合入；分支打 archive tag 后删除。
+- **如何改（两个选项，存档备查）**：
+  - **甲**：不换。需新增图标时继续自绘。
+  - **乙（已执行）**：单开一棒「图标全量迁移 phosphor」，`ui/icons.rs` 自绘退役，与图片/图床主线**串行**做。
+  - 回退：revert `da8061a` 即回到自绘版（icons.rs 消费者 API 不变）。
     注意选乙后，`Icon` 枚举的所有消费者（`titlebar`/`sidebar`/`format_bar`/`menubar`）要同步改。
 - **2026-09-27 更新**：坤哥指令「根据文档的最近规划，图片，emoji，ui等功能，添加新的流水线workflow」——
   UI 现代化已按**甲**（不迁移）排入流水线（auto-plan #27 已放行，范围 U0/U1/U3，预写脚本待看护自动开棒）；
