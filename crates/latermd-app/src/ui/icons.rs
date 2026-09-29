@@ -86,6 +86,13 @@ pub enum Icon {
     OrderedList,
     /// 任务列表:勾选框两个 + 两条线,首框带勾。
     TaskList,
+    // —— 文件树(docs/auto-plan.md #32 I1)——
+    /// 文件树目录(收起):经典闭合文件夹。
+    FolderClosed,
+    /// 文件树目录(展开):开口文件夹 —— 前盖下移外张,与闭合形一眼可分。
+    FolderOpen,
+    /// 文件树文件:折角纸页。
+    File,
 }
 
 impl Icon {
@@ -156,7 +163,9 @@ impl Icon {
                 seg((0.20, 0.02), (0.44, 0.02));
                 seg((0.32, -0.10), (0.32, 0.14));
             }
-            Self::Open => {
+            // 工具栏「打开」与文件树收起目录共用闭合文件夹几何:闭合文件夹
+            // 就是这把形状,分两套坐标只会画出两个略有出入的文件夹。
+            Self::Open | Self::FolderClosed => {
                 frame((-0.42, -0.22), (0.42, 0.38));
                 path(&[
                     (-0.42, -0.22),
@@ -332,6 +341,39 @@ impl Icon {
                 seg((-0.02, -0.10), (0.42, -0.10));
                 seg((-0.02, 0.30), (0.42, 0.30));
             }
+            // —— 文件树(#32 I1):开口文件夹与折角纸页(闭合 FolderClosed
+            // 已并入上方 Open 分支)——
+            Self::FolderOpen => {
+                // 一笔连画:前盖(口在左端内收、右端外张)→ 底边 → 背板左沿
+                // → 舌片 → 背板上沿 → 背板右沿收在前盖上沿上方,留出「口」
+                path(&[
+                    (-0.24, 0.10),
+                    (-0.10, -0.08),
+                    (0.34, -0.08),
+                    (0.46, 0.14),
+                    (0.32, 0.38),
+                    (-0.34, 0.38),
+                    (-0.46, 0.24),
+                    (-0.46, -0.30),
+                    (-0.36, -0.40),
+                    (-0.10, -0.40),
+                    (0.02, -0.30),
+                    (0.30, -0.30),
+                    (0.42, -0.14),
+                ]);
+            }
+            Self::File => {
+                // 折角纸页:右上角切角,补一小三角表示折进去的页角
+                path(&[
+                    (-0.26, -0.44),
+                    (0.14, -0.44),
+                    (0.26, -0.32),
+                    (0.26, 0.44),
+                    (-0.26, 0.44),
+                    (-0.26, -0.44),
+                ]);
+                path(&[(0.14, -0.44), (0.14, -0.32), (0.26, -0.32)]);
+            }
         }
     }
 }
@@ -465,6 +507,10 @@ mod tests {
             Icon::BulletList,
             Icon::OrderedList,
             Icon::TaskList,
+            // 文件树(#32 I1)
+            Icon::FolderClosed,
+            Icon::FolderOpen,
+            Icon::File,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -517,5 +563,39 @@ mod tests {
             icon_button(ui, Icon::Settings, "设置");
         });
         output.drop_without_applying_deltas();
+    }
+
+    /// 文件树三枚新图标:明暗两套 visuals 各渲染三帧不 panic,且每帧都有
+    /// Shape 落进输出(三帧手法与 gutter.rs 同款——首帧字体注册、后续帧
+    /// tessellation 各有冷启动路径,单帧绿不等于帧帧绿)。颜色随主题取
+    /// visuals 前景,验证的是取色路径本身,不是某个写死色。
+    #[test]
+    fn tree_icons_render_three_frames_in_both_visuals() {
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            for step in 0..3 {
+                for icon in [Icon::FolderClosed, Icon::FolderOpen, Icon::File] {
+                    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        icon.draw(
+                            ui.painter(),
+                            egui::pos2(20.0, 20.0),
+                            crate::ui::tokens::ICON_SM,
+                            ui.visuals().text_color(),
+                        );
+                    });
+                    assert!(
+                        !output.shapes.is_empty(),
+                        "{} 第 {step} 帧 {icon:?} 应有 Shape 输出",
+                        if dark { "暗色" } else { "亮色" }
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
     }
 }
