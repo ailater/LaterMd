@@ -1,0 +1,103 @@
+# Linux x64 deb 包 —— cargo-dist 0.33 的 installer 白名单没有 deb
+# (只支持 shell/powershell/npm/homebrew/msi/pkg),故自建本 job,
+# 模式与 macos-dmg.yml 同构:不重新编译,直接取 dist 已产出的 linux
+# tar.xz 里的二进制,用 dpkg-deb 组包后回传同一 Release。
+#
+# 时序:release.yml host job 尾部(LOCAL PATCH)与 macos-dmg.yml 一同
+# dispatch 本 workflow(GitHub 防递归规则,workflow_dispatch 是唯一例外
+# 通道,详见 docs/distribution.md §1)。
+#
+# 产出资产名:latermd_{version}_amd64.deb —— Debian 惯例(文件名内嵌版本),
+# 与 dist 资产的无版本号命名刻意不同(两套命名共存的理由见
+# docs/distribution.md §2)。Linux 分发渠道 = tar.xz(热链)+ deb(装包),
+# 两者都保留,deb 不是替代品。
+
+name: Linux deb
+
+on:
+  release:
+    types: [published]
+  # 常规通道:release.yml host job dispatch(tag 入参)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要打 deb 的版本 tag(如 v0.0.2)"
+        required: true
+
+permissions:
+  contents: write
+
+# 同一 tag 若被 release 事件与 dispatch 双触发,只跑一个
+concurrency:
+  group: linux-deb-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: true
+
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 取版本号
+        id: ver
+        run: |
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 下载 dist 产出的 linux tar.xz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.ver.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'latermd-x86_64-unknown-linux-gnu.tar.xz'
+          tar -xf latermd-x86_64-unknown-linux-gnu.tar.xz
+          test -x latermd-x86_64-unknown-linux-gnu/latermd
+
+      - name: 组装 deb 目录树
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG="latermd_${VERSION}_amd64"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/doc/latermd"
+          install -m 755 latermd-x86_64-unknown-linux-gnu/latermd \
+            "$PKG/usr/bin/latermd"
+          # 随包文档按 Debian 惯例放 /usr/share/doc;README 首位(安装说明)
+          install -m 644 latermd-x86_64-unknown-linux-gnu/README.md \
+            latermd-x86_64-unknown-linux-gnu/CHANGELOG.md \
+            latermd-x86_64-unknown-linux-gnu/LICENSE \
+            "$PKG/usr/share/doc/latermd/"
+          # control 不用 heredoc 的理由同 macos-dmg.yml:YAML block scalar
+          # 里的结束标记必然带缩进,shell 认不出来
+          {
+            echo "Package: latermd"
+            echo "Version: ${VERSION}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Maintainer: crazykun <jilikun@gmail.com>"
+            echo "Homepage: https://github.com/ailater/LaterMd"
+            echo "Description: LaterMD - Markdown knowledge workbench"
+            echo " Cross-platform, versioned, AI-ready Markdown workbench."
+            echo " GUI app on egui/wgpu; needs a Vulkan/GL driver stack at runtime."
+          } > "$PKG/DEBIAN/control"
+
+      - name: 打 deb 并回传 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          DEB="latermd_${VERSION}_amd64.deb"
+          # --root-owner-group:包内文件属主归 root,不以打包者的 uid 打进包
+          dpkg-deb --build --root-owner-group "latermd_${VERSION}_amd64" "$DEB"
+          dpkg-deb --info "$DEB"
+          SHA=$(sha256sum "$DEB" | cut -d' ' -f1)
+          {
+            echo "### Linux x64 deb"
+            echo ""
+            echo "- 文件: \`$DEB\`"
+            echo "- sha256: \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "${{ steps.ver.outputs.tag }}" "$DEB" --clobber \
+            --repo "${{ github.repository }}"

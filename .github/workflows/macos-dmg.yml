@@ -120,3 +120,25 @@ jobs:
           gh release upload "${{ steps.ver.outputs.tag }}" \
             "${{ steps.dmg.outputs.file }}" --clobber \
             --repo "${{ github.repository }}"
+
+      # 清理发布冗余资产:macOS 分发只走 universal2 dmg(AGENTS.md §5),
+      # 每架构 tar.xz 只是本 job 的 dmg 原料;dist 的 source.tar.gz 与 GitHub
+      # 自动生成的 source 归档重复。dist 无产物白名单配置,只能发布后清理。
+      # 放在本 job 尾部(原料已用完、dmg 已回传)才不会与下载步竞态;
+      # 每个资产容忍缺失(只 echo 不标红),命名漂移靠 docs/distribution.md 表 2 核对。
+      # 已知代价:sha256.sum 是 dist 生成的全量清单,仍含已删条目,接受。
+      - name: 清理冗余资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for A in \
+            latermd-aarch64-apple-darwin.tar.xz \
+            latermd-aarch64-apple-darwin.tar.xz.sha256 \
+            latermd-x86_64-apple-darwin.tar.xz \
+            latermd-x86_64-apple-darwin.tar.xz.sha256 \
+            source.tar.gz \
+            source.tar.gz.sha256; do
+            gh release delete-asset "${{ steps.ver.outputs.tag }}" "$A" \
+              --repo "${{ github.repository }}" --yes \
+              || echo "skip $A(不存在)"
+          done

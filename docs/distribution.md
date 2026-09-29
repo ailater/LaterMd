@@ -5,6 +5,7 @@
 > [.github/workflows/release.yml](../.github/workflows/release.yml)(dist 生成 + 三处 LOCAL PATCH,见 §1)、
 > [.github/workflows/auto-tag.yml](../.github/workflows/auto-tag.yml)(自动打 tag,2026-09-26 接入)、
 > [.github/workflows/macos-dmg.yml](../.github/workflows/macos-dmg.yml)(自建 dmg job)、
+> [.github/workflows/linux-deb.yml](../.github/workflows/linux-deb.yml)(自建 deb job,2026-09-29 接入)、
 > [packaging/latermd.rb](../packaging/latermd.rb)(cask 模板)。
 > 与本文冲突时,以配置文件为准并回改本文。
 
@@ -32,15 +33,33 @@ PR 合入 main(版本号已 bump)
 │   (正文 = CHANGELOG.md 对应版本小节)          │
 └─────────────────────────────────────────────┘
         │  host job 尾部 dispatch(非 on: release 事件)
-        ▼  gh workflow run macos-dmg.yml -f tag=<tag>
+        ▼  gh workflow run macos-dmg.yml / linux-deb.yml -f tag=<tag>
 ┌─────────────────────────────────────────────┐
 │ macos-dmg.yml(自建 job,macos-14)             │
 │ checkout(取 packaging/macos/Info.plist)      │
 │ → 下载双架构 tar.xz → lipo 合一 → 组装 .app    │
 │ → hdiutil 合 dmg → sha256 写 step summary     │
 │ → gh release upload 回传同一 Release           │
+│ → 尾部清理冗余资产(mac 每架构 tar.xz 等,见 §2) │
+└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│ linux-deb.yml(自建 job,ubuntu-22.04)         │
+│ 下载 linux tar.xz → 取二进制 → dpkg-deb 组包   │
+│ → gh release upload 回传同一 Release           │
 └─────────────────────────────────────────────┘
 ```
+
+**为什么 deb 也走自建 job**:cargo-dist 0.33 的 installer 白名单是
+shell/powershell/npm/homebrew/msi/pkg,**没有 deb**,`installers = ["deb"]`
+直接 TOML 解析报错。deb 与 dmg 同构:不重新编译,取 dist 已产出的
+tar.xz 里的二进制组包(deb 用 dpkg-deb,dmg 用 lipo + hdiutil)。
+Linux 分发渠道 = tar.xz(热链)+ deb(装包),两者并存,deb 不是替代品。
+
+**为什么 macos-dmg 尾部要清理资产**:macOS 分发只走 universal2 dmg
+(AGENTS.md §5),每架构 tar.xz 只是 dmg 的 lipo 原料;dist 的
+source.tar.gz 与 GitHub 自动生成的 source 归档重复。dist 没有产物
+白名单/排除配置,只能发布后清理(`gh release delete-asset`)。已知代价:
+`sha256.sum` 是 dist 生成的全量清单,仍含已删条目,接受。
 
 **为什么链路必须显式 dispatch(GitHub 防递归规则)**:workflow 用 GITHUB_TOKEN
 推的 tag、建的 Release,产生的事件**不会触发新的 workflow run**(防无限递归),
@@ -53,7 +72,8 @@ PR 合入 main(版本号已 bump)
 重新生成时会被覆盖,必须重新打上):
 1. `on:` 增加 `workflow_dispatch`(auto-tag 的 dispatch 入口);
 2. `permissions` 增加 `"actions": "write"`(host job 要 dispatch macos-dmg);
-3. host job 尾部「Dispatch macOS dmg build」步骤。
+3. host job 尾部「Dispatch macOS dmg build」步骤(一个步骤内先后
+   dispatch macos-dmg.yml 与 linux-deb.yml)。
 
 **LOCAL PATCH 的前置条件**:`dist-workspace.toml` 里 `allow-dirty = ["ci"]`。
 dist 0.33 运行时会校验 release.yml 与生成模板逐字节一致,任何补丁都会触发
@@ -82,21 +102,27 @@ bot 直推 main 改版本号会被分支保护拦截。版本号不变地合入 
 | 资产 | 产生方 | 命名 | 版本号 |
 |---|---|---|---|
 | Linux | dist | `latermd-x86_64-unknown-linux-gnu.tar.xz` | **无**(官方刻意,`releases/latest/download/` 热链可用) |
-| macOS x64 | dist | `latermd-x86_64-apple-darwin.tar.xz` | 无 |
-| macOS arm64 | dist | `latermd-aarch64-apple-darwin.tar.xz` | 无 |
+| Linux deb | linux-deb.yml | `latermd_{version}_amd64.deb` | **有**(Debian 惯例,文件名内嵌版本) |
+| macOS x64 | dist | `latermd-x86_64-apple-darwin.tar.xz` | 无;**发布后清理**(仅 dmg 原料) |
+| macOS arm64 | dist | `latermd-aarch64-apple-darwin.tar.xz` | 无;**发布后清理**(仅 dmg 原料) |
 | Windows x64 | dist | `latermd-x86_64-pc-windows-msvc.zip` | 无 |
 | Windows ARM64 | dist | `latermd-aarch64-pc-windows-msvc.zip` | 无 |
 | macOS universal2 | macos-dmg.yml | `latermd-v{version}-universal2-apple-darwin.dmg` | **有**(lscreen 同构,cask url 模板依赖) |
 | 校验和 | dist | 每资产附 `.sha256`,另有 `sha256.sum` | — |
 
+- **发布后清理**(macos-dmg.yml 尾部步骤):上述两行 macOS 每架构 tar.xz
+  (含 `.sha256`)与 `source.tar.gz`(含 `.sha256`)在 dmg 回传后从 Release
+  删除;清理是容忍失败式(资产缺失只 echo)。重打历史 dmg 时 tar.xz 已不在,
+  需从对应 tag 重跑 dist 构建取料。
 - 二进制名统一 `latermd`(crate 名仍为 `latermd-app`,`[[bin]]` 改名 +
   `crates/latermd-app/dist.toml` shadow 资产前缀)。
 - **风险登记册 #7**:cask 停更的教训是 dmg 资产命名变化后 cask URL 模板没跟上
   (lscreen 曾因此停在 0.6.0)。**任何资产命名调整必须同步改 cask url / livecheck**,
   并在本文表 2 回改。
-- 注意 dist 的 tar.xz/zip 与自建 dmg 的版本号策略**刻意不同**:前者无版本号
+- 注意 dist 的 tar.xz/zip 与自建 dmg/deb 的版本号策略**刻意不同**:前者无版本号
   (dist 官方设计,支持 latest 热链),后者带版本号(Homebrew cask 惯例,url 与
-  version 绑定以便 sha256 校验)。这是两套命名共存的原因,不是疏漏。
+  version 绑定以便 sha256 校验;Debian 惯例文件名内嵌版本)。这是两套命名
+  共存的原因,不是疏漏。
 
 ## 3. 首个 Release 步骤(v0.0.1)
 
@@ -136,13 +162,14 @@ git tag v0.0.1 && git push origin v0.0.1   # 人工 tag push 直接触发 releas
 ### 3.3 资产核对清单(Release 页面逐项勾)
 
 - [ ] `latermd-x86_64-unknown-linux-gnu.tar.xz`(+`.sha256`)
-- [ ] `latermd-x86_64-apple-darwin.tar.xz`(+`.sha256`)
-- [ ] `latermd-aarch64-apple-darwin.tar.xz`(+`.sha256`)
+- [ ] `latermd_{version}_amd64.deb`(linux-deb job 完成,回传资产)
 - [ ] `latermd-x86_64-pc-windows-msvc.zip`(+`.sha256`)
 - [ ] `latermd-aarch64-pc-windows-msvc.zip`(+`.sha256`)
 - [ ] `latermd-v0.1.0-universal2-apple-darwin.dmg`(macos-dmg job 完成)
       —— **回传资产不在 dist 生成的下载表里**,需在 Release 正文手工补一行(见 §4 第 5 步)
-- [ ] `sha256.sum`、`source.tar.gz` 及 `dist-manifest.json`(dist 附带)
+- [ ] `sha256.sum`、`dist-manifest.json`(dist 附带)
+- [ ] **清理已生效**:Release 页面不再出现 `*-apple-darwin.tar.xz` 与
+      `source.tar.gz`(macos-dmg 尾部清理;若在,是清理步失败,查其日志)
 - [ ] 「macOS dmg」job 的 **step summary** 里有 dmg 的 sha256 —— 首次填入
       cask 模板用(macos-dmg.yml:96-106)。
 - [ ] Release 未被误标 prerelease(除非 tag 带预发布后缀)。
