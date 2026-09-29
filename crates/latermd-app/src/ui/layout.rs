@@ -1265,6 +1265,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 浮窗测试的统一 viewport:浮窗首次打开锚定 viewport 中心,无头默认
+    /// viewport 是 NOTHING(中心点非有限值),必须显式给真实尺寸,事件命中
+    /// 语义才与真实窗口一致。
+    fn test_viewport() -> Rect {
+        Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))
+    }
+
     /// commit 建议浮窗:复制按钮把 subject 写进系统剪贴板输出命令;关闭按钮
     /// 经完整 draw → reduce 链路清掉建议(浮窗随之消失)。
     ///
@@ -1279,10 +1286,16 @@ mod tests {
         let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
 
         // 帧 1:单独渲染浮窗拿按钮位置(Area 按 id 记忆,draw 内位置一致)
-        ctx.run_ui(RawInput::default(), |ui| {
-            let (copy, close) = commit_dialog(ui, "docs: 新增README.md");
-            rects.set((copy.rect, close.rect));
-        })
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(test_viewport()),
+                ..Default::default()
+            },
+            |ui| {
+                let (copy, close) = commit_dialog(ui, "docs: 新增README.md");
+                rects.set((copy.rect, close.rect));
+            },
+        )
         .drop_without_applying_deltas();
 
         let (copy_center, close_center) = {
@@ -1300,6 +1313,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![Event::PointerMoved(copy_center)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| {
@@ -1310,6 +1324,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![click(copy_center, true)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| {
@@ -1320,6 +1335,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![click(copy_center, false)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| {
@@ -1340,6 +1356,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![Event::PointerMoved(close_center)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| app.draw(ui),
@@ -1348,6 +1365,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![click(close_center, true)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| app.draw(ui),
@@ -1356,6 +1374,7 @@ mod tests {
         let output = ctx.run_ui(
             RawInput {
                 events: vec![click(close_center, false)],
+                screen_rect: Some(test_viewport()),
                 ..Default::default()
             },
             |ui| app.draw(ui),

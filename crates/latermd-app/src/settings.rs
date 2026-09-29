@@ -181,7 +181,10 @@ pub fn dialog(
     let mut open = settings.open;
     let mut close = None;
     egui::Window::new("设置")
-        .default_pos([120.0, 100.0])
+        // 首次打开锚定屏幕中心(pivot=窗口中心对齐锚点,与窗口尺寸无关);
+        // 拖动后的位置由 Area 按窗口 id 记忆,不再回中心
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ui.ctx().viewport_rect().center())
         .default_size([600.0, 440.0])
         .collapsible(false)
         .resizable(true)
