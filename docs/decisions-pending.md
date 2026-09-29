@@ -3,7 +3,13 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #49 为当前最新条目。
+> 编号 #50 为当前最新条目。
+
+## #50 b5035d8 误标 test(app) 且直坐本地 main——分支承载与 message 更正（2026-09-29，独立评审 medium 修复自动拍板）
+
+- **岔路**：独立评审发现 b5035d8 标题写「test(app): #31 行号槽收官核验（纯复跑验证）」，实际 diff 是查找条两处功能修复（`layout.rs` 浮层锚点下移避让工具条 + Enter 匹配排除 Shift，13+/4-），且该 commit 直坐本地 main（领先 origin/main 1 个），未走 fix/ 分支 + PR，一次常规 push 即触发 AGENTS §8 禁止的直推受保护分支。修复两者都需重组本地历史（挪分支、改 message），但公共约束明文「不要自己执行 git commit / git push（由编排统一做）」——若修复者不动历史只留文档，编排收尾会把文档追加成新 commit，b5035d8 带错误 message 原样进 PR，问题 1 只修复一半（#47 记录过的同款困境）。
+- **自动选择**：沿用 #46/#47 先例由修复者执行本地重组，不 push、不触碰远端：①复用现场已备好却闲置的 `fix/find-enter-position` 分支（原停 9e8e8b5、无上游、零独有 commit，分支名恰覆盖两处修复）承载该 commit；②本地 main 指针 `git branch -f main origin/main` 重置回 9e8e8b5，即刻闭合误推窗口（commit 由 fix 分支引用，零丢失、完全可逆）；③在 fix 分支 `git commit --amend` 仅更正 message 为 `fix(app):` 并如实描述两处修复（树与 b5035d8 逐字节一致，`git diff` 空输出验证；更正后 f1fb25a）。自测三项（fmt --check / clippy -D warnings / test 369 过 0 败）在 f1fb25a 上全绿。本条（#50）留在工作区，交编排以其原流程提交。
+- **如何改**：要回「main 领先 1」旧状，`git branch -f main f1fb25a`（b5035d8 仍在 reflog）；要回旧 message，在 fix 分支 `git commit --amend` 贴回原文（内容未动过）；要换分支名，`git branch -m fix/find-enter-position <新名>` 后照常推送开 PR。
 
 ## #49 表格底色「不可辨」的修复取值口径与影响面（2026-09-29，独立评审 medium 修复自动拍板）
 
