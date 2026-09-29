@@ -474,8 +474,30 @@ mod tests {
         }
     }
 
-    /// 页签:选中态与未选中态都能渲染,点击返回 clicked(选中与否由调用方
-    /// 的消息归约决定,本函数只做视觉与交互)。
+    /// Close 是 Painter 画的两条交叉线,不走 Unicode 字体字形(查找卡
+    /// 曾用 `ui.button("✕")`,缺字时呈方框)。用 shapes 取证至少应有
+    /// 两条 LineSegment,且一条正斜率/一条负斜率。
+    #[test]
+    fn close_icon_is_vector_cross_not_text() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            Icon::Close.draw(ui.painter(), egui::pos2(20.0, 20.0), ICON, Color32::WHITE);
+        });
+        let mut lines = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::LineSegment { points, .. } = &clipped.shape {
+                lines.push(*points);
+            }
+        }
+        assert!(lines.len() >= 2, "Close 必须至少画两条交叉线: {lines:?}");
+        assert!(
+            lines.iter().any(|[a, b]| (b.x - a.x) * (b.y - a.y) > 0.0)
+                && lines.iter().any(|[a, b]| (b.x - a.x) * (b.y - a.y) < 0.0),
+            "Close 必须同时包含两种对角方向: {lines:?}"
+        );
+        output.drop_without_applying_deltas();
+    }
+
     #[test]
     fn icon_tab_renders_selected_and_clickable() {
         let ctx = egui::Context::default();

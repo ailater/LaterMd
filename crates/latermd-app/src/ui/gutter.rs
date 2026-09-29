@@ -180,6 +180,21 @@ mod tests {
             .expect("编辑器正文 galley 已绘制")
     }
 
+    /// 逻辑行(1-based)→ 其首 visual row 的下标(与绘制侧 `is_line_start`
+    /// 同一定义,供测试换算真值)。
+    fn logical_anchor_row(galley: &egui::Galley, line: usize) -> Option<usize> {
+        let mut seen = 0usize;
+        for idx in 0..galley.rows.len() {
+            if is_line_start(galley, idx) {
+                seen += 1;
+                if seen == line {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     /// ① 行号 y 与 galley 逻辑行首 visual row 对齐:数字矩形中心 y 逐行
     /// 等于 `galley_pos.y + 行矩形中心 y`(同一帧的 galley 度量),且
     /// 右缘对齐、值连续。
@@ -336,6 +351,68 @@ mod tests {
         assert_eq!(by_y[0].0, "1", "视口在文档顶,首行行号是 1");
         for (idx, (label, _, _)) in by_y.iter().enumerate() {
             assert_eq!(label, &(idx + 1).to_string(), "可见区间行号连续");
+        }
+    }
+
+    /// 滚动帧:行号与文本同处一个 ScrollArea 闭包,滚轮把内容推离顶部后,
+    /// 可见行号区间从 1 之外开始、数量仍是视口规模,且与 galley 行首
+    /// 中心的对齐关系在滚动后保持(与 editor.rs 滚轮测试同款事件序列,
+    /// 滚动落账后补两帧再取证)。
+    #[test]
+    fn scrolled_viewport_keeps_digits_aligned_and_culled() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let wheel = || {
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let _ = frame_shapes(&ctx, &mut editor, 0.0, None, Vec::new());
+        for i in 0..10 {
+            let _ = frame_shapes(&ctx, &mut editor, 0.1 + f64::from(i) * 0.1, None, wheel());
+        }
+        // 偏移在 ScrollArea::end 落账、hover 判定滞后一帧,补两帧再取证
+        let _ = frame_shapes(&ctx, &mut editor, 1.2, None, Vec::new());
+        let _ = frame_shapes(&ctx, &mut editor, 1.3, None, Vec::new());
+        let shapes = frame_shapes(&ctx, &mut editor, 1.4, None, Vec::new());
+
+        let editor_text = editor_text(&shapes, "普通的一行");
+        let mut by_y = digits(&shapes);
+        by_y.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        assert!(
+            (20..45).contains(&by_y.len()),
+            "滚动后仍只画视口规模(实测 {} 个)",
+            by_y.len()
+        );
+        let first: usize = by_y[0].0.parse().expect("行号是数字");
+        assert!(first > 1, "视口已离开文档顶,首见行号 >1(实测 {first})");
+        for pair in by_y.windows(2) {
+            let a: usize = pair[0].0.parse().unwrap();
+            let b: usize = pair[1].0.parse().unwrap();
+            assert_eq!(b, a + 1, "滚动后行号仍连续");
+        }
+        // 对齐保持:每个可见行号中心 y == 该逻辑行首 visual row 中心
+        for (label, rect, _) in &by_y {
+            let line: usize = label.parse().unwrap();
+            let anchor = logical_anchor_row(&editor_text.galley, line).expect("逻辑行存在");
+            let row = editor_text.galley.rows[anchor].rect();
+            let expected = editor_text.pos.y + row.center().y;
+            assert!(
+                (rect.center().y - expected).abs() < 0.51,
+                "滚动后第 {line} 行号中心 {} 与 galley 行首中心 {} 对齐",
+                rect.center().y,
+                expected
+            );
         }
     }
 

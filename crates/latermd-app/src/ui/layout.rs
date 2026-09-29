@@ -304,6 +304,7 @@ impl LaterMdApp {
         // 「控件附属状态」的例外见 state.rs)。
         let state = &mut self.state;
         let outbox = &mut self.outbox;
+        let mut source_rect = None;
         // 编辑器区显式铺内容色:panel 默认 fill 是 `panel_fill`(侧栏色),
         // 不覆盖的话编辑器与右预览会出现两种底色(theme.rs 的口径是
         // 「编辑器与预览面板显式 .fill;侧栏吃 panel_fill」)。margin 取
@@ -346,12 +347,6 @@ impl LaterMdApp {
                     outbox,
                     self.format_probe.as_deref_mut(),
                 );
-                // 文档内查找条(#17 最小版):源码模式且开着才占一行;
-                // Live 模式不支持(源码栏功能,坤哥点名),开着切 Live 时
-                // 收起避免悬着一条无处跳转的死条。
-                if state.find.open && state.render_mode == crate::live::RenderMode::Source {
-                    find_bar(ui, &mut state.find, outbox);
-                }
                 crate::ui::editor::ui(
                     ui,
                     editor,
@@ -365,9 +360,18 @@ impl LaterMdApp {
                     state.render_mode,
                     crate::ui::editor::tab_editor_id(*id),
                 );
+                source_rect = Some(ui.min_rect());
             });
 
-        // ⑤ 顶层浮层五件套(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
+        // ⑤ 查找卡是源码区专属浮层:不参与 CentralPanel 普通布局,因此
+        // 不会把源码整体向下推;右上锚点留出滚动条/边框间隙。
+        if state.find.open && state.render_mode == crate::live::RenderMode::Source {
+            if let Some(rect) = source_rect {
+                draw_find_overlay(ui.ctx(), rect, &mut state.find, outbox);
+            }
+        }
+
+        // ⑥ 顶层浮层五件套(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
         // 图片框):浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后
         // 取语义上的「最上层」。三栏与禅定两条布局路径共用,理由见
         // [`Self::draw_overlay_dialogs`]。
@@ -672,11 +676,36 @@ fn poll_capture(ctx: &egui::Context, state: &mut crate::state::State) {
     }
 }
 
-/// 文档内查找条(#17 最小版,Ctrl+F):查找词输入 + 上一个/下一个 +
-/// 计数 + 关闭。输入变化即重扫并跳第一命中(归约侧),Enter/Shift+Enter
-/// 前后跳(环绕),Esc 关闭并把输入框交还。命中跳转经归约写
-/// `pending_selection`,下一帧编辑器写回光标并滚入视口(#29 链路)。
-fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &mut Vec<Message>) {
+/// 查找条的源码区浮层:固定在源码宿主右上角,不参加正文布局。用 Window
+/// 而不是普通 horizontal,并关闭 title bar/resize/collapse,避免它变成可拖
+/// 对话框;id 稳定,位置每帧由源码 rect 重算,侧栏/窗口拖宽后不会漂走。
+fn draw_find_overlay(
+    ctx: &egui::Context,
+    source_rect: egui::Rect,
+    find: &mut crate::state::FindBarState,
+    outbox: &mut Vec<Message>,
+) {
+    let margin = 8.0;
+    let anchor = source_rect.right_top() + egui::vec2(-margin, margin);
+    egui::Window::new("文档内查找")
+        .id(egui::Id::new("editor-find-overlay"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_pos(anchor)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .order(egui::Order::Foreground)
+        .constrain_to(source_rect.shrink(margin))
+        .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)))
+        .show(ctx, |ui| find_bar_contents(ui, find, outbox));
+}
+
+/// 查找卡内容与状态无关,可在 Window/无头测试中复用。
+fn find_bar_contents(
+    ui: &mut egui::Ui,
+    find: &mut crate::state::FindBarState,
+    outbox: &mut Vec<Message>,
+) {
     let total = find.hits.len();
     let pos = find.hit.map(|h| h + 1).unwrap_or(0);
     ui.horizontal(|ui| {
@@ -684,6 +713,7 @@ fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &m
         let mut query_buf = find.query.clone();
         let response = ui.add(
             egui::TextEdit::singleline(&mut query_buf)
+                .id(egui::Id::new("editor-find-input"))
                 .desired_width(220.0)
                 .hint_text("输入即跳转;Enter 下一个"),
         );
@@ -691,8 +721,6 @@ fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &m
             find.query = query_buf.clone();
             outbox.push(Message::FindQueryChanged(query_buf));
         }
-        // Enter/Shift+Enter 在输入框聚焦时由这里消费(TextEdit 会吃普通
-        // 键事件,必须在 input 流里抢先)
         let enter = ui.input(|i| {
             i.events.iter().any(|e| {
                 matches!(
@@ -709,12 +737,8 @@ fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &m
             i.events.iter().any(|e| {
                 matches!(
                     e,
-                    egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.shift
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
+                        if modifiers.shift
                 )
             })
         });
@@ -739,13 +763,14 @@ fn find_bar(ui: &mut egui::Ui, find: &mut crate::state::FindBarState, outbox: &m
         } else {
             format!("{pos}/{total}")
         });
-        if ui.button("✕").clicked() {
+        if crate::ui::icons::icon_button(ui, crate::ui::icons::Icon::Close, "关闭查找 (Esc)")
+            .clicked()
+        {
             outbox.push(Message::FindBarToggled(false));
         }
     });
 }
 
-/// 底部状态栏:路径 · 行列 · 字数 · 主题 · 渲染后端 · AI · MCP。
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · AI · MCP。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
     ui.horizontal_wrapped(|ui| {
