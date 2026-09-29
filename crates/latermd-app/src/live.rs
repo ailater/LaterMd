@@ -35,14 +35,6 @@ pub enum RenderMode {
 }
 
 impl RenderMode {
-    /// 状态栏/面板标题用。
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Source => "源码",
-            Self::Live => "Live",
-        }
-    }
-
     /// 互换(命令入口)。
     pub fn opposite(self) -> Self {
         match self {
