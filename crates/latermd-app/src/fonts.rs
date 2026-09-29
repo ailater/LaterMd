@@ -106,11 +106,6 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
         .get_mut(&FontFamily::Proportional)
         .expect("出厂 Proportional 族恒存在")
         .insert(0, NAME_REGULAR.to_owned());
-    // phosphor 图标字体(U2/#35 拍板全量迁移)。字形在私有区码位
-    // (U+E0xx),不与拉丁/CJK/emoji 抢;icons.rs 排版文本走 Proportional 族,
-    // add_to_fonts 内部把数据插入该族(与 Monospace),位置约定见下方单测
-    // inter_leads_and_emoji_order_survives 的 phosphor 断言。
-    egui_phosphor::add_to_fonts(&mut defs, egui_phosphor::Variant::Regular);
     // Medium/SemiBold 独立族:链头是对应字重,其余与 Proportional 同构 ——
     // emoji 链照旧,CJK 回退也挂尾(工具条/标题是中文,链尾无 CJK 会变方块)
     // `bold` 是 SemiBold 的别名族(vendored 渲染按字面量探测,decisions #48)
@@ -252,15 +247,6 @@ mod tests {
         assert!(pos(prop, "NotoEmoji-Regular") < pos(prop, "emoji-icon-font"));
         assert_eq!(prop.last().map(String::as_str), Some(CJK_PROPORTIONAL));
 
-        // phosphor 图标字体(egui-phosphor add_to_fonts 内部 insert 到第 1
-        // 位):必须在 Inter 之后(其自带的基本拉丁字形不得抢先正文),在
-        // NotoEmoji 之前(私有区 U+E0xx 图标码位在 emoji 命中前落定)。
-        assert!(
-            pos(prop, NAME_REGULAR) < pos(prop, "phosphor")
-                && pos(prop, "phosphor") < pos(prop, "NotoEmoji-Regular"),
-            "phosphor 应插在 Inter 之后、emoji 之前: {prop:?}"
-        );
-
         // Inter 非等宽,不进 Monospace;CJK 照挂尾
         let mono = chain(&FontFamily::Monospace);
         assert!(!mono.iter().any(|n| n == NAME_REGULAR));
@@ -392,14 +378,6 @@ mod tests {
         assert!(
             ctx.fonts_mut(|f| f.has_glyphs(&bold, "标题加粗")),
             "bold 别名族的 CJK 回退链生效"
-        );
-        // phosphor 图标码位(私有区 U+E0xx):icons.rs 全量迁移(U2/#35)后
-        // 图标 = 排版一段 phosphor 文本,码位命中是整个图标体系的前提;
-        // 用 crate 常量避免硬编码码位。
-        let icon = egui::FontId::new(14.0, FontFamily::Proportional);
-        assert!(
-            ctx.fonts_mut(|f| f.has_glyphs(&icon, egui_phosphor::regular::FILE_PLUS)),
-            "phosphor 图标码位命中(图标体系的前提)"
         );
     }
 }
