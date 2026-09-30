@@ -36,7 +36,7 @@
 | 18 | autosave | 自动保存与崩溃恢复:编辑停顿 30s 或切标签时把脏缓冲落 `<doc>.latermd-draft`(与原文件同目录或状态目录);启动检测孤儿 draft 弹恢复条(恢复/丢弃);正常保存/关闭即清 draft | ⏳待开始 | 防丢是编辑器基本盘;draft 不进 Git 忽略清单之外的地方,文件树过滤 `*.latermd-draft` |
 | 19 | ime-follow | Linux IME 候选框跟随:光标移动时上报 IME 位置(egui 0.36 ViewportCommand::IMEPosition 或 input IME 事件链),fcitx5 实测候选框贴光标;m0-report 验证 1 销账 | 🔄本地完成(Linux 链路+冒烟完成,候选框目视与 Win/mac 真机留人工;待推送/PR) | m0 挂账「输入可用但候选框不跟随」;Win/mac 行为留真机人工项。落点:feature/ime-follow 三 commits `e749fce`(显式 IMERect 上报,触发判定纯函数+4 无头测试+gdb XIM spot 取证)+`3450a12`(冒烟取证落档 ime-follow-acceptance.md 与 m0 验证 1 复测小节)+`d9f94cc`(finding 1:触发判定镜像 egui-winit 自动路径谓词,事件帧/滚动帧同帧盖回,轮次 3 帧分段取证 37/37 覆盖 0 单飞)。自动侧证明到「帧末 spot 值恒为 caret 值+无 panic」为止;候选框目视贴光标(含快速打字不跳顶,坤哥 2026-09-30 症状复测指引见 ime-follow-acceptance §3.1.1)、Win/mac 真机三项、Wayland 对照均留人工/blocked_external,收口前本行不得标完成 |
 | 20 | ai-adapters | AI provider 补全:Anthropic(messages API/SSE)与 Ollama(本地 /api/chat NDJSON)两个 adapter,与 openai.rs 同 trait;设置页 provider 三选一;mock 不动 | ⏳待开始 | #3 只交付了 OpenAI 兼容端;key 由用户填(decisions-pending #3),无 key 走 mock |
-| 22 | cask-bump | Homebrew cask 自动回填:Release 发布 workflow 追加一步,gh api 更新 crazykun/homebrew-ailater 的 Cask latermd.rb(version + universal2 dmg sha256),失败仅告警不阻塞发布 | ⏳待开始 | macos-dmg.yml 注释明说「auto-bump 只管 Formula,cask 靠手动」——发版链路最后一块手动环节 |
+| 22 | cask-bump | Homebrew cask 自动回填:Release 发布 workflow 追加一步,gh api 更新 crazykun/homebrew-ailater 的 Cask latermd.rb(version + universal2 dmg sha256),失败仅告警不阻塞发布 | 🔄本地完成(macos-dmg.yml 尾部 cask-bump 步落地:无 token/gh api 失败/行格式不匹配均只告警,trap EXIT 强制 exit 0;stub gh 六场景端到端实测;tap 仓默认分支实为 master,任务书 ref=main 实测 404,步骤按默认分支读写;与 tap auto-bump cron 双写并存留评审,decisions-pending #57。HOMEBREW_TAP_TOKEN 需人工配 secrets + GitHub 侧生效验证 blocked_external;待推送/PR) | 原「auto-bump 只管 Formula」口径已过时(tap 已扩 CASKS 表),本步改为即时回填、tap cron 兜底的双路并存 |
 | 23 | font-prefs | 编辑器字号/行距用户设置:外观页两滑杆(字号 12-24 默认 15,行距 1.2-2.0 默认 1.5),持久化 settings.json,作用于编辑器与预览正文(标题按比例) | ⏳待开始 | 密度档位特意不动字号,用户手动可调是缺口;CJK 可读性下限 12 |
 | 24 | command-palette | Ctrl+P 快速打开:居中浮层,模糊搜文件树全部 md(打开)+ Command 全集(执行),↑↓ 选择 Enter 确认,Esc 关 | ⏳待开始 | 现代编辑器标配体验;复用 Command enum 与文件树快照,无新依赖 |
 | 25 | export-pdf | 导出 PDF:headless 渲染(铁律 2 的验证场——latermd-render 不依赖 egui),printpdf 或 HTML→PDF 选型走 ADR;CJK 字体嵌入 | ⏳待开始 | 最重的候选,列队尾;P0 只交付了导出 HTML |
@@ -91,5 +91,5 @@
 - ~~三平台打包真机验收（feature/p0-packaging 分支）~~ 已过时：cargo-dist 链路已进 main，v0.0.1/v0.0.2/v0.0.3 均自动发版（V1 核对表 R16，证据 E1/E4/E10）
 - AI provider 真实 API key 配置（decisions-pending #3）
 - 发布产物真机验收（三平台可安装 / 连续写 1 小时 / 导出 HTML / .md 不篡改，roadmap P0 出口四条）
-- ~~cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）~~ 已失效（2026-09-30 核实）：tap 仓 auto-bump 已含 CASKS 表，自动跟版至 0.0.3，无需手动回填；主仓 #22 cask-bump 与其功能重复，撤留留后续评审（V1 核对表 L4，证据 E12/E13；decisions-pending #53 补全第 3 点）
+- ~~cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）~~ 已失效（2026-09-30 核实）：tap 仓 auto-bump 已含 CASKS 表，自动跟版至 0.0.3，无需手动回填；主仓 #22 cask-bump 与其功能重复，撤留留后续评审（V1 核对表 L4，证据 E12/E13；decisions-pending #53 补全第 3 点）。追记（同日）：#22 已按队列落地为 macos-dmg.yml 尾部 cask-bump 步，与 tap cron 即时+兜底双路并存，撤留仍待评审（decisions-pending #57）
 - 图床真机上传走通一次（acceptance-checklist）

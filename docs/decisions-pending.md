@@ -3,7 +3,23 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #56 为当前最新条目。
+> 编号 #58 为当前最新条目。
+
+## #58 M2 文档棒被点名改 README.md,而「改动面只有 macos-dmg.yml 与 docs/」——同文两口径冲突的解读(2026-09-30,#22 cask-bump M2 文档对齐·自动拍板)
+
+- **岔路**:#22 收官的 M2 任务书 2) 明确要求「在 distribution.md 该小节与主仓 README 安装节各补一段」失效下载说明,同一任务书公共约束又写「改动面只有 .github/workflows/macos-dmg.yml 与 docs/」——README.md 两个口径都不包含,直接矛盾(与 #54 同型:模块 paths 与任务文本点名 README 的冲突)。
+- **备选**:A 按「改动面」句跳过 README,失效下载说明只落 distribution.md;B 改 README 补段并登记本条;C escalate 等人工裁决。
+- **自动选择**:B。
+- **理由**:任务 2 是本模块三大目标之一(模块标题即「失效下载说明」),README 是用户侧说明的第一入口,不改则任务 2 只完成一半;「改动面」一句的可辨认意图是排除其余 workflow(同句逐一列出 release.yml/auto-tag.yml/linux-deb.yml/rust.yml)与代码,README 属文档面不在排除语义内;#54 前例里 README 改动只是次要纠偏且彼时 paths 确为 ["docs"],本次不同——README 补段是主交付物。补充内容全部为既有实测口径的复述(universal2 dmg 资产、xattr 命令、tap cron 兜底),无新断言。
+- **如何改**:若评审认为该棒无权动 README,回删 README.md「安装」节新增的「brew 拿不到新版本时」bullet 即可,失效下载说明以 distribution.md §3.4 为唯一落点,其余改动不受影响。
+
+## #57 #22 cask 回填落地:与 tap 侧 auto-bump cron 双写同一 cask 文件的去留(2026-09-30,#22 cask-bump·自动拍板)
+
+- **岔路**:docs/distribution.md §3.4 与 auto-plan.md:94 已核实 tap 仓 auto-bump 含 CASKS 表、每小时自动跟版 cask version/sha256,主仓 #22 与其功能重复、「撤与留留后续评审」;但 auto-plan 队列(权威清单 priority-queue-2026-09-30.json)仍排 #22 且本棒任务书明确要求在 macos-dmg.yml 实现 cask 回填步——照做(与文档「重复」结论冲突)还是停手等评审,是本棒第一岔路。次级岔路:任务书要求 `?ref=main` 读 cask,实测 tap 仓只有 master 一个分支、`ref=main` 404。
+- **备选**:A 拒做引用 #53 等评审;B 按任务书落地,步内注释与 docs 如实标注双写关系与竞态分析,分支按现状取默认分支;C escalate。
+- **自动选择**:B;分支读写不钉名字(GET 省 ref、PUT 省 branch 字段,均落默认分支,现为 master)。
+- **理由**:#53 只登记冲突未裁决,队列把 #22 排在 #19 之后且本 run 按队列派工,「后续评审」的执行主体是用户不是本棒;该步失败语义为纯告警,落地后与 tap cron 并存无实际风险——两边写同一文件的 version/sha256 两行且值同源同值(sha256 都取自同一 dmg 文件:本地 shasum == GitHub asset digest),contents API 带 blob sha 原子覆盖,撞车最坏是 PUT 409 → 告警跳过、cron 兜底,双方都写不坏文件;ref=main 实测 404(gh api 「No commit found for the ref main」,2026-09-30),按「任务描述与仓库现状冲突,以现状为准」改默认分支,还顺带免疫未来分支改名。
+- **如何改**:若评审结论是撤主仓侧——删 macos-dmg.yml 尾部 cask-bump 步与 secrets.HOMEBREW_TAP_TOKEN,回删 distribution.md §3.4/§4 与 auto-plan.md:94 的双路口径即可,tap 侧无感;若撤 tap 侧 CASKS 表项——本步成为唯一回填通道,须把 HOMEBREW_TAP_TOKEN 从可选升为必配并在 §4 发版清单加巡检项;若要钉死分支,把 GET 换回 `?ref=<分支>` 并给 PUT payload 加 `"branch"` 字段。
 
 ## #56 IME 补报红线的「空闲帧」口径:按自动路径谓词镜像重定义(2026-09-30,#19 ime-follow 独立评审修复·自动拍板)
 
