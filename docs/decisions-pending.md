@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #60 为当前最新条目。
+> 编号 #62 为当前最新条目。
+
+## #61 代码块复制按钮(#38)的六处口径:挂载点上游已有零 vendor、常驻显示、语言标签取 info 首词、空块两形态、反馈按内容指纹、无语言块也留按钮(2026-09-30,#38 codeblock-copy·自动拍板)
+
+- **岔路**:①甲案预设「在 vendored 代码块 widget 头部加可选 copy 按钮挂载点(独立 vendor: commit + 登记 vendor/README.md)」,动手探测发现 subtree 引入的上游代码本就带 `MarkdownLabel::code_block_buttons(Fn(&mut Ui, &str, &str))` 挂载点(subtree 基点 8e58d97 即有,label.rs 两条代码块渲染路径都调用,回调直接给 `(块源文本, 语言)`);②头部 hover 显示 vs 常驻;③语言标签显示完整 info string 还是首词;④空代码块形态(pulldown 对无空行的空围栏不产 Text 事件,vendored parser 无 token、整块不渲染;带空行的空块 text 为空串、块存在);⑤「已复制」✓ 反馈态的键控(widget id 还是内容);⑥无语言块显示按钮与否。
+- **备选**:①按任务书字面在 vendor 再造一个 hook(与上游既有挂载点重复、多一个 vendor: commit 与登记行);② hover 才显示;③显示完整 info;④给空块强行造按钮;⑤按 egui widget id 键控;⑥无语言藏按钮。
+- **自动选择**:①零 vendor 改动,直接消费上游挂载点(甲案意图——通用挂载点、按钮视觉 app 侧注入、点击经回调出 app 侧——完全被既有 API 满足);②常驻;③首词;④带空行空块留按钮、点击复制空串,无空行空块随上游语义不渲染(只验不 panic);⑤全局单份「最近复制块指纹+到期时刻」存 egui data,按内容认领;⑥无语言块按钮照旧(只是没有标签行)。
+- **理由**:①重复造 hook 违反「以现状为准」;上游回调直接给源文本,任务书「经 code_block_spans 切 rendered」的绕路不再需要(少一处偏移换算出错面);②常驻可发现性好(GitHub/Gitea 同款),hover-only 在无指针环境不可达;③完整 info 可带 `title=` 等元数据,不是语言名;④⑤vendored 挂载点的子 Ui id 按帧内序号自动分配,文档编辑后块序平移会让 id 键控的反馈错位到别的块;内容指纹最多让同文本多块同显 ✓(与 ```ai 卡片按指令文本认领状态同款简化,decisions-pending #13 先例),且跨视口(右栏预览与 Live 中央富渲染)同显合理——同一块内容;⑥交互一致性优先于按内容藏控件。
+- **如何改**:①若坚持 vendor 侧出按钮皮肤——把 `code_copy_buttons`(crates/latermd-app/src/ui/preview.rs)的绘制逻辑下沉进 vendored ①类改动并按 AGENTS §6 登记;②改 hover-only——在 `code_copy_buttons` 里按 `ui.ctx().input(|i| i.pointer.latest_pos())` 与 rect 的包含关系门控绘制;③改完整 info——`lang.split_whitespace().next()` 换 `lang`;④想让无空行空块也渲染——需 vendored parser 对空 CodeBlock 补 token(①类,另登记);⑤改 per-块反馈——把指纹换成 (tab, 块序号) 二元组键;⑥藏无语言块按钮——`lang.split_whitespace().next().is_none()` 时提前 return。
 
 ## #60 切换卡顿(#39 M2)四候选修法的取舍:per-tab 缓存槽位+heal 条件化落地,首屏分段与后台预热不做(2026-09-30,#39 tab-switch-perf M2·自动拍板)
 
@@ -521,3 +529,10 @@
 - **拍板依据**：用户 2026-09-26 指令「看下现在还有什么未完成的任务，加入流水线」——即放行 #13 进入自动循环；按循环授权（自动选最优解不等人），D1–D5 全部取规格中已论证的**默认选择**。
 - **风险兜底**：D1 无边框的三平台拖拽/缩放风险保留 `LATERMD_NATIVE_DECORATIONS=1` 逃生口回落原生装饰（与 `LATERMD_RENDERER=glow` 同构）；M5 收口棒带明暗像素采样验收，Win/mac 真机复测留在人工清单。
 - **如何改**：任一决策想推翻，改 ui-shell-redesign.md 对应 §（D1 见 §3、D2 见 §2、D3 见 §5、D4 见 §7、D5 见 §8），在对应里程碑棒完成前修订代价最低；已完成后再改 D1 需同时保留逃生口路径。
+
+## #62 代码块复制按钮(#38)乙案接管通道不可行的探测取证:块体复用三件套均 pub(crate)(2026-09-30 自动选择)
+
+- **岔路**：auto-plan #38 的乙案要求「`is_block_code_widget` 接管全部代码块,块体复用 vendored 高亮/横向滚动」——接管意味着 app 侧自绘块体,复用是否成立决定乙/甲走向。
+- **取证(探测棒实读)**：块体复用所需的 `scrolling_code_galley` / `StreamingCodeCache` / `theme_identity_ptr` 在 vendor/egui_markdown/src/layout.rs 尾部(`pub(crate) use syntect_code::{scrolling_code_galley, theme_identity_ptr, StreamingCodeCache}`)均为 **`pub(crate)`,app 侧不可见**;公开的 `highlight_code` 只有裸 LayoutJob,无横向滚动包装与流式缓存。乙案要走通必须先做 vendor ①类改 pub——比直接消费既有挂载点还重。
+- **自动选择**：**零 vendor(与 #61① 同结论,独立取证)**——消费上游既有 `MarkdownLabel::code_block_buttons` 挂载点;源文本由 vendored 回调直接透传 `Token::CodeBlock.text`(与 ```ai 指令卡同法)。另记录任务口径出入:auto-plan #38 写「经 code_block_spans 偏移切 rendered」,但 ```ai 先例的实际机制是 vendored 回调透传文本(label.rs `block_code_widget(ui, text, …)`),不经偏移换算;按「以现状为准」取后者。
+- **如何改**：若将来确需乙案接管(如块体上方独立行),在 vendor ①类里把上述三件套提为 `pub`(上游可合的通用能力)并登记 vendor/README.md 变更表;落地口径见 #61。
