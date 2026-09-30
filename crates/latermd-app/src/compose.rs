@@ -210,6 +210,21 @@ pub fn insert_image(text: &str, sel: Range<usize>, url: &str, alt: &str) -> (Str
     View::new(text, sel).image(url, Some(alt))
 }
 
+/// 在选区处插入 emoji 字符,替换选中内容,新选区 collapsed 落在 emoji
+/// 之后(docs/emoji-plan.md §6.1)。
+///
+/// 与 [`insert_image`] 同属「对话框类动作」—— emoji 字符无法从
+/// `text + sel` 推导,必须由面板提供,故不进 [`FormatAction`](那条边界
+/// 的完整论证见 emoji-plan §6.1)。选区是字符偏移;`emoji` 以 `chars`
+/// 计数,单组件 emoji(含非 BMP)与旗帜的双码位都天然 CJK 安全。
+pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Range<usize>) {
+    let view = View::new(text, sel);
+    let (a, b) = (view.byte_of(view.start), view.byte_of(view.stop));
+    let (left, right) = (&text[..a], &text[b..]);
+    let caret = left.chars().count() + emoji.chars().count();
+    (format!("{left}{emoji}{right}"), caret..caret)
+}
+
 /// 已知的**行前缀**,按长度降序 —— 匹配时要先试长的(`### ` 先于 `# `)。
 const LINE_PREFIXES: [&str; 8] = ["### ", "## ", "# ", "- [x] ", "- [ ] ", "> ", "- ", "1. "];
 
@@ -673,6 +688,41 @@ mod tests {
         let (out, sel) = apply(FormatAction::Image, "", 0..0);
         assert_eq!(out, "![](https://)");
         assert_eq!(sel, 2..2, "无选区时光标停在 alt 开头等着填");
+    }
+
+    /// emoji 插入(`insert_emoji`):空文档 / 有选区 / 行内 / 行尾(CJK
+    /// 混排)四种情形(docs/emoji-plan.md §8)—— 选中内容被替换,新选区
+    /// collapsed 落在 emoji 之后;偏移全按字符,不在多字节序列中间切。
+    #[test]
+    fn emoji_inserts_collapse_caret_after_the_glyph() {
+        // 空文档:整串凭空出现,光标在其后
+        let (out, sel) = insert_emoji("", 0..0, "🚀");
+        assert_eq!(out, "🚀");
+        assert_eq!(sel, 1..1, "光标落在 emoji 之后");
+
+        // 有选区:选中文字被替换(不是保留在旁)
+        let (out, sel) = insert_emoji("甲乙丙", 0..3, "🚀");
+        assert_eq!(out, "🚀");
+        assert_eq!(sel, 1..1);
+
+        // 行内:两侧正文不动,光标按字符落位(CJK 语境下非 BMP 同样安全)
+        let (out, sel) = insert_emoji("中文text", 2..2, "😀");
+        assert_eq!(out, "中文😀text");
+        assert_eq!(sel, 3..3);
+
+        // 行尾(CJK 混排 + 双码位旗帜):光标跨过两枚旗面字符
+        let (out, sel) = insert_emoji("中文行尾", 4..4, "🇨🇳");
+        assert_eq!(out, "中文行尾🇨🇳");
+        assert_eq!(sel, 6..6, "旗帜是两个码位,光标落在整面旗之后");
+
+        // 防御:越界选区按端点收敛,不 panic(UI 侧选区可能来自过期快照);
+        // 空载荷是归约侧的兜底分支,这里同样自洽
+        let (out, sel) = insert_emoji("甲乙", 99..99, "🚀");
+        assert_eq!(out, "甲乙🚀");
+        assert_eq!(sel, 3..3);
+        let (out, sel) = insert_emoji("甲乙", 0..0, "");
+        assert_eq!(out, "甲乙");
+        assert_eq!(sel, 0..0);
     }
 
     /// 空文本 / 越界选区不 panic,且结果自洽(防御:UI 侧选区可能来自过期快照)。

@@ -36,20 +36,30 @@ use eframe::egui;
 /// 面板拖窄时逐组换行(`horizontal_wrapped`)而不是溢出裁切 —— 中间栏最窄
 /// 可到 400px 左右,十七个按钮不可能一行排完。
 pub fn ui(panel: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
-    ui_with_probe(panel, keymap, outbox, None::<fn(FormatAction, egui::Rect)>)
+    ui_with_probe(
+        panel,
+        keymap,
+        outbox,
+        None::<fn(FormatAction, egui::Rect)>,
+        None::<fn(egui::Rect)>,
+    )
 }
 
 /// 同 [`ui`],额外把每个按钮的 `(动作, 矩形)` 交给 `probe`(`None` 即不探针)。
 ///
 /// 无头测试量按钮位置用:十七个按钮的具体坐标由 `horizontal_wrapped` 的换
 /// 行演算 + 它前面的标签条/提示行共同决定,手搓必然与真实帧错位。
+/// `emoji_probe` 同理,量的是末尾那枚 Emoji 入口(不是 FormatAction,进
+/// 不了 `probe` 的载荷)。
 pub fn ui_with_probe(
     panel: &mut egui::Ui,
     keymap: &Keymap,
     outbox: &mut Vec<Message>,
     probe: Option<impl FnMut(FormatAction, egui::Rect)>,
+    emoji_probe: Option<impl FnMut(egui::Rect)>,
 ) {
     let mut probe = probe;
+    let mut emoji_probe = emoji_probe;
     panel.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
         for group in FormatGroup::ALL {
@@ -73,7 +83,26 @@ pub fn ui_with_probe(
                 ui.separator();
             }
         }
+        // Emoji 面板入口(docs/emoji-plan.md E1):第二个「对话框类动作」,
+        // 与 Image 同款 —— 点了只开面板,不进 `FormatAction` 四组(emoji
+        // 字符无法从 text+sel 推导,§6.1 的边界)。
+        ui.separator();
+        let response = icons::icon_button(ui, Icon::Emoji, &emoji_tooltip(keymap));
+        if let Some(probe) = emoji_probe.as_mut() {
+            probe(response.rect);
+        }
+        if response.clicked() {
+            outbox.push(Message::EmojiPickerToggle(true));
+        }
     });
+}
+
+/// Emoji 按钮 tooltip(带当前键位,与动作按钮的 tooltip 同款口径)。
+fn emoji_tooltip(keymap: &Keymap) -> String {
+    match keymap.get(Command::EmojiPicker) {
+        Some(shortcut) => format!("插入 Emoji({})", shortcut.platform_text()),
+        None => "插入 Emoji".to_owned(),
+    }
 }
 
 /// 单个按钮。返回响应以便测试定位(与 `ui::menubar::item` 同款手法)。
@@ -333,6 +362,7 @@ mod tests {
                             rect.set(button_rect);
                         }
                     }),
+                    None::<fn(Rect)>,
                 );
             },
         )
@@ -366,6 +396,61 @@ mod tests {
             .drop_without_applying_deltas();
         }
         assert_eq!(outbox, vec![Message::ImageDialogOpened]);
+    }
+
+    /// 点笑脸按钮是**开 Emoji 面板**,不是发格式请求:第二个「对话框类
+    /// 动作」(docs/emoji-plan.md E1),不进 FormatAction 四组。位置经
+    /// emoji 探针在同一条真实工具条布局里取(与图片测试同一手法)。
+    #[test]
+    fn clicking_emoji_opens_the_picker_not_a_format() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                super::ui_with_probe(
+                    ui,
+                    &Keymap::builtin(),
+                    &mut Vec::new(),
+                    None::<fn(FormatAction, Rect)>,
+                    Some(|button_rect: Rect| rect.set(button_rect)),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        let center = rect.get().center();
+        assert!(center.x > 0.0, "探针拿到了 Emoji 按钮的位置:{center:?}");
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        for events in [
+            Vec::new(),
+            Vec::new(),
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &Keymap::builtin(), &mut outbox),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::EmojiPickerToggle(true)]);
     }
 
     /// 自绘图标基本不重合。十七个动作里六个形态类走 RichText(不经

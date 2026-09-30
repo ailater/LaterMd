@@ -38,6 +38,7 @@ use crate::search::SearchState;
 use crate::settings::SettingsState;
 use crate::tabs::TabsState;
 use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
+use crate::ui::emoji_panel::EmojiPanelState;
 use crate::ui::image_dialog::ImageDialogState;
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
@@ -65,6 +66,10 @@ const AI_PROMPT_TAIL_CHARS: usize = 2000;
 /// [`latermd_md::heading_section_span`] 的定位键(层级 + 文本精确匹配)
 /// 保持一致 —— 重复生成时凭它移除旧节,避免摘要堆积。
 const AI_SUMMARY_HEADING: &str = "AI 摘要";
+
+/// Emoji 面板「最近使用」的容量:去重置顶后截断(E2 起随 settings.json
+/// 持久化,docs/emoji-plan.md §6.3)。
+const EMOJI_RECENT_CAP: usize = 16;
 
 /// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
 const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
@@ -229,6 +234,10 @@ pub struct State {
     /// 归约只置 `open` 与消费插入,UI 经 `&mut` 改草稿 —— 与 `SettingsState`
     /// 持草稿同款分工(`TextEdit` 是立即模式控件,草稿必须能就地 `&mut`)。
     pub image_dialog: ImageDialogState,
+    /// 「插入 Emoji」面板(docs/emoji-plan.md E1):open/query/group/recent。
+    /// 归约置 `open`,UI 经 `&mut` 改 `query` / `group`(与 `image_dialog`
+    /// 持草稿同款分工);点选插入与「最近使用」维护都在归约。
+    pub emoji: EmojiPanelState,
     /// 剪贴板图片读取(docs/image-plan.md D 段):后台线程 + channel 的
     /// 接收端,生命周期与 `BedState` 同构(发起/收流/收尾三原语)。
     pub clipboard: ClipboardState,
@@ -335,6 +344,7 @@ impl Default for State {
             settings: SettingsState::default(),
             bed: BedState::default(),
             image_dialog: ImageDialogState::default(),
+            emoji: EmojiPanelState::default(),
             clipboard: ClipboardState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
@@ -423,6 +433,14 @@ pub enum Message {
     /// 5MB 上限、落 `.assets/` 并在光标处插引用。文件读取是本地磁盘
     /// (毫秒级),同步做,不上后台线程 —— 与文件树打开文件同口径。
     ImageFileDropped(PathBuf),
+    /// 开/关「插入 Emoji」面板(docs/emoji-plan.md E1):工具条笑脸按钮 /
+    /// `Cmd/Ctrl+Shift+E` 产出 `true`,Esc / 点选插入后的关闭产出 `false`。
+    /// 归约只翻 `open`(开时清搜索词,分类与最近使用沿用)。
+    EmojiPickerToggle(bool),
+    /// Emoji 面板点选,载荷为该格的字符:归约走 [`crate::compose::insert_emoji`]
+    /// 写入活动标签(新选区 collapsed 落在 emoji 之后)、关闭面板并记入
+    /// 「最近使用」(去重置顶)。空载荷是防御分支,不动文档只关面板。
+    EmojiInserted(String),
     /// 后台上传收尾(后台线程经 channel 回传,每帧归约收流翻成此消息):
     /// **只接受最新序号**(`seq` 与当前序号相等才处理,防旧请求覆盖 ——
     /// 照抄 AI 流式防重入手法,旧结果静默丢弃)。`Ok(url)` 按发起时的用途
@@ -614,6 +632,8 @@ impl State {
             Message::ImagePasteRequested => self.request_image_paste(),
             Message::ImagePasteFinished { result } => self.finish_image_paste(result),
             Message::ImageFileDropped(path) => self.drop_image_file(&path),
+            Message::EmojiPickerToggle(open) => self.toggle_emoji_panel(open),
+            Message::EmojiInserted(emoji) => self.insert_emoji(&emoji),
             Message::BedProfileSaved { profile, token } => self.save_bed_profile(profile, token),
             Message::BedProfileDeleted { id } => self.delete_bed_profile(id),
             Message::BedTestUploadRequested { profile_id } => self.test_bed_upload(profile_id),
@@ -1045,6 +1065,11 @@ impl State {
         self.skins = SkinCatalog::load_from(&dir);
         let skin = self.theme.skin.clone();
         self.theme.select_skin(skin.as_deref(), &self.skins);
+        // Emoji「最近使用」随 settings.json 回来(E2,与主题同文件同路);
+        // 手改配置存多的部分截到容量,两处同步收敛到同一份
+        self.emoji.recent = self.theme.emoji_recent.clone();
+        self.emoji.recent.truncate(EMOJI_RECENT_CAP);
+        self.theme.emoji_recent = self.emoji.recent.clone();
         // 跟随系统:启动即探测一次,否则首帧只能靠 fallback
         if self.theme.mode == ThemeMode::System {
             self.refresh_system_theme();
@@ -1305,6 +1330,48 @@ impl State {
             bed,
             ..ImageDialogState::default()
         };
+    }
+
+    /// Emoji 面板开/关(docs/emoji-plan.md E1):开时清搜索词(上次的
+    /// 搜索词对下一次插入没有意义,与图片框关框清草稿同一取舍),分类与
+    /// 「最近使用」沿用。
+    fn toggle_emoji_panel(&mut self, open: bool) {
+        self.emoji.open = open;
+        if open {
+            self.emoji.query.clear();
+        }
+    }
+
+    /// Emoji 面板点选(docs/emoji-plan.md §6.4):插入 → 关面板 → 记
+    /// 「最近使用」。写回路径与 [`Self::apply_format`] 同款(整篇替换 +
+    /// `pending_selection` 回填 + `cursor.byte` 边界折算);打碎 TextEdit
+    /// 内建 undo 的代价同 §9 R3,已知并接受(emoji-plan §7 #5)。
+    fn insert_emoji(&mut self, emoji: &str) {
+        self.emoji.open = false;
+        // 防御:空载荷(UI 不会产出)不动文档,只关面板
+        if emoji.is_empty() {
+            return;
+        }
+        let tab = self.tabs.current_mut();
+        let selection = tab.selection.unwrap_or((0, 0));
+        let start = selection.0.min(selection.1);
+        let stop = selection.0.max(selection.1);
+        let (text, new_selection) =
+            crate::compose::insert_emoji(tab.editor.text(), start..stop, emoji);
+        tab.editor.replace_all(&text);
+        tab.pending_selection = Some((new_selection.start, new_selection.end));
+        if let Some(byte) = tab.cursor.byte {
+            tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+        }
+        // 最近使用:去重置顶、封顶截断;同步进 theme 后走主题的既有落盘
+        // 路径写 settings.json(E2,docs/emoji-plan.md §6.3「与 ThemeSettings
+        // 同路」)。落盘失败只落提示行,插入本身照常生效 —— 与切主题同口径。
+        let recent = &mut self.emoji.recent;
+        recent.retain(|seen| seen != emoji);
+        recent.insert(0, emoji.to_owned());
+        recent.truncate(EMOJI_RECENT_CAP);
+        self.theme.emoji_recent = self.emoji.recent.clone();
+        self.persist_theme();
     }
 
     /// 「浏览…」(`Message::ImageFilePickRequested` 的归约):弹图片选择框,
@@ -4118,6 +4185,145 @@ mod tests {
             Some("p-1".to_owned()),
             "关框保留图床选择,下次开框沿用"
         );
+    }
+
+    /// Emoji 面板开/关:开时清搜索词、分类沿用;关只翻 open。
+    #[test]
+    fn emoji_panel_toggle_keeps_group_clears_query() {
+        let mut state = State::default();
+        state.emoji.group = 3;
+        state.emoji.query = "旧搜索".to_owned();
+
+        state.apply(Message::EmojiPickerToggle(true));
+        assert!(state.emoji.open);
+        assert_eq!(state.emoji.group, 3, "分类沿用上次");
+        assert_eq!(state.emoji.query, "", "搜索词每次开框重置");
+
+        state.apply(Message::EmojiPickerToggle(false));
+        assert!(!state.emoji.open);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            SAMPLE_MD,
+            "开关不动文档"
+        );
+    }
+
+    /// Emoji 插入:字符写入、新选区 collapsed 落在 emoji 之后、面板关闭、
+    /// 「最近使用」去重置顶(写回路径与格式动作同源)。
+    #[test]
+    fn emoji_inserted_writes_closes_panel_and_records_recent() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("开头\n中文");
+        state.tabs.current_mut().selection = Some((3, 3));
+        state.emoji.open = true;
+
+        state.apply(Message::EmojiInserted("😀".to_owned()));
+
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "开头\n😀中文");
+        assert_eq!(
+            tab.pending_selection,
+            Some((4, 4)),
+            "光标 collapsed 落在 emoji 之后(字符偏移)"
+        );
+        assert!(!state.emoji.open, "点选插入后关闭面板");
+        assert_eq!(state.emoji.recent, vec!["😀".to_owned()]);
+
+        // 再点新的一枚、又点回旧的:去重、新的在前
+        state.emoji.open = true;
+        state.apply(Message::EmojiInserted("🚀".to_owned()));
+        state.emoji.open = true;
+        state.apply(Message::EmojiInserted("😀".to_owned()));
+        assert_eq!(
+            state.emoji.recent,
+            vec!["😀".to_owned(), "🚀".to_owned()],
+            "最近使用去重置顶"
+        );
+    }
+
+    /// Emoji 插入的防御分支:空载荷(UI 不会产出)不动文档只关面板;
+    /// 有选区时选中内容被替换(compose 层语义,这里钉归约侧连通)。
+    #[test]
+    fn emoji_inserted_defends_empty_payload_and_replaces_selection() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲乙丙");
+        state.tabs.current_mut().selection = Some((0, 3));
+        state.emoji.open = true;
+
+        state.apply(Message::EmojiInserted(String::new()));
+        assert_eq!(state.tabs.current().editor.text(), "甲乙丙", "空载荷不产文");
+        assert!(!state.emoji.open);
+
+        state.apply(Message::EmojiInserted("🚀".to_owned()));
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "🚀", "选中内容被替换");
+        assert_eq!(tab.pending_selection, Some((1, 1)));
+    }
+
+    /// 「最近使用」上限(E2:16 枚):第 17 枚进来时最早的一枚被挤掉,
+    /// 顺序保持新的在前。
+    #[test]
+    fn emoji_recent_truncates_to_cap() {
+        let mut state = State::default();
+        // 17 枚互不相同的载荷;每次插入都会关面板,故逐枚重开
+        let batch = [
+            "😀", "😃", "😄", "😁", "😆", "😅", "😂", "😉", "😊", "😍", "😘", "😋", "😛", "😜",
+            "😏", "😒", "😬",
+        ];
+        assert_eq!(batch.len(), EMOJI_RECENT_CAP + 1);
+        for emoji in batch {
+            state.emoji.open = true;
+            state.apply(Message::EmojiInserted(emoji.to_owned()));
+        }
+        assert_eq!(state.emoji.recent.len(), EMOJI_RECENT_CAP, "封顶截断");
+        assert_eq!(state.emoji.recent[0], "😬", "最新的一枚在前");
+        assert_eq!(
+            state.emoji.recent[EMOJI_RECENT_CAP - 1],
+            "😃",
+            "最早的一枚(😀)被挤掉"
+        );
+    }
+
+    /// 「最近使用」持久化(E2,docs/emoji-plan.md §6.3):插入即随主题
+    /// 路径落 settings.json;重启(main 装载 ThemeSettings → load_preferences
+    /// 回装)后顺序保持。
+    #[test]
+    fn emoji_recent_persists_and_reloads() {
+        let dir = temp_path("emoji-recent");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        for emoji in ["🚀", "😀"] {
+            state.emoji.open = true;
+            state.apply(Message::EmojiInserted(emoji.to_owned()));
+        }
+        assert!(state.tabs.current().document.notice.is_none(), "落盘无提示");
+
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            json.contains("emoji_recent"),
+            "随 settings.json 落盘:{json}"
+        );
+        let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(
+            reloaded_theme.emoji_recent,
+            vec!["😀".to_owned(), "🚀".to_owned()],
+            "重启装载:新的在前"
+        );
+
+        // 重启路径复现(main 的 LaterMdApp::new:先装 theme 再 load_preferences)
+        let mut restarted = State {
+            theme: reloaded_theme,
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        restarted.load_preferences();
+        assert_eq!(
+            restarted.emoji.recent,
+            vec!["😀".to_owned(), "🚀".to_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 浏览本地图片(B 段):复制进 `<doc名>.assets/`,url 回填相对地址,

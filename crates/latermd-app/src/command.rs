@@ -89,6 +89,11 @@ pub enum Command {
     /// 归约是「开对话框」而不是「执行格式」。它也没有
     /// [`Self::format_action`]:真正的文本动作由 `compose::insert_image` 承担。
     ImageInsert,
+    /// 插入 Emoji(docs/emoji-plan.md E1):开 Emoji 面板,点选即在光标处
+    /// 插入纯 Unicode 字符。与 `ImageInsert` 同属「对话框类动作」—— emoji
+    /// 字符无法从 text+sel 推导,不走 `format_action`;真正的文本动作由
+    /// `compose::insert_emoji` 承担。
+    EmojiPicker,
     /// 复制选中(无选中复制当前行)——编辑器语义,坤哥 2026-09-29 指令。
     DuplicateSelection,
     /// 复制当前行(选区多行时复制全部涉及行)。
@@ -109,7 +114,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 34] = [
+    pub const ALL: [Command; 35] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -139,6 +144,7 @@ impl Command {
         Self::FormatOrdered,
         Self::FormatTask,
         Self::ImageInsert,
+        Self::EmojiPicker,
         Self::DuplicateSelection,
         Self::DuplicateLine,
         Self::FindInDoc,
@@ -203,6 +209,7 @@ impl Command {
             Self::FormatOrdered => "format_ordered",
             Self::FormatTask => "format_task",
             Self::ImageInsert => "image_insert",
+            Self::EmojiPicker => "emoji_picker",
             Self::DuplicateSelection => "duplicate_selection",
             Self::DuplicateLine => "duplicate_line",
             Self::FindInDoc => "find_in_doc",
@@ -246,6 +253,7 @@ impl Command {
             // 「图片」,命令层要的是动作名「插入图片」(快捷键设置页里
             // 「图片」两个字说不清是干什么的)
             Self::ImageInsert => "插入图片",
+            Self::EmojiPicker => "插入 Emoji",
             Self::DuplicateSelection => "复制选中(Ctrl+D)",
             Self::DuplicateLine => "复制当前行",
             Self::FindInDoc => "查找",
@@ -320,6 +328,13 @@ impl Command {
             Self::ImageInsert => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::I)
             }
+            // Emoji 面板:Ctrl/Cmd+Shift+E 在出厂表里无占用者(与导出的
+            // Ctrl/Cmd+E 只差一个 Shift;消费顺序按修饰键个数降序,Shift
+            // 组合先被问到,两者互不抢 —— 与 SaveAs 之于 Save 同款共存,
+            // 见 `emoji_shortcut_overlaps_export_but_does_not_conflict`)。
+            Self::EmojiPicker => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::E)
+            }
             Self::DuplicateSelection => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::D)
             }
@@ -373,6 +388,7 @@ impl Command {
             Self::FormatOrdered => Icon::OrderedList,
             Self::FormatTask => Icon::TaskList,
             Self::ImageInsert => Icon::Image,
+            Self::EmojiPicker => Icon::Emoji,
             Self::DuplicateSelection | Self::DuplicateLine | Self::FindInDoc => Icon::Search,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
@@ -393,6 +409,7 @@ impl Command {
             Self::AiCommitMessage => Message::AiCommitRequested,
             Self::AiSummary => Message::AiSummaryRequested,
             Self::ImageInsert => Message::ImageDialogOpened,
+            Self::EmojiPicker => Message::EmojiPickerToggle(true),
             Self::ToggleLivePreview => Message::ToggleLivePreview,
             Self::TabNext => Message::TabNext,
             Self::TabClose => Message::TabCloseActive,
@@ -509,6 +526,46 @@ mod tests {
             },
         );
         output.drop_without_applying_deltas();
+    }
+
+    /// Emoji 面板键位的撞键核查(emoji-plan §6.3 / decisions-pending #9
+    /// 口径):出厂表里无占用者;它与导出(Ctrl/Cmd+E)只差一个 Shift,
+    /// `consume_shortcut` 的 `matches_logically` 会忽略多余 Shift —— 靠
+    /// 「修饰键个数降序」的消费顺序共存(与 SaveAs/Save 同款):Shift 组合
+    /// 先被问到,两个键各自只触发一条命令。
+    #[test]
+    fn emoji_shortcut_overlaps_export_but_does_not_conflict() {
+        let emoji = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+            key: Key::E,
+        };
+        // #9 口径的静态核查:撞键检测按整条 Shortcut 相等,出厂表无人占用
+        assert_eq!(
+            Keymap::builtin().conflict(Command::EmojiPicker, emoji),
+            None,
+            "Ctrl/Cmd+Shift+E 不该撞任何出厂键位"
+        );
+
+        for (key, modifiers, expected) in [
+            (
+                Key::E,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                vec![Command::EmojiPicker],
+            ),
+            (Key::E, Modifiers::COMMAND, vec![Command::ExportHtml]),
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![key_event(key, modifiers)],
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(poll_shortcuts(ui.ctx(), &Keymap::builtin()), expected);
+                },
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 
     /// 全部命令的绑定都能被各自按键触发,且消费一次后同帧不回流。

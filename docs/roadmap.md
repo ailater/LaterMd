@@ -26,8 +26,9 @@
 多标签已落地(2026-09-26,用户追加需求)
 [x] 外壳重构      2026-09-27 全部落地(规格 2026-09-26 产出:[ui-shell-redesign.md](ui-shell-redesign.md),D1–D5 按默认拍板 decisions-pending #30;M1–M5 = auto-plan 13a–13e):M1 自绘标题栏+三栏重排 `389dafb`、M2 左栏三段式 `8f07cd5`、M3 格式工具条 `b7c918b`、M4 禅定 `7fd24a6`、M5 收口(修复三连 `d797451`/`bff7405` + 明暗像素采样验收 11 断言 [m5-acceptance.md](m5-acceptance.md))**均于 2026-09-27 合入 main**(此前本行曾记「M1 已落地 2026-09-26」,以 git 合入日期为准订正);真机遗留(无边框拖窗/resize 于 Win/mac)见 acceptance-checklist §8 三项
 [x] 图片框与图床已落地(2026-09-27)   A–D 四段全部合入 main:A 插入骨架 `ee694b6`(PR #46)、B 本地图片复制进 .assets/ 与相对路径预览出图 `1f96fb6`、C latermd-bed 图床 crate 与设置第五页 `eb9c38e`、D Ctrl+V/拖入图片直接落 .assets/ 插入 `c38084a`(均 2026-09-28 落盘);#21 随 D 段完结;真机验收项(自定义图床上传走通一次、Win/mac 剪贴板与拖入)留人工清单
-[ ] 表情符号(emoji)面板   规格 [emoji-plan.md](emoji-plan.md)(2026-09-27 坤哥指令),E1–E4 共 ~1.3d:**待放行**;E1(按钮 + 面板)0.5d 可独立先交付。**实测两条硬事实**:egui 0.36.2 默认字体链已含黑白 Noto Emoji(零新增依赖即可渲染);但**彩色 emoji 上游不支持**,应用内是黑白、导出 HTML 仍是彩色
+[x] 表情符号(emoji)面板   规格 [emoji-plan.md](emoji-plan.md)(2026-09-27 坤哥指令),E1–E4 共 ~1.3d:E1–E3 已落地(auto-plan #28,见下行),E4(可选 短码补全)未做。**实测两条硬事实**:egui 0.36.2 默认字体链已含黑白 Noto Emoji(零新增依赖即可渲染);但**彩色 emoji 上游不支持**,应用内是黑白、导出 HTML 仍是彩色
 [x] UI 现代化 U0/U1/U3 已落地(2026-09-27)   三 commits 合入(见 auto-plan #27):U0 设计 token 扩充(`RADIUS_MD`/`INPUT_H`/`INPUT_PAD_X`/`INPUT_PAD_Y`/`FONT_SM` 带来源注释与数值断言)+ 九套预设色板字面量编进 `theme_presets.rs` 启动铺盘 `themes/*.ron`;U1 Inter 三字重(Proportional 首位 + CJK 回退链保序 + SemiBold 上标题栏与格式条);U3 自研轻量动效(模式切换 crossfade 0.15s,浮层淡入由 egui 0.36 内建 Area fade-in 承接)。U2 即图片框(已另行落地);**U4 phosphor 迁移后实机回滚(2026-09-29,decisions-pending #35)**——拍板乙并落地(PR #55)当天真机目视 30 枚图标,观感不及定制自绘体系,拍板回滚甲(revert `ca6e164`),`ui/icons.rs` 维持自绘;phosphor 完整实现存档于 PR #55 与 archive tag 备重启。岔路口径见 #43/#44/#45,三 commit 的分支承载与 main 指针处置见 #46;真机观感项(36px 输入框比例、三平台 CJK 混排目视、动效目视)留人工
+[x] Emoji 面板已落地(2026-09-27,应用内黑白/导出彩色)
 ```
 
 **本轮已提交模块（2026-09-24 ~ 09-25，11 commits）**：
