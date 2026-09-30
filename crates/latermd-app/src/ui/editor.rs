@@ -73,6 +73,18 @@ fn ime_report_needed(i: &ImeTriggerInputs) -> bool {
     }
 }
 
+/// 由 caret 条矩形(`pos_from_cursor` 给零宽、整行高的 galley 局部矩形)算
+/// 上报给 `ViewportCommand::IMERect` 的屏幕矩形。#19 坤哥复测反馈:候选框
+/// 贴着光标、盖住当前行 —— 锚点整体下移一个行高,候选窗从当前行底之下
+/// 展开。
+fn ime_anchor_rect(galley_pos: egui::Pos2, caret: egui::Rect) -> egui::Rect {
+    let shift = egui::vec2(0.0, caret.height());
+    egui::Rect::from_min_max(
+        galley_pos + caret.min.to_vec2() + shift,
+        galley_pos + caret.max.to_vec2() + shift,
+    )
+}
+
 /// 把 [`EditorBuffer`] 适配成 egui `TextBuffer` 的 newtype。
 ///
 /// 孤儿规则:`egui::TextBuffer` 与 `EditorBuffer` 都不归本 crate,
@@ -337,10 +349,7 @@ pub fn ui(
         let rect = output
             .galley
             .pos_from_cursor(egui::text::CCursor::new(caret));
-        egui::Rect::from_min_max(
-            output.galley_pos + rect.min.to_vec2(),
-            output.galley_pos + rect.max.to_vec2(),
-        )
+        ime_anchor_rect(output.galley_pos, rect)
     });
     let has_input_events = panel.ctx().input(|input| !input.events.is_empty());
     if ime_report_needed(&ImeTriggerInputs {
@@ -780,6 +789,26 @@ mod tests {
             &mut cursor,
         );
         assert_eq!(rects.len(), 1, "焦点重进帧重报一次(光标未动)");
+    }
+
+    /// #19 复测反馈回归:上报锚点整体下移一行 —— `ime_anchor_rect` 的顶边
+    /// 必须落在 caret 行底(叠加 galley 屏幕偏移后),候选窗不再盖住当前行。
+    #[test]
+    fn ime_anchor_rect_shifts_below_caret_row() {
+        // pos_from_cursor 语义:零宽、整行高(此处行高 20)。
+        let caret = egui::Rect::from_min_max(egui::pos2(5.0, 100.0), egui::pos2(5.0, 120.0));
+        let galley_pos = egui::pos2(30.0, 200.0);
+        let anchor = ime_anchor_rect(galley_pos, caret);
+        assert_eq!(
+            anchor.min,
+            egui::pos2(35.0, 320.0),
+            "顶边 = caret 行底 + galley 屏幕偏移(下移一行)"
+        );
+        assert_eq!(anchor.height(), 20.0, "行高保持,纯平移");
+        assert!(
+            anchor.min.y >= caret.max.y + galley_pos.y,
+            "锚点顶不低于 caret 行底"
+        );
     }
 
     /// finding 1 回归:keyup/指针 motion/preedit 文本未变的更新帧里光标没动,
