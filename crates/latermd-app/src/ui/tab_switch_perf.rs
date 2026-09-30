@@ -14,9 +14,12 @@
 //! **C 编辑器侧**:multiline `TextEdit` 冷帧(文本变化触发整篇 layout)与热帧;
 //! **D 整帧(生产路径)**:tab A 稳态 → `TabActivate` → B 首帧/次帧/稳态 →
 //! 往返 A 首帧,与 B/C 的微基准数字互相咬合,核验 vendored temp memory 缓存
-//! 在切换帧的命中/miss 行为。
+//! 在切换帧的命中/miss 行为;
+//! **E 规模放大**:20000 行样本的整帧与单件切换/往返,含 pre-M2 常量 id
+//! 单槽机制的旧路径对照行(切回必全量 miss = 用户「来回翻长文档」的旧成本)。
 //!
-//! 跑法:`cargo test -p latermd-app --test-threads=1 tab_switch -- --ignored --nocapture`;
+//! 跑法(计时口径 = release;debug 构建数字大 ~10×,只可作相对对照):
+//! `cargo test -p latermd-app --release tab_switch -- --test-threads=1 --ignored --nocapture`;
 //! 两个回归断言测试(不加 `--ignored`)随常规门禁跑,防缓存行为悄悄回归。
 
 use std::borrow::Cow;
@@ -93,7 +96,10 @@ fn sample_doc(seed: u32, target_lines: usize) -> String {
     doc
 }
 
-/// 预览单件一帧,生产同配置(ScrollArea + 常量 id + wrap + heal)。返回耗时。
+/// 预览单件一帧,pre-M2 生产同配置(ScrollArea + 常量 id + wrap + heal)。
+/// M2 起生产 id 已按 tab 分槽(见 [`label_frame_with_id`]),本函数保留常量
+/// id 作为旧路径单槽机制的基线探针:回归哨的 miss 断言与 [E] 的旧路径
+/// 对照行都靠它复现「切文本必全量重解析」的切换帧成本。返回耗时。
 fn label_frame(ctx: &egui::Context, rendered: &str) -> Duration {
     label_frame_with_id(ctx, &Id::new("preview-md"), rendered)
 }
@@ -190,10 +196,10 @@ fn row(name: &str, d: Duration) {
     println!("  {name:<58} {}", fmt_us(d));
 }
 
-/// `#[ignore]` 完整取证:打印四路分段耗时表(证据与结论见
-/// docs/auto-plan.md #39 与本测试输出)。
+/// `#[ignore]` 完整取证:打印五段耗时表(数字对比落档 docs/auto-plan.md
+/// #39 行,修法取舍见 docs/decisions-pending.md #60)。
 #[test]
-#[ignore = "M1 取证报告;跑法:cargo test -p latermd-app tab_switch -- --ignored --nocapture"]
+#[ignore = "取证报告;跑法:cargo test -p latermd-app --release tab_switch -- --test-threads=1 --ignored --nocapture"]
 fn tab_switch_finding_report() {
     let doc_a = sample_doc(1, SAMPLE_LINES);
     let doc_b = sample_doc(2, SAMPLE_LINES);
@@ -285,7 +291,7 @@ fn tab_switch_finding_report() {
         median(samples)
     });
 
-    println!("[B2] MarkdownLabel 单件(生产配置,id=preview-md,同一 ctx 连续帧)");
+    println!("[B2] MarkdownLabel 单件(pre-M2 常量 id 口径,id=preview-md,同一 ctx 连续帧)");
     let ctx = egui::Context::default();
     // 预热一帧:字体图集等一次性初始化不混进冷帧数字(只冷在文档缓存)。
     ctx.run_ui(RawInput::default(), |_| {})
@@ -423,6 +429,14 @@ fn tab_switch_finding_report() {
         &latermd_md::expand_wikilinks(&sample_doc(7, 20_000)),
     );
     row("20000 行 MarkdownLabel 换文本首帧(单件)", label_big_switch);
+    // 旧路径(pre-M2 常量 id 单槽)对照:上一帧 doc7 已把单槽覆盖,此刻
+    // 切回 big 文档必然全量 miss —— 用户「来回翻长文档」在旧路径的真实
+    // 成本;per-tab 分槽后同场景见上面的「20000 行往返切回 A 首帧」。
+    let label_big_back_old_path = label_frame(&ctx_big, &big_rendered);
+    row(
+        "20000 行旧路径(常量 id)往返切回 A 首帧(单件)",
+        label_big_back_old_path,
+    );
 
     println!("==== 结论速读(数字解释见报告)====");
     println!(
