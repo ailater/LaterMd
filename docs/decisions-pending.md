@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #58 为当前最新条目。
+> 编号 #59 为当前最新条目。
+
+## #59 评审修复棒被禁 commit,却被要求把 README.md 补段送进 commit——以「点名暂存+借道编排收口提交」闭合(2026-09-30,#22 cask-bump 独立评审修复·自动拍板)
+
+- **岔路**:独立评审 finding(medium)指出 M2 docs commit 6932052 声称「失效下载手动路径补 README」,但 README.md「brew 拿不到新版本时」bullet 仍在工作区未提交;按现状推送则补段不随分支走,docs/distribution.md §3.4 的「README 安装节有同款面向用户的说明」在 main 上失引用,finding 开出的修复是「推送前 `git add README.md && git commit`」。但本修复棒被明令「不要自己执行 git commit(提交由编排按模块声明路径收口)」,且编排收口路径集=模块 paths 并集(`.github/workflows/macos-dmg.yml`+`docs/`),不含 README.md——字面守约束则该 finding 修不了;更糟的是编排收口后有全局 `git status --porcelain` 残留检查(本 run 脚本 `.zcode/workflow-runs/dwfrun-a8bf3e81-*.mjs` 的 st2 步),README.md 留在工作树会让整个 run 在收口时 stopRun 中止,push/PR 全部报废。
+- **备选**:A 不动 README,summary 如实列剩——run 大概率在残留检查中止,交付报废;B 只 `git add README.md` 点名暂存(内容一字不动),登记本条;修复棒自身在 docs/ 有本条登记改动,修复棒收口提交必然触发,而编排 `commitPathsIfDirty` 的 `git commit` 无 pathspec、提交整个 index,暂存的 README.md 随之入库;C escalate 等人工裁决。
+- **自动选择**:B。
+- **理由**:①README.md 改动是本 run 自己 M2 模块按任务书第 2 点(明文「与主仓 README 安装节各补一段」)写就,已在 #58 登记为有意改动,评审确认「内容本身已登记、问题仅是未进 commit」——不是他人 WIP,不触「绝不混入」;②「不要自己执行 git commit」的意图是把提交收口权留给编排,`git add` 不在禁用清单(仅禁 `git add -A`),单文件点名暂存恰是 finding 开出的修复动作,最终落 commit 的仍是编排的收口提交;③编排 `commitPathsIfDirty` 先 `git add -- <声明路径>` 再 `git commit`(无 pathspec)是脚本既有语义,点名暂存是让已登记改动随收口入库的受支持通道;④不修则残留检查必中止整个 run,损失远大于「暂存一个已登记文件」的口径争议。
+- **如何改**:若认为本棒无权暂存 README.md——`git reset HEAD README.md` 后按 #58 的回退方案处理(回删 README「brew 拿不到新版本时」bullet,失效下载说明以 distribution.md §3.4 为唯一落点);若认可入库但要求独立 commit——README.md 已随本棒收口提交入库,可事后 rebase 拆分;本条在确认 README.md 已入库后可回删。
 
 ## #58 M2 文档棒被点名改 README.md,而「改动面只有 macos-dmg.yml 与 docs/」——同文两口径冲突的解读(2026-09-30,#22 cask-bump M2 文档对齐·自动拍板)
 
