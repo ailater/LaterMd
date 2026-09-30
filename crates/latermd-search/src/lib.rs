@@ -477,6 +477,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// draft 镜像不入搜索(#18):`x.md.latermd-draft` 的扩展名不在
+    /// [`MARKDOWN_EXTENSIONS`] 里,`is_markdown` 天然排除 —— 内容即便命中
+    /// 关键词也不产出结果。钉住该行为,自动保存的防丢镜像不进导航。
+    #[test]
+    fn search_skips_draft_mirror_files() {
+        let root = temp_vault("draft-mirror");
+        std::fs::write(root.join("x.md"), "latermd 正文\n").unwrap();
+        std::fs::write(root.join("x.md.latermd-draft"), "latermd 草稿镜像\n").unwrap();
+
+        let mut service = SearchService::new();
+        service.spawn(query(&root, "latermd", false)).unwrap();
+        let (hits, done) = drain(&mut service);
+
+        assert!(done);
+        assert_eq!(
+            hit_triples(&hits),
+            vec![(root.join("x.md"), 1, "latermd 正文".into())],
+            "draft 即使命中关键词也不入搜索"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 大小写不敏感:嵌套子目录里的小写变体一并命中(按路径排序稳定断言)。
     #[test]
     fn case_insensitive_hits_nested_variant() {

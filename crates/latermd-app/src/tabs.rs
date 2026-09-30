@@ -19,6 +19,27 @@ use crate::live::LiveState;
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// 单个标签的自动保存记忆(#18):draft 落点、已落盘修订号、上次缓冲改动
+/// 时刻。判定与写入都在 [`crate::state::State`] 的帧末归约
+/// (`State::autosave_pass`),本结构只记账,不含任何 IO。
+#[derive(Debug, Default)]
+pub struct TabAutosave {
+    /// 上次成功写出的 draft 落点;`None` = 本标签从未写过。保存/关闭的
+    /// 清理钩子按它删文件 —— 不从落盘身份现算,「另存为换路径后旧位置的
+    /// draft」才找得回来。
+    pub draft_path: Option<PathBuf>,
+    /// 已落盘的缓冲修订号;与当前修订号相同即跳过重写(防每帧空转重写)。
+    /// 写失败不记 —— 下次触发照常重试。
+    pub saved_rev: Option<u64>,
+    /// 上次缓冲改动时刻(手敲/IME/AI 流式都算);`None` = 尚无编辑,
+    /// 停顿判定不满足。
+    pub last_edit: Option<Instant>,
+    /// 帧末比对用的「上次见到的修订号」:与当前修订号不同即发生过改动,
+    /// 刷新 `last_edit`。AI 流可写非活动标签,故按标签各自记账。
+    pub(crate) seen_rev: u64,
+}
 
 /// 单个标签的全部文档状态。
 pub struct TabState {
@@ -32,6 +53,8 @@ pub struct TabState {
     pub preview: PreviewState,
     /// 大纲↔编辑器光标协调。
     pub cursor: OutlineCursor,
+    /// 自动保存记忆(#18)。
+    pub autosave: TabAutosave,
     /// 编辑器选区的**字符**区间`(起, 止)`,由 `ui::editor` 每帧回填。
     ///
     /// 存在的理由:工具条按钮被点中的时候编辑器已经失焦,而 `TextEdit` 的
@@ -61,6 +84,7 @@ impl TabState {
             },
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
+            autosave: TabAutosave::default(),
             selection: None,
             pending_selection: None,
             live: LiveState::default(),
@@ -70,12 +94,22 @@ impl TabState {
 
     /// 整篇换入并复位文档身份(读盘成功后的换入;同 `State::load_document`
     /// 的旧语义,但只作用于本标签)。
+    ///
+    /// 自动保存记忆随换入重置内容侧(`saved_rev`/`last_edit`/`seen_rev`),
+    /// `draft_path` **保留** —— 它是清理钩子找回旧位置 draft 的唯一线索
+    /// (回滚后保存一次即清)。盘上的 draft 文件不动:换入意味着旧编辑
+    /// 已被用户确认丢弃,但误删防丢镜像的代价远大于多留一份冗余。
     pub fn load(&mut self, path: Option<PathBuf>, text: &str) {
         self.editor.load(text);
         self.document.path = path;
         self.document.notice = None;
         self.preview.rebuild(&self.editor);
         self.live.reset();
+        let kept_draft = self.autosave.draft_path.take();
+        self.autosave = TabAutosave {
+            draft_path: kept_draft,
+            ..TabAutosave::default()
+        };
     }
 }
 

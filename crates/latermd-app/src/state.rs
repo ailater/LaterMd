@@ -36,7 +36,7 @@ use crate::live::RenderMode;
 use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
-use crate::tabs::TabsState;
+use crate::tabs::{TabState, TabsState};
 use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
 use crate::ui::emoji_panel::EmojiPanelState;
 use crate::ui::image_dialog::ImageDialogState;
@@ -70,6 +70,21 @@ const AI_SUMMARY_HEADING: &str = "AI 摘要";
 /// Emoji 面板「最近使用」的容量:去重置顶后截断(E2 起随 settings.json
 /// 持久化,docs/emoji-plan.md §6.3)。
 const EMOJI_RECENT_CAP: usize = 16;
+
+/// 自动保存的停顿阈值(#18):上次缓冲改动后静置 30s 落一份 draft。
+/// 取「停顿」而不是「周期」—— 敲字中途写盘毫无意义,还和保存的原子
+/// rename 抢同一份 fsync。
+const AUTOSAVE_IDLE: Duration = Duration::from_secs(30);
+
+/// draft 文件的后缀(含点):`<doc>.latermd-draft`,追加在完整文件名之后
+/// 而不是替换既有扩展名 —— `a.md` 落成 `a.md.latermd-draft`,文件树/搜索
+/// 按扩展名过滤时天然排除(`Path::extension` 取的是最后一段)。git 状态
+/// 面板按它滤掉 untracked 里的 draft(git2 如实上报,产品口径在 app 侧)。
+pub(crate) const DRAFT_SUFFIX: &str = ".latermd-draft";
+
+/// 未命名文档的 draft 子目录(挂在配置目录下,与 settings.json 同处):
+/// 没有落盘身份就没有同目录锚点,状态目录是唯一确定归属的地方。
+const DRAFTS_DIR: &str = "drafts";
 
 /// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
 const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
@@ -261,6 +276,12 @@ pub struct State {
     /// 主题落盘目录;`None` = 平台默认。仅为测试注入临时目录而存在,
     /// 生产恒为 `None`。
     pub(crate) settings_dir: Option<PathBuf>,
+    /// 本帧被切出的标签**稳定 id**(#18):帧末归约为它落 draft(切换即
+    /// 落,不等停顿 —— 切走后它不可见,是防丢的主要对象)。存 id 而非
+    /// 索引,与 `confirm_close` / `ai_active_tab` 同手法:模态与关闭入口
+    /// 会使索引漂移,id 不会。同帧二次切换只记最后一位切出者,更早的
+    /// 由停顿路径兜底。消费即清。
+    autosave_switch_out: Option<u64>,
 }
 
 /// 文档落盘身份 + 未保存镜像。
@@ -353,6 +374,7 @@ impl Default for State {
             system_theme_ok: false,
             system_theme_due: None,
             settings_dir: None,
+            autosave_switch_out: None,
         }
     }
 }
@@ -1806,6 +1828,9 @@ impl State {
     pub fn end_of_logic(&mut self) {
         let dirty = self.tabs.current().editor.is_dirty();
         self.tabs.current_mut().document.dirty = dirty;
+        // 自动保存帧末归约(#18):停顿/切出判定 + 落 draft。时刻参数化,
+        // 单测注入不真等 30s。
+        self.autosave_pass(std::time::Instant::now());
         // 文件树懒加载落点:根 + 展开中目录的子项缓存补齐(键缺席才 IO)。
         self.file_tree.ensure_loaded();
         // 搜索结果收流:非阻塞收空 channel(重绘驱动见 `ui::layout::reduce`)。
@@ -1823,6 +1848,96 @@ impl State {
             if self.layout.save_to(self.settings_dir.as_deref()).is_ok() {
                 self.layout_written = snapshot;
             }
+        }
+    }
+
+    /// 自动保存的帧末归约(#18,`end_of_logic` 的一部分):
+    ///
+    /// 1. 刷新各标签「上次缓冲改动时刻」—— AI 流可写非活动标签,按标签
+    ///    各自比对修订号,不能只看当前;
+    /// 2. **切出标签**:本帧被切走的脏标签即刻落 draft,不等停顿(切走后
+    ///    它不可见,是防丢的主要对象);
+    /// 3. **当前标签**:dirty 且距上次改动 ≥ [`AUTOSAVE_IDLE`] 才落。
+    ///
+    /// 两条路径都受「同一修订号已落过则跳过」约束;写入失败只落提示行,
+    /// 绝不打断编辑。时刻由调用方传入(生产取真实时钟,单测注入)。
+    fn autosave_pass(&mut self, now: std::time::Instant) {
+        for tab in &mut self.tabs.tabs {
+            let rev = tab.editor.revision();
+            if rev != tab.autosave.seen_rev {
+                tab.autosave.seen_rev = rev;
+                tab.autosave.last_edit = Some(now);
+            }
+        }
+        // 切出者按稳定 id 找回:同帧的关闭路径可能已把它移除,找不到即
+        // 作废 —— 关闭钩子自己会清 draft。
+        if let Some(id) = self.autosave_switch_out.take() {
+            if let Some(index) = self.tabs.index_by_id(id) {
+                if Self::tab_needs_draft(&self.tabs.tabs[index]) {
+                    self.write_draft(index);
+                }
+            }
+        }
+        let active = self.tabs.active;
+        let due = self.tabs.tabs[active]
+            .autosave
+            .last_edit
+            .is_some_and(|at| now.duration_since(at) >= AUTOSAVE_IDLE);
+        if Self::tab_needs_draft(&self.tabs.tabs[active]) && due {
+            self.write_draft(active);
+        }
+    }
+
+    /// draft 触发条件的公共判定:缓冲脏,且当前修订号还没落过盘。
+    fn tab_needs_draft(tab: &TabState) -> bool {
+        tab.editor.is_dirty() && tab.autosave.saved_rev != Some(tab.editor.revision())
+    }
+
+    /// 命名文档的 draft 落点:`<doc>.latermd-draft`,追加完整文件名之后
+    /// (保留 `a.md` 原名,不替换扩展名)。
+    fn named_draft_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(DRAFT_SUFFIX);
+        PathBuf::from(name)
+    }
+
+    /// 未命名文档的 draft 落点:配置目录 `drafts/untitled-<标签id>`。
+    /// id 稳定且不复用,多个未命名标签互不覆盖。无配置目录(极简环境)
+    /// 返回 `None` —— 沿用「偏好不落盘不报错」的既有先例,静默放弃
+    /// draft 而不是反复提示。
+    fn untitled_draft_path(&self, tab_id: u64) -> Option<PathBuf> {
+        self.config_dir().map(|dir| {
+            dir.join(DRAFTS_DIR)
+                .join(format!("untitled-{tab_id}{DRAFT_SUFFIX}"))
+        })
+    }
+
+    /// 标签的 draft 落点:有落盘身份与原文件同目录,否则进状态目录。
+    fn draft_path_for(&self, tab: &TabState) -> Option<PathBuf> {
+        match tab.document.path.as_deref() {
+            Some(path) => Some(Self::named_draft_path(path)),
+            None => self.untitled_draft_path(tab.id),
+        }
+    }
+
+    /// 把一个标签的缓冲全量落成 draft(调用方已判定该写)。走 [`file::write`]
+    /// 的原子落盘,失败时盘上旧 draft 完好。父目录先建 —— 只为状态目录
+    /// 的 `drafts/` 而设(命名文档的父目录即文档所在目录,幂等空操作);
+    /// 建目录失败不单独报,让随后的 write 报真实原因。
+    fn write_draft(&mut self, index: usize) {
+        let Some(path) = self.draft_path_for(&self.tabs.tabs[index]) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tab = &mut self.tabs.tabs[index];
+        match file::write(&path, tab.editor.text()) {
+            Ok(()) => {
+                tab.autosave.draft_path = Some(path);
+                tab.autosave.saved_rev = Some(tab.editor.revision());
+            }
+            Err(error) => tab.document.notice = Some(format!("自动保存失败:{error}")),
         }
     }
 
@@ -1892,14 +2007,21 @@ impl State {
     }
 
     /// 开新标签的统一入口。不动在途 AI 流:流绑定发起标签
-    /// ([`State::ai_active_tab`]),新标签不是它的写入目标。
+    /// ([`State::ai_active_tab`]),新标签不是它的写入目标。开新标签同样
+    /// 把原标签切出(#18):打开另一文件/新建时,旧标签的脏缓冲与显式切换
+    /// 同样值得一份 draft,记切出 id 交帧末归约处理。
     fn spawn_tab(&mut self, path: Option<PathBuf>, text: &str) -> usize {
+        self.autosave_switch_out = Some(self.tabs.current().id);
         self.tabs.open_tab(path, text)
     }
 
     /// 激活某标签。不动在途 AI 流:chunk 的写入目标由发起标签 id 决定,
-    /// 与当前标签无关(多标签 #11 的核心不变量)。
+    /// 与当前标签无关(多标签 #11 的核心不变量)。切出脏标签时记下它的
+    /// 稳定 id —— 帧末 `autosave_pass` 为它落 draft(#18 切换即落)。
     fn switch_active(&mut self, index: usize) {
+        if index != self.tabs.active && index < self.tabs.tabs.len() {
+            self.autosave_switch_out = Some(self.tabs.current().id);
+        }
         self.tabs.activate(index);
     }
 
@@ -1919,8 +2041,21 @@ impl State {
     }
 
     /// 真正移除(确认后或干净标签)。关掉的是在途流的发起标签则作废流
-    /// —— 剩余 chunk 无处可写,落到任何别的标签都是写错文档。
+    /// —— 剩余 chunk 无处可写,落到任何别的标签都是写错文档。关闭同时
+    /// 清掉该标签的 draft(#18):丢弃(确认关闭)与干净标签都不该在盘上
+    /// 留冗余镜像 —— 记忆落点 + 按落盘身份/标签 id 推导的落点都删,防
+    /// 「写过但记忆被换入重置」的漏网;文件不存在是常态,删失败静默。
     fn remove_tab(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.tabs.get(index) {
+            let stale = tab.autosave.draft_path.clone();
+            let derived = match tab.document.path.as_deref() {
+                Some(path) => Some(Self::named_draft_path(path)),
+                None => self.untitled_draft_path(tab.id),
+            };
+            for victim in [stale, derived].into_iter().flatten() {
+                let _ = std::fs::remove_file(victim);
+            }
+        }
         let closing_stream_origin = self.ai_stream_tab_index() == Some(index);
         self.tabs.remove(index);
         if closing_stream_origin {
@@ -2028,9 +2163,21 @@ impl State {
         }
         match file::write(&path, self.tabs.current_mut().editor.text()) {
             Ok(()) => {
-                self.tabs.current_mut().editor.clear_dirty();
-                self.tabs.current_mut().document.path = Some(path);
-                self.tabs.current_mut().document.notice = None;
+                // 正常保存即清 draft(#18):记忆中的落点 + 按新路径推导的
+                // 落点各删一份(另存为换过路径时两者不同)。文件不存在是
+                // 常态,删失败静默 —— draft 只是冗余镜像,清不掉顶多留一份
+                // 孤儿,恢复条会兜底。
+                let tab = self.tabs.current_mut();
+                let stale = tab.autosave.draft_path.take();
+                tab.editor.clear_dirty();
+                tab.document.path = Some(path.clone());
+                tab.document.notice = None;
+                for victim in [stale, Some(Self::named_draft_path(&path))]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = std::fs::remove_file(victim);
+                }
             }
             Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
@@ -2347,6 +2494,249 @@ mod tests {
         assert!(!state.tabs.current().document.dirty, "编辑动作本身不动镜像");
         state.end_of_logic();
         assert!(state.tabs.current().document.dirty);
+    }
+
+    // ---- 自动保存(#18)----------------------------------------------------
+    // 时刻全部经 `autosave_pass(now)` 注入,不真等 30s;沙盒目录自清理。
+
+    /// 停顿触发:编辑后静置 ≥30s 落 draft(内容 = 缓冲全量),不满阈值
+    /// 一帧都不多写。
+    #[test]
+    fn autosave_writes_draft_after_idle_pause() {
+        let dir = temp_path("autosave-idle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("doc.md");
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc);
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "手敲的未保存内容");
+
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0); // 帧末记账 last_edit;30s 未满
+        assert!(!draft.exists(), "编辑当帧不写");
+        state.autosave_pass(t0 + Duration::from_secs(29));
+        assert!(!draft.exists(), "29s 仍不满阈值");
+        state.autosave_pass(t0 + Duration::from_secs(30));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            state.tabs.current().editor.text(),
+            "draft 内容 = 缓冲全量"
+        );
+        assert!(state.tabs.current().document.notice.is_none(), "成功无提示");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切标签触发:被切出的脏标签即刻落 draft,不等停顿;开新标签
+    /// (`FileCmd::New` / 打开文件的 spawn 路径)同样把原标签切出,同落。
+    #[test]
+    fn autosave_writes_draft_on_tab_switch_out() {
+        let dir = temp_path("autosave-switch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "切走前的改动");
+        state.tabs.open_tab(None, ""); // 直接开第二个(不经消息,见后半段)
+        state.apply(Message::TabActivate(0)); // 切回 0:切出的新标签不脏,无事
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        assert!(!draft.exists(), "距上次改动 0s,停顿路径未到点");
+
+        state.apply(Message::TabActivate(1)); // 切出脏的 0 号标签
+        state.autosave_pass(t0 + Duration::from_millis(10)); // 仍远不满 30s
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            state.tabs.tabs[0].editor.text(),
+            "切出即落,不等停顿"
+        );
+
+        // 开新标签的 spawn 路径:先在当前标签(1 号)弄出脏改动再开新标签,
+        // 验证 spawn 同样触发「切出即落」
+        let second = dir.join("second.md.latermd-draft");
+        state.tabs.current_mut().document.path = Some(dir.join("second.md"));
+        state.tabs.current_mut().editor.insert_chars(0, "第二条");
+        state.apply(Message::FileCommand(FileCmd::New)); // 开新标签 = 切出
+        state.autosave_pass(t0 + Duration::from_millis(20));
+        assert!(second.exists(), "spawn 开新标签同样触发切出落盘");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常保存即清:save_to 成功后 draft 消失(记忆落点 + 新路径推导
+    /// 两处都清)。
+    #[test]
+    fn autosave_draft_cleared_after_save() {
+        let dir = temp_path("autosave-save");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("doc.md");
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(doc.clone());
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "落过 draft 的改动");
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        state.autosave_pass(t0 + Duration::from_secs(31));
+        assert!(draft.exists());
+
+        state.save_to(doc);
+        assert!(!draft.exists(), "保存成功即清 draft");
+        assert!(!state.tabs.current_mut().editor.is_dirty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关闭即清:脏标签经确认模态关闭后 draft 消失(丢弃不留镜像)。
+    #[test]
+    fn autosave_draft_cleared_after_tab_close() {
+        let dir = temp_path("autosave-close");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "将被丢弃的改动");
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        state.autosave_pass(t0 + Duration::from_secs(31));
+        assert!(draft.exists());
+
+        state.apply(Message::TabCloseActive); // 脏 → 弹确认
+        assert!(state.tabs.confirm_close.is_some());
+        state.apply(Message::TabCloseConfirmed);
+        assert!(!draft.exists(), "确认关闭即清 draft");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一修订号不重写:落过之后外部改动 draft 文件,后续帧末(哪怕
+    /// 早已超过停顿阈值)不覆盖它;新编辑推进修订号才重新落盘。
+    #[test]
+    fn autosave_skips_rewrite_for_same_revision() {
+        let dir = temp_path("autosave-rev");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        state.tabs.current_mut().editor.insert_chars(0, "第一版");
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        state.autosave_pass(t0 + Duration::from_secs(31));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            state.tabs.current().editor.text()
+        );
+
+        std::fs::write(&draft, "外部改动,重写会覆盖我").unwrap();
+        state.autosave_pass(t0 + Duration::from_secs(120));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            "外部改动,重写会覆盖我",
+            "同修订号跳过重写"
+        );
+
+        // 新编辑推进修订号:恢复重写(证明上一段不是恒真)
+        state.tabs.current_mut().editor.insert_chars(0, "第二版:");
+        state.autosave_pass(t0 + Duration::from_secs(121));
+        state.autosave_pass(t0 + Duration::from_secs(152));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            state.tabs.current().editor.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未命名文档的 draft 落状态目录 `drafts/`(配置目录注入沙盒),
+    /// 文件名带标签 id,多个未命名标签互不覆盖。
+    #[test]
+    fn autosave_untitled_draft_goes_to_config_drafts_dir() {
+        let dir = temp_path("autosave-untitled");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        let tab_id = state.tabs.current().id;
+        state.tabs.current_mut().editor.insert_chars(0, "未命名稿");
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        assert!(!dir.join("drafts").exists(), "不满阈值不落文件");
+        state.autosave_pass(t0 + Duration::from_secs(31));
+        let draft = dir
+            .join("drafts")
+            .join(format!("untitled-{tab_id}.latermd-draft"));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            state.tabs.current().editor.text(),
+            "未命名 draft 落 config_dir()/drafts/,按标签 id 命名"
+        );
+
+        // 未命名标签关闭 → 状态目录里的 draft 同步删
+        state.apply(Message::TabCloseActive);
+        state.apply(Message::TabCloseConfirmed);
+        assert!(!draft.exists(), "未命名标签关闭即清状态目录 draft");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写入失败不 panic、旧 draft 保留:落点被同名目录占据时原子写失败,
+    /// 只落提示行;此前在别处落成的 draft 分毫未动。
+    #[test]
+    fn autosave_write_failure_keeps_old_draft_and_notifies() {
+        let dir = temp_path("autosave-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dir1")).unwrap();
+        std::fs::create_dir_all(dir.join("dir2")).unwrap();
+        let first_draft = dir.join("dir1").join("doc.md.latermd-draft");
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(dir.join("dir1").join("doc.md"));
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "第一处成功的内容");
+        let first_text = state.tabs.current().editor.text().to_owned();
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0);
+        state.autosave_pass(t0 + Duration::from_secs(31));
+        assert!(first_draft.exists());
+
+        // 换路径:新 draft 落点被目录占据 → 原子写失败(rename 顶不动目录)
+        std::fs::create_dir_all(dir.join("dir2").join("doc.md.latermd-draft")).unwrap();
+        state.tabs.current_mut().document.path = Some(dir.join("dir2").join("doc.md"));
+        state.tabs.current_mut().editor.insert_chars(0, "更多");
+        state.autosave_pass(t0 + Duration::from_secs(40)); // 记账新 last_edit
+        state.autosave_pass(t0 + Duration::from_secs(71)); // 到点,写失败
+        let notice = state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .unwrap_or_default();
+        assert!(notice.contains("自动保存失败"), "失败走提示行: {notice}");
+        assert_eq!(
+            std::fs::read_to_string(&first_draft).unwrap(),
+            first_text,
+            "旧 draft 保留,失败不破坏既有文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 主题切换归约:状态翻转 + settings.json 落盘(注入临时目录,不碰
