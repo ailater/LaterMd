@@ -22,8 +22,8 @@
 
 ## 功能队列
 
-> **排队顺序（2026-09-30 第七次更新，#28–#36 已收官，#38–#43 新入队）**：**#14 LP v2 → #15 反向链接 → #16 图标接入 → #17 查找替换 → #18 自动保存 → #19 IME 跟随 → #20 AI 适配器 → #22 cask 回填 → #23 字号行距 → #24 Ctrl+P → #25 PDF → #37 标签管理 → #38 代码块复制 → #39 切换卡顿 → #40 文件树截断 → #41 齿轮图标 → #42 大纲跳预览 → #43 预览字体**。
-> 预写脚本在 `.zcode/workflow-drafts/`（`自动流水线-NN-<名>.dwf.ts`，#26–#32、#37–#43 齐备——#38–#43 于 2026-09-30 预写就绪，等待夜间看护按本队列顺序调度；脚本内的队列描述会过时，开棒以本注记为准）。
+> **排队顺序（2026-09-30 第八次更新，重排版；权威清单 = .zcode/workflow-drafts/priority-queue-2026-09-30.json，25 任务线性依赖，#28 已收官经 PR #72）**：**#44 验收与文档纠偏 → #19 IME 跟随 → #22 cask 回填 → #39 切换卡顿 → #38 代码块复制 → #18 自动保存 → #17 查找替换 → #37 标签管理 → #45 关闭标签恢复 → #40 文件树截断 → #41 齿轮图标 → #43 预览字体 → #23 字号行距 → #16 图标接入 → #47 彩色emoji面板(E-C1) → #46 流式性能复测 → #42 大纲跳预览 → #14 LP v2 → #15 反向链接 → #48 预览内联彩色emoji(E-C2) → #24 Ctrl+P → #20 AI 适配器 → #25 PDF → #49 emoji 短码补全(可选,不默认)**。
+> 预写脚本在 `.zcode/workflow-drafts/`（`自动流水线-NN-<名>.dwf.ts`，#14–#25、#37–#49 齐备——2026-09-30 重排版统一按安全模板重生成：feature 分支开工/按声明路径收口提交/失败即中止/最终 head 六项门禁复验/默认本地终点不自动 push 不开 PR）。脚本内的队列描述会过时，开棒以本注记为准。
 > 状态图例：⏳待开始 → 🔄进行中 → ✅完成 / ❌挂起（3 次失败）/ ⛔受阻（依赖挂起）。
 
 | # | id | 功能 | 状态 | 备注 |
@@ -47,6 +47,7 @@
 | 41 | settings-gear | **设置图标齿轮化**（用户 2026-09-30 反馈「右上角的设置图标弄成齿轮的形状，现在像个星星」）：现状 = icons.rs `Self::Settings`（icons.rs:242-248）= ring((0,0),0.16) + 上下左右四根正向辐条——四向星芒观感。修 = 标准齿轮形：外齿圈（8 向齿：4 正向 + 4 斜向，或加粗齿段）+ 中心孔双 ring 结构，归一化坐标纯绘制，尺寸/线宽与既有图标族一致；「图标字符不得回流文本」快照护栏沿用；明暗两套像素验收齿轮轮廓可辨 | ⏳待开始 | 与 #16 应用图标无关（那是窗口图标，本条是 UI 内自绘图标）；改完标题栏齿轮与全部 Settings 消费点同步生效 |
 | 42 | outline-preview-jump | **大纲跳转预览侧**（用户 2026-09-30 反馈「点击大纲，源码栏和预览界面都支持跳转到位置，目前就源码跳转了」）：现状 = outline_row 点击发 Message::OutlineItemClicked(span)，归约只驱动编辑器 cursor.jump_to（editor.rs:115 scroll_to_rect）；预览侧无消费者。需要 span→预览屏幕位置通道：vendored LayoutResult 已有 code_block_spans 等块级 span 信息，块 rect 通道待探测——vendor 未暴露则 ①类扩展暴露块 rect 表（登记 vendor/README）。跳转语义 = 大纲点击源码 + 预览双侧跳（源码已有，预览 scroll_to_rect 一次到位居中）；预览面板滚动容器在 app 侧，滚动指令走 app，只把 rect 查询放 vendor | ⏳待开始 | 与 #14 LP v2 不冲突（#14 是块内源码/富渲染混合，本条只读跳转）；roadmap 原列 P3「大纲预览跳转」提前交付；偏移口径沿用 OutlineItem span（字节） |
 | 43 | preview-font-metrics | **预览排版字体修复**（用户 2026-09-30 反馈「中文英文数字高低不一，行高也有问题，有显示不全的问题，可能是字体问题导致的」）：嫌疑 = ①混排基线不齐——Inter（拉丁）与 CJK 回退族 ascent/descent 不同，行内取 max metrics 后基线对齐放大高低差；②显示不全——某处行距按单一字体 metrics 计算裁切更高字形（vendored layout/label 行距公式待核）；③同域前科：每个 FontFamily::Name 是独立回退链，bold/标题族曾漏挂 CJK（PR #52）。**取证式开工**：先写最小复现断言（同段中英数字混排的行盒 y 范围/基线一致性、字形不裁切），grep vendored 行距计算点定位真凶再修（候选 = 行距公式用行内实际 max metrics、字体回退链逐族核查、CJK 字体选型）；修后像素验收。若动 vendored 层行距 = ①类（通用能力，上游可合），登记 vendor/README | ⏳待开始 | 与 #23 字号行距设置衔接——本条修基线正确性，#23 修用户偏好，先后不互斥；三平台字体差异留真机人工清单 |
+| 44 | acceptance-triage | **核心验收与文档状态纠偏**(2026-09-30 重排版入队,第二组首位):V1 只读事实核对——gh 三路在线取证(三版 Release 资产/rust.yml@fd40701 结构化/tap CASKS 表)+本仓 git tag/Cargo/CHANGELOG 互证,产出 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md):四栏核对表 16 失实(R1–R16)+4 滞后(L1–L4)+真机 blocked_external 清单(§6)+E1–E22 证据摘录;V2 文档纠偏——六个 docs 文件 14 失实+3 滞后改真,每处旁注核对表行号与证据编号,R1/R2/L2 越界留 #54;V3 可自动验收项落证据——测试复跑(export 9 passed/app file:: 6 passed)+样例 HTML 12 项结构断言+DISPLAY=:0 15s 冒烟与 WM_CLASS=LaterMD 取证+main CI 结构化复验,acceptance-checklist 仅勾有证据的 §0.6,汇总进 status §8 三分栏 | 🔄本地完成(核对与纠偏完成,真机项留人工;待推送/PR) | 三 commits 于 feature/acceptance-doc-triage:f3d0b2c(V1)+042e4e4(V2)+75c1f98(V3);真机项(IME 三判据/wgpu 真机 adapter/SmartScreen+Gatekeeper/universal2/brew 安装/1 小时长跑/图床上传/Win CRLF 往返)全部未勾标 blocked_external(status §8.3);workspace 六项门禁复验与 push/PR 由编排收口,收口前本行不得标完成 |
 
 ### 已完成归档（29 条，2026-09-29 起）
 
@@ -87,8 +88,8 @@
 
 - IME 真机实测（Win11 微软拼音 / macOS 简体拼音）——M0 挂账项（Linux 首测已过，候选框跟随挂 #19）
 - Win/mac wgpu 真机启动验证（13a 无边框化后需一并复测）
-- ~~三平台打包真机验收（feature/p0-packaging 分支）~~ 已过时：cargo-dist 链路已进 main，v0.0.1/v0.0.2 均自动发版
+- ~~三平台打包真机验收（feature/p0-packaging 分支）~~ 已过时：cargo-dist 链路已进 main，v0.0.1/v0.0.2/v0.0.3 均自动发版（V1 核对表 R16，证据 E1/E4/E10）
 - AI provider 真实 API key 配置（decisions-pending #3）
 - 发布产物真机验收（三平台可安装 / 连续写 1 小时 / 导出 HTML / .md 不篡改，roadmap P0 出口四条）
-- cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）
+- ~~cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）~~ 已失效（2026-09-30 核实）：tap 仓 auto-bump 已含 CASKS 表，自动跟版至 0.0.3，无需手动回填；主仓 #22 cask-bump 与其功能重复，撤留留后续评审（V1 核对表 L4，证据 E12/E13；decisions-pending #53 补全第 3 点）
 - 图床真机上传走通一次（acceptance-checklist）

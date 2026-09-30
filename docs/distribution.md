@@ -124,7 +124,12 @@ bot 直推 main 改版本号会被分支保护拦截。版本号不变地合入 
   version 绑定以便 sha256 校验;Debian 惯例文件名内嵌版本)。这是两套命名
   共存的原因,不是疏漏。
 
-## 3. 首个 Release 步骤(v0.0.1)
+## 3. 首个 Release 历史记录(v0.0.1,2026-09-26 已过)
+
+> **本节已成历史**(V1 核对表 R3,证据 E1–E4):首个 Release(v0.0.1)已于 2026-09-26
+> 自动发版,v0.0.2(09-29)/ v0.0.3(09-30)复跑同链路。日常发版流程见 §4;§3.2 的
+> 应急通道与 §3.1 的前置检查清单仍然有效(§4 第 4 条仍引用 §3.1)。以下小节按
+> 历史记录订正(V1 R12–R15),未回填项如实保留,不随归档默认打勾。
 
 ### 3.1 前置检查
 
@@ -159,60 +164,80 @@ git checkout main && git pull --rebase origin main
 git tag v0.0.1 && git push origin v0.0.1   # 人工 tag push 直接触发 release.yml
 ```
 
-### 3.3 资产核对清单(Release 页面逐项勾)
+### 3.3 资产核对清单(历史回填:2026-09-30 按三版 Release 资产名单逐项核对)
 
-- [ ] `latermd-x86_64-unknown-linux-gnu.tar.xz`(+`.sha256`)
-- [ ] `latermd_{version}_amd64.deb`(linux-deb job 完成,回传资产)
-- [ ] `latermd-x86_64-pc-windows-msvc.zip`(+`.sha256`)
-- [ ] `latermd-aarch64-pc-windows-msvc.zip`(+`.sha256`)
-- [ ] `latermd-v0.1.0-universal2-apple-darwin.dmg`(macos-dmg job 完成)
-      —— **回传资产不在 dist 生成的下载表里**,需在 Release 正文手工补一行(见 §4 第 5 步)
-- [ ] `sha256.sum`、`dist-manifest.json`(dist 附带)
-- [ ] **清理已生效**:Release 页面不再出现 `*-apple-darwin.tar.xz` 与
-      `source.tar.gz`(macos-dmg 尾部清理;若在,是清理步失败,查其日志)
-- [ ] 「macOS dmg」job 的 **step summary** 里有 dmg 的 sha256 —— 首次填入
-      cask 模板用(macos-dmg.yml:96-106)。
-- [ ] Release 未被误标 prerelease(除非 tag 带预发布后缀)。
+> 证据 = V1 核对表 §1(核对项 A1–A6)与证据摘录 E1–E5/E18;**v0.0.1 无 deb 与
+> 未清理系时序事实**(deb job 与清理步均 2026-09-29 由 `0519c01`/PR #56 接入,
+> E18/E21),不是资产缺失或清理失败事故,按版本分开判。
 
-首个 Release 还要额外验证(只此一次,之后信任链路):
+- [x] `latermd-x86_64-unknown-linux-gnu.tar.xz`(+`.sha256`)—— 三版均在(A2)
+- [x] `latermd_{version}_amd64.deb` —— v0.0.2/v0.0.3 在;v0.0.1 无(deb job
+      2026-09-29 才接入,设计时序)(A3)
+- [x] `latermd-x86_64-pc-windows-msvc.zip`(+`.sha256`)—— 三版均在(A2)
+- [x] `latermd-aarch64-pc-windows-msvc.zip`(+`.sha256`)—— 三版均在(A2);
+      windows-11-arm 原生 runner 首编已证通过(见下方 R13)
+- [x] `latermd-v{version}-universal2-apple-darwin.dmg`(macos-dmg job 完成)
+      —— 三版均在,实际资产名按各自版本 v0.0.1/v0.0.2/v0.0.3(V1 核对表 R12,
+      证据 A4/E2–E4;原文写的 `v0.1.0` 从未存在,E9);**回传资产不在 dist 生成的
+      下载表里**,Release 正文补一行见 §4 第 5 步
+- [x] `sha256.sum`、`dist-manifest.json`(dist 附带)—— 在;sha256.sum 含已删
+      条目为 §1 既知代价(A6/E5)
+- [~] **清理已生效** —— v0.0.2/v0.0.3 已无 `*-apple-darwin.tar.xz` 与
+      `source.tar.gz`;**v0.0.1 未清理**系彼时清理步尚未引入(A5/E18),不是
+      清理步失败
+- [x] 「macOS dmg」job 的 **step summary** 里有 dmg 的 sha256 —— 已产出;但
+      cask 填值已不经此路径(tap auto-bump 直读 Release asset digest,
+      V1 R14/L3,证据 E12/E13)
+- [x] Release 未被误标 prerelease —— 三版均非 draft 非 prerelease(A1/E1)
+
+首个 Release 的额外验证(只此一次,之后信任链路):
 - ~~Windows xwin 交叉编能否通过~~ **已实测编不过**:ring 0.17 的 ARM64 汇编
   在 cargo-xwin 容器内失败(容器 clang 不认 cc-rs 的 `/imsvc` 参数,
   2026-09-26 v0.0.1 首发踩中),已改 `github-custom-runners` 把
   `aarch64-pc-windows-msvc` 指到 `windows-11-arm` 原生 runner;
-  **windows-11-arm 首编能否通过是下一个待验项**;
-- dmg 内 .app 在真机可启动(本机无 macOS,lipo/hdiutil/codesign 均未自测)。
+  ~~windows-11-arm 首编能否通过是下一个待验项~~ **已实测通过**(V1 核对表 R13,
+  证据 E2–E4:三版资产名单均含 win ARM64 zip);
+- dmg 内 .app 在真机可启动 —— **仍未做**,留人工(blocked_external,本机无
+  macOS;acceptance-checklist §3)。
 
-### 3.4 cask 落地(动 tap 仓库 crazykun/homebrew-ailater)
+### 3.4 cask 落地(动 tap 仓库 crazykun/homebrew-ailater)—— 已落地
 
-模板在本仓 [packaging/latermd.rb](../packaging/latermd.rb),已按 lscreen 模式
-写好(universal2 单 dmg url、`livecheck :github_latest`、postflight 去
-quarantine、`depends_on macos: :sonoma`、zap)。**复刻对象是
-`Casks/lscreen.rb`,不要抄同 tap 的 `glmeter.rb`**(后者仍是按架构拼 URL 的
-旧式双包写法,lscreen v0.8.0 起已废弃该模式)。要动三处:
+模板在本仓 [packaging/latermd.rb](../packaging/latermd.rb)(按 lscreen 模式:
+universal2 单 dmg url、`livecheck :github_latest`、postflight 去 quarantine、
+`depends_on macos: :sonoma`、zap)。**复刻对象是 `Casks/lscreen.rb`,不要抄
+同 tap 的 `glmeter.rb`**(后者仍是按架构拼 URL 的旧式双包写法,lscreen v0.8.0
+起已废弃该模式)。原「要动三处」的现状(2026-09-30 核实,V1 R14,证据 E12/E13):
 
-1. **新建 `Casks/latermd.rb`**:从 packaging/latermd.rb 复制,改两处 ——
-   `version` 填本次版本;`sha256` 用 step summary 的真值替换 `:no_check`
-   占位(`:no_check` 只是让 cask 在填值前可安装,不是长期形态)。
-2. **tap README**:Formula/Cask 表加 `latermd` 一行,安装命令区补
-   `brew install --cask crazykun/ailater/latermd`。
-3. **验证**:`brew install --cask crazykun/ailater/latermd` 在真机跑通;随后
-   核对主仓 README「安装」节三条路径与实测一致(2026-09-26 起 README 已按
-   已发布状态撰写,如命令有变以实测回改)。
+1. **`Casks/latermd.rb` 已建**(不再是「新建」):version "0.0.3"、sha256 真值
+   `d86ec30a…`,由 tap 仓 auto-bump workflow 自动维护(源:Release asset
+   digest);主仓 packaging/latermd.rb 的 `version "0.1.0"` / `sha256
+   :no_check` 仅为初版模板占位(V1 R2,主仓侧纠偏见 decisions-pending #54)。
+2. **tap README**:是否已加 `latermd` 行未核(V1 取证未覆盖 tap README,以
+   tap 仓库现状为准)。
+3. **验证**:`brew install --cask crazykun/ailater/latermd` 真机跑通**仍未做**
+   (blocked_external,缺 macOS 真机;acceptance-checklist §7.2);主仓 README
+   「安装」节三条路径与三版 Release 资产核对一致(E2–E4/E12)。
 
-**auto-bump 空档(重要)**:tap 的 auto-bump 流水线(cron 每小时 :23,
-`bump_formula.py` 做 version/url/sha256 三点重写)**只遍历 `Formula/`**,
-`Casks/` 不在自动范围 —— lscreen 的 cask 停在 0.6.0 就是手动维护失手的实证。
-LaterMD 若只发 cask,每次发版后需手动改 `Casks/latermd.rb` 的
-version/sha256;要自动化,需扩 `bump_formula.py` 支持 Casks(其 url+相邻
-sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表加上
-`latermd:LaterMd` 前先确认流水线已扩。**cask 的 version/sha256 不更新 =
-用户 brew 拿不到新版本**,这是发版检查单的一部分,不是可选项。
+**auto-bump 空档(历史,已闭合)**:本节曾记「tap 的 auto-bump(cron 每小时
+:23)只遍历 `Formula/`,`Casks/` 不在自动范围,latermd cask 需每版手动回填
+version/sha256」——该空档在 tap 侧已扩表闭合(V1 R15,证据 E12/E13):tap 的
+auto-bump.yml 现含 `CASKS=("latermd:ailater/LaterMd" …)` 表(cron 每小时
+:23),注释明言「Cask 的 url 是 v#{version} 插值模板永不改动,只更新
+version + sha256 两行;sha256 从 GitHub Release asset 的 digest 字段直接读取
+(免下载)」,cask 已自动跟版至 0.0.3。发版后不再需要手动回填(§4 第 3 步已
+相应改写)。主仓 #22(cask-bump:Release workflow 里 gh api 更新 cask)与
+tap 侧自动跟版功能重复,撤与留留后续评审(decisions-pending #53 第三轮补全
+第 3 点只登记冲突,本文不代撤)。
 
-### 3.5 首发后回填
+### 3.5 首发后回填(2026-09-30 纠偏回填;未做项如实保留,不随归档默认打勾)
 
-- 主仓 README 安装节:确认三条路径命令可执行(2026-09-26 已按发布状态重写)。
-- docs/roadmap.md「当前位置」:P0 打包条目状态更新。
-- m0-report.md 真机项:Win11 / macOS 冒烟结果(IME、字体 face index 核对)。
+- 主仓 README 安装节:三条路径(macOS dmg/brew、Windows zip、Linux tar.xz)
+  与三版 Release 资产核对一致(E2–E4/E12);**未完**:deb 渠道一行未列
+  (V1 L2)、README:8 版本行仍写 v0.0.1(V1 R1)——README/packaging 因本棒
+  路径约束未改,登记 decisions-pending #54 留后续单独 PR。
+- docs/roadmap.md「当前位置」:P0 行已按三版发版事实订正(本 PR,R3)。
+- m0-report.md 真机项:Win11 / macOS 冒烟结果(IME、字体 face index 核对)
+  **未回填**,留人工(blocked_external)。
 
 ## 4. 后续版本发布(v0.0.2+)
 
@@ -222,8 +247,11 @@ sha256 的正则替换逻辑对 cask 同样适用),或在 tap 的 FORMULAS 表�
    漏了 Release 页面就只剩一张下载表(v0.0.2 踩过一次,事后 `gh release edit`
    才补上)。
 2. 链路全自动(§3.2),无需打 tag。
-3. **发版后必做**:更新 tap 的 `Casks/latermd.rb`(version + sha256,取新
-   Release 的 dmg step summary 值;见 §3.4 的 auto-bump 空档)。
+3. **发版后核对 tap(已自动化,原「必做手动回填」口径作废)**:tap 仓
+   auto-bump 已含 CASKS 表,cask 的 version/sha256 每小时自动跟版(源:
+   Release asset digest,E12/E13;§3.4 空档段已闭合)——发版后无需手动回填,
+   只需巡检 cask version 与新 tag 一致;主仓 #22 cask-bump 与其功能重复,
+   撤留留后续评审(decisions-pending #53 补全第 3 点)。
 4. dist 配置(dist-workspace.toml)改动后本地必须重跑 §3.1 第 3 步的
    manifest 校验,再 `dist generate` 重新生成 release.yml —— 重新生成会
    **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上;allow-dirty 见 §1

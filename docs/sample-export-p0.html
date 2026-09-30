@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LaterMD P0 验收样例</title>
+<style>
+body {
+  margin: 0 auto;
+  padding: 2rem 1rem;
+  max-width: 46em;
+  line-height: 1.6;
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+code, pre {
+  font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace;
+}
+pre {
+  padding: 0.8em 1em;
+  border-radius: 6px;
+  background: #f6f8fa;
+  overflow-x: auto;
+}
+code {
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background: #f6f8fa;
+  font-size: 0.9em;
+}
+pre code {
+  padding: 0;
+  background: none;
+}
+table {
+  border-collapse: collapse;
+}
+th, td {
+  border: 1px solid #d0d7de;
+  padding: 0.35em 0.75em;
+}
+th {
+  background: #f6f8fa;
+}
+blockquote {
+  margin-inline: 0;
+  padding-inline: 1em;
+  border-inline-start: 4px solid #d0d7de;
+  color: #57606a;
+}
+img {
+  max-width: 100%;
+}
+@media (prefers-color-scheme: dark) {
+  pre, code, th {
+    background: #161b22;
+  }
+  th, td {
+    border-color: #30363d;
+  }
+  blockquote {
+    border-color: #30363d;
+    color: #8b949e;
+  }
+}
+</style>
+</head>
+<body>
+<h1>LaterMD P0 验收样例</h1>
+<p>这是 2026-09-30 自动验收棒生成的导出样例,正文含中文与 <code>ropey</code> 行内代码。</p>
+<h2>功能矩阵</h2>
+<table><thead><tr><th>能力</th><th>状态</th></tr></thead><tbody>
+<tr><td>双栏预览</td><td>已交付</td></tr>
+<tr><td>导出 HTML</td><td>本样例</td></tr>
+</tbody></table>
+<h2>代码块</h2>
+<pre><code class="language-rust">fn main() {
+    println!("你好,LaterMD");
+}
+</code></pre>
+<h2>待办与备注</h2>
+<ul>
+<li><input disabled="" type="checkbox" checked=""/>
+导出测试全绿</li>
+<li><input disabled="" type="checkbox"/>
+真机人工段</li>
+</ul>
+<p><del>旧说法</del> 已被 <del>删除线</del> 标记;脚注样例<sup class="footnote-reference"><a href="#1">1</a></sup>。</p>
+<blockquote>
+<p>单文件 HTML,内嵌 CSS,无外部资源。</p>
+</blockquote>
+<div class="footnote-definition" id="1"><sup class="footnote-definition-label">1</sup>
+<p>脚注内容原样保留。</p>
+</div>
+</body>
+</html>
