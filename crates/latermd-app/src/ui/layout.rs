@@ -178,8 +178,9 @@ impl LaterMdApp {
     }
 
     /// `App::ui` 的面板主体。独立成函数是为了测试能在同一 run_ui 帧里按
-    /// eframe 顺序(先 `reduce` 后绘制)跑完整帧。
-    fn draw(&mut self, ui: &mut egui::Ui) {
+    /// eframe 顺序(先 `reduce` 后绘制)跑完整帧(本模块测试与
+    /// `tab_switch_perf` 取证 harness 同用,故 `pub(crate)`)。
+    pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
         // 禅定模式(§7)是**另一整套面板组合**,不是给三栏各加一个 if:
         // 藏面板的最佳办法是从一开始就不添加它(侧栏宽度演算与 z 序全部
         // 让位),而不是添加了再把可见性摁掉。故在这里整体分叉。
@@ -276,10 +277,16 @@ impl LaterMdApp {
             )
             .show_collapsible(ui, right, |ui| {
                 let tab = self.state.tabs.current_mut();
+                // heal 只在 AI 流式写入本标签时开:补闭合是流式残缺帧的
+                // 必需品,完整文档上是恒等变换但逐行全文扫描,稳态帧不该付。
+                let streaming_here =
+                    self.state.ai.is_streaming() && self.state.ai_active_tab == Some(tab.id);
                 crate::ui::preview::ui(
                     ui,
                     &mut tab.preview,
                     &self.state.ai,
+                    tab.id,
+                    streaming_here,
                     // 相对图片以文档所在目录为锚拼 file://(未落盘为 None)
                     tab.document
                         .path
@@ -587,10 +594,15 @@ impl LaterMdApp {
                     // 是同一棵树上的不相交分支,挨着写会被借用检查器拦下。
                     let LaterMdApp { state, outbox, .. } = self;
                     let tab = state.tabs.current_mut();
+                    // heal 条件同三栏路径:仅 AI 流式写入本标签时开。
+                    let streaming_here =
+                        state.ai.is_streaming() && state.ai_active_tab == Some(tab.id);
                     crate::ui::preview::ui(
                         ui,
                         &mut tab.preview,
                         &state.ai,
+                        tab.id,
+                        streaming_here,
                         tab.document
                             .path
                             .as_deref()

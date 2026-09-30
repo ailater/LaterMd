@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #59 为当前最新条目。
+> 编号 #60 为当前最新条目。
+
+## #60 切换卡顿(#39 M2)四候选修法的取舍:per-tab 缓存槽位+heal 条件化落地,首屏分段与后台预热不做(2026-09-30,#39 tab-switch-perf M2·自动拍板)
+
+- **岔路**:M1 根因锁定「切换帧 vendored 预览缓存全量 miss」后,任务列了四个候选修法:rendered/heal 按 (tab, rev) 缓存、heal 仅流式启用、大文档首屏分段(视口外延迟)、TextEdit 切换预热;另有「切 tab 后台预热下一文档解析」。实施时发现四者并非并列:①归约/快照侧(rendered/outline)本来就按 rev 缓存(PreviewState 只在 revision 前进时 rebuild),无重复成本可省;②真正的命中障碍是 vendored 缓存全部挂同一个常量 widget id("preview-md"),切 tab 时槽位被另一文档的 hash 覆盖——这可以在 app 侧解(id 加 tab 维度)也可以在 vendored 侧解(缓存搬出 temp memory 做跨文档 LRU);③「大文档首屏分段」必须改 vendored flush_text_range 的 miss 路径(miss 帧没有段高缓存,跳过布局会塌、用估计高度会跳),是①类中等改动且破坏布局连续性;④「TextEdit 预热」经核实不需要——editor.rs 的 TextEdit 早已用 `tab_editor_id`(per-tab),往返天然命中。最大的实测岔路:M1 基线「切换后首帧 9.45ms」与本次改动后 92ms 的对比表面上是回归,实为 harness 同构样本的假象(sample_doc(1)/sample_doc(2) 模板相同,大量段落 token 内容一致,旧路径同 id 换文本时段级 ctx_hash 命中 A 残留缓存,6.95ms;换成同规模非同构文档对照,旧路径首切实测 92.4ms,与 per-tab id 的 91.5ms 持平)。
+- **备选**:A 只做 app 侧:per-tab widget id + heal 条件化,首切成本如实报数字,首屏分段/预热登记后续路线;B 连 vendored 一起改:缓存迁出 temp memory 做跨文档 LRU + miss 帧视口外延迟布局(①类,~几百行,含布局正确性风险);C 加后台预热:打开文档时空闲帧预渲染(无免费午餐——成本只是移到别的帧,galley 非 Send 做不到线程池)。
+- **自动选择**:A。附带一个顺手的正确性修复:预览 ScrollArea 的 id_salt 同步 per-tab(原常量 "preview-scroll" 下所有标签共享滚动偏移,切 tab 滚动位置互相踩;per-tab 后各标签记住各自的滚动位置——egui temp memory 无按帧回收,已实测跨往返存活)。
+- **理由**:①egui 0.36 `IdTypeMap` 实证无按帧 GC(temp 仅在 clear/remove 时清,egui src/util/id_type_map.rs 与 memory/mod.rs begin_pass/end_pass 均不触碰 data),per-tab id 即可让 vendored 缓存跨切换存活,零 vendor 达成任务预期;②首切 miss 是「该文档第一次被渲染」的固有成本,预热只是把卡移位不消除,分帧预热又有布局塌陷/滚动条跳动问题,两者都违反「不做不达标优化」的务实原则;③2000 行口径往返切回 9.38→2.82ms、20000 行往返 41.2ms,稳态帧 594.7→458.5µs(heal 条件化),改善达标(以上为 M2 当轮数字;**2026-09-30 评审补测修正**:原括注「旧路径真实场景同场景为 900ms+ 量级」系机制推断且量级有误——harness [E] 新增旧路径对照行(常量 id 单槽,doc7 覆盖后切回 big 文档)release 实测 20000 行往返切回 72.1ms(单件),900ms 量级实为「该文档从未渲染过」的冷首切(847–927ms),新旧路径同付,本改法改善的是往返与稳态而非冷首切;同轮 release 复跑 2000 行往返 6.29ms(旧机制单件)→2.33ms(整帧)、20000 行 72.1→31.1ms,结论 A 不变);④20000 行首切 926.8ms>100ms 属「不达标」项,按任务要求如实进 notes 并给出后续路线(vendored ①类:miss 帧视口外段延迟布局,或打开时空闲帧逐段预热),不隐瞒不糊弄。
+- **如何改**:若要首帧也达标——授权 vendored ①类改动(label.rs `flush_text_range` miss 路径加视口外延迟 + `CachedMarkdownLayout`/`CachedFlushRange`/`StreamingCodeCache` 迁到跨文档 LRU,按 AGENTS §6 三分类独立 vendor: commit 并登记 vendor/README.md);若接受首切一次卡顿的现状——本条可回删;若要恢复滚动位置跨标签共享的旧行为——把 preview.rs `tab_preview_id` 相关的 ScrollArea `id_salt` 改回常量即可(MarkdownLabel 的 per-tab id 不受影响)。
 
 ## #59 评审修复棒被禁 commit,却被要求把 README.md 补段送进 commit——以「点名暂存+借道编排收口提交」闭合(2026-09-30,#22 cask-bump 独立评审修复·自动拍板)
 
