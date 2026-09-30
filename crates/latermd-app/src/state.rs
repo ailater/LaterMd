@@ -67,9 +67,9 @@ const AI_PROMPT_TAIL_CHARS: usize = 2000;
 /// 保持一致 —— 重复生成时凭它移除旧节,避免摘要堆积。
 const AI_SUMMARY_HEADING: &str = "AI 摘要";
 
-/// Emoji 面板「最近使用」的容量:去重置顶后截断。E1 仅内存维护,
-/// 落 `settings.json` 是 E2 的活(docs/emoji-plan.md §6.3)。
-const EMOJI_RECENT_CAP: usize = 24;
+/// Emoji 面板「最近使用」的容量:去重置顶后截断(E2 起随 settings.json
+/// 持久化,docs/emoji-plan.md §6.3)。
+const EMOJI_RECENT_CAP: usize = 16;
 
 /// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
 const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
@@ -1065,6 +1065,11 @@ impl State {
         self.skins = SkinCatalog::load_from(&dir);
         let skin = self.theme.skin.clone();
         self.theme.select_skin(skin.as_deref(), &self.skins);
+        // Emoji「最近使用」随 settings.json 回来(E2,与主题同文件同路);
+        // 手改配置存多的部分截到容量,两处同步收敛到同一份
+        self.emoji.recent = self.theme.emoji_recent.clone();
+        self.emoji.recent.truncate(EMOJI_RECENT_CAP);
+        self.theme.emoji_recent = self.emoji.recent.clone();
         // 跟随系统:启动即探测一次,否则首帧只能靠 fallback
         if self.theme.mode == ThemeMode::System {
             self.refresh_system_theme();
@@ -1358,11 +1363,15 @@ impl State {
         if let Some(byte) = tab.cursor.byte {
             tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
         }
-        // 最近使用:去重置顶、封顶截断(E1 仅内存,E2 才落 settings.json)
+        // 最近使用:去重置顶、封顶截断;同步进 theme 后走主题的既有落盘
+        // 路径写 settings.json(E2,docs/emoji-plan.md §6.3「与 ThemeSettings
+        // 同路」)。落盘失败只落提示行,插入本身照常生效 —— 与切主题同口径。
         let recent = &mut self.emoji.recent;
         recent.retain(|seen| seen != emoji);
         recent.insert(0, emoji.to_owned());
         recent.truncate(EMOJI_RECENT_CAP);
+        self.theme.emoji_recent = self.emoji.recent.clone();
+        self.persist_theme();
     }
 
     /// 「浏览…」(`Message::ImageFilePickRequested` 的归约):弹图片选择框,
@@ -4249,6 +4258,72 @@ mod tests {
         let tab = state.tabs.current();
         assert_eq!(tab.editor.text(), "🚀", "选中内容被替换");
         assert_eq!(tab.pending_selection, Some((1, 1)));
+    }
+
+    /// 「最近使用」上限(E2:16 枚):第 17 枚进来时最早的一枚被挤掉,
+    /// 顺序保持新的在前。
+    #[test]
+    fn emoji_recent_truncates_to_cap() {
+        let mut state = State::default();
+        // 17 枚互不相同的载荷;每次插入都会关面板,故逐枚重开
+        let batch = [
+            "😀", "😃", "😄", "😁", "😆", "😅", "😂", "😉", "😊", "😍", "😘", "😋", "😛", "😜",
+            "😏", "😒", "😬",
+        ];
+        assert_eq!(batch.len(), EMOJI_RECENT_CAP + 1);
+        for emoji in batch {
+            state.emoji.open = true;
+            state.apply(Message::EmojiInserted(emoji.to_owned()));
+        }
+        assert_eq!(state.emoji.recent.len(), EMOJI_RECENT_CAP, "封顶截断");
+        assert_eq!(state.emoji.recent[0], "😬", "最新的一枚在前");
+        assert_eq!(
+            state.emoji.recent[EMOJI_RECENT_CAP - 1],
+            "😃",
+            "最早的一枚(😀)被挤掉"
+        );
+    }
+
+    /// 「最近使用」持久化(E2,docs/emoji-plan.md §6.3):插入即随主题
+    /// 路径落 settings.json;重启(main 装载 ThemeSettings → load_preferences
+    /// 回装)后顺序保持。
+    #[test]
+    fn emoji_recent_persists_and_reloads() {
+        let dir = temp_path("emoji-recent");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        for emoji in ["🚀", "😀"] {
+            state.emoji.open = true;
+            state.apply(Message::EmojiInserted(emoji.to_owned()));
+        }
+        assert!(state.tabs.current().document.notice.is_none(), "落盘无提示");
+
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            json.contains("emoji_recent"),
+            "随 settings.json 落盘:{json}"
+        );
+        let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(
+            reloaded_theme.emoji_recent,
+            vec!["😀".to_owned(), "🚀".to_owned()],
+            "重启装载:新的在前"
+        );
+
+        // 重启路径复现(main 的 LaterMdApp::new:先装 theme 再 load_preferences)
+        let mut restarted = State {
+            theme: reloaded_theme,
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        restarted.load_preferences();
+        assert_eq!(
+            restarted.emoji.recent,
+            vec!["😀".to_owned(), "🚀".to_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 浏览本地图片(B 段):复制进 `<doc名>.assets/`,url 回填相对地址,

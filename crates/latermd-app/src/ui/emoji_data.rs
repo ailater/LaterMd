@@ -45,6 +45,36 @@ macro_rules! entries {
     };
 }
 
+/// 三路大小写不敏感匹配(docs/emoji-plan.md E2):查询对**中文名 / 英文
+/// 名 / 短码**做子串包含;`to_lowercase` 对 CJK 是恒等变换,只归一 ASCII
+/// 大小写。空查询恒命中(调用方据此走「当前分类全表」分支,不走这里)。
+pub fn matches(entry: &EmojiEntry, query: &str) -> bool {
+    let needle = query.to_lowercase();
+    needle.is_empty()
+        || entry.name_zh.to_lowercase().contains(&needle)
+        || entry.name_en.to_lowercase().contains(&needle)
+        || entry.shortcode.to_lowercase().contains(&needle)
+}
+
+/// 跨分类搜索:返回 `(分类下标, 条目)`,按分类顺序、分类内按表序排列
+/// (面板据此分段渲染,段头即命中来源)。空查询返回空 —— 空态显示的是
+/// 当前分类全表,不是全库。
+pub fn search(query: &str) -> Vec<(usize, &'static EmojiEntry)> {
+    let needle = query.trim().to_lowercase();
+    let mut hits = Vec::new();
+    if needle.is_empty() {
+        return hits;
+    }
+    for (group_index, group) in GROUPS.iter().enumerate() {
+        for entry in group.entries {
+            if matches(entry, &needle) {
+                hits.push((group_index, entry));
+            }
+        }
+    }
+    hits
+}
+
 /// 八个分类,顺序即面板标签页顺序。
 pub const GROUPS: [EmojiGroup; 8] = [
     EmojiGroup {
@@ -466,5 +496,55 @@ mod tests {
             assert!(!entry.name_en.is_empty(), "{:?} 缺英文名", entry.char);
             assert!(!entry.shortcode.is_empty(), "{:?} 缺短码", entry.char);
         }
+    }
+
+    /// E2 三路匹配之一:中文名子串(火箭 → 🚀)。
+    #[test]
+    fn search_matches_chinese_name() {
+        let hits = search("火箭");
+        assert_eq!(hits.len(), 1, "「火箭」只命中一枚:{hits:?}");
+        assert_eq!(hits[0].1.char, "🚀");
+        assert!(matches(hits[0].1, "火箭"));
+    }
+
+    /// E2 三路匹配之二:英文名大小写不敏感(ROCK → rocket → 🚀)。
+    #[test]
+    fn search_matches_english_name_case_insensitively() {
+        let hits = search("ROCK");
+        assert!(hits.iter().any(|(_, entry)| entry.char == "🚀"), "{hits:?}");
+        assert!(hits
+            .iter()
+            .all(|(_, entry)| entry.name_en.to_lowercase().contains("rock")));
+    }
+
+    /// E2 三路匹配之三:短码(tada 不出现在任何中英文名里,只命中 🎉)。
+    #[test]
+    fn search_matches_shortcode() {
+        let hits = search("tada");
+        assert_eq!(hits.len(), 1, "「tada」只命中一枚:{hits:?}");
+        assert_eq!(hits[0].1.char, "🎉");
+    }
+
+    /// 空查询不展开成全库(空态走「当前分类全表」,不是跨分类);查不到
+    /// 返回空,面板据此显示「无匹配」。
+    #[test]
+    fn empty_query_and_misses_return_nothing() {
+        assert!(search("").is_empty());
+        assert!(search("   ").is_empty(), "纯空白等价空查询");
+        assert!(search("不存在的词zzz").is_empty());
+    }
+
+    /// 命中跨分类:查询「手」至少落在两个分类(手势 / 人物),且按分类
+    /// 顺序排列 —— 面板的来源分段依赖这一顺序。
+    #[test]
+    fn hits_span_groups_in_group_order() {
+        let hits = search("手");
+        let groups: Vec<usize> = hits.iter().map(|(group, _)| *group).collect();
+        assert!(groups.contains(&1), "手势分类有命中:{groups:?}");
+        assert!(groups.contains(&2), "人物分类有命中:{groups:?}");
+        assert!(
+            groups.windows(2).all(|pair| pair[0] <= pair[1]),
+            "命中按分类顺序排列:{groups:?}"
+        );
     }
 }

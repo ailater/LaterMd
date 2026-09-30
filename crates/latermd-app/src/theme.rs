@@ -155,6 +155,12 @@ pub struct ThemeSettings {
     pub density: Density,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
+    /// Emoji 面板「最近使用」(docs/emoji-plan.md §6.3):新的在前、去重、
+    /// 容量上限见 `state::EMOJI_RECENT_CAP`。落 settings.json 是 E2 的既定
+    /// 路线(「与 ThemeSettings 同路」)—— 本结构即 settings.json 的载荷,
+    /// 主题动作落盘时顺带持久化,不另开文件;旧文件缺该项由
+    /// `#[serde(default)]` 补空。
+    pub emoji_recent: Vec<String>,
     /// 当前皮肤的**内容**:由 `skin` 名字从磁盘载入,**不落盘**
     /// (避免同一份样式在 settings.json 与皮肤文件里各存一份、改了一处另一处
     /// 不跟着变)。
@@ -706,6 +712,28 @@ mod tests {
 
         settings.save_to(Some(&dir)).unwrap();
         assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Emoji「最近使用」随 settings.json 往返(E2,docs/emoji-plan.md
+    /// §6.3):顺序保持(新的在前),旧存档缺该项回落空、不致解析失败。
+    #[test]
+    fn emoji_recent_round_trips_and_defaults_to_empty() {
+        let dir = temp_dir("emoji-recent");
+        let settings = ThemeSettings {
+            emoji_recent: vec!["🚀".to_owned(), "😀".to_owned(), "🇨🇳".to_owned()],
+            ..ThemeSettings::default()
+        };
+
+        settings.save_to(Some(&dir)).unwrap();
+        assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+
+        // 旧版 settings.json 没有 emoji_recent:serde(default) 兜底
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert!(ThemeSettings::load_from(&dir)
+            .unwrap()
+            .emoji_recent
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,4 +1,4 @@
-//! 「插入 Emoji」面板(docs/emoji-plan.md E1 骨架)。
+//! 「插入 Emoji」面板(docs/emoji-plan.md E1 骨架 + E2 搜索/分类/最近使用)。
 //!
 //! ## 分工(与 `ui::image_dialog` 同一套写法)
 //!
@@ -7,11 +7,14 @@
 //! 归约在 `state`(走 `compose::insert_emoji`),点选后关面板与 Esc 关闭
 //! 也都经消息(`EmojiInserted` / `EmojiPickerToggle(false)`)。
 //!
-//! ## E1 的边界
+//! ## E2 的口径
 //!
-//! 搜索框是**占位**:草稿进 `state.emoji.query`,三路匹配(中文名 / 英文
-//! 名 / 短码)与「最近使用」一行是 E2 的活,本版输入不过滤网格。分类
-//! 标签可切换,否则八个分类只剩第一个可达。
+//! - **搜索**:`query` 非空时走 `emoji_data::search` 三路匹配(中文名 /
+//!   英文名 / 短码,大小写不敏感),结果**跨分类**呈现,段头与 tooltip
+//!   都标来源分类;无命中显式给「无匹配」。空查询 = 当前分类全表。
+//! - **最近使用**:面板底部一行(空态整行隐藏);点选即再插入 —— 连插
+//!   多个靠它二次进入。去重、封顶与落盘都在归约(`state::insert_emoji`
+//!   → `settings.json`,与主题同路)。
 //!
 //! ## 渲染口径
 //!
@@ -31,23 +34,29 @@ const COLUMNS: usize = 8;
 const CELL: f32 = 32.0;
 /// 单元格字号:占格子约六成,再大就顶到 hover 底色边缘。
 const CELL_FONT: f32 = CELL * 0.6;
+/// 搜索结果滚动区的高度上限(约 5 行)。每类 ≤ 40 枚本就单屏放得下;
+/// 跨分类搜索的命中总数不受该约束,用滚动 + 屏外字形不绘制(`cell` 里
+/// `is_rect_visible` 跳过)把渲进字体图集的量限在可视区,防图集膨胀
+/// (emoji-plan §7 #6)。
+const RESULTS_MAX_H: f32 = 200.0;
 
 /// Emoji 面板状态(归约置 `open`,UI 改 `query` / `group`)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmojiPanelState {
     /// 面板是否可见。
     pub open: bool,
-    /// 搜索草稿。E1 占位(不参与过滤);E2 接三路匹配。
+    /// 搜索草稿。非空时网格换 `emoji_data::search` 的跨分类结果;归约在
+    /// 开面板时清空(上次的搜索词对下一次插入没有意义)。
     pub query: String,
-    /// 当前分类(`emoji_data::GROUPS` 的下标)。
+    /// 当前分类(`emoji_data::GROUPS` 的下标);清空搜索词即回到它。
     pub group: usize,
-    /// 最近使用(去重、新的在前)。E1 只在内存维护,持久化与面板展示
-    /// 是 E2 的活。
+    /// 最近使用(去重、新的在前、上限见 `state::EMOJI_RECENT_CAP`)。
+    /// 维护与持久化都在归约(E2 起随 settings.json),面板只展示。
     pub recent: Vec<String>,
 }
 
-/// 画面板,返回当前分类网格里每个单元的响应(测试定位用,生产调用方
-/// 忽略)。
+/// 画面板,返回所有可点 emoji 单元的响应(网格 + 搜索结果 + 最近使用,
+/// 测试定位用,生产调用方忽略)。
 ///
 /// 点选单元发 [`Message::EmojiInserted`],归约里插入并关面板;Esc 直接
 /// 发 `Message::EmojiPickerToggle(false)`(只关面板,不动文档)。
@@ -64,15 +73,15 @@ pub fn panel(
         .collapsible(false)
         .resizable(false)
         .show(ui.ctx(), |ui| {
-            // 搜索框:E1 占位(见模块文档),desired_width 撑满让网格与
-            // 输入框同宽
+            // 搜索框:E2 起参与过滤(三路大小写不敏感匹配,emoji_data::search);
+            // desired_width 撑满让网格与输入框同宽
             ui.add(
                 egui::TextEdit::singleline(&mut state.query)
                     .hint_text("搜索中文名 / 英文名 / 短码")
                     .desired_width(f32::INFINITY),
             );
             ui.add_space(tokens::SPACE_SM);
-            // 分类横向标签
+            // 分类横向标签。搜索态下标签保留可点:清空搜索词即回到所选分类
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
                 for (index, group) in emoji_data::GROUPS.iter().enumerate() {
@@ -85,18 +94,62 @@ pub fn panel(
                 }
             });
             ui.add_space(tokens::SPACE_SM);
-            // 网格:按 8 个一行切块,窗口宽度不改变列数
-            let index = state.group.min(emoji_data::GROUPS.len() - 1);
-            for row in emoji_data::GROUPS[index].entries.chunks(COLUMNS) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
-                    for entry in row {
-                        cells.push(cell(ui, entry, outbox));
-                    }
-                });
+            // 网格:空查询 = 当前分类全表;有查询 = 跨分类命中,段头高亮
+            // 来源分类(emoji-plan E2)
+            let query = state.query.trim();
+            if query.is_empty() {
+                let index = state.group.min(emoji_data::GROUPS.len() - 1);
+                let group = &emoji_data::GROUPS[index];
+                for row in group.entries.chunks(COLUMNS) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+                        for entry in row {
+                            cells.push(cell(ui, entry, None, outbox));
+                        }
+                    });
+                }
+            } else {
+                let hits = emoji_data::search(query);
+                if hits.is_empty() {
+                    ui.weak("无匹配");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("emoji-search-results")
+                        .max_height(RESULTS_MAX_H)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            // hits 按分类有序:连续同组号即一个来源分类,
+                            // 段头就是命中来源(跨分类可发现)
+                            for run in hits.chunk_by(|a, b| a.0 == b.0) {
+                                let source = emoji_data::GROUPS[run[0].0].name;
+                                ui.strong(source);
+                                for row in run.chunks(COLUMNS) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+                                        for &(_, entry) in row {
+                                            cells.push(cell(ui, entry, Some(source), outbox));
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                }
             }
             ui.add_space(tokens::SPACE_XS);
             ui.separator();
+            // 「最近使用」一行(E2):空态整行隐藏;点选即再插入 —— 连插
+            // 多个靠它二次进入,不用重新翻分类
+            if !state.recent.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+                    ui.weak("最近");
+                    for emoji in &state.recent {
+                        cells.push(glyph_cell(ui, emoji, "最近使用 · 点选再次插入", outbox));
+                    }
+                });
+                ui.add_space(tokens::SPACE_XS);
+                ui.separator();
+            }
             ui.weak("应用内为黑白显示;导出 HTML 或粘贴到外部仍是彩色");
         });
     // Esc 关闭:面板开着才走到这里,Esc 就是「收起面板」;不消费 ——
@@ -108,8 +161,35 @@ pub fn panel(
     cells
 }
 
-/// 网格单元:字符居中 + hover 底色 + tooltip(三名一路,可发现性)。
-fn cell(ui: &mut egui::Ui, entry: &EmojiEntry, outbox: &mut Vec<Message>) -> egui::Response {
+/// 网格单元:字符居中 + hover 底色 + tooltip(三名一路,可发现性);
+/// `source` 非 None(搜索态)时前置来源分类名。
+fn cell(
+    ui: &mut egui::Ui,
+    entry: &EmojiEntry,
+    source: Option<&'static str>,
+    outbox: &mut Vec<Message>,
+) -> egui::Response {
+    let tooltip = match source {
+        Some(group) => format!(
+            "{group} · {} · {} · :{}:",
+            entry.name_zh, entry.name_en, entry.shortcode
+        ),
+        None => format!(
+            "{} · {} · :{}:",
+            entry.name_zh, entry.name_en, entry.shortcode
+        ),
+    };
+    glyph_cell(ui, entry.char, &tooltip, outbox)
+}
+
+/// 字符单元的公共体(网格与「最近使用」共用):32×32 点击区,字符居中,
+/// hover 底色 + tooltip,点选发插入消息。
+fn glyph_cell(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    tooltip: &str,
+    outbox: &mut Vec<Message>,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -123,17 +203,14 @@ fn cell(ui: &mut egui::Ui, entry: &EmojiEntry, outbox: &mut Vec<Message>) -> egu
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            entry.char,
+            glyph,
             egui::FontId::proportional(CELL_FONT),
             ui.visuals().text_color(),
         );
     }
-    let response = response.on_hover_text(format!(
-        "{} · {} · :{}:",
-        entry.name_zh, entry.name_en, entry.shortcode
-    ));
+    let response = response.on_hover_text(tooltip);
     if response.clicked() {
-        outbox.push(Message::EmojiInserted(entry.char.to_owned()));
+        outbox.push(Message::EmojiInserted(glyph.to_owned()));
     }
     response
 }
@@ -279,5 +356,97 @@ mod tests {
             frame(&ctx, &mut state, events, Some(&mut outbox));
         }
         assert_eq!(outbox, vec![Message::EmojiPickerToggle(false)]);
+    }
+
+    /// 搜索(E2):空查询 = 当前分类全表;非空 = 跨分类三路匹配(当前
+    /// 分类是「表情」,「火箭」命中旅行分类 —— 单元数 1 证明网格已换源);
+    /// 无命中零单元(「无匹配」提示无点击目标)。
+    #[test]
+    fn search_filters_the_grid_across_groups() {
+        let ctx = egui::Context::default();
+        let mut state = EmojiPanelState {
+            open: true,
+            ..EmojiPanelState::default()
+        };
+
+        let cells = frame(&ctx, &mut state, Vec::new(), None);
+        assert_eq!(
+            cells.len(),
+            emoji_data::GROUPS[0].entries.len(),
+            "空查询显示当前分类全表"
+        );
+
+        state.query = "火箭".to_owned();
+        let cells = frame(&ctx, &mut state, Vec::new(), None);
+        assert_eq!(cells.len(), 1, "跨分类命中唯一:{cells:?}");
+
+        state.query = "查无此物xyz".to_owned();
+        let cells = frame(&ctx, &mut state, Vec::new(), None);
+        assert!(cells.is_empty(), "无匹配不给可点单元");
+    }
+
+    /// 搜索态点选命中单元:发出该枚字符的插入消息(ScrollArea 需要更多
+    /// sizing pass,取第 6 帧的单元矩形定位;与 E1 的 4 帧 + 探针同一手法)。
+    #[test]
+    fn search_result_click_inserts_the_hit() {
+        let ctx = egui::Context::default();
+        let mut state = EmojiPanelState {
+            open: true,
+            query: "火箭".to_owned(),
+            ..EmojiPanelState::default()
+        };
+        let mut first = Rect::NOTHING;
+        for step in 0..6 {
+            let cells = frame(&ctx, &mut state, Vec::new(), None);
+            if step == 5 {
+                if let Some(cell) = cells.first() {
+                    first = cell.rect;
+                }
+            }
+        }
+        let center = first.center();
+        assert!(center.x > 0.0, "拿到了命中单元的位置:{center:?}");
+
+        let mut outbox = Vec::new();
+        click_at(&ctx, &mut state, center, &mut outbox);
+        assert_eq!(outbox, vec![Message::EmojiInserted("🚀".to_owned())]);
+    }
+
+    /// 「最近使用」行(E2):空态整行隐藏(单元数 = 网格数);有记录时
+    /// 尾追可点单元,点选发同样的插入消息 —— 连插多个的二次入口。
+    #[test]
+    fn recent_row_hides_when_empty_and_inserts_on_click() {
+        let ctx = egui::Context::default();
+        let mut state = EmojiPanelState {
+            open: true,
+            ..EmojiPanelState::default()
+        };
+        let cells = frame(&ctx, &mut state, Vec::new(), None);
+        assert_eq!(
+            cells.len(),
+            emoji_data::GROUPS[0].entries.len(),
+            "空态无最近使用行"
+        );
+
+        state.recent = vec!["🚀".to_owned(), "🎉".to_owned()];
+        let mut last = Rect::NOTHING;
+        for step in 0..6 {
+            let cells = frame(&ctx, &mut state, Vec::new(), None);
+            assert_eq!(
+                cells.len(),
+                emoji_data::GROUPS[0].entries.len() + 2,
+                "第 {step} 帧:网格之外多出两枚最近单元"
+            );
+            if step == 5 {
+                last = cells.last().expect("最近单元存在").rect;
+            }
+        }
+        let mut outbox = Vec::new();
+        click_at(&ctx, &mut state, last.center(), &mut outbox);
+        assert_eq!(
+            outbox,
+            vec![Message::EmojiInserted("🎉".to_owned())],
+            "点的是最后一枚(🚀 之后的 🎉)"
+        );
     }
 }
