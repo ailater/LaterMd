@@ -13,7 +13,7 @@
 
 | # | 验证项 | 状态 | 一句话结论 |
 |---|---|---|---|
-| 1 | IME 中文输入 | **Linux 已实测:可用,候选框不跟随** | Deepin X11 + fcitx5:中文组词上屏正常,但候选框不落在光标下方;上报链路核对完整,故障点待定位(见验证 1) |
+| 1 | IME 中文输入 | **Linux 已实测:可用;候选框不跟随 → 修复已提交,待人工复测** | Deepin X11 + fcitx5:中文组词上屏正常;候选框不跟随,应用侧根因已定位(自动上报路径错位),显式 IMERect 上报修复已提交(e749fce)—— 自动侧证据仅限「位置上报链路接通 + 无 panic」,候选框目视跟随待人工复测,不销账(见验证 1「修复复测」) |
 | 2 | 长文档性能 | **渲染路径 + 交互 fps 均已实测,真机复测后放行** | 自建 10 万字 bench:滚动到中部 430 µs/帧,与顶部持平(视口剔除生效);真窗口滚动 p50 60.3 fps 达标、p95 49.3 fps 略低于 55fps 线 —— 且这是 llvmpipe **软件渲染**的下限 |
 | 3 | wgpu 三 target | **Linux ✅(软件 adapter),Win/mac 待真机** | Linux Vulkan 起动并正确渲染,但 adapter 为 llvmpipe;Win11 DX12 / macOS Metal 待真机 |
 | 4 | 流式性能边界 | **⚠️ O(n),P1 硬约束** | 500/2000/10000 行追加成本 38.7 / 154.7 / 789.3 ms,约 77 µs/行线性增长;超 ~1300 行即跟不上 100ms/chunk,P1 开工前必须先解决 |
@@ -37,6 +37,19 @@
   - **定性**:缺陷隔离在「候选框跟随」,不是「输入不可用」;Linux 不在 M0 放行线内(验收标准只定义 Win11/macOS 真机),**不触发风险登记册 #1 的换 iced 应对**。归属定位后再定:app/配置层可修则修;若为上游(egui/winit/fcitx5-XIM)限制,按既定原则记为已知问题,不硬修 egui。
 - **历史(2026-09-24)**:M0 冒烟载体(`crates/latermd-app/src/main.rs`)只有只读标签,无 `TextEdit`,IME 无从触发;X11 下 eframe 窗口稳定运行(见验证 3 证据),无输入法服务相关启动报错。
 - **下一步**:① 先做上面③的 Wayland 对照实验,定位故障环节后回填本文档(连同吞字/抢焦点观察);② Win11 / macOS 真机实测,记录候选框跟随、连续输入不吞字、窗口切换不抢焦点三项。
+
+### 验证 1 修复复测(2026-09-30,#19 ime-follow,commit e749fce)
+
+- **修复内容(显式上报链路)**:应用侧根因 = egui-winit 0.36 的自动上报路径把 `IMEOutput::rect`(整个 TextEdit 矩形,`egui-winit-0.36.2/src/lib.rs:1171`)当 IME 光标区,XIM spot 恒钉在编辑器左上角。修复:编辑器持焦点且光标位置实际变化的帧,经 `ViewportCommand::IMERect` 显式上报 caret rect(`crates/latermd-app/src/ui/editor.rs:316`);该命令由 eframe 在每帧平台输出阶段消费(`wgpu_integration.rs:1300`),是每帧最后一次 spot 写入,自动路径错位值被同帧覆盖。红线落地:失焦帧/空闲帧不发任何 IME 命令(`editor.rs:37` 触发判定纯函数),不对组合中(composition)状态做额外干预,不发明清除命令。
+- **冒烟证据(本机 Deepin 25 / X11(DISPLAY=:0)/ fcitx5 挂搜狗模块,xdotool 驱动真实窗口,两轮)**:编辑器聚焦 → 输入 → 光标上下左右移动 → 中文组词上屏(「你好」「世界」「俺爸」均上屏,截图核对)→ 点预览栏失焦再点回 → 窗口最小化/恢复焦点翻转 → Ctrl+N 开新标签 + Ctrl+Tab 双标签往返 —— **全程无 panic**(两份运行日志 `panicked|SIGSEGV|SIGABRT` 均 0 命中);gdb 断点直击 winit X11 `send_xim_spot`(`winit-0.30.13/.../x11/ime/mod.rs:188`)观测到上报 45 + 42 = **87 次,坐标随光标移动/输入/切标签持续出现** —— 位置上报链路接通。应用侧命令流单测:`cargo test -p latermd-app -- ime` 7 passed(4 条 IME 断言:触发判定红线/聚焦跟 caret/重进重报/失焦不报)。
+- **方法偏差(如实记录)**:任务预设的 `RUST_LOG=egui_winit=trace` 在本应用上无输出(实测 stderr 0 行;应用进程未安装 logger 实现,log 宏为 no-op),改用 gdb 断点法直接观测 winit→Xlib 边界的 spot 上报,取证点比 trace 日志更靠近生效端。
+- **结论(不销账)**:修复已提交,**候选框目视跟随待人工复测**(清单与判定见 [ime-follow-acceptance.md](ime-follow-acceptance.md) §3.1);Win11 微软拼音 / macOS 14 简体拼音真机三项(跟随/不吞字/不抢焦点,M0 出口线)维持待真机,不写结论(§3.2,blocked_external);Wayland 对照实验(上文怀疑方向③)维持待切会话,未做(§3.3,blocked_external)。自动侧不证明目视跟随,吞字/抢焦点两项本轮不记结论。
+
+### 验证 1 修复复测·补(2026-09-30,独立评审 finding 1/2 处置)
+
+- **finding 1(high,已修)**:评审指出「持焦点+光标未动+有输入事件」的帧(keyup/鼠标 motion/preedit 文本未变的更新帧,打字流中高频)只有 egui-winit 自动路径生效,spot 被重设为 TextEdit 整体矩形左上角,而原触发判定把这类帧判为空闲不发显式命令 —— 「显式命令同帧盖回」的假设只在光标变化帧成立。修复(`crates/latermd-app/src/ui/editor.rs`):触发判定改为**镜像自动路径谓词**(egui-winit lib.rs:1173 = 内容矩形变化 ∨ 本帧有输入事件;镜像基准 = `TextEditOutput::text_clip_rect`,即自动路径上报的 `inner_rect`),并改以 caret 条**屏幕矩形**变化为红线主项(滚动动画帧也被覆盖);真空闲帧(无事件、无位移、非写回)仍一条命令不发。取舍登记 [decisions-pending.md](decisions-pending.md) #56。单测 9 项(新增 finding 1 回归与滚动帧端到端),`cargo test -p latermd-app -- ime` 9 passed、`cargo test -p latermd-app` 全量 418 passed。
+- **finding 2(medium,证据补强)**:轮次 3 冒烟(X11+fcitx5,gdb 四断点帧分段)回答了「同一帧两次 set,fcitx5 取哪个」—— winit X11 的 spot 写经 channel 异步 FIFO 冲刷(`event_processor.rs:88-97`),同帧先 auto 后 explicit 入队,帧末值恒为显式 caret 值;**37/37 次自动写均被同帧显式写覆盖,0 单飞**;显式值随打字/组合/箭头精确变化,0 panic。证据与边界见 [ime-follow-acceptance.md](ime-follow-acceptance.md) §2.2.1/§2.3/§4。
+- **结论(仍不销账)**:自动侧已证明到「应用侧写入 winit 的帧末 spot 值恒为 caret 值」为止;候选框渲染正确性(fcitx5/搜狗消费 XIM spot)与吞字/抢焦点仍待人工目视/真机,口径不变。
 
 ## 主验证 2:长文档性能 —— 10 万字 bench 通过(渲染路径),交互 fps 待真窗口
 

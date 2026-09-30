@@ -3,7 +3,23 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #54 为当前最新条目。
+> 编号 #56 为当前最新条目。
+
+## #56 IME 补报红线的「空闲帧」口径:按自动路径谓词镜像重定义(2026-09-30,#19 ime-follow 独立评审修复·自动拍板)
+
+- **岔路**:原任务红线写「只在编辑器持焦点且光标位置实际变化的帧上报;失焦帧/空闲帧不发任何 IME 命令」;而独立评审 finding 1(high)指出「持焦点+光标未动+有输入事件」的帧(keyup/鼠标 motion/preedit 未变更新帧)里 egui-winit 自动路径必然重写 spot 到 TextEdit 左上角(其 lib.rs:1173 第二个触发项即「事件非空」),不补报就留下整帧错位(坤哥症状帧类)。字面守「光标变化才报」= finding 1 不可修,两条指令冲突。
+- **备选**:A 字面守红线、不修 finding 1(残留症状);B 把「空闲帧」解读为「无输入事件且无任何位移的帧」,触发判定镜像自动路径谓词(事件非空 ∨ 内容矩形变化即补报),红线意图(失焦不抢位、空闲/动画帧不轰炸)保住;C escalate 等人裁决。
+- **自动选择**:B。
+- **理由**:本棒指令「逐条修复」评审 finding 即最新意图;自动路径在事件帧**必然**写 spot,补报与之一一对应,不产生任何多余的窗口系统写入(真空闲帧两边都不写,单测 `ime_trigger_requires_focus_and_change_or_auto_path_risk` 钉住);红线同句「光标位置实际变化」改按 caret 条**屏幕矩形**判定后由滚动/重排位移帧字面满足;轮次 3 冒烟实测 37/37 自动写被同帧盖回、0 单飞,选择 B 未引入多余命令(见 [ime-follow-acceptance.md](ime-follow-acceptance.md) §2.2.1)。
+- **如何改**:若要退回更严口径,把 `crates/latermd-app/src/ui/editor.rs` 的 `ime_report_needed` 中 `auto_path_will_fire` 项删掉即可(会重新放行 finding 1 的错位帧类,不建议);若想把镜像基准从点空间改为像素空间以封死纯 ppp 变化的理论窄缝,需另读 egui-winit 的 `ime_rect_px` 语义,改前先补对照冒烟。
+
+## #55 IME 位置显式上报只接源码模式,Live Preview 活动块未覆盖(2026-09-30,#19 ime-follow·自动拍板)
+
+- **岔路**:#19 要求「编辑器持焦点的帧,光标位置变化时向窗口系统上报 caret 区域」;但编辑器有两个渲染面:源码模式(`ui/editor.rs` 的 multiline `TextEdit`,本模块 paths 声明的唯一落点)与 Live Preview(`live.rs` 的活动块 `TextEdit`,id `editor_id.with(("live-block", index))` —— 另一文件、另一 widget)。只接源码模式的话,在 Live 模式活动块里组合中文,候选框仍落在块编辑器左上角(egui-winit 自动路径上报的 widget rect),不随 caret。
+- **备选**:A 只接源码模式,缺口登记进本文件与结果 notes;B 本棒扩 paths 改 `live.rs`,同手法复用(块内 primary + 块首字符偏移换算全文 caret,记忆键按块挂)。
+- **自动选择**:A。
+- **理由**:公共约束明文「只改本模块 paths 声明的路径」,`live.rs` 不在声明内;#19 任务文本与 auto-plan #19 行的实现指引均点名 `ui/editor.rs` + follow_char 同源手法(follow_char 本就是源码模式的产物);Live 块的 caret 换算(块内字符偏移 + 块首)与按块记忆键是新增设计点,该独立一棒受全量门禁,不宜顺手混入。
+- **如何改**:后续模块扩 paths 至 `crates/latermd-app/src/live.rs`:活动块 `TextEdit` 渲染后复用 `ui::editor` 的 `ime_report_needed` 与 `ImeCaretTracking`(记忆键 `editor_id.with(("live-block", index)).with("ime-caret")`),caret 取 `块首字符偏移 + 块内 primary`,rect 仍 `galley_pos + pos_from_cursor`;落地后回删本条。
 
 ## #54 V2 纠偏棒无法触碰 README.md 与 packaging/latermd.rb：模块 paths=["docs"] 与任务文本点名 README 的冲突（2026-09-30，#44 V2 文档状态纠偏·自动拍板）
 

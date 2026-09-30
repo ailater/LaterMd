@@ -21,6 +21,58 @@ pub(crate) fn tab_editor_id(tab_id: u64) -> egui::Id {
     egui::Id::new("source-editor").with(tab_id)
 }
 
+/// IME caret 上报的每标签记忆(#19):上次显式上报的 caret 条矩形,以及
+/// 上次见到的 TextEdit 内容矩形(egui-winit 自动路径上报给窗口系统的就是
+/// 它)。`None` = 尚未上报,或刚经历失焦(X11 下 IME 上下文随焦点翻转被
+/// winit 重建,重进必须重报)。挂在 `editor_id.with("ime-caret")` 上,随
+/// TextEdit 持久 state 同生命周期,切标签互不惊扰。
+#[derive(Clone, Copy, Default)]
+struct ImeCaretTracking {
+    last_sent_rect: Option<egui::Rect>,
+    last_widget_rect: Option<egui::Rect>,
+}
+
+/// [`ime_report_needed`] 的输入快照。
+struct ImeTriggerInputs {
+    focused: bool,
+    /// 写回帧(大纲跳转/格式动作覆写光标并要回焦点)。
+    write_back: bool,
+    /// 本帧 caret 条矩形(egui points);`None` = 光标从未落过。
+    caret_rect: Option<egui::Rect>,
+    /// 上次显式上报的 caret 条矩形;`None` = 尚未上报/刚失焦。
+    last_sent_rect: Option<egui::Rect>,
+    /// 本帧 TextEdit 内容矩形(`TextEditOutput::text_clip_rect`)。
+    widget_rect: egui::Rect,
+    /// 上次见到的内容矩形;`None` = 首帧。
+    last_widget_rect: Option<egui::Rect>,
+    /// 本帧输入事件非空 —— egui-winit 自动路径触发项的镜像。
+    has_input_events: bool,
+}
+
+/// IME 位置上报的触发判定(#19 红线 + 独立评审 finding 1 的纯函数形态)。
+/// 只在编辑器持焦点且满足其一时报:
+///
+/// ①写回帧(大纲跳转/格式动作覆写光标并要回焦点);
+/// ②caret 条矩形相对上次上报有变化 —— 含滚动/重排导致的屏幕位移,即红线
+///   的「光标位置实际变化」;
+/// ③egui-winit 自动路径将重写 spot 的帧(keyup/指针 motion/preedit 更新
+///   这类「有输入事件但光标没动」的帧,或内容矩形变化的滚动动画帧;自动
+///   路径条件见 `egui-winit-0.36.2/src/lib.rs:1173`)—— 它把 spot 钉到
+///   TextEdit 左上角,必须同帧补报盖回。
+///
+/// 失焦帧恒 `false`;真正的空闲帧(无输入事件、无任何位移、非写回)三项
+/// 全假,一条 IME 命令都不发。
+fn ime_report_needed(i: &ImeTriggerInputs) -> bool {
+    match (i.focused, i.caret_rect) {
+        (true, Some(caret_rect)) => {
+            let auto_path_will_fire =
+                i.has_input_events || Some(i.widget_rect) != i.last_widget_rect;
+            i.write_back || Some(caret_rect) != i.last_sent_rect || auto_path_will_fire
+        }
+        _ => false,
+    }
+}
+
 /// 把 [`EditorBuffer`] 适配成 egui `TextBuffer` 的 newtype。
 ///
 /// 孤儿规则:`egui::TextBuffer` 与 `EditorBuffer` 都不归本 crate,
@@ -115,6 +167,9 @@ pub fn ui(
     if let Some(jump) = cursor.jump_to.take() {
         format_result = Some((jump, jump));
     }
+    // 写回帧的 caret 目标在 ScrollArea 闭包里记下,IME 上报(闭包外)用:
+    // 写回当帧 output.state 还是写回前的旧快照,定位只能用写回目标本身。
+    let mut ime_write_back: Option<usize> = None;
 
     let output = egui::ScrollArea::vertical()
         // 每标签一套滚动位置,与 TextEdit 持久状态的口径一致;id 不含内容
@@ -168,6 +223,7 @@ pub fn ui(
             if let Some((start, end)) = format_result {
                 write_selection(ui, &output.response.response.id, &output.state, start, end);
                 follow_char = Some(start);
+                ime_write_back = Some(start);
             }
 
             // 光标跟随只走**显式请求**,标志是帧内局部变量,当帧即焚 ——
@@ -250,6 +306,71 @@ pub fn ui(
         .char_range()
         .map(|range| (range.primary.index.0, range.secondary.index.0));
 
+    // IME 位置显式上报(#19):egui-winit 0.36 的自动路径把 `IMEOutput::rect`
+    // (整个 TextEdit 内容矩形,其 lib.rs:1171)当 IME 光标区调
+    // `Window::set_ime_cursor_area` —— XIM spot 被钉到编辑器左上角。该路径
+    // 在「内容矩形变化 **或** 本帧有输入事件」时都会重写 spot(lib.rs:
+    // 1173):keyup、指针 motion、preedit 文本未变的更新帧在打字流中高频
+    // 出现而光标没动,只按光标变化补报会留下整帧错位(候选框跳回左上角,
+    // 即坤哥症状的帧类)。因此触发判定镜像自动路径的谓词(`text_clip_rect`
+    // == 自动路径用的 `inner_rect`,见 egui builder.rs:781):自动路径要写
+    // spot 的帧,这里同帧经 `ViewportCommand::IMERect` 补报 caret 条矩形盖
+    // 回 —— 该命令由 eframe 在平台输出**之后**消费(wgpu_integration.rs:
+    // 1300 晚于 :1248),是帧内最后一次 spot 写入。真正的空闲帧(无事件、
+    // 无位移、非写回)依然一条 IME 命令都不发。
+    let tracking_id = editor_id.with("ime-caret");
+    let mut tracking: ImeCaretTracking = panel
+        .ctx()
+        .data_mut(|data| data.get_temp(tracking_id).unwrap_or_default());
+    let focused = panel
+        .ctx()
+        .memory(|mem| mem.has_focus(output.response.response.id));
+    // 写回帧的 caret 取写回目标,其余帧读持久化光标 —— 与行号/大纲回填同源。
+    let caret_char = ime_write_back.or_else(|| {
+        output
+            .state
+            .cursor
+            .char_range()
+            .map(|range| range.primary.index.0)
+    });
+    let caret_rect = caret_char.map(|caret| {
+        let rect = output
+            .galley
+            .pos_from_cursor(egui::text::CCursor::new(caret));
+        egui::Rect::from_min_max(
+            output.galley_pos + rect.min.to_vec2(),
+            output.galley_pos + rect.max.to_vec2(),
+        )
+    });
+    let has_input_events = panel.ctx().input(|input| !input.events.is_empty());
+    if ime_report_needed(&ImeTriggerInputs {
+        focused,
+        write_back: ime_write_back.is_some(),
+        caret_rect,
+        last_sent_rect: tracking.last_sent_rect,
+        widget_rect: output.text_clip_rect,
+        last_widget_rect: tracking.last_widget_rect,
+        has_input_events,
+    }) {
+        panel
+            .ctx()
+            .send_viewport_cmd(egui::ViewportCommand::IMERect(
+                caret_rect.expect("ime_report_needed 为真则 caret 已知"),
+            ));
+        tracking.last_sent_rect = caret_rect;
+    }
+    // 内容矩形每帧记忆(自动路径触发项的镜像基准),与是否上报无关。
+    tracking.last_widget_rect = Some(output.text_clip_rect);
+    if !focused {
+        // 失焦帧不发任何 IME 命令(红线),记忆归零:焦点重进帧的
+        // last_sent_rect 是 None,光标没动也重报一次 —— X11 下焦点翻转会让
+        // winit 重建 IME 上下文,spot 不重报就丢。
+        tracking = ImeCaretTracking::default();
+    }
+    panel
+        .ctx()
+        .data_mut(|data| data.insert_temp(tracking_id, tracking));
+
     output.response.response
 }
 
@@ -300,11 +421,14 @@ mod tests {
             &mut pending,
             cursor,
         )
+        .0
     }
 
     /// 同 [`frame`],额外把 §6.4 的两个槽位交给调用方。八条实参里五条是
     /// 同一帧的被测对象、一起传是大势所趋,故单独豁免形参计数 lint ——
     /// 它只作用于本测试辅助,不去污染 `ui` 的 API 面。
+    /// 返回值第二项是本帧 viewport 命令流里的全部 `IMERect` 矩形(#19:
+    /// IME 上报断言的截取口,与生产侧 egui-winit 消费的是同一条命令流)。
     #[allow(clippy::too_many_arguments)]
     fn frame_with_channel(
         ctx: &egui::Context,
@@ -315,7 +439,7 @@ mod tests {
         selection: &mut Option<(usize, usize)>,
         pending: &mut Option<(usize, usize)>,
         cursor: &mut OutlineCursor,
-    ) -> egui::Id {
+    ) -> (egui::Id, Vec<egui::Rect>) {
         // 真实窗口尺度的视口:滚不滚得动取决于「内容是否高过一屏」,
         // 默认 10000×10000 的测试视口永远装得下,滚动路径测不到。
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
@@ -349,8 +473,22 @@ mod tests {
         );
         // egui 0.36 的 TexturesDelta drop 检查:测试里不消费绘制增量,
         // 显式丢弃(与 vendored 层测试同一处理)
+        let ime_rects = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .filter_map(|command| match command {
+                        egui::ViewportCommand::IMERect(rect) => Some(*rect),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         output.drop_without_applying_deltas();
-        id.get()
+        (id.get(), ime_rects)
     }
 
     /// §6.4 通道的**回来那一半**:归约把新选区挂到 `pending`,本模块把它写
@@ -369,7 +507,7 @@ mod tests {
         let mut selection = None;
         let mut pending = Some((2, 5));
 
-        let id = frame_with_channel(
+        let (id, _) = frame_with_channel(
             &ctx,
             Vec::new(),
             0.0,
@@ -431,6 +569,440 @@ mod tests {
         let recorded = selection.expect("选区已回填");
         let span = [recorded.0.min(recorded.1), recorded.0.max(recorded.1)];
         assert_eq!(span, [1, 3], "上一帧写进去的选区被搬了出来");
+    }
+
+    /// #19 触发判定的纯函数单测:红线逐条落成断言 —— 失焦恒不报;持焦点
+    /// 时在「caret 屏幕位置有变 / 写回 / 记忆为空(首次或重进)/ 自动路径
+    /// 将重写 spot 的帧(有输入事件或内容矩形变化)」时报;真空闲帧
+    /// (无事件、无位移、非写回)不报;没有光标就没位置可报。
+    #[test]
+    fn ime_trigger_requires_focus_and_change_or_auto_path_risk() {
+        let caret = || egui::Rect::from_min_max(egui::pos2(100.0, 200.0), egui::pos2(101.0, 218.0));
+        let caret2 =
+            || egui::Rect::from_min_max(egui::pos2(120.0, 200.0), egui::pos2(121.0, 218.0));
+        let widget = || egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let trig = |focused, write_back, caret_rect, last_sent_rect, has_input_events| {
+            ime_report_needed(&ImeTriggerInputs {
+                focused,
+                write_back,
+                caret_rect,
+                last_sent_rect,
+                widget_rect: widget(),
+                last_widget_rect: Some(widget()),
+                has_input_events,
+            })
+        };
+
+        // 失焦帧:无论光标/写回/事件状态,一律不上报
+        assert!(!trig(false, false, Some(caret()), Some(caret()), false));
+        assert!(!trig(false, false, Some(caret()), Some(caret()), true));
+        assert!(!trig(false, true, Some(caret()), Some(caret()), true));
+        // 持焦点 + 记忆为空(首次进入/失焦后重进):报
+        assert!(trig(true, false, Some(caret()), None, false));
+        // 持焦点 + caret 屏幕位置变化(红线主项,含滚动/重排位移):报
+        assert!(trig(true, false, Some(caret2()), Some(caret()), false));
+        // 持焦点 + caret 未动 + 无事件 + 内容矩形未变 = 真空闲帧:不报
+        assert!(!trig(true, false, Some(caret()), Some(caret()), false));
+        // finding 1:持焦点 + caret 未动 + 有输入事件(keyup/motion/preedit
+        // 更新帧)—— 自动路径将把 spot 重写到 widget 左上角,必须同帧盖回
+        assert!(trig(true, false, Some(caret()), Some(caret()), true));
+        // 写回帧:rect 未变也要报一次
+        assert!(trig(true, true, Some(caret()), Some(caret()), false));
+        // 光标从未落过(caret_rect 为 None):没有位置可报
+        assert!(!trig(true, false, None, None, false));
+        assert!(!trig(true, true, None, None, true));
+        // 自动路径另一半触发项:内容矩形变化(滚动动画/布局变化)或首帧
+        // (last_widget_rect 为空)时,即使无事件、caret 未动也要盖回
+        assert!(ime_report_needed(&ImeTriggerInputs {
+            focused: true,
+            write_back: false,
+            caret_rect: Some(caret()),
+            last_sent_rect: Some(caret()),
+            widget_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 300.0)),
+            last_widget_rect: Some(widget()),
+            has_input_events: false,
+        }));
+        assert!(ime_report_needed(&ImeTriggerInputs {
+            focused: true,
+            write_back: false,
+            caret_rect: Some(caret()),
+            last_sent_rect: Some(caret()),
+            widget_rect: widget(),
+            last_widget_rect: None,
+            has_input_events: false,
+        }));
+    }
+
+    /// #19:焦点进入帧与光标移动帧各报一次 `IMERect`,rect 随光标前进
+    /// 右移;持焦点的空闲帧一条 IME 命令都不发。
+    #[test]
+    fn ime_rect_follows_caret_while_focused() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        // 先经写回通道把光标明确落到 0(从未落过光标的编辑器第一次吃导航
+        // 键会初始化到 galley 末端,见 arrow_down_navigation_keeps_cursor_visible);
+        // 这本身也是一帧「写回 + 焦点进入」:当帧上报一次。
+        let mut selection = None;
+        let mut pending = Some((0, 0));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "写回帧(同时是焦点进入帧)上报一次");
+        let at_zero = rects[0];
+
+        // 持焦点空闲帧:光标没动,不发任何 IME 命令
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "空闲帧不发 IME 命令");
+
+        // ArrowRight:光标 0 → 1,当帧上报且 caret 条右移一个字宽
+        let right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            vec![right],
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "光标移动帧上报一次");
+        assert!(
+            rects[0].min.x > at_zero.min.x,
+            "caret rect 随光标移动右移(实测 {} → {})",
+            at_zero.min.x,
+            rects[0].min.x
+        );
+
+        // 移动之后再空闲一帧:不再报
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.4,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "移动后的空闲帧不再上报");
+    }
+
+    /// #19:失焦帧不报;焦点重进帧**即使光标没动**也要重报一次 —— X11 下
+    /// 焦点翻转会让 winit 重建 IME 上下文,spot 不重报候选框就落不回光标。
+    #[test]
+    fn ime_report_repeats_when_focus_returns() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let mut selection = None;
+        let mut pending = Some((2, 2));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "写回帧上报一次");
+
+        // 失焦(等价于点进侧栏):不报
+        ctx.memory_mut(|mem| mem.surrender_focus(id));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "失焦帧不发任何 IME 命令");
+
+        // 焦点重进:光标未动也要重报一次
+        ctx.memory_mut(|mem| mem.request_focus(id));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "焦点重进帧重报一次(光标未动)");
+    }
+
+    /// finding 1 回归:keyup/指针 motion/preedit 文本未变的更新帧里光标没动,
+    /// 但 egui-winit 自动路径因「本帧有输入事件」照样把 spot 重写到 TextEdit
+    /// 左上角(其 lib.rs:1173 的第二个触发项)—— 这类帧必须同帧补报同一
+    /// caret 条矩形盖回,否则快速打字时候选框会周期性跳回编辑器左上角
+    /// (坤哥症状的帧类)。
+    #[test]
+    fn ime_rect_resent_on_event_frames_without_caret_move() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        // 写回把光标落到 2 并聚焦:当帧上报一次,记下 caret 条矩形
+        let mut selection = None;
+        let mut pending = Some((2, 2));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "写回帧上报一次");
+        let sent = rects[0];
+
+        // 真空闲帧(无事件、光标未动、无位移):不报
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "真空闲帧不发 IME 命令");
+
+        // 指针划过编辑区(motion 帧,光标未动):同帧补报同一矩形
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            vec![Event::PointerMoved(egui::pos2(120.0, 80.0))],
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "事件帧即使光标未动也补报一次");
+        assert_eq!(
+            rects[0], sent,
+            "补报的是同一 caret 条矩形,盖回自动路径的错位值"
+        );
+
+        // preedit 更新帧(组合开始,未上屏):同样上报。egui 0.36 会把 preedit
+        // 文本插进缓冲并把组合选区末尾当 primary(builder.rs 的
+        // ImeComposition 分支),caret rect 随组合串右移 —— 这正是候选框
+        // 该跟随的位置。
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            vec![Event::Ime(egui::ImeEvent::Preedit {
+                text: "nihao".into(),
+                active_range_chars: None,
+            })],
+            0.4,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "preedit 更新帧补报一次");
+        let composed = rects[0];
+        assert!(
+            composed.min.x > sent.min.x,
+            "组合串插入后 caret 移到组合串末尾(实测 {} → {})",
+            sent.min.x,
+            composed.min.x
+        );
+
+        // preedit 文本未变的重复更新帧:缓冲先删后插同串,内容与光标回到
+        // 同一处,rect 与上次上报一致 —— 事件非空仍触发,重发同值盖回。
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            vec![Event::Ime(egui::ImeEvent::Preedit {
+                text: "nihao".into(),
+                active_range_chars: None,
+            })],
+            0.5,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "重复 preedit 帧补报一次");
+        assert_eq!(rects[0], composed, "与上一帧同值(组合串未变)");
+    }
+
+    /// 自动路径另一半触发项(内容矩形变化)的端到端:写回触发的滚动动画帧
+    /// 没有任何输入事件,但内容矩形与 caret 屏幕位置都在动 —— 自动路径随
+    /// 位移逐帧重写 spot,显式上报必须跟住,否则滚动期间候选框钉死在编辑
+    /// 器左上角。
+    #[test]
+    fn ime_rect_follows_scroll_without_input_events() {
+        let ctx = test_ctx();
+        let text = (0..500).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+
+        // 写回到文末:当帧上报一次,caret 远在首屏之外
+        let tail = editor.len_chars();
+        let mut selection = None;
+        let mut pending = Some((tail, tail));
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert_eq!(rects.len(), 1, "写回帧上报一次");
+        assert!(
+            rects[0].min.y > 600.0,
+            "写回帧 caret 还在视口外(实测 y={})",
+            rects[0].min.y
+        );
+
+        // 无事件的滚动动画帧:caret 屏幕位置持续变化 → 持续补报并进视口
+        let mut reports = 0;
+        let mut reached_view = false;
+        for i in 0..8 {
+            let (_, rects) = frame_with_channel(
+                &ctx,
+                Vec::new(),
+                0.2 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+            );
+            reports += rects.len();
+            reached_view |= rects.iter().any(|rect| rect.min.y <= 600.0);
+        }
+        assert!(reports > 0, "滚动动画帧持续上报(共 {reports} 次)");
+        assert!(reached_view, "上报的 caret 矩形随滚动进过视口");
+
+        // 动画落定后的真空闲帧:不再报
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            3.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "落定后的空闲帧不再上报");
+    }
+
+    /// #19:编辑器从未持焦点的帧,一个 IME 命令都不发 —— 指针划过也不算。
+    #[test]
+    fn ime_report_never_fires_without_focus() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut None,
+            &mut None,
+            &mut cursor,
+        );
+        assert!(rects.is_empty());
+        let (_, rects) = frame_with_channel(
+            &ctx,
+            vec![Event::PointerMoved(egui::pos2(400.0, 300.0))],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut None,
+            &mut None,
+            &mut cursor,
+        );
+        assert!(rects.is_empty(), "无焦点的指针事件帧也不上报");
     }
 
     fn test_ctx() -> egui::Context {
