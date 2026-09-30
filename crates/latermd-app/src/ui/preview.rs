@@ -398,26 +398,43 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
     }
 }
 
-/// 绘制预览面板。`base_dir` 是当前文档所在目录:相对图片地址以它为锚
-/// 拼成 `file://` 绝对 URI(见 [`resolve_relative_images`]);`None` =
-/// 文档未落盘,原样渲染。
+/// 预览 widget id 的 tab 维度成分(#39 M2)。vendored 层的解析/分段/高亮
+/// 缓存全部挂在这个 id 命名空间下,每标签独立一份:切到别的标签期间本
+/// 标签的缓存不被覆盖,切回即命中 —— 这是「切标签往返不重解析」的机制
+/// (egui temp memory 无按帧回收,跨帧存活,实证见 tab_switch_perf 回归测试)。
+/// id 只含稳定 tab id,绝不含内容 hash/长度(AGENTS.md §6.7)。
+fn tab_preview_id(tab_id: u64) -> egui::Id {
+    egui::Id::new("preview-md").with(tab_id)
+}
+
+/// 绘制预览面板。`tab_id` 是当前标签的稳定 id(缓存命名空间,见
+/// [`tab_preview_id`]);`heal` 为 true 时渲染前对整篇文本补闭合 —— 仅在
+/// AI 流式写入本标签时开:流式残缺帧(未闭合 fence/加粗)需要补闭合才
+/// 语法合法(AGENTS.md §6.5),完整文档上 heal 是恒等变换(Cow::Borrowed),
+/// 但扫描本身逐行全文(2 万行样本 ~2ms/帧),人工编辑的稳态帧不该付。
+/// `base_dir` 是当前文档所在目录:相对图片地址以它为锚拼成 `file://`
+/// 绝对 URI(见 [`resolve_relative_images`]);`None` = 文档未落盘,原样渲染。
 pub fn ui(
     panel: &mut egui::Ui,
     preview: &mut PreviewState,
     ai: &AiState,
+    tab_id: u64,
+    heal: bool,
     base_dir: Option<&Path>,
     outbox: &mut Vec<Message>,
 ) {
+    let label_id = tab_preview_id(tab_id);
     egui::ScrollArea::vertical()
-        .id_salt("preview-scroll")
+        .id_salt(label_id.with("scroll"))
         // 不收缩宽度,让 wrap 以面板宽为界
         .auto_shrink([false, false])
         .show(panel, |ui| {
-            // widget id 必须是常量:绝不含内容长度/hash,否则每次编辑都
-            // 清空 vendored 层临时缓存,增量高亮与分段缓存全部失效
-            // (AGENTS.md §6.7)。内容变化已在上游按修订号节流,这里每帧
-            // 拿到的都是"仅在变化时重建"的同一字符串;相对图片的改写也
-            // 是纯函数 —— 同样的输入永远产出同样的字符串,缓存照常命中。
+            // widget id 必须稳定:只由 tab id 构成,绝不含内容长度/hash,
+            // 否则每次编辑都清空 vendored 层临时缓存,增量高亮与分段缓存
+            // 全部失效(AGENTS.md §6.7)。内容变化已在上游按修订号节流,
+            // 这里每帧拿到的都是"仅在变化时重建"的同一字符串;相对图片的
+            // 改写也是纯函数 —— 同样的输入永远产出同样的字符串,缓存照常
+            // 命中。
             let handler = AiLinkHandler::new(
                 ai_link_color(ui.visuals().dark_mode),
                 ui.visuals().dark_mode,
@@ -427,13 +444,9 @@ pub fn ui(
             // [X](<wiki://X>) 链接,点击由下面的 handler 拦截;相对图片
             // 地址在这里再换成 file:// URI(两层都是"只改渲染,源码不动")
             let rendered = resolve_relative_images(&preview.rendered, base_dir);
-            MarkdownLabel::new(egui::Id::new("preview-md"), rendered.as_ref())
+            MarkdownLabel::new(label_id, rendered.as_ref())
                 .wrap()
-                // heal:true = 每帧渲染前对整篇文本补闭合(vendored parser::heal),
-                // AI 流式输出的残缺帧(未闭合 fence/加粗)语法合法,完整文档
-                // 上是恒等变换(Cow::Borrowed 原样返回)。P1 流式的必需品
-                // (AGENTS.md §6.5),岔路登记见 docs/decisions-pending.md #10。
-                .heal(true)
+                .heal(heal)
                 .link_handler(&handler)
                 .show(ui);
             handler.drain_into(outbox);
@@ -442,7 +455,7 @@ pub fn ui(
     // 大纲跳转的预览侧:把字节偏移换算成 y 再滚过去。锚点是上一行渲染时
     // vendored 层记录下的(section → y),这里只做查表 + 请求滚动。
     if let Some(target) = preview.scroll_target.take() {
-        if let Some(anchors) = egui_markdown::section_anchors(panel, egui::Id::new("preview-md")) {
+        if let Some(anchors) = egui_markdown::section_anchors(panel, label_id) {
             // 取「起点不超过目标」的最后一个锚点:标题所在节的顶部
             let anchor = anchors
                 .iter()
@@ -605,7 +618,15 @@ mod tests {
                 outline: Vec::new(),
                 scroll_target: None,
             };
-            ui(panel, &mut preview, &AiState::default(), None, &mut outbox);
+            ui(
+                panel,
+                &mut preview,
+                &AiState::default(),
+                1,
+                false,
+                None,
+                &mut outbox,
+            );
         });
         let painted = painted_text(&output);
         output.drop_without_applying_deltas();
@@ -681,7 +702,15 @@ mod tests {
         };
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |panel| {
-            ui(panel, &mut preview, &AiState::default(), None, &mut outbox);
+            ui(
+                panel,
+                &mut preview,
+                &AiState::default(),
+                1,
+                false,
+                None,
+                &mut outbox,
+            );
         });
         output.drop_without_applying_deltas();
         assert_eq!(preview.scroll_target, None, "滚动目标只消费一次");
@@ -817,6 +846,8 @@ mod tests {
                     panel,
                     &mut preview,
                     &AiState::default(),
+                    1,
+                    false,
                     Some(dir.as_path()),
                     &mut outbox,
                 );
@@ -885,5 +916,73 @@ mod tests {
         let ids_c = render(doc_c);
         assert_eq!(ids_c.len(), 2);
         assert_ne!(ids_c[0], ids_c[1]);
+    }
+
+    /// #39 M2 缓存正确性(编辑后缓存失效):同一 tab 的缓存槽位按文本 hash
+    /// 键控,内容变了 hash 变 → miss 重建,预览第一帧就必须反映新文本 ——
+    /// 缓存绝不允许吞掉编辑。撤销回旧文本(hash 回到旧值,命中旧产物)对
+    /// 同一文本产物必然正确,同样立即显示。heal 开关切换(流式结束,调用方
+    /// 由 heal(true) 转 heal(false))不改变完整文档的渲染结果。
+    #[test]
+    fn preview_reflects_edits_immediately_despite_per_tab_cache() {
+        let ctx = egui::Context::default();
+        // 生产入口 preview::ui(同一 tab id 反复渲染,模拟切换往返中的
+        // 编辑/撤销);收 painted 文本做内容断言。
+        let render = |rendered: &str, heal: bool| -> Vec<String> {
+            let mut preview = PreviewState {
+                rendered: rendered.to_owned(),
+                text: rendered.to_owned(),
+                synced_rev: 0,
+                outline: Vec::new(),
+                scroll_target: None,
+            };
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(RawInput::default(), |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    7,
+                    heal,
+                    None,
+                    &mut outbox,
+                );
+            });
+            let painted = painted_text(&output);
+            output.drop_without_applying_deltas();
+            painted
+        };
+
+        let v1 = "# 版本一\n\n原始段落 unique-v1-marker。\n";
+        let v2 = "# 版本二\n\n编辑后的段落 unique-v2-marker。\n";
+
+        let painted_v1 = render(v1, false);
+        assert!(painted_v1.iter().any(|t| t.contains("unique-v1-marker")));
+
+        // 编辑(v1 → v2):新文本第一帧就画出来,旧内容不得残留
+        let painted_v2 = render(v2, false);
+        assert!(
+            painted_v2.iter().any(|t| t.contains("unique-v2-marker")),
+            "编辑后预览必须立即反映新文本(缓存吞掉了编辑)"
+        );
+        assert!(
+            !painted_v2.iter().any(|t| t.contains("unique-v1-marker")),
+            "编辑后旧内容不得因缓存残留"
+        );
+
+        // 撤销(v2 → v1):文本回到旧值,立即显示 v1
+        let painted_undo = render(v1, false);
+        assert!(
+            painted_undo.iter().any(|t| t.contains("unique-v1-marker")),
+            "撤销后预览必须回到 v1"
+        );
+
+        // heal 开关切换(流式结束帧)不改变完整文档渲染:同一文本 heal
+        // 是恒等变换,两次渲染的 painted 文本必须逐条一致。
+        let painted_healed = render(v1, true);
+        assert_eq!(
+            painted_healed, painted_undo,
+            "heal 开关不得改变完整文档渲染"
+        );
     }
 }

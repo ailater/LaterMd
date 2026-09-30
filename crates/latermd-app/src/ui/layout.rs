@@ -277,10 +277,16 @@ impl LaterMdApp {
             )
             .show_collapsible(ui, right, |ui| {
                 let tab = self.state.tabs.current_mut();
+                // heal 只在 AI 流式写入本标签时开:补闭合是流式残缺帧的
+                // 必需品,完整文档上是恒等变换但逐行全文扫描,稳态帧不该付。
+                let streaming_here =
+                    self.state.ai.is_streaming() && self.state.ai_active_tab == Some(tab.id);
                 crate::ui::preview::ui(
                     ui,
                     &mut tab.preview,
                     &self.state.ai,
+                    tab.id,
+                    streaming_here,
                     // 相对图片以文档所在目录为锚拼 file://(未落盘为 None)
                     tab.document
                         .path
@@ -588,10 +594,15 @@ impl LaterMdApp {
                     // 是同一棵树上的不相交分支,挨着写会被借用检查器拦下。
                     let LaterMdApp { state, outbox, .. } = self;
                     let tab = state.tabs.current_mut();
+                    // heal 条件同三栏路径:仅 AI 流式写入本标签时开。
+                    let streaming_here =
+                        state.ai.is_streaming() && state.ai_active_tab == Some(tab.id);
                     crate::ui::preview::ui(
                         ui,
                         &mut tab.preview,
                         &state.ai,
+                        tab.id,
+                        streaming_here,
                         tab.document
                             .path
                             .as_deref()

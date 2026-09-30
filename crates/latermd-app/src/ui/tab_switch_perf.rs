@@ -95,6 +95,13 @@ fn sample_doc(seed: u32, target_lines: usize) -> String {
 
 /// 预览单件一帧,生产同配置(ScrollArea + 常量 id + wrap + heal)。返回耗时。
 fn label_frame(ctx: &egui::Context, rendered: &str) -> Duration {
+    label_frame_with_id(ctx, &Id::new("preview-md"), rendered)
+}
+
+/// [`label_frame`] 的 id 参数化变体:M2 起生产 id 含 tab 维度
+/// (`tab_preview_id` = "preview-md".with(tab_id)),往返命中断言需要分别
+/// 驱动两个 tab 的缓存槽位。
+fn label_frame_with_id(ctx: &egui::Context, id: &egui::Id, rendered: &str) -> Duration {
     let start = Instant::now();
     ctx.run_ui(
         RawInput {
@@ -103,15 +110,12 @@ fn label_frame(ctx: &egui::Context, rendered: &str) -> Duration {
         },
         |ui| {
             ScrollArea::vertical()
-                .id_salt("perf-preview-scroll")
+                .id_salt(id.with("scroll"))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // 与生产 preview.rs 同一 id("preview-md"):切换文本时的
-                    // 缓存行为(同 id 覆盖/hash 不匹配 → miss)与生产一致。
-                    MarkdownLabel::new(Id::new("preview-md"), rendered)
-                        .wrap()
-                        .heal(true)
-                        .show(ui);
+                    // 与生产 preview.rs 同一 id 命名空间:切换文本时的缓存
+                    // 行为(同 id 覆盖/hash 不匹配 → miss)与生产一致。
+                    MarkdownLabel::new(*id, rendered).wrap().heal(true).show(ui);
                 });
         },
     )
@@ -400,6 +404,12 @@ fn tab_switch_finding_report() {
     row("20000 行切换后首帧", big_first);
     let big_second = app_frame(&mut app_big, &ctx_big);
     row("20000 行切换后次帧", big_second);
+    // M2 追加:大文档往返切回(用户反馈「切换卡顿」的主场景 —— 来回翻
+    // 已打开过的长文档)。M2 起切回命中本 tab 缓存槽位,机制见
+    // preview_cache_survives_tab_roundtrip_with_per_tab_ids。
+    app_big.state.apply(Message::TabActivate(big_index_a));
+    let big_back = app_frame(&mut app_big, &ctx_big);
+    row("20000 行往返切回 A 首帧", big_back);
     let label_big_steady = {
         let mut samples = Vec::new();
         for _ in 0..7 {
@@ -442,7 +452,8 @@ fn heal_complete_document_is_identity_and_borrowed() {
 ///   冷帧要做 heal+hash+parse+owned tokens+分段 layout+syntect 高亮,量级差
 ///   两个数量级。稳态帧若贵到冷帧的两成以上,说明每帧在偷偷全量重解析。
 /// - **切换文本后首帧等于 miss 量级**:同 id 换文本必然 hash 不匹配 → 全量
-///   重建(当前实现的既定行为,M2 改造时此断言随新行为改向)。
+///   重建(vendored 层单槽缓存的既定行为;M2 的改造落在 app 侧把槽位按
+///   tab 分开,单槽语义不变,本断言维持原向)。
 #[test]
 fn markdown_cache_hits_in_steady_state_and_misses_on_text_change() {
     let rendered_a = latermd_md::expand_wikilinks(&sample_doc(4, 300));
@@ -466,5 +477,37 @@ fn markdown_cache_hits_in_steady_state_and_misses_on_text_change() {
     assert!(
         switched.as_secs_f64() > hot.as_secs_f64() * 5.0,
         "换文本首帧 {switched:?} 应是 miss 量级(≫ 稳态 {hot:?});若变快了,说明切文本路径已有缓存,回归断言需要跟着改向"
+    );
+}
+
+/// #39 M2 回归哨(切 tab 往返不重解析):per-tab widget id 下,两个 tab 的
+/// vendored 缓存槽位互不覆盖,切走再切回必须命中自己槽位的既有产物 ——
+/// 往返首帧与稳态同量级,而不是重新全量解析。egui 0.36 temp memory 无按帧
+/// 回收(egui src/util/id_type_map.rs:temp 仅在 clear/remove 时清),缓存
+/// 跨帧存活是这一机制的前提;时间断言口径同上一条(命中 < 冷帧 20%)。
+#[test]
+fn preview_cache_survives_tab_roundtrip_with_per_tab_ids() {
+    let rendered_a = latermd_md::expand_wikilinks(&sample_doc(6, 300));
+    let rendered_b = latermd_md::expand_wikilinks(&sample_doc(7, 300));
+    let ctx = egui::Context::default();
+    ctx.run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+
+    let id_a = Id::new("preview-md").with(1_u64);
+    let id_b = Id::new("preview-md").with(2_u64);
+
+    let cold_a = label_frame_with_id(&ctx, &id_a, &rendered_a);
+    let cold_b = label_frame_with_id(&ctx, &id_b, &rendered_b);
+    // A→B→A 往返:切回 A 的一帧,不得重新全量解析
+    let back_a = label_frame_with_id(&ctx, &id_a, &rendered_a);
+    assert!(
+        back_a.as_secs_f64() < cold_a.as_secs_f64() * 0.2,
+        "往返切回 A 首帧 {back_a:?} 应命中 A 自己的缓存槽位(冷帧 {cold_a:?} 的 20% 以内);若红了说明 B 的渲染覆盖/清掉了 A 的缓存"
+    );
+    // 再切回 B 同样命中:B 的槽位也没被 A 的往返破坏
+    let back_b = label_frame_with_id(&ctx, &id_b, &rendered_b);
+    assert!(
+        back_b.as_secs_f64() < cold_b.as_secs_f64() * 0.2,
+        "再切回 B 首帧 {back_b:?} 应命中 B 自己的缓存槽位(冷帧 {cold_b:?} 的 20% 以内)"
     );
 }
