@@ -45,6 +45,12 @@
 - **方法偏差(如实记录)**:任务预设的 `RUST_LOG=egui_winit=trace` 在本应用上无输出(实测 stderr 0 行;应用进程未安装 logger 实现,log 宏为 no-op),改用 gdb 断点法直接观测 winit→Xlib 边界的 spot 上报,取证点比 trace 日志更靠近生效端。
 - **结论(不销账)**:修复已提交,**候选框目视跟随待人工复测**(清单与判定见 [ime-follow-acceptance.md](ime-follow-acceptance.md) §3.1);Win11 微软拼音 / macOS 14 简体拼音真机三项(跟随/不吞字/不抢焦点,M0 出口线)维持待真机,不写结论(§3.2,blocked_external);Wayland 对照实验(上文怀疑方向③)维持待切会话,未做(§3.3,blocked_external)。自动侧不证明目视跟随,吞字/抢焦点两项本轮不记结论。
 
+### 验证 1 修复复测·补(2026-09-30,独立评审 finding 1/2 处置)
+
+- **finding 1(high,已修)**:评审指出「持焦点+光标未动+有输入事件」的帧(keyup/鼠标 motion/preedit 文本未变的更新帧,打字流中高频)只有 egui-winit 自动路径生效,spot 被重设为 TextEdit 整体矩形左上角,而原触发判定把这类帧判为空闲不发显式命令 —— 「显式命令同帧盖回」的假设只在光标变化帧成立。修复(`crates/latermd-app/src/ui/editor.rs`):触发判定改为**镜像自动路径谓词**(egui-winit lib.rs:1173 = 内容矩形变化 ∨ 本帧有输入事件;镜像基准 = `TextEditOutput::text_clip_rect`,即自动路径上报的 `inner_rect`),并改以 caret 条**屏幕矩形**变化为红线主项(滚动动画帧也被覆盖);真空闲帧(无事件、无位移、非写回)仍一条命令不发。取舍登记 [decisions-pending.md](decisions-pending.md) #56。单测 9 项(新增 finding 1 回归与滚动帧端到端),`cargo test -p latermd-app -- ime` 9 passed、`cargo test -p latermd-app` 全量 418 passed。
+- **finding 2(medium,证据补强)**:轮次 3 冒烟(X11+fcitx5,gdb 四断点帧分段)回答了「同一帧两次 set,fcitx5 取哪个」—— winit X11 的 spot 写经 channel 异步 FIFO 冲刷(`event_processor.rs:88-97`),同帧先 auto 后 explicit 入队,帧末值恒为显式 caret 值;**37/37 次自动写均被同帧显式写覆盖,0 单飞**;显式值随打字/组合/箭头精确变化,0 panic。证据与边界见 [ime-follow-acceptance.md](ime-follow-acceptance.md) §2.2.1/§2.3/§4。
+- **结论(仍不销账)**:自动侧已证明到「应用侧写入 winit 的帧末 spot 值恒为 caret 值」为止;候选框渲染正确性(fcitx5/搜狗消费 XIM spot)与吞字/抢焦点仍待人工目视/真机,口径不变。
+
 ## 主验证 2:长文档性能 —— 10 万字 bench 通过(渲染路径),交互 fps 待真窗口
 
 ### 2.1 自建 10 万字基准(2026-09-25,`crates/latermd-app/benches/longdoc.rs`)
