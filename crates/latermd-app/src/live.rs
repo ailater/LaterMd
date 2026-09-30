@@ -253,6 +253,9 @@ pub fn ui(
                     let top = ui.cursor().top();
                     MarkdownLabel::new(editor_id.with(("live-render", index)), &block_text)
                         .wrap()
+                        // 代码块复制头(#38)与右栏预览同一份:Live 模式的
+                        // 富渲染块也是「code 预览的地方」。
+                        .code_block_buttons(&crate::ui::preview::code_copy_buttons)
                         .show(ui);
                     let bottom = ui.cursor().top();
                     let rect = egui::Rect::from_min_max(
