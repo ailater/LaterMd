@@ -1,10 +1,11 @@
 # P0 验收状态核对表(2026-10)
 
 日期: 2026-09-30
-产出: #44 核心验收与文档状态纠偏 —— V1 事实核对(只读取证与核对表)
+产出: #44 核心验收与文档状态纠偏 —— V1 事实核对(只读取证与核对表);V3 自动验收与 blocked_external 登记见 §8
 关联: [p0-acceptance.md](p0-acceptance.md)、[acceptance-checklist.md](acceptance-checklist.md)、[roadmap.md](roadmap.md)「当前位置」、[distribution.md](distribution.md) §2–§4、[README.md](../README.md) 安装节、[decisions-pending.md](decisions-pending.md) #53(第三轮评审补全)
 
 > 本表由 V1 只读取证棒产出:**全部命令只读**(gh 仅 list/view/api GET;git 仅只读子命令)。取证命令与关键输出见文末「证据摘录」,行内证据编号 E1–E22 一一对应。
+> §8 由 V3 棒追加(自动验收实跑证据,编号 V3-E1…,与 E1–E22 两套编号不混用)。
 > **事实基线(2026-09-30 取证)**:最新 Release = **v0.0.3**(2026-09-30T06:01:47Z 发布,tag 指向 PR #74 合入的 `fd40701` = origin/main 头);v0.0.1 / v0.0.2 / v0.0.3 三版 Release 均存在且**非 draft 非 prerelease**;main 上 `rust.yml`(name=Rust)在精确 SHA `fd40701` 上 `conclusion=success`;tap 仓 `Casks/latermd.rb` 已自动跟版 **0.0.3**。
 > **档位口径**(decisions-pending #53 拍板二):「失实」= 与已取证事实直接冲突;「滞后」= 内容不错但过时/应补,不混入失实。真机项一律保持未勾并标 **blocked_external**,不以自动结论冒充。
 > 纠偏棒(V2)按本表行号(R/L 编号)只改失实处,每处改动旁注本表行号;本核对文档自身不改任何既有文件。
@@ -145,3 +146,71 @@
 - **E20 cask 模板现状** → packaging/latermd.rb:13 `version "0.1.0"`、:14 `sha256 :no_check # TODO: 首个 Release 发布后填…`
 - **E21 workflows 清单** → `.github/workflows/`:auto-tag.yml、linux-deb.yml、macos-dmg.yml、release.yml、rust.yml(distribution.md 头注五份引用齐备)
 - **E22 latermd-export 测试实跑** → `cargo test -p latermd-export`:`running 9 tests` / `test result: ok. 9 passed; 0 failed`(与 p0-acceptance.md:18 自述一致;计数以实跑输出为准,#53 拍板三)
+
+---
+
+## 8. V3 自动验收与 blocked_external 登记(2026-09-30)
+
+> 本章由 #44 V3 棒产出:本棒**实跑**的自动验收证据(编号 **V3-E1…**)、三分栏汇总与人工项挂账。两套证据编号(E1–E22 = V1 取证;V3-E… = 本棒)不混用。
+> 证据平台:**Linux / Deepin rolling + X11(DISPLAY=:0)**。按 #53 拍板三:Linux 自动结论不冒充三平台结论,凡引用处注明平台。
+> workspace 全量六项门禁本棒未复跑(与 V1 §0.5 同口径),由编排收口在最终 head 复验;本棒只跑验收点名的相关测试目标。
+
+### 8.1 三分栏 · 自动完成(本棒实跑)
+
+| 验收项 | 命令 | 结果 | 证据 |
+|---|---|---|---|
+| `.md` 不篡改——导出逻辑 | `cargo test -p latermd-export` | `test result: ok. 9 passed; 0 failed`(骨架/内嵌 CSS/代码块 language class/GFM 表格/任务列表/标题转义/删除线/脚注/空输入) | V3-E1 |
+| `.md` 不篡改——打开-保存往返 | `cargo test -p latermd-app file::` | `test result: ok. 6 passed; 0 failed`,含 `file::tests::write_then_read_is_byte_exact`(CRLF/LF 混排+尾随空行**逐字节一致**;既有测试引用,不重造) | V3-E2 |
+| 导出 HTML 可读(结构断言) | 生成样例 [sample-export-p0.html](sample-export-p0.html) + 12 项断言 | 全过:非空(2223 B)、`<!DOCTYPE html>` 开头 `</html>` 结尾、中文正文原样、`<title>`、表格/`language-rust` 代码块/checkbox/`<del>`/脚注、无 U+FFFD、内嵌 CSS 且无 `<link>`/`<script>` 外链 | V3-E3 |
+| Linux 本机有界冒烟 | `DISPLAY=:0 timeout 15 cargo run -p latermd-app --quiet` | **无 panic**:rc=124(timeout 到期杀,预期),stdout/stderr 均 0 字节;补充窗口取证(6 秒段)`WM_CLASS("", "LaterMD")`、`_NET_WM_NAME = "LaterMD — 未命名"`、900×600 @ (40,21) | V3-E4 |
+| checklist §0.6 main CI 绿(本棒复验) | `gh run list --repo ailater/LaterMd --workflow rust.yml --branch main --commit fd40701a1fde4263c698846f3a2dbcade0d49959 --json name,status,conclusion` | `[{"conclusion":"success","name":"Rust","status":"completed"}]`(只认 name=Rust,与 V1 E6 一致) | V3-E5 |
+
+三条如实声明:
+- V3-E3 是**结构断言**(非空/含正文/骨架完整),不冒充「人眼可读性」——真实浏览器观感确认仍待人工(8.2)。
+- V3-E4 是 **15 秒有界冒烟**(任务 c 口径),不冒充验收 2 的「连续写 1 小时」长跑;且是 debug build `cargo run`,非 dist 产物 tar.xz 解压运行(后者历史实测见 p0-acceptance §1 验收 1)。
+- 任务原文 `cargo run -p latermd` 的包名在本仓不存在:workspace 包名是 `latermd-app`(产物 binary 名 `latermd`),已按现状以 `-p latermd-app` 执行。
+
+### 8.2 三分栏 · 待人工(不被外部资源阻塞,需要人做)
+
+| 项 | 缺什么 | 谁能补 |
+|---|---|---|
+| 导出 HTML 浏览器观感确认 | 人在真实浏览器打开 [sample-export-p0.html](sample-export-p0.html) 看一眼(结构断言已过,观感不可自动) | 坤哥 |
+| Linux X11 IME 候选框跟随 | #19 落地后 fcitx5 目视复验(m0-report 验证 1 只记复测不销账) | 坤哥(自动段挂队列 #19) |
+| 外壳拖拽 / resize 手感(checklist §8.2 真机部分) | 真窗口手感;xdotool 合成输入不可信已记档(m5-acceptance §0) | 坤哥 |
+| checklist §6 六项真机抽查 | 皮肤文件 / 跟随系统 / Live Preview / wikilink / 大纲预览跳转 / MCP 被外部调用的人工操作 | 坤哥 |
+
+### 8.3 三分栏 · 被阻塞(blocked_external,保持未勾,逐项挂账)
+
+| 项 | 缺什么 | 谁能补 | 挂账处 |
+|---|---|---|---|
+| Win11 安装 + IME 真机(§2.1/§2.2/§2.4) | Win11 实体机:SmartScreen 交互、DX12 adapter 上报、微软拼音三判据(跟随/不吞字/不抢焦点) | 坤哥 | checklist §2 |
+| macOS 14 安装 + IME 真机(§3.1–§3.5) | macOS 14 (Sonoma) 实体机:`.app` 安装、Gatekeeper/xattr、Metal adapter、简体拼音三判据、universal2 双架构各跑一次 | 坤哥 | checklist §3 |
+| wgpu 真机启动(adapter 上报) | 同上两台真机(Linux 侧 llvmpipe 已跑通,不冒充 DX12/Metal) | 坤哥 | checklist §2.2/§3.3、m0-report 验证 3 |
+| `brew install --cask crazykun/ailater/latermd` 实测 | macOS 真机 + brew 环境;主仓 #22 自动回填链另需 `HOMEBREW_TAP_TOKEN` 进 secrets——tap 侧 auto-bump 已自动跟版 0.0.3(E12/E13),brew 实测本身不依赖该 token | 坤哥 | checklist §7.2 后半 |
+| 连续写 1 小时长跑(§5.1–§5.3) | 人工连续写作时段 + 真实文档场景;自动侧只做 15s 有界冒烟(V3-E4),不冒充 | 坤哥 | checklist §5 |
+| 图床真机上传走通一次 | 自定义图床服务 + 真实凭据 + 真机操作。注:acceptance-checklist 本身**无图床独立行**(§6 六项不含图床),实际挂账在 auto-plan 人工待办末行「图床真机上传走通一次(acceptance-checklist)」与 roadmap「图片框与图床」行的真机验收段 | 坤哥 | auto-plan 人工待办、roadmap |
+| Windows CRLF 实机往返 | Windows 实体机(file.rs 字节往返的 Linux 侧测试已有,V3-E2;Win 侧 Notepad/编辑器链路的 CRLF 行为需实机) | 坤哥 | p0-acceptance §1 验收 4 |
+
+### 8.4 证据摘录(V3 本棒实跑,2026-09-30,Linux/Deepin X11)
+
+- **V3-E1 导出测试(既有)**
+  `cargo test -p latermd-export`
+  → `running 9 tests` … `test result: ok. 9 passed; 0 failed; 0 ignored`(9 项逐一 `ok`:empty_input…/minimal_css…/inline_code…/heading…/fenced_code…/gfm_table…/title_falls_back…/task_list…/strikethrough…)
+- **V3-E2 保存/往返测试(既有)**
+  `cargo test -p latermd-app file::`
+  → `running 6 tests` … `test result: ok. 6 passed; 0 failed; 406 filtered out`
+  6 项含 `file::tests::write_then_read_is_byte_exact … ok`(该测试断言 `read()==原文` 且 `std::fs::read()==原文.as_bytes()`,crates/latermd-app/src/file.rs:189)
+- **V3-E3 样例 HTML 生成与结构断言**
+  生成(临时 probe 链 `latermd_export::export_html`,不触碰仓库代码;输入样例含标题/中文正文/表格/代码块/任务列表/删除线/脚注/引用):
+  `cargo build -p latermd-export --quiet` + `rustc --edition 2024 /tmp/export_probe.rs --extern latermd_export=target/debug/liblatermd_export.rlib -L dependency=target/debug/deps -o /tmp/export_probe` + `/tmp/export_probe > docs/sample-export-p0.html`
+  → `wc -c` = 2223;`head -c 300` 显示 `<!DOCTYPE html>`/`<title>LaterMD P0 验收样例</title>`/内嵌 CSS。
+  12 项断言(非空>1KB / DOCTYPE 开头 / `</html>` 结尾 / 含「双栏预览」正文 / `<title>` 命中 / `<table>` / `language-rust` / checkbox / `<del>` / footnote / 无 U+FFFD / 内嵌 CSS 且无 `<link>`/`<script>` 外链)输出 `PASS` ×12,`=== 断言结果: 全部通过 ===`
+- **V3-E4 有界冒烟(Linux/X11)**
+  `DISPLAY=:0 timeout 15 cargo run -p latermd-app --quiet > /tmp/smoke_stdout.log 2> /tmp/smoke_stderr.log`
+  → `exit_code=124`(timeout 到期);stdout 0 bytes、stderr 0 bytes;`grep -iE 'panicked|RUST_BACKTRACE'` 无命中;无残留进程。rc=124 本身证明进程活满 15 秒(启动即 panic 的退出码是 101,不会等满)。
+  窗口取证(第二次运行,6 秒段,SIGTERM 收尾 rc=143):
+  `xdotool search --onlyvisible --class latermd` → 窗口 341835780;`xprop -id 341835780 WM_CLASS _NET_WM_NAME` → `WM_CLASS(STRING) = "", "LaterMD"`、`_NET_WM_NAME(UTF8_STRING) = "LaterMD — 未命名"`;`getwindowgeometry` → `Geometry: 900x600` @ (40,21);期间 stderr 全空(无 wgpu/panic 报错)。
+- **V3-E5 main CI 结构化复验(本棒)**
+  `SHA=$(git rev-parse origin/main)` → `fd40701a1fde4263c698846f3a2dbcade0d49959`
+  `gh run list --repo ailater/LaterMd --workflow rust.yml --branch main --commit "$SHA" --json name,status,conclusion,headSha`
+  → `[{"conclusion":"success","headSha":"fd40701…","name":"Rust","status":"completed"}]`(仅 name=Rust 计入判据;与 V1 E6 同 SHA 同结论)

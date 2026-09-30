@@ -13,10 +13,10 @@
 
 | # | 验收标准(roadmap 阶段 2) | 状态 | 证据 / 缺口 |
 |---|---|---|---|
-| 1 | **三平台可安装** | 🟨 Linux 已本地验证;CI 产物链路三版跑通;Win / mac 真机安装待做(blocked_external) | **Linux**:`dist build` 出的 `latermd-x86_64-unknown-linux-gnu.tar.xz` 解压即跑(31 MB 二进制 + LICENSE + README,实测运行 6 秒无 panic),动态链 libgcc_s / libm / libc,**要求 glibc ≥ 2.35**(Ubuntu 22.04+ / Debian 12+ 量级)。`dist plan` 五目标齐备。**CI 产物链路已三版跑通**(V1 核对表 R6,证据 A1–A5/E1–E4):v0.0.1(2026-09-26)/ v0.0.2(09-29)/ v0.0.3(09-30)Release 均非 draft 非 prerelease,五目标资产齐备,universal2 dmg 三版均在,deb v0.0.2 起在。**macOS / Windows 产物尚未在任何真机上安装启动过**——真机安装留人工(blocked_external:Win11 / macOS 14 实体机) |
+| 1 | **三平台可安装** | 🟨 Linux 已本地验证;CI 产物链路三版跑通;Win / mac 真机安装待做(blocked_external) | **Linux**:`dist build` 出的 `latermd-x86_64-unknown-linux-gnu.tar.xz` 解压即跑(31 MB 二进制 + LICENSE + README,实测运行 6 秒无 panic),动态链 libgcc_s / libm / libc,**要求 glibc ≥ 2.35**(Ubuntu 22.04+ / Debian 12+ 量级);2026-09-30 V3 复验 Linux/X11 有界冒烟 15 秒无 panic + 窗口取证(证据 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.4 V3-E4)。`dist plan` 五目标齐备。**CI 产物链路已三版跑通**(V1 核对表 R6,证据 A1–A5/E1–E4):v0.0.1(2026-09-26)/ v0.0.2(09-29)/ v0.0.3(09-30)Release 均非 draft 非 prerelease,五目标资产齐备,universal2 dmg 三版均在,deb v0.0.2 起在。**macOS / Windows 产物尚未在任何真机上安装启动过**——真机安装留人工(blocked_external:Win11 / macOS 14 实体机) |
 | 2 | **能连续写 1 小时技术文档不崩、不卡** | 🟨 部分 | 性能有实测(下 §3);「连续 1 小时」的稳定性**无自动化验证**,需人工长跑 |
-| 3 | **导出的 HTML 可直接交付他人阅读** | ✅ 逻辑已测 | `latermd-export` 9 项测试:完整文档骨架、内嵌最小 CSS、代码块 language class、GFM 表格、任务列表复选框、标题转义、删除线/脚注。**未做**:在真实浏览器里打开导出件的观感确认 |
-| 4 | **`.md` 文件保持原样(无格式化篡改)** | ✅ 已测 | `file.rs::write_then_read_is_byte_exact`(CRLF/LF 混排、尾随空行逐字节一致);另测非 UTF-8 报错、原子落盘、权限位保留。**未做**:Windows CRLF 实机往返 |
+| 3 | **导出的 HTML 可直接交付他人阅读** | ✅ 逻辑已测 + 结构断言 | `latermd-export` 9 项测试:完整文档骨架、内嵌最小 CSS、代码块 language class、GFM 表格、任务列表复选框、标题转义、删除线/脚注。2026-09-30 V3 复跑 `9 passed; 0 failed`,并生成样例 [sample-export-p0.html](sample-export-p0.html) 过 12 项结构断言(非空/含中文正文/骨架完整/无 U+FFFD/无外链,证据 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.4 V3-E1/V3-E3)。**未做**:在真实浏览器里打开导出件的观感确认(待人工,非 blocked) |
+| 4 | **`.md` 文件保持原样(无格式化篡改)** | ✅ 已测 | `file.rs::write_then_read_is_byte_exact`(CRLF/LF 混排、尾随空行逐字节一致);另测非 UTF-8 报错、原子落盘、权限位保留。2026-09-30 V3 复跑 `cargo test -p latermd-app file::` `6 passed; 0 failed`(证据 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.4 V3-E2)。**未做**:Windows CRLF 实机往返(blocked_external:Win11 实体机) |
 
 ---
 

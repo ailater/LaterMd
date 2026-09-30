@@ -19,7 +19,7 @@
 | 0.3 | `macos-dmg.yml` | 监听 `release: published`，产出 `latermd-v{version}-universal2-apple-darwin.dmg` | ✅ 已核对 |
 | 0.4 | cask 模板 `packaging/latermd.rb` | version 与 URL 模板两处版本号一致，`depends_on macos: :sonoma` | ✅ 已核对（sha256 待 §6 填） |
 | 0.5 | 六项门禁本地全绿 | fmt / 三轮 clippy / test / doc；vendor 改动加跑 `vendor/egui_markdown/check.sh` | ✅ 每提交必跑 |
-| 0.6 | main 分支 CI 绿 | 合入 PR 后 `rust.yml` 六项 + 三平台 build | ☐ 待你在 GitHub 上看一眼 |
+| 0.6 | main 分支 CI 绿 | 合入 PR 后 `rust.yml` 六项 + 三平台 build | ✅ 结构化核验通过(2026-09-30 V3 复验:`name=Rust, conclusion=success @ fd40701`,命令与输出见 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.4 V3-E5;V1 首验同结论,E6) |
 
 ---
 
@@ -51,25 +51,29 @@ git tag vX.Y.Z && git push origin vX.Y.Z   # 应急通道;X.Y.Z 按实际版本
 
 ## 2. Windows 11
 
+> 整节需 Win11 实体机,自动侧无替代——逐行 ☐ blocked_external(缺什么/谁能补见 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.3)。
+
 | # | 项 | 操作 | 判据 |
 |---|---|---|---|
-| 2.1 | 装 | 下 `latermd-x86_64-pc-windows-msvc.zip` 解压 | 双击启动，SmartScreen 警告 →「更多信息 → 仍要运行」（无签名是既定路线，不算缺陷） |
-| 2.2 | 渲染后端 | 设置 → 外观 看「渲染后端」 | 显示 `wgpu`；M0 验证 3 要求确认 **DX12 adapter 上报合理**（不是回落软件渲染） |
-| 2.3 | 中文字体 | 打开含中文的 md | 无方块；`fonts.rs` 的 Windows 候选（`msyh.ttc` / `simhei.ttf`）命中其一 |
-| 2.4 | **IME** | 微软拼音连续输入中文 | ①候选框**跟随光标**；②不吞字；③切走窗口再回来不抢焦点。**任一条不过 = M0 头号风险命中，停下来记档** |
-| 2.5 | MCP | 设置 → MCP 勾启用 → 保存 | 状态行显示 `监听 127.0.0.1:8731`；浏览器打开该地址不是必须，用客户端连一次即可 |
+| 2.1 | 装 | 下 `latermd-x86_64-pc-windows-msvc.zip` 解压 | 双击启动，SmartScreen 警告 →「更多信息 → 仍要运行」（无签名是既定路线，不算缺陷） ☐ blocked_external |
+| 2.2 | 渲染后端 | 设置 → 外观 看「渲染后端」 | 显示 `wgpu`；M0 验证 3 要求确认 **DX12 adapter 上报合理**（不是回落软件渲染） ☐ blocked_external |
+| 2.3 | 中文字体 | 打开含中文的 md | 无方块；`fonts.rs` 的 Windows 候选（`msyh.ttc` / `simhei.ttf`）命中其一 ☐ blocked_external |
+| 2.4 | **IME** | 微软拼音连续输入中文 | ①候选框**跟随光标**；②不吞字；③切走窗口再回来不抢焦点。**任一条不过 = M0 头号风险命中，停下来记档** ☐ blocked_external |
+| 2.5 | MCP | 设置 → MCP 勾启用 → 保存 | 状态行显示 `监听 127.0.0.1:8731`；浏览器打开该地址不是必须，用客户端连一次即可 ☐ blocked_external |
 
 ---
 
 ## 3. macOS 14（Sonoma）
 
+> 整节需 macOS 14 实体机,自动侧无替代——逐行 ☐ blocked_external(挂账明细同 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.3)。
+
 | # | 项 | 操作 | 判据 |
 |---|---|---|---|
-| 3.1 | 装 | **必须走 `.app`**（dmg 拖入 `/Applications` 或 `brew install --cask crazykun/ailater/latermd`） | 裸二进制跑命令行会**丢输入法上下文**，IME 结论不成立 —— 这条是 2.4 的前置，不是可选项 |
-| 3.2 | Gatekeeper | 首次打开 | 无签名 → 报「已损坏/无法验证」；brew 装的由 postflight 去 quarantine；直下 dmg 的手动 `xattr -dr com.apple.quarantine /Applications/LaterMD.app` |
-| 3.3 | 渲染后端 | 设置 → 外观 | `wgpu` + **Metal adapter** 上报合理 |
-| 3.4 | **IME** | 简体拼音连续输入 | 同 2.4 三条判据；macOS 上 IME 是最容易挂的一项 |
-| 3.5 | universal2 | Apple Silicon 与 Intel 各跑一次 | 两架构都能启动（lipo 合一的验证） |
+| 3.1 | 装 | **必须走 `.app`**（dmg 拖入 `/Applications` 或 `brew install --cask crazykun/ailater/latermd`） | 裸二进制跑命令行会**丢输入法上下文**，IME 结论不成立 —— 这条是 2.4 的前置，不是可选项 ☐ blocked_external |
+| 3.2 | Gatekeeper | 首次打开 | 无签名 → 报「已损坏/无法验证」；brew 装的由 postflight 去 quarantine；直下 dmg 的手动 `xattr -dr com.apple.quarantine /Applications/LaterMD.app` ☐ blocked_external |
+| 3.3 | 渲染后端 | 设置 → 外观 | `wgpu` + **Metal adapter** 上报合理 ☐ blocked_external |
+| 3.4 | **IME** | 简体拼音连续输入 | 同 2.4 三条判据；macOS 上 IME 是最容易挂的一项 ☐ blocked_external |
+| 3.5 | universal2 | Apple Silicon 与 Intel 各跑一次 | 两架构都能启动（lipo 合一的验证） ☐ blocked_external |
 
 ---
 
@@ -85,11 +89,13 @@ git tag vX.Y.Z && git push origin vX.Y.Z   # 应急通道;X.Y.Z 按实际版本
 
 ## 5. 稳定性长跑（P0 验收 2 的人工部分）
 
+> 人工连续写作时段不可自动替代——自动侧只做过 **15 秒有界冒烟**(Linux/X11 debug build,无 panic,证据 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8.4 V3-E4),不冒充本节长跑;逐行 ☐ blocked_external。
+
 | # | 项 | 判据 |
 |---|---|---|
-| 5.1 | 连续写 1 小时技术文档 | 不崩、不卡；内存无明显增长 |
-| 5.2 | 期间切换明暗 / 紧凑密度 | 外壳与正文**同帧**换肤无闪变 |
-| 5.3 | 期间开关 MCP、切 Live Preview | 切模式不丢光标、不丢 undo |
+| 5.1 | 连续写 1 小时技术文档 | 不崩、不卡；内存无明显增长 ☐ blocked_external |
+| 5.2 | 期间切换明暗 / 紧凑密度 | 外壳与正文**同帧**换肤无闪变 ☐ blocked_external |
+| 5.3 | 期间开关 MCP、切 Live Preview | 切模式不丢光标、不丢 undo ☐ blocked_external |
 
 ---
 
@@ -113,7 +119,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z   # 应急通道;X.Y.Z 按实际版本
 | 7.1 | cask sha256 | ~~把 §1.4 的 sha256 填进 `packaging/latermd.rb`(替换 `:no_check`)~~ 已由 tap 仓 auto-bump 自动维护(直读 Release asset digest,每小时 :23),不经 step summary → 主仓模板手填 |
 | 7.2 | 推 tap | ~~该文件进 `crazykun/homebrew-ailater` 的 `Casks/`~~ 已由 tap 侧完成(cask 已建,version "0.0.3" 自动跟版,E12);**`brew install --cask` 真机实测仍 ☐ blocked_external**(缺 macOS 真机) |
 | 7.3 | README 更新 | 「当前还没发过版」那段已于 2026-09-26 按发布状态重写(见 git 历史);**未完**:README:8 版本行仍写 v0.0.1(V1 R1)、安装表无 deb 渠道(V1 L2)——因本棒路径约束登记 decisions-pending #54 留后续单独 PR |
-| 7.4 | 回填证据 | 本文件勾选结果回填 [p0-acceptance.md](p0-acceptance.md) §1 与 [m0-report.md](m0-report.md) 验证 1/3;**IME 结论无论好坏都要写进去**——真机项留人工(blocked_external) |
+| 7.4 | 回填证据 | 本文件勾选结果回填 [p0-acceptance.md](p0-acceptance.md) §1 与 [m0-report.md](m0-report.md) 验证 1/3;**IME 结论无论好坏都要写进去**——真机项留人工(blocked_external)。**自动侧回填已做**(2026-09-30 V3:p0-acceptance §1 验收 1/3/4 已引用 [p0-acceptance-status-2026-10.md](p0-acceptance-status-2026-10.md) §8 证据;§0.6 已勾 V3-E5;m0-report 验证 1/3 的真机结论段仍空缺,IME 真机未做) |
 
 ---
 
