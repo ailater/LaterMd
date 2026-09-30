@@ -415,11 +415,33 @@ fn copied_feedback_id() -> egui::Id {
     egui::Id::new("latermd-code-copy-feedback")
 }
 
-/// 测试探针在 egui data 的键:本帧各复制按钮的 rect(照 vendored
-/// `section_anchors` 的 data 手法 —— 生产侧写入开销一次 Vec,无头测试
-/// 借它把指针事件投到真按钮上)。每帧首写按帧号重置。
+/// 探针在 egui data 的键:本帧各复制按钮的 rect(照 vendored
+/// `section_anchors` 的 data 手法 —— 生产侧写入开销一次 Vec)。读法见
+/// [`copy_button_probe`]/[`copy_button_rects`]。每帧首写按帧号重置。
 fn copy_button_rects_id() -> egui::Id {
     egui::Id::new("latermd-code-copy-button-rects")
+}
+
+/// 原始探针:(最后写入帧号, 该帧按钮 rect 清单)。写入发生在渲染帧内,
+/// 而测试在 `run_ui` 返回之后才读 —— 那时帧号已前进(`end_pass` 处 +1),
+/// 帧号核对必然失配,故测试按「最后写入者即本帧」直接取清单。
+pub(crate) fn copy_button_probe(ctx: &egui::Context) -> (u64, Vec<egui::Rect>) {
+    ctx.data(|d| {
+        d.get_temp::<(u64, Vec<egui::Rect>)>(copy_button_rects_id())
+            .unwrap_or_default()
+    })
+}
+
+/// 当前帧的按钮 rect 清单(帧号核对通过的才返回):供 Live 列「点击进
+/// 编辑」在帧内排除按钮命中(live.rs `clicked_for_edit`)。零按钮帧返回
+/// 空 —— 比如全部代码块都转入编辑态时,上一帧的旧 rect 不得再拦点击。
+pub(crate) fn copy_button_rects(ctx: &egui::Context) -> Vec<egui::Rect> {
+    let (frame, rects) = copy_button_probe(ctx);
+    if frame == ctx.cumulative_pass_nr() {
+        rects
+    } else {
+        Vec::new()
+    }
 }
 
 fn code_fingerprint(code: &str) -> u64 {
@@ -1103,15 +1125,6 @@ mod tests {
 
     // —— 代码块复制头(#38)——
 
-    /// 从 ctx 读回本帧探针记录的复制按钮 rect。
-    fn copy_button_rects(ctx: &egui::Context) -> Vec<egui::Rect> {
-        ctx.data(|d| {
-            d.get_temp::<(u64, Vec<egui::Rect>)>(copy_button_rects_id())
-                .map(|(_, rects)| rects)
-        })
-        .unwrap_or_default()
-    }
-
     /// 覆盖 #38 验收面的文档:带语言块(CJK + emoji 行)、裸围栏、带空行的
     /// 空围栏(text 为空串但块存在)、```ai 指令卡、末尾短块(验「无尾换行」
     /// 边界)。另含一个无空行的空围栏 —— pulldown 对它不产 Text 事件,
@@ -1162,7 +1175,8 @@ mod tests {
         );
         let texts = painted_text(&output);
         let copied = copied_texts(&output);
-        let rects = copy_button_rects(ctx);
+        // 帧后读取:帧号已前进,按「最后写入者即本帧」取原始探针。
+        let rects = copy_button_probe(ctx).1;
         output.drop_without_applying_deltas();
         (rects, texts, copied)
     }
@@ -1280,7 +1294,7 @@ mod tests {
                 &mut outbox,
             );
         });
-        let rects = copy_button_rects(&ctx);
+        let rects = copy_button_probe(&ctx).1;
         assert_eq!(rects.len(), 4, "反馈帧按钮仍在");
         let button = rects[0];
         let mut slopes = Vec::new();

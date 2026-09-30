@@ -247,9 +247,8 @@ pub fn ui(
                     }
                     active_response = Some(response);
                 } else {
-                    // 富渲染。MarkdownLabel::show 不返回响应,区域用渲染前后
-                    // 的 cursor 差值框出来 —— 点击即进入编辑(精确 hit-test
-                    // 需要文本布局反查,v1 不追求点击落点的像素级精确)。
+                    // 富渲染。区域用渲染前后的 cursor 差值框出来;「点击进
+                    // 编辑」的命中不走 egui widget,理由见 [`clicked_for_edit`]。
                     let top = ui.cursor().top();
                     MarkdownLabel::new(editor_id.with(("live-render", index)), &block_text)
                         .wrap()
@@ -262,7 +261,7 @@ pub fn ui(
                         egui::pos2(ui.min_rect().left(), top),
                         egui::pos2(ui.min_rect().right(), bottom.max(top + 1.0)),
                     );
-                    if ui.allocate_rect(rect, egui::Sense::click()).clicked() {
+                    if clicked_for_edit(ui, rect) {
                         activate = Some(index);
                     }
                 }
@@ -284,6 +283,45 @@ pub fn ui(
     }
     active_response
         .unwrap_or_else(|| panel.allocate_response(egui::vec2(0.0, 0.0), egui::Sense::click()))
+}
+
+/// 富渲染块「点击进入编辑」的命中检测。**不挂 egui widget**:块级矩形一旦
+/// 参与 hit-test,注册序必与块内其它可点件二选一 —— egui 0.36 同层点击
+/// 平局取后注册者(hit_test.rs「In tie, pick last = topmost」),后注册的
+/// 块矩形抢走代码块复制头(#38)的点击(复制失效、块误进编辑);先注册
+/// 又抢不过富渲染体(`MarkdownLabel` 的 `Sense::click_and_drag` 整块响应
+/// 在 `show()` 内注册得更晚,实测点击后进编辑同样失效)。所以直接读原始
+/// 指针事件:本帧有主键 click(egui 已按拖动阈值判定,块内拖选文本不算
+/// click,不误触发)且抬起点落在本块;再排除两类本就另有归属的点击 ——
+/// 落在代码块复制按钮上的(本帧探针几何,`crate::ui::preview::
+/// copy_button_rects`)和打开了链接的(链接点击归属富渲染层,不连带进
+/// 编辑;OpenUrl 在 `show()` 内已进本帧输出,这里读得到)。
+///
+/// 抬起点核对而按不下起点核对:`press_origin` 在抬起帧已被 egui 清空
+/// (input_state 释放即置 None);好在 `primary_clicked` 本身就含「未超出
+/// 点击距离」判定,残余歧义最多块边界 max_click_dist 一线。
+fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    if !ui.input(|input| input.pointer.primary_clicked()) {
+        return false;
+    }
+    let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
+        return false;
+    };
+    if !rect.contains(pos) {
+        return false;
+    }
+    if crate::ui::preview::copy_button_rects(ui.ctx())
+        .iter()
+        .any(|button| button.contains(pos))
+    {
+        return false;
+    }
+    !ui.ctx().output(|output| {
+        output
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, egui::OutputCommand::OpenUrl(_)))
+    })
 }
 
 #[cfg(test)]
@@ -436,5 +474,246 @@ mod tests {
             Some(live.blocks.len() - 1),
             "文末归最后一块"
         );
+    }
+
+    // —— 代码块复制头(#38)与「整块点击进编辑」的点击优先级 ——
+
+    /// 从帧输出抽出全部 CopyText 命令的载荷(照 ui/preview.rs tests 同款)。
+    fn copied_texts(output: &eframe::egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                eframe::egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 指针序列:移入 → 按下 → 抬起(照 ui/preview.rs tests 同款三帧;
+    /// egui 的 click 判定发生在抬起帧)。
+    fn click_events(pos: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![
+            vec![egui::Event::PointerMoved(pos)],
+            vec![click(pos, true)],
+            vec![click(pos, false)],
+        ]
+    }
+
+    /// 一帧 Live 列渲染的取证:复制按钮 rect 探针、CopyText 载荷、OpenUrl
+    /// 目标、画出的文本 rect(正文/链接点击定位用)。
+    struct LiveFrame {
+        button_rects: Vec<egui::Rect>,
+        copied: Vec<String>,
+        opened: Vec<String>,
+        texts: Vec<(String, egui::Rect)>,
+    }
+
+    /// 跑一帧 Live 面板(生产入口 `super::ui`)并收集取证。
+    fn live_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> LiveFrame {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    live,
+                    egui::Id::new("live-copy-test"),
+                );
+            },
+        );
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                texts.push((
+                    t.galley.text().to_owned(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                ));
+            }
+        }
+        let copied = copied_texts(&output);
+        let opened = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        LiveFrame {
+            // 帧后读取:帧号已前进,按「最后写入者即本帧」取原始探针。
+            button_rects: crate::ui::preview::copy_button_probe(ctx).1,
+            copied,
+            opened,
+            texts,
+        }
+    }
+
+    /// Live 模式点非活动代码块的复制按钮必须复制、且不得切入编辑态(#38
+    /// 评审修复):「整块点击进编辑」一旦参与 hit-test,无论注册先后都按
+    /// egui 0.36 同层平局规则取后注册者(hit_test.rs `find_closest_within`)
+    /// 与块内可点件二选一 —— 后注册抢按钮(复制失效、块误进编辑),先注册
+    /// 被富渲染体抢(进编辑失效,实测点击后 active 仍 None)。修法 = 块级
+    /// 命中不挂 widget,读原始指针事件([`clicked_for_edit`])。
+    #[test]
+    fn live_copy_button_click_copies_without_entering_edit() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("# 标题\n\n正文段落。\n\n```rust\nfn a(){}\n```\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        // 静帧:非活动代码块恰一枚按钮,块全部富渲染。
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(frame.copied.is_empty(), "静帧不应复制");
+        assert_eq!(
+            frame.button_rects.len(),
+            1,
+            "非活动代码块一枚复制按钮:{:?}",
+            frame.button_rects
+        );
+        assert_eq!(live.active, None);
+
+        // 三帧点击按钮中心:复制恰一次、内容为块源文本;块不得切入编辑。
+        let target = frame.button_rects[0].center();
+        let mut copied = Vec::new();
+        for events in click_events(target) {
+            let frame = live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+            copied.extend(frame.copied);
+        }
+        assert_eq!(
+            copied,
+            vec!["fn a(){}".to_owned()],
+            "点按钮必须复制块源文本(修复前被整块 rect 抢走,这里为空)"
+        );
+        assert_eq!(live.active, None, "点按钮不得切入编辑态:{live:?}");
+    }
+
+    /// 点块内正文(非按钮)仍切入编辑(修复不得伤及「整块点击进编辑」本身)。
+    #[test]
+    fn live_click_outside_copy_button_still_enters_edit() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("# 标题\n\n正文段落。\n\n```rust\nfn a(){}\n```\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(frame.button_rects.len(), 1);
+
+        // 点击代码正文(galley rect 中心):离右上角复制按钮足够远。
+        let (_, code_rect) = frame
+            .texts
+            .iter()
+            .find(|(text, _)| text.contains("fn a()"))
+            .expect("代码正文已渲染");
+        let target = code_rect.center();
+        assert!(
+            !frame.button_rects[0].contains(target),
+            "点击点必须避开按钮:{target:?}"
+        );
+        let mut copied = Vec::new();
+        for events in click_events(target) {
+            let frame = live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+            copied.extend(frame.copied);
+        }
+        assert!(copied.is_empty(), "点正文不触发复制:{copied:?}");
+        assert_eq!(live.active, Some(2), "点块内正文应切入编辑态:{live:?}");
+    }
+
+    /// 链接点击归属富渲染层:打开 URL,不连带把块切进编辑(修复后富渲染
+    /// 块的链接恢复点击 —— 修复前被整块矩形整体抢走)。
+    #[test]
+    fn live_link_click_opens_url_without_entering_edit() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("[点我](https://example.com)\n\n后续。\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(1),
+            ..LiveState::default()
+        };
+
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (_, link_rect) = frame
+            .texts
+            .iter()
+            .find(|(text, _)| text.contains("点我"))
+            .expect("链接文本已渲染");
+
+        let mut opened = Vec::new();
+        for events in click_events(link_rect.center()) {
+            let frame = live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+            opened.extend(frame.opened);
+        }
+        assert_eq!(
+            opened,
+            vec!["https://example.com".to_owned()],
+            "链接点击打开 URL"
+        );
+        assert_eq!(live.active, Some(1), "链接点击不切进编辑:{live:?}");
     }
 }
