@@ -17,7 +17,7 @@
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
 [~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。验证 1 IME Linux 已首测:输入可用,候选框不跟随光标,排查挂账(m0-report.md 验证 1)。出口仍卡两条真机项(Win/mac IME、Win/mac wgpu),见 m0-report.md
-[~] P0 骨架       ← 当前(2026-09-25):功能 10/11 已落地;打包配置已就绪(cargo-dist 五目标 + macOS universal2 dmg job + cask 模板,发布 runbook 见 [distribution.md](distribution.md));收尾修补(跨平台字体候选/ADR 登记/后端显示)已于 2026-09-25 完成;P0 剩余 = 首个 Release 发布(tag 触发 CI 全链路跑通)+ 三平台真机验收
+[~] P0 骨架       ← 当前(2026-09-30 按 V1 核对表 R3/R8 纠偏):功能 11/11 已落地(打包分发链路三版跑通);收尾修补(跨平台字体候选/ADR 登记/后端显示)已于 2026-09-25 完成;Release 链路已跑通——v0.0.1 2026-09-26、v0.0.2 09-29、v0.0.3 09-30 三版均自动发版(auto-tag → release → dmg/deb 全链路,runbook 见 [distribution.md](distribution.md),证据 E1–E4/E7);P0 剩余 = 三平台真机验收(安装/IME/wgpu)与连续写作长跑人工段
 [~] P1 差异化     全文搜索已落地(2026-09-25),latermd-ai 基础(Mock 流式)已落地(2026-09-25),ai:// 链接与 AI 指令块已落地(2026-09-25),AI commit message 与摘要大纲已落地(2026-09-25);阶段内模块全部落地,P1 剩余仅真实 key 的凭据存取,按 auto-plan 队列归 #7(P2) 实施
 [x] P2 版本层     Git 只读集成已落地(2026-09-25);凭据管理已落地(2026-09-25);P2 全部完成(latermd-creds + AI key 闸门/设置区经 PR #20 携带合入)
 [x] P2.5 界面打磨   2026-09-26 全部落地:批次 B-light(图标/工具栏/状态栏/设置对话框/快捷键可改绑/AI 配置页)+ 批次 B 本体(三态主题含跟随系统 + themes/*.ron 皮肤文件 + 标准/紧凑密度),设计规格见 docs/ui-polish.md
@@ -49,9 +49,9 @@
 
 > P0 范围表对照：Markdown 与代码高亮已由 vendor 提供，上表已覆盖其余功能条目。
 >
-> **打包分发进展（2026-09-25）**：cargo-dist 0.33 已接入，`dist plan/build` 实测五目标齐备（Linux x64、macOS 双架构、Windows x64 + ARM64），资产名 `latermd-{triple}` 不含版本号；macOS universal2 dmg 走自建 job（`.github/workflows/macos-dmg.yml`：lipo + `.app` + hdiutil），cask 模板在 `packaging/latermd.rb`。**待首个 tag 在 CI 上跑通验证**（本机无 macOS，lipo/hdiutil/codesign 无法自测）。
+> **打包分发进展（2026-09-25）**：cargo-dist 0.33 已接入，`dist plan/build` 实测五目标齐备（Linux x64、macOS 双架构、Windows x64 + ARM64），资产名 `latermd-{triple}` 不含版本号；macOS universal2 dmg 走自建 job（`.github/workflows/macos-dmg.yml`：lipo + `.app` + hdiutil），cask 模板在 `packaging/latermd.rb`。**CI 首跑验证已过**(V1 核对表 R4/R13,证据 E2–E4/E7):2026-09-26 v0.0.1 首跑,09-29 / 09-30 两版复跑,三版 dmg job 均成功合成 universal2 dmg 并回传,windows-11-arm 原生 runner 首编通过;本机无 macOS 的部分(dmg 内 .app 真机启动)仍留人工(blocked_external)。
 >
-> **剩余**：上段打包的首跑验证，与 M0 两条真机项（Win/mac IME、Win/mac wgpu；Linux IME 已首测 —— 输入可用、候选框不跟随，缺陷排查挂账见 m0-report.md 验证 1）。
+> **剩余**：M0 两条真机项（Win/mac IME、Win/mac wgpu；Linux IME 已首测 —— 输入可用、候选框不跟随，缺陷排查挂账见 m0-report.md 验证 1）与三平台真机安装/连续写作长跑人工段;打包首跑验证已完成(V1 核对表 R5,证据 E1–E4)。
 
 > Vendor 适配实测纪要:15 个升级错误全部修复;另有 checklist 未预见的 **TexturesDelta drop 检查**(egui 0.36 新增)导致 10 个测试失败,已在测试中补 `output.textures_delta.clear()`。`source_span` 以**平行数组**形态落地(`Markdown { s, tokens, spans }`),不动 15 个 enum 变体,不变量 `spans.len() == tokens.len()` 有单测。差异全记录在 [vendor/egui\_markdown/README.md](../vendor/egui_markdown/README.md)。100 个测试全绿;`latermd-app` 空窗口在 Linux/X11 实际运行通过(wgpu adapter 正常)。
 

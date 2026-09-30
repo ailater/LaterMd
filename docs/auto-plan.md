@@ -87,8 +87,8 @@
 
 - IME 真机实测（Win11 微软拼音 / macOS 简体拼音）——M0 挂账项（Linux 首测已过，候选框跟随挂 #19）
 - Win/mac wgpu 真机启动验证（13a 无边框化后需一并复测）
-- ~~三平台打包真机验收（feature/p0-packaging 分支）~~ 已过时：cargo-dist 链路已进 main，v0.0.1/v0.0.2 均自动发版
+- ~~三平台打包真机验收（feature/p0-packaging 分支）~~ 已过时：cargo-dist 链路已进 main，v0.0.1/v0.0.2/v0.0.3 均自动发版（V1 核对表 R16，证据 E1/E4/E10）
 - AI provider 真实 API key 配置（decisions-pending #3）
 - 发布产物真机验收（三平台可安装 / 连续写 1 小时 / 导出 HTML / .md 不篡改，roadmap P0 出口四条）
-- cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）
+- ~~cask version+sha256 手动回填（v0.0.2 起每版都要；#22 cask-bump 落地后自动化）~~ 已失效（2026-09-30 核实）：tap 仓 auto-bump 已含 CASKS 表，自动跟版至 0.0.3，无需手动回填；主仓 #22 cask-bump 与其功能重复，撤留留后续评审（V1 核对表 L4，证据 E12/E13；decisions-pending #53 补全第 3 点）
 - 图床真机上传走通一次（acceptance-checklist）

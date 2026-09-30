@@ -13,7 +13,7 @@
 
 | # | 验收标准(roadmap 阶段 2) | 状态 | 证据 / 缺口 |
 |---|---|---|---|
-| 1 | **三平台可安装** | 🟨 Linux 已本地验证;Win / mac 待 CI 首跑 | **Linux**:`dist build` 出的 `latermd-x86_64-unknown-linux-gnu.tar.xz` 解压即跑(31 MB 二进制 + LICENSE + README,实测运行 6 秒无 panic),动态链 libgcc_s / libm / libc,**要求 glibc ≥ 2.35**(Ubuntu 22.04+ / Debian 12+ 量级)。`dist plan` 五目标齐备。**macOS** dmg job 与 cask 模板待首个 tag 在 CI 验证;**Windows 产物尚未在任何机器上跑过** |
+| 1 | **三平台可安装** | 🟨 Linux 已本地验证;CI 产物链路三版跑通;Win / mac 真机安装待做(blocked_external) | **Linux**:`dist build` 出的 `latermd-x86_64-unknown-linux-gnu.tar.xz` 解压即跑(31 MB 二进制 + LICENSE + README,实测运行 6 秒无 panic),动态链 libgcc_s / libm / libc,**要求 glibc ≥ 2.35**(Ubuntu 22.04+ / Debian 12+ 量级)。`dist plan` 五目标齐备。**CI 产物链路已三版跑通**(V1 核对表 R6,证据 A1–A5/E1–E4):v0.0.1(2026-09-26)/ v0.0.2(09-29)/ v0.0.3(09-30)Release 均非 draft 非 prerelease,五目标资产齐备,universal2 dmg 三版均在,deb v0.0.2 起在。**macOS / Windows 产物尚未在任何真机上安装启动过**——真机安装留人工(blocked_external:Win11 / macOS 14 实体机) |
 | 2 | **能连续写 1 小时技术文档不崩、不卡** | 🟨 部分 | 性能有实测(下 §3);「连续 1 小时」的稳定性**无自动化验证**,需人工长跑 |
 | 3 | **导出的 HTML 可直接交付他人阅读** | ✅ 逻辑已测 | `latermd-export` 9 项测试:完整文档骨架、内嵌最小 CSS、代码块 language class、GFM 表格、任务列表复选框、标题转义、删除线/脚注。**未做**:在真实浏览器里打开导出件的观感确认 |
 | 4 | **`.md` 文件保持原样(无格式化篡改)** | ✅ 已测 | `file.rs::write_then_read_is_byte_exact`(CRLF/LF 混排、尾随空行逐字节一致);另测非 UTF-8 报错、原子落盘、权限位保留。**未做**:Windows CRLF 实机往返 |
@@ -34,9 +34,9 @@
 | 快捷键(Ctrl / Cmd 自动适配) | ✅ | `b0bbc2c` |
 | 文件树(基础版) | ✅ | `37c9e0c` |
 | 大纲(廉价版,跳编辑器光标) | ✅ | `8c00cdd` |
-| **打包分发** | 🟨 配置就位,待首跑 | dist 五目标 + `macos-dmg.yml` + `packaging/latermd.rb` |
+| **打包分发** | ✅ 链路已跑通 | dist 五目标 + `macos-dmg.yml` + `linux-deb.yml` + `packaging/latermd.rb`;v0.0.1–v0.0.3 三版自动发版,资产实证(V1 核对表 R7,证据 A1–A5/E1–E4/E7);余三平台真机安装验收(blocked_external) |
 
-**10 / 11 功能已落地,剩打包。**
+**11 / 11 功能已落地**(打包链路三版跑通,V1 核对表 R8,证据 E1–E4);P0 剩余为真机验收人工段(见 §1 与 acceptance-checklist)。
 
 ---
 
@@ -56,7 +56,7 @@
 
 > **操作步骤与判据见 [acceptance-checklist.md](acceptance-checklist.md)**（人工真机验收清单，2026-09-26 新增）。本节只列"哪三件事"，执行细节一律以那份清单为准。
 
-1. **首个 tag 跑通发布链路**:合入打包 PR → `git tag v0.1.0 && git push origin v0.1.0` → 确认 release.yml 五目标产物齐备、macos-dmg.yml 合成 dmg 成功。
+1. ~~**首个 tag 跑通发布链路**:合入打包 PR → `git tag v0.1.0 && git push origin v0.1.0` → 确认 release.yml 五目标产物齐备、macos-dmg.yml 合成 dmg 成功~~ **已完成**(V1 核对表 R9,证据 E1–E4/E9/E10):v0.0.1/v0.0.2/v0.0.3 三版均由 auto-tag 自动打 tag(annotated,tagger github-actions[bot])并自动发版,五目标产物 + universal2 dmg 齐备;`v0.1.0` 版本号从未存在,手打 tag 仅是自动链路故障时的应急通道(distribution.md §3.2)。
 2. **真机 IME 实测**(M0 遗留,头号风险):Win11 微软拼音 + macOS 14 简体拼音,记录候选框跟随 / 连续输入不吞字 / 窗口切换不抢焦点。macOS 必须走 `.app` 启动(裸二进制丢输入法上下文)。
 3. **三平台装一次、跑一次**:Win11 DX12 与 macOS Metal 的 adapter 上报确认(M0 验证 3),以及连续写作的稳定性长跑(验收 2 的人工部分)。
 
@@ -66,4 +66,4 @@
 
 - **流式追加是 O(n)**(~77 µs/行):超 ~1300 行就跟不上 100 ms/chunk 的 LLM 节奏。**P1 开工前必须定分段重排方案**,详见 [m0-report](m0-report.md) §4.2。
 - **Windows / macOS 字体候选**:`fonts.rs` 的候选表需在各平台实测后补(含 `.ttc` face index 重查)。
-- **cask 版本自动更新**:tap 的 auto-bump 目前只管 Formula,Casks/ 需人工或扩展流水线。
+- ~~**cask 版本自动更新**:tap 的 auto-bump 目前只管 Formula,Casks/ 需人工或扩展流水线~~ **已解决**(2026-09-30 核实,与 V1 核对表 R15 同源事实,证据 E12/E13):tap auto-bump 已含 CASKS 表(latermd 在列),cask 自动跟版至 0.0.3;主仓 #22 cask-bump 与其功能重复,撤留留后续评审(decisions-pending #53 补全第 3 点)。

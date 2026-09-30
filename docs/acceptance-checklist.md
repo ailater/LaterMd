@@ -15,7 +15,7 @@
 | # | 项 | 判据 | 状态 |
 |---|---|---|---|
 | 0.1 | `dist-workspace.toml` 五目标矩阵 | Linux x64 / macOS 双架构 / Windows x64 + ARM64，`installers = []`、`merge-tasks = true` | ✅ 已核对 |
-| 0.2 | `release.yml` 触发 | tag 形如 `v0.1.0`（正则 `**[0-9]+.[0-9]+.[0-9]+*`）；由 `dist generate` 维护，**禁止手改** | ✅ 已核对 |
+| 0.2 | `release.yml` 触发 | tag 形如 `v0.0.x`（正则 `**[0-9]+.[0-9]+.[0-9]+*`；实际 tag v0.0.1–v0.0.3，`v0.1.0` 从未存在，V1 L1/E9）；由 `dist generate` 维护，**禁止手改** | ✅ 已核对 |
 | 0.3 | `macos-dmg.yml` | 监听 `release: published`，产出 `latermd-v{version}-universal2-apple-darwin.dmg` | ✅ 已核对 |
 | 0.4 | cask 模板 `packaging/latermd.rb` | version 与 URL 模板两处版本号一致，`depends_on macos: :sonoma` | ✅ 已核对（sha256 待 §6 填） |
 | 0.5 | 六项门禁本地全绿 | fmt / 三轮 clippy / test / doc；vendor 改动加跑 `vendor/egui_markdown/check.sh` | ✅ 每提交必跑 |
@@ -23,21 +23,29 @@
 
 ---
 
-## 1. 打 tag 触发发布
+## 1. 发布触发(已成历史记录:v0.0.1–v0.0.3 三版均自动发版)
+
+> 常规路径全自动(合入版本 bump PR → auto-tag 自动打 tag → release.yml → dmg/deb
+> dispatch,见 distribution.md §1),无需手打 tag——三版 tag 均为 annotated、tagger
+> `github-actions[bot]`(V1 核对表 R9/R10,证据 E9/E10)。下方手打命令仅是自动链路
+> 故障时的**应急通道**(distribution.md §3.2),版本号按实际待发版本写(`v0.1.0`
+> 从未存在,证据 E9):
 
 ```bash
 git checkout main && git pull
-git tag v0.1.0 && git push origin v0.1.0
+git tag vX.Y.Z && git push origin vX.Y.Z   # 应急通道;X.Y.Z 按实际版本
 ```
 
-| # | 观察点 | 判据 |
-|---|---|---|
-| 1.1 | `release.yml` plan 阶段 | 五目标全部出现在 manifest，无 `notCovered` |
-| 1.2 | 五个 build job | 全部成功；Linux 产物是 `latermd-x86_64-unknown-linux-gnu.tar.xz` |
-| 1.3 | Release 创建 | 非 draft、非 prerelease（dmg job 依赖 `published`） |
-| 1.4 | `macos-dmg.yml` | lipo 合一 → `.app` → dmg → 回传同一 Release；**step summary 里有 sha256**（§6 要用） |
+三版观察点回填(2026-09-30 按资产名单实证,V1 核对表 R10,证据 E1–E4/E7):
 
-**失败处置**：`release.yml` 失败 → 删 tag 重来（`git tag -d v0.1.0 && git push --delete origin v0.1.0`）后修完再打；dmg job 失败 → 修完在 Release 页手动重跑该 workflow 即可，不必重打 tag。
+| # | 观察点 | 判据 | 三版结果 |
+|---|---|---|---|
+| 1.1 | `release.yml` plan 阶段 | 五目标全部出现在 manifest,无 `notCovered` | ✅ 五目标资产三版齐备(A2) |
+| 1.2 | 五个 build job | 全部成功;Linux 产物是 `latermd-x86_64-unknown-linux-gnu.tar.xz` | ✅ 三版均在(A2) |
+| 1.3 | Release 创建 | 非 draft、非 prerelease(dmg job 依赖 `published`) | ✅ 三版均非(A1/E1) |
+| 1.4 | `macos-dmg.yml` | lipo 合一 → `.app` → dmg → 回传同一 Release;**step summary 里有 sha256** | ✅ 三版 dmg 均回传(A4/E2–E4);sha256 已不经手填——tap auto-bump 直读 Release asset digest(§7.1,E12/E13) |
+
+**失败处置**(应急通道语境,V1 核对表 R11:原示例 `v0.1.0` 从未存在,改为按实际 tag 口径):`release.yml` 失败 → 删 tag 重来(`git tag -d <tag> && git push --delete origin <tag>`)后修完再打;dmg job 失败 → 修完在 Release 页手动重跑该 workflow 即可,不必重打 tag。
 
 ---
 
@@ -98,14 +106,14 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ---
 
-## 7. 发布后收尾
+## 7. 发布后收尾(2026-09-30 重定性:常规已自动化,真机项留人工;V1 核对表 L3/R15,证据 E12/E13)
 
-| # | 项 | 判据 |
+| # | 项 | 原判据 → 现状 |
 |---|---|---|
-| 7.1 | cask sha256 | 把 §1.4 的 sha256 填进 `packaging/latermd.rb`（替换 `:no_check`） |
-| 7.2 | 推 tap | 该文件进 `crazykun/homebrew-ailater` 的 `Casks/`；`brew install --cask` 实测通过 |
-| 7.3 | README 更新 | 「当前还没发过版」那段改写为真实版本与下载方式 |
-| 7.4 | 回填证据 | 本文件勾选结果回填 [p0-acceptance.md](p0-acceptance.md) §1 与 [m0-report.md](m0-report.md) 验证 1/3；**IME 结论无论好坏都要写进去** |
+| 7.1 | cask sha256 | ~~把 §1.4 的 sha256 填进 `packaging/latermd.rb`(替换 `:no_check`)~~ 已由 tap 仓 auto-bump 自动维护(直读 Release asset digest,每小时 :23),不经 step summary → 主仓模板手填 |
+| 7.2 | 推 tap | ~~该文件进 `crazykun/homebrew-ailater` 的 `Casks/`~~ 已由 tap 侧完成(cask 已建,version "0.0.3" 自动跟版,E12);**`brew install --cask` 真机实测仍 ☐ blocked_external**(缺 macOS 真机) |
+| 7.3 | README 更新 | 「当前还没发过版」那段已于 2026-09-26 按发布状态重写(见 git 历史);**未完**:README:8 版本行仍写 v0.0.1(V1 R1)、安装表无 deb 渠道(V1 L2)——因本棒路径约束登记 decisions-pending #54 留后续单独 PR |
+| 7.4 | 回填证据 | 本文件勾选结果回填 [p0-acceptance.md](p0-acceptance.md) §1 与 [m0-report.md](m0-report.md) 验证 1/3;**IME 结论无论好坏都要写进去**——真机项留人工(blocked_external) |
 
 ---
 

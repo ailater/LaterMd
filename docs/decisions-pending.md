@@ -3,9 +3,17 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #53 为当前最新条目。
+> 编号 #54 为当前最新条目。
 
-## #53 #38 核对计划的五处口径：取证双口径与降级边界、失实判定分档、自动/人工验收边界、§3 归档红线、手打 tag 口径（2026-09-30，#38 核心验收与文档状态纠偏·规划自动拍板）
+## #54 V2 纠偏棒无法触碰 README.md 与 packaging/latermd.rb：模块 paths=["docs"] 与任务文本点名 README 的冲突（2026-09-30，#44 V2 文档状态纠偏·自动拍板）
+
+- **岔路**：#44 V2 任务文本第 4 点点名「README.md 安装节……失实处改真」，V1 失实清单另含 packaging/latermd.rb:13 的 `version "0.1.0"`（R2）与滞后项 L2（README:54/56 安装表无 deb 渠道）；但编排模块声明的可改动路径是 `paths: ["docs"]`，且编排脚本的收口提交只 `git add -- docs`，其后有全工作区残留检查（`git status --porcelain` 非空即安全中止）——任何非 docs 改动留在工作树会让整个 run（含 V3 验收、全量门禁、推送与 PR）报废。
+- **备选**：A 越界照改两文件（残留检查中止全 run）；B 只改 docs/，把 R1/R2/L2 登记留后续单独 PR；C 停下上报等主会话。
+- **自动选择**：B。
+- **理由**：公共约束明文「严禁 git add -A；只改本模块 paths 声明的路径」与「任务描述与仓库现状冲突，以现状为准」；文档纠偏与 README/模板修订本可分离，延后一棒只损失时效，而 A 会把 V3 真机项登记与六项门禁一并报废，C 违反「登记后继续，不阻塞」的既定玩法。
+- **如何改**：后续单独一棒（或主会话授权）按 V1 核对表落三处——R1（README.md:8「当前版本 v0.0.1」→ v0.0.3）、R2（packaging/latermd.rb:13 `version "0.1.0"` → 0.0.3，或注明「实际 version/sha256 由 tap auto-bump 维护，此文件仅初版模板」）、L2（README:54/56 安装表补 deb 一行，`latermd_{version}_amd64.deb`，glibc ≥ 2.35 口径见 acceptance-checklist §4.2）；commitSubject 建议 `docs(#44): README/packaging 版本行与 deb 渠道补正`。落完后回删本条。
+
+## #53 #38 核对计划的五处口径：取证双口径与降级边界、失实判定分档、自动/人工验收边界、§3 归档红线、手打 tag 口径（2026-09-30，#38 核对与文档状态纠偏·规划自动拍板）
 
 - **岔路**：#38 要对六份文档（acceptance-checklist / roadmap / distribution / auto-plan / README / p0-acceptance）做「文档说的 vs 仓库实际的」纠偏核对，但取证依赖 GitHub 网络（Release 资产、CI 结论、tap 仓 cask 状态），网络不可达时如何收场、以及「失实」的判定边界没有先例可循。
 - **拍板一（取证双口径）**：在线优先——本机 `gh` 已登录（crazykun，repo 权限），`gh release view <tag> --json assets` / `gh run list --workflow=rust.yml --branch=main` / `gh api repos/crazykun/homebrew-ailater/contents/Casks/latermd.rb` 三路实测可用（2026-09-30 本会话验证）。网络不可达时降级为**本仓可证事实**：`git tag -l` + `git ls-remote --tags origin`（tag 存在性）、`Cargo.toml` 的 `workspace.package.version` 与 CHANGELOG.md 小节一致性、tag 指向 commit 的 `git log`（发版时间线）。**降级时明确标注不可证项**——Release 资产存在性、CI 绿、tap cask 版本三者本仓无镜像，宁可留「未验证」也不许用推测补结论。
