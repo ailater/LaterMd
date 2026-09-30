@@ -41,12 +41,32 @@ pub struct TabAutosave {
     pub(crate) seen_rev: u64,
 }
 
+/// 孤儿 draft 的待恢复状态(#18 恢复条)。
+///
+/// 新标签认领文档路径时若文档旁有遗留的 `<doc>.latermd-draft`,检测结果
+/// 挂在标签上,编辑区上方的恢复条据此渲染;「恢复 / 丢弃」的归约消费即清
+/// ([`crate::state::State::recover_draft`] / [`discard_draft`](crate::state::State::discard_draft))。
+/// 用户无视恢复条直接编辑(缓冲变脏)时也在帧末撤下 —— 那是隐性选择了
+/// 以盘上版本续写,条留着只会诱导一次「拿旧稿盖掉新稿」的误点;draft
+/// **文件**不随撤条删除,停顿/切出路径照常接管。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftRecovery {
+    /// draft 落点(检测时已确认存在)。
+    pub path: PathBuf,
+    /// 检测时刻的 mtime,恢复条显示「保存于何时」用。文件系统不给
+    /// (`modified()` 失败)以「存在」为准,`None` 容之(文案落「保存时间
+    /// 未知」),不为一个展示字段放弃整条恢复能力。
+    pub mtime: Option<std::time::SystemTime>,
+}
+
 /// 单个标签的全部文档状态。
 pub struct TabState {
     /// 稳定 id:编辑器 widget id 与测试定位都用它,不随标签增删变化。
     pub id: u64,
     /// 落盘身份 + dirty 镜像 + 提示行。
     pub document: DocumentState,
+    /// 待恢复的孤儿 draft(#18 恢复条);`None` = 无待裁决草稿。
+    pub recover: Option<DraftRecovery>,
     /// 编辑器缓冲(该标签的正文真源)。
     pub editor: EditorBuffer,
     /// 预览快照(含大纲)。
@@ -82,6 +102,7 @@ impl TabState {
                 dirty: false,
                 notice: None,
             },
+            recover: None,
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
             autosave: TabAutosave::default(),
@@ -97,8 +118,10 @@ impl TabState {
     ///
     /// 自动保存记忆随换入重置内容侧(`saved_rev`/`last_edit`/`seen_rev`),
     /// `draft_path` **保留** —— 它是清理钩子找回旧位置 draft 的唯一线索
-    /// (回滚后保存一次即清)。盘上的 draft 文件不动:换入意味着旧编辑
-    /// 已被用户确认丢弃,但误删防丢镜像的代价远大于多留一份冗余。
+    /// (回滚后保存一次即清)。`recover`(待恢复的孤儿 draft)同样不动:
+    /// 换入的是磁盘内容,盘旁的遗留草稿与「用户还没裁决」这一事实都还在。
+    /// 盘上的 draft 文件不动:换入意味着旧编辑已被用户确认丢弃,但误删
+    /// 防丢镜像的代价远大于多留一份冗余。
     pub fn load(&mut self, path: Option<PathBuf>, text: &str) {
         self.editor.load(text);
         self.document.path = path;
