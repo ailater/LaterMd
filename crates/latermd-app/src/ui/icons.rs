@@ -100,6 +100,12 @@ pub enum Icon {
     /// ui-polish §1.1 约束,但工具条按钮本身必须是自绘,不是 `😀` 字符
     /// (emoji-plan §3 的边界)。
     Emoji,
+    // —— 代码块复制头(docs/auto-plan.md #38)——
+    /// 复制:两枚错位矩形(后框被前框遮住的右、下两边不画,仿 `Restore`
+    /// 的遮挡画法)。
+    Copy,
+    /// 已复制(✓ 反馈态):短下挑 + 长上挑两条线段。
+    Check,
 }
 
 impl Icon {
@@ -395,6 +401,18 @@ impl Icon {
                     std::f32::consts::PI * 0.75,
                 );
             }
+            // —— 代码块复制头(#38):错位双矩形与对勾 ——
+            Self::Copy => {
+                // 前框(右下)完整;后框(左上)只画上边与左边,右、下
+                // 两边落在前框内不画 —— 交叠处的线被「遮挡」是这个图标
+                // 的全部立体感来源。
+                frame((-0.10, -0.10), (0.42, 0.42));
+                path(&[(0.10, -0.42), (-0.42, -0.42), (-0.42, 0.10)]);
+            }
+            Self::Check => {
+                seg((-0.30, 0.02), (-0.08, 0.24));
+                seg((-0.08, 0.24), (0.34, -0.22));
+            }
         }
     }
 }
@@ -534,6 +552,9 @@ mod tests {
             Icon::File,
             // Emoji 面板入口(#28 E1)
             Icon::Emoji,
+            // 代码块复制头(#38)
+            Icon::Copy,
+            Icon::Check,
         ];
         for icon in icons {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -585,6 +606,57 @@ mod tests {
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             icon_button(ui, Icon::Settings, "设置");
         });
+        output.drop_without_applying_deltas();
+    }
+
+    /// Copy 与 Check 是 Painter 画的矢量,不走 Unicode 字形(`⧉`/`✓` 在三平台
+    /// 缺字风险真实)。Copy 在左、Check 在右(x=40 分界):Copy 应有一枚完整
+    /// 矩形描边(前框)+ 至少两条边线(后框上、左边);Check 两条线段一负
+    /// 斜率(下挑)一正斜率(上挑),连成对勾。
+    #[test]
+    fn copy_and_check_icons_are_vector_shapes() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            Icon::Copy.draw(ui.painter(), egui::pos2(20.0, 20.0), ICON, Color32::WHITE);
+            Icon::Check.draw(ui.painter(), egui::pos2(60.0, 20.0), ICON, Color32::WHITE);
+        });
+        let mut copy_rects = 0;
+        let mut copy_lines = 0;
+        let mut check_lines = Vec::new();
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.brush.is_none() => {
+                    if rect.visual_bounding_rect().center().x < 40.0 {
+                        copy_rects += 1;
+                    }
+                }
+                egui::Shape::LineSegment { points, .. } => {
+                    if points[0].x < 40.0 {
+                        copy_lines += 1;
+                    } else {
+                        check_lines.push(*points);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            copy_rects >= 1,
+            "Copy 前框应有一枚矩形描边:rects={copy_rects}"
+        );
+        assert!(
+            copy_lines >= 2,
+            "Copy 后框应至少画上、左两条边:{copy_lines}"
+        );
+        assert!(
+            check_lines
+                .iter()
+                .any(|[a, b]| (b.x - a.x) * (b.y - a.y) < 0.0)
+                && check_lines
+                    .iter()
+                    .any(|[a, b]| (b.x - a.x) * (b.y - a.y) > 0.0),
+            "Check 应同时包含下挑与上挑两种斜率:{check_lines:?}"
+        );
         output.drop_without_applying_deltas();
     }
 

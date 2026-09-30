@@ -398,6 +398,117 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
     }
 }
 
+// —— 代码块复制头(docs/auto-plan.md #38)——
+
+/// 「已复制」✓ 反馈的存活窗口:点击后停留 1.5s 自行消退,不需要用户再
+/// 交互确认。
+const COPIED_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1500);
+/// 点击帧后再排一短帧:点击帧里按钮已按普通态画完,✓ 要等下一帧才上屏,
+/// 不主动排程的话它得等到下一次用户输入。
+const COPIED_FEEDBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// 反馈态在 egui data 的键:全局单份「最近复制块的指纹 + 到期时刻」。
+/// 按块内容而非 widget id 认领 —— vendored 挂载点的子 Ui id 按帧内序号
+/// 自动分配,文档编辑后块序平移会让 id 键控的反馈错位到别的块;内容指纹
+/// 最多让同文本多块同显 ✓(与 ```ai 卡片按指令文本认领状态同款简化)。
+fn copied_feedback_id() -> egui::Id {
+    egui::Id::new("latermd-code-copy-feedback")
+}
+
+/// 测试探针在 egui data 的键:本帧各复制按钮的 rect(照 vendored
+/// `section_anchors` 的 data 手法 —— 生产侧写入开销一次 Vec,无头测试
+/// 借它把指针事件投到真按钮上)。每帧首写按帧号重置。
+fn copy_button_rects_id() -> egui::Id {
+    egui::Id::new("latermd-code-copy-button-rects")
+}
+
+fn code_fingerprint(code: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 代码块头部一行(常驻):复制按钮 + 语言标签,挂在 vendored
+/// `MarkdownLabel::code_block_buttons` 挂载点 —— 该挂载点上游自带(subtree
+/// 引入即有),普通代码块右上角悬浮调用,回调直接收到 `(块源文本, 语言)`,
+/// 无需从 `code_block_spans` 切偏移;```ai 指令卡走 `block_code_widget` 另
+/// 一条路,不经过这里。
+///
+/// 点击 → `Context::copy_text` 整块源文本(vendored parser 已去块尾换行)
+/// → 按钮进入 ✓ 反馈态。无语言/空块同样给按钮:复制空串是合法操作,
+/// 交互一致比按内容藏按钮好猜。
+pub(crate) fn code_copy_buttons(ui: &mut egui::Ui, code: &str, lang: &str) {
+    let now = std::time::Instant::now();
+    let until = ui
+        .ctx()
+        .data(|d| d.get_temp::<(u64, std::time::Instant)>(copied_feedback_id()))
+        .filter(|(hash, until)| *hash == code_fingerprint(code) && *until > now)
+        .map(|(_, until)| until);
+    let copied = until.is_some();
+
+    // 子 Ui 是 right_to_left(Center):先分配的贴右缘,按钮在语言标签右侧。
+    let size = egui::vec2(
+        crate::ui::tokens::ICON + 2.0 * crate::ui::tokens::SPACE_XS,
+        20.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(
+                rect,
+                crate::ui::tokens::RADIUS_SM,
+                ui.visuals().widgets.hovered.bg_fill,
+            );
+        }
+        let (icon, color) = if copied {
+            (crate::ui::icons::Icon::Check, crate::ui::tokens::OK)
+        } else {
+            (crate::ui::icons::Icon::Copy, ui.visuals().weak_text_color())
+        };
+        icon.draw(painter, rect.center(), crate::ui::tokens::ICON, color);
+    }
+
+    // 探针:记录本帧按钮几何,帧号变了就重开清单(一帧一份)。
+    let probe_id = copy_button_rects_id();
+    let frame = ui.ctx().cumulative_pass_nr();
+    let mut rects = ui
+        .ctx()
+        .data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(probe_id))
+        .filter(|(seen, _)| *seen == frame)
+        .map(|(_, rects)| rects)
+        .unwrap_or_default();
+    rects.push(rect);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(probe_id, (frame, rects)));
+
+    // 语言标签:info string 首词(完整 info 可带 `title=` 等元数据,首词才是
+    // 语言);无语言(裸围栏/缩进块,vendored 侧落到空串)不画标签。
+    if let Some(word) = lang.split_whitespace().next() {
+        ui.label(egui::RichText::new(word).small().weak())
+            .on_hover_text("代码块语言");
+    }
+
+    if response.clicked() {
+        ui.ctx().copy_text(code.to_owned());
+        let deadline = now + COPIED_FEEDBACK;
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(copied_feedback_id(), (code_fingerprint(code), deadline)));
+        ui.ctx().request_repaint_after(COPIED_FEEDBACK_DELAY);
+    }
+
+    // hover 文案放最后(on_hover_text 消费 response)。
+    if let Some(until) = until {
+        // 到点排程一帧,让 ✓ 自行消退;静止窗口里 egui 不会再醒。
+        ui.ctx()
+            .request_repaint_after(until.saturating_duration_since(now));
+        response.on_hover_text("已复制");
+    } else {
+        response.on_hover_text("复制代码");
+    }
+}
+
 /// 预览 widget id 的 tab 维度成分(#39 M2)。vendored 层的解析/分段/高亮
 /// 缓存全部挂在这个 id 命名空间下,每标签独立一份:切到别的标签期间本
 /// 标签的缓存不被覆盖,切回即命中 —— 这是「切标签往返不重解析」的机制
@@ -448,6 +559,10 @@ pub fn ui(
                 .wrap()
                 .heal(heal)
                 .link_handler(&handler)
+                // 代码块复制头(#38):挂载点上游自带,点击经回调出 app 侧
+                // 执行复制(见 [`code_copy_buttons`])。源码/Live 两种模式下
+                // 右栏都走本入口,label_id 只含 tab id,互切不清缓存、按钮仍在。
+                .code_block_buttons(&code_copy_buttons)
                 .show(ui);
             handler.drain_into(outbox);
         });
@@ -984,5 +1099,252 @@ mod tests {
             painted_healed, painted_undo,
             "heal 开关不得改变完整文档渲染"
         );
+    }
+
+    // —— 代码块复制头(#38)——
+
+    /// 从 ctx 读回本帧探针记录的复制按钮 rect。
+    fn copy_button_rects(ctx: &egui::Context) -> Vec<egui::Rect> {
+        ctx.data(|d| {
+            d.get_temp::<(u64, Vec<egui::Rect>)>(copy_button_rects_id())
+                .map(|(_, rects)| rects)
+        })
+        .unwrap_or_default()
+    }
+
+    /// 覆盖 #38 验收面的文档:带语言块(CJK + emoji 行)、裸围栏、带空行的
+    /// 空围栏(text 为空串但块存在)、```ai 指令卡、末尾短块(验「无尾换行」
+    /// 边界)。另含一个无空行的空围栏 —— pulldown 对它不产 Text 事件,
+    /// vendored parser 也就没有 token,整块不渲染(上游既有语义,只验不
+    /// panic,不指望按钮)。
+    fn code_copy_doc() -> String {
+        let mut doc = String::from("前文段落。\n\n");
+        doc.push_str("```zzprobe\nfn hello() {\n    println!(\"你好,世界 🌏\");\n}\n```\n\n");
+        doc.push_str("```\n裸围栏,没有语言。\n```\n\n");
+        doc.push_str("```\n\n```\n\n");
+        doc.push_str("```\n```\n\n");
+        doc.push_str("```ai\n指令不走这里\n```\n\n");
+        doc.push_str("```rust\ntail_line()\n```\n");
+        doc
+    }
+
+    /// 以生产入口渲染一帧,返回 (探针按钮 rect, 帧输出收集的 Text shape 文本,
+    /// 本帧 CopyText 命令载荷)。
+    fn render_copy_frame(
+        ctx: &egui::Context,
+        doc: &str,
+        events: Vec<egui::Event>,
+    ) -> (Vec<egui::Rect>, Vec<String>, Vec<String>) {
+        let mut preview = PreviewState {
+            rendered: latermd_md::expand_wikilinks(doc),
+            text: doc.to_owned(),
+            synced_rev: 0,
+            outline: Vec::new(),
+            scroll_target: None,
+        };
+        let mut outbox = Vec::new();
+        let output = ctx.run_ui(
+            eframe::egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    1,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            },
+        );
+        let texts = painted_text(&output);
+        let copied = copied_texts(&output);
+        let rects = copy_button_rects(ctx);
+        output.drop_without_applying_deltas();
+        (rects, texts, copied)
+    }
+
+    /// 按指针三帧(移入/按下/抬起)点击 `target`,汇集整个序列的 CopyText 载荷。
+    fn click_and_collect(ctx: &egui::Context, doc: &str, target: egui::Pos2) -> Vec<String> {
+        let mut copied = Vec::new();
+        for events in click_events(target) {
+            let (_, _, frame) = render_copy_frame(ctx, doc, events);
+            copied.extend(frame);
+        }
+        copied
+    }
+
+    /// 指针序列:移入 → 按下 → 抬起(与 ai_key 的无头点击同款三帧)。
+    fn click_events(pos: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![
+            vec![egui::Event::PointerMoved(pos)],
+            vec![click(pos, true)],
+            vec![click(pos, false)],
+        ]
+    }
+
+    /// 从帧输出里抽出全部 CopyText 命令的载荷。
+    fn copied_texts(output: &eframe::egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                eframe::egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 按钮存在性与命中:每个**普通**代码块一枚按钮(裸围栏/空块也有,
+    /// ```ai 指令卡走 block_code_widget 另一条路不经过挂载点);点击后
+    /// `Context::copy_text` 出整块源文本 —— CJK/emoji 行逐字节保留、
+    /// 末块无尾换行、空块复制空串。渲染不 panic、点击不产消息。
+    #[test]
+    fn code_block_copy_buttons_render_per_block_and_copy_on_click() {
+        let ctx = egui::Context::default();
+        let doc = code_copy_doc();
+
+        let (rects, _, _) = render_copy_frame(&ctx, &doc, Vec::new());
+        assert_eq!(
+            rects.len(),
+            4,
+            "zzprobe/裸/空/末尾 rust 四个普通块各一枚按钮,ai 卡不算:{rects:?}"
+        );
+
+        // 点击 zzprobe 块:复制内容与块源文本逐字符相等(CJK + emoji +
+        // 内部缩进换行原样),点击不产消息。
+        assert_eq!(
+            click_and_collect(&ctx, &doc, rects[0].center()),
+            vec!["fn hello() {\n    println!(\"你好,世界 🌏\");\n}".to_owned()],
+            "点击恰复制一次,内容与块源文本逐字符相等"
+        );
+
+        // 末块边界:无尾换行(vendored parser 的 trim_end_newlines)。
+        let (rects, _, _) = render_copy_frame(&ctx, &doc, Vec::new());
+        assert_eq!(
+            click_and_collect(&ctx, &doc, rects[3].center()),
+            vec!["tail_line()".to_owned()],
+            "末块复制不带尾换行"
+        );
+
+        // 空块:按钮在,点击复制空串(不 panic)。
+        let (rects, _, _) = render_copy_frame(&ctx, &doc, Vec::new());
+        assert_eq!(
+            click_and_collect(&ctx, &doc, rects[2].center()),
+            vec![String::new()],
+            "空块复制空串"
+        );
+    }
+
+    /// 瞬时反馈:点击帧写入反馈态,下一帧按钮图标换成 ✓(Check 的两条
+    /// 斜率异号线段落在按钮 rect 内;Copy 后框的边线是水平/垂直,不混判)。
+    /// 再渲染一帧按钮仍在(连续帧稳定,源码/Live 互切共用本入口的底座)。
+    #[test]
+    fn copy_click_flashes_check_feedback_next_frame() {
+        let ctx = egui::Context::default();
+        let doc = code_copy_doc();
+
+        let (rects, _, _) = render_copy_frame(&ctx, &doc, Vec::new());
+        let target = rects[0].center();
+        for events in click_events(target) {
+            let _ = render_copy_frame(&ctx, &doc, events);
+        }
+
+        // 点击后的第一帧:按钮 rect 内出现一正一负两条非零斜率线段(Check)。
+        let output = ctx.run_ui(egui::RawInput::default(), |panel| {
+            let mut preview = PreviewState {
+                rendered: latermd_md::expand_wikilinks(&doc),
+                text: doc.clone(),
+                synced_rev: 0,
+                outline: Vec::new(),
+                scroll_target: None,
+            };
+            let mut outbox = Vec::new();
+            ui(
+                panel,
+                &mut preview,
+                &AiState::default(),
+                1,
+                false,
+                None,
+                &mut outbox,
+            );
+        });
+        let rects = copy_button_rects(&ctx);
+        assert_eq!(rects.len(), 4, "反馈帧按钮仍在");
+        let button = rects[0];
+        let mut slopes = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::LineSegment { points, .. } = &clipped.shape {
+                let inside = points.iter().all(|p| button.contains(*p));
+                if inside {
+                    slopes.push((points[1].x - points[0].x) * (points[1].y - points[0].y));
+                }
+            }
+        }
+        assert!(
+            slopes.iter().any(|s| *s > 0.0) && slopes.iter().any(|s| *s < 0.0),
+            "✓ 反馈 = 两条斜率异号线段落在按钮内:{slopes:?}"
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    /// 快照护栏(照 #32 图标护栏手法):复制按钮与语言标签不得回流正文
+    /// 文本 —— 语言标签 `zzprobe` 只允许出现在独立的头部 Text shape,
+    /// 含代码正文的 galley 不得混入语言标签;图标字形(`⧉`/`✓`)与
+    /// hover 文案不得以文本形态出现(无 hover 帧本就不该有 tooltip)。
+    #[test]
+    fn code_block_header_stays_out_of_body_text() {
+        let ctx = egui::Context::default();
+        let doc = code_copy_doc();
+        let (_, texts, _) = render_copy_frame(&ctx, &doc, Vec::new());
+
+        let body = texts
+            .iter()
+            .find(|t| t.contains("fn hello()"))
+            .expect("代码正文应仍在文本层");
+        assert!(
+            !body.contains("zzprobe"),
+            "语言标签不得回流正文 galley:{body:?}"
+        );
+        assert!(
+            body.contains("裸围栏,没有语言。"),
+            "裸围栏块的正文原样在 galley:{body:?}"
+        );
+        let label_shapes = texts.iter().filter(|t| t.as_str() == "zzprobe").count();
+        assert_eq!(label_shapes, 1, "语言标签恰一枚独立 Text shape:{texts:?}");
+        for text in &texts {
+            assert!(
+                !text.contains('⧉') && !text.contains('✓') && !text.contains("复制代码"),
+                "图标字形/hover 文案不得以文本形态出现:{text:?}"
+            );
+        }
+    }
+
+    /// ```ai 指令卡回归:挂上复制头之后,指令块仍走卡片(标题/指令/执行
+    /// 按钮三要素齐全),代码块复制按钮不叠上卡片。
+    #[test]
+    fn ai_instruction_card_unaffected_by_copy_header() {
+        let ctx = egui::Context::default();
+        let doc = code_copy_doc();
+        let (rects, texts, _) = render_copy_frame(&ctx, &doc, Vec::new());
+
+        assert_eq!(rects.len(), 4, "指令卡不产复制按钮");
+        for expected in ["AI 指令", "指令不走这里", "执行"] {
+            assert!(
+                texts.iter().any(|t| t.contains(expected)),
+                "卡片要素 {expected} 缺失:{texts:?}"
+            );
+        }
     }
 }
