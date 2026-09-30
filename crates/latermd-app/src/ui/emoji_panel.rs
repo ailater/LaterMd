@@ -22,6 +22,21 @@
 //! 限制不是 bug,面板底部一行小字说明「导出 / 外发仍是彩色」
 //! (emoji-plan §2 F2)。无头测试只断言「点击 → 发出正确消息」与「渲染
 //! 不 panic」,不断言字形(has_glyph 依赖真实字体,会 flaky,§7 #7)。
+//!
+//! ## E3 的口径:不让用户看到豆腐块
+//!
+//! 面板首帧(字体装载后才会开面板,天然满足「装载后」)按出厂
+//! NotoEmoji 的 **cmap format 12 覆盖**核验全表一次,结果缓存于
+//! [`EmojiPanelState::glyphs`],此后不再核验(不是每帧)。缺字形条目
+//! **数据保留、渲染剔除**(`emoji_data::visible_entries` / `visible_hits`,
+//! 谓词注入);分类被剔光时显示「本机字体缺字形」占位而非空网格;
+//! 「最近使用」同样过滤。单测给假集合 / 全量集合注入,不碰真实字形。
+//!
+//! **为什么不是 `Fonts::has_glyphs`**(emoji-plan F4 原方案):epaint
+//! 0.36.2 的替换字形 ◻ 恰在 NotoEmoji 上,`has_glyph` 凡该 face 拥有的
+//! 字符一律误报 false,实测全表 0/272 —— 原方案作废,按 decisions-pending
+//! #52 的 cmap 直验口径运行时化(`emoji_data::from_font_cmap12`),同时
+//! 给 #52 的入库清洗加一道常驻回归防线。
 
 use crate::state::Message;
 use crate::ui::emoji_data::{self, EmojiEntry};
@@ -53,6 +68,45 @@ pub struct EmojiPanelState {
     /// 最近使用(去重、新的在前、上限见 `state::EMOJI_RECENT_CAP`)。
     /// 维护与持久化都在归约(E2 起随 settings.json),面板只展示。
     pub recent: Vec<String>,
+    /// E3 字形探测缓存:`None` = 未探测(面板首帧探一次);`Some` 后本
+    /// 会话不再探测。本应用字体只在启动时装一次(fonts::install),故不
+    /// 设失效路径 —— 若将来支持运行中换字体,须同时清此缓存。
+    pub glyphs: Option<emoji_data::GlyphSet>,
+}
+
+/// 出厂 emoji 字体在 `FontDefinitions::font_data` 里的键名(egui 出厂链,
+/// fonts.rs 保序不动)。
+const NOTO_EMOJI_FONT: &str = "NotoEmoji-Regular";
+
+/// E3 真实核验(emoji-plan E3,按 decisions-pending #52 的 cmap 口径
+/// 运行时化):直读出厂 NotoEmoji-Regular 的 cmap format 12 子表核验
+/// 全表覆盖,缺字形的字符不进集合。只在面板首帧调用一次(缓存于
+/// `EmojiPanelState::glyphs`),不是每帧 —— 出厂字体编译期嵌入,核验
+/// 结果整个会话不变。
+///
+/// **不用 `Fonts::has_glyphs`**:epaint 0.36.2 的替换字形 ◻ 恰在
+/// NotoEmoji 上,凡该 face 拥有的字符一律误报 false(#52 实测,本棒
+/// 复测 0/272 全 false);渲染 shaping 走 harfrust 独立解析,不受其害。
+///
+/// 兜底:键名缺失或解析失败(结果为空)时全量放行 —— 内置字体编译期
+/// 嵌入、任何平台必有 emoji 字形,「全空」只可能是核验自身失效;报废
+/// 整个面板比冒豆腐风险更糟,豆腐风险的最后一道是真机目视(§8)。
+fn probe_glyphs() -> emoji_data::GlyphSet {
+    let defs = egui::FontDefinitions::default();
+    let Some(bytes) = defs
+        .font_data
+        .get(NOTO_EMOJI_FONT)
+        .map(|fd| fd.font.as_ref())
+    else {
+        eprintln!("LaterMD: 出厂字体链无 {NOTO_EMOJI_FONT},跳过字形核验(全表放行)");
+        return emoji_data::GlyphSet::all();
+    };
+    let set = emoji_data::GlyphSet::from_font_cmap12(bytes);
+    if set.is_empty() {
+        eprintln!("LaterMD: {NOTO_EMOJI_FONT} cmap 核验失败(空结果),全表放行");
+        return emoji_data::GlyphSet::all();
+    }
+    set
 }
 
 /// 画面板,返回所有可点 emoji 单元的响应(网格 + 搜索结果 + 最近使用,
@@ -65,6 +119,11 @@ pub fn panel(
     state: &mut EmojiPanelState,
     outbox: &mut Vec<Message>,
 ) -> Vec<egui::Response> {
+    // E3:首帧核验一次并缓存(开面板必然在字体装载之后);生产走真实
+    // 核验,无头测试由 frame() 预置注入,不碰真实字形(§7 #7)
+    if state.glyphs.is_none() {
+        state.glyphs = Some(probe_glyphs());
+    }
     let mut cells = Vec::new();
     egui::Window::new("插入 Emoji")
         // 与 image_dialog 同款:首帧锚定屏幕中心,拖动后由 Area 记忆保持
@@ -94,22 +153,33 @@ pub fn panel(
                 }
             });
             ui.add_space(tokens::SPACE_SM);
-            // 网格:空查询 = 当前分类全表;有查询 = 跨分类命中,段头高亮
-            // 来源分类(emoji-plan E2)
+            // E3:字形白名单(首帧已探好),网格 / 搜索 / 最近统一据此过滤
+            let glyphs = state
+                .glyphs
+                .as_ref()
+                .expect("面板首帧已探测字形(见函数开头)");
+            let has = |glyph: &str| glyphs.allows(glyph);
+            // 网格:空查询 = 当前分类全表(剔缺字形);有查询 = 跨分类命中,
+            // 段头高亮来源分类(emoji-plan E2)
             let query = state.query.trim();
             if query.is_empty() {
                 let index = state.group.min(emoji_data::GROUPS.len() - 1);
                 let group = &emoji_data::GROUPS[index];
-                for row in group.entries.chunks(COLUMNS) {
+                // 分类被剔光:占位说明,不是空网格(E3)
+                let visible = emoji_data::visible_entries(group.entries, has);
+                if visible.is_empty() {
+                    ui.weak("本机字体缺字形");
+                }
+                for row in visible.chunks(COLUMNS) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
-                        for entry in row {
+                        for &entry in row {
                             cells.push(cell(ui, entry, None, outbox));
                         }
                     });
                 }
             } else {
-                let hits = emoji_data::search(query);
+                let hits = emoji_data::visible_hits(emoji_data::search(query), has);
                 if hits.is_empty() {
                     ui.weak("无匹配");
                 } else {
@@ -138,12 +208,14 @@ pub fn panel(
             ui.add_space(tokens::SPACE_XS);
             ui.separator();
             // 「最近使用」一行(E2):空态整行隐藏;点选即再插入 —— 连插
-            // 多个靠它二次进入,不用重新翻分类
-            if !state.recent.is_empty() {
+            // 多个靠它二次进入,不用重新翻分类。E3:缺字形的历史记录同样
+            // 剔除,不让豆腐块从这条缝里漏回来
+            let recent: Vec<&String> = state.recent.iter().filter(|g| has(g)).collect();
+            if !recent.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
                     ui.weak("最近");
-                    for emoji in &state.recent {
+                    for emoji in recent {
                         cells.push(glyph_cell(ui, emoji, "最近使用 · 点选再次插入", outbox));
                     }
                 });
@@ -220,13 +292,18 @@ mod tests {
     use super::*;
     use egui::{Event, PointerButton, RawInput, Rect};
 
-    /// 一帧:画面板(可带走本帧的网格单元矩形)。
+    /// 一帧:画面板(可带走本帧的网格单元矩形)。未探测(`None`)时预置
+    /// 全量集 —— 既有断言(全表可见)因此不依赖真实字形(E3 口径:过滤
+    /// 行为用注入集合测,真实字形交给真机目视,emoji-plan §7 #7)。
     fn frame(
         ctx: &egui::Context,
         state: &mut EmojiPanelState,
         events: Vec<Event>,
         outbox: Option<&mut Vec<Message>>,
     ) -> Vec<egui::Response> {
+        if state.glyphs.is_none() {
+            state.glyphs = Some(emoji_data::GlyphSet::all());
+        }
         let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 800.0));
         let mut cells = Vec::new();
         let mut sink = Vec::new();
@@ -447,6 +524,132 @@ mod tests {
             outbox,
             vec![Message::EmojiInserted("🎉".to_owned())],
             "点的是最后一枚(🚀 之后的 🎉)"
+        );
+    }
+
+    /// E3 过滤(注入集合,不碰真实字形,emoji-plan §7 #7):白名单只放行
+    /// 一枚 → 网格只剩它且点选发它;空集 → 全分类占位零单元、搜索态命中
+    /// 全被剔也走「无匹配」零单元 —— 豆腐块没有任何可渲染入口。
+    #[test]
+    fn glyph_filter_prunes_grid_and_shows_placeholder() {
+        let ctx = egui::Context::default();
+        let mut only_first = emoji_data::GlyphSet::default();
+        only_first.insert("😀");
+        let mut state = EmojiPanelState {
+            open: true,
+            glyphs: Some(only_first),
+            ..EmojiPanelState::default()
+        };
+
+        // 浮窗 sizing 多轮后才取矩形点击(与 clicking_a_cell 同款手法)
+        let mut first = Rect::NOTHING;
+        for step in 0..4 {
+            let cells = frame(&ctx, &mut state, Vec::new(), None);
+            assert_eq!(cells.len(), 1, "第 {step} 帧白名单只放行首枚:{cells:?}");
+            if step == 3 {
+                first = cells[0].rect;
+            }
+        }
+        let mut outbox = Vec::new();
+        click_at(&ctx, &mut state, first.center(), &mut outbox);
+        assert_eq!(outbox, vec![Message::EmojiInserted("😀".to_owned())]);
+
+        // 空集:分类页与搜索态都零单元(占位文案无点击目标)
+        state.glyphs = Some(emoji_data::GlyphSet::default());
+        state.query.clear();
+        assert!(
+            frame(&ctx, &mut state, Vec::new(), None).is_empty(),
+            "分类全剔无单元"
+        );
+        state.group = 4; // 换个分类,占位路径同款
+        assert!(
+            frame(&ctx, &mut state, Vec::new(), None).is_empty(),
+            "任意分类同款占位"
+        );
+        state.group = 0;
+        state.query = "笑脸".to_owned(); // 有文本命中,但全被剔
+        assert!(
+            frame(&ctx, &mut state, Vec::new(), None).is_empty(),
+            "搜索命中全剔无单元"
+        );
+    }
+
+    /// E3:「最近使用」同受白名单过滤 —— 历史记录里缺字形的不再回到
+    /// 面板(豆腐块不从这条缝漏回来),放行的照常可点。
+    #[test]
+    fn glyph_filter_prunes_the_recent_row() {
+        let ctx = egui::Context::default();
+        let mut allow_first = emoji_data::GlyphSet::default();
+        allow_first.insert("😀");
+        let mut state = EmojiPanelState {
+            open: true,
+            glyphs: Some(allow_first),
+            recent: vec!["🚀".to_owned(), "😀".to_owned()],
+            ..EmojiPanelState::default()
+        };
+
+        let mut last = Rect::NOTHING;
+        for step in 0..6 {
+            let cells = frame(&ctx, &mut state, Vec::new(), None);
+            assert_eq!(
+                cells.len(),
+                2,
+                "第 {step} 帧:同一白名单下网格剩 😀、最近行剩 😀(🚀 两处都被剔)"
+            );
+            if step == 5 {
+                last = cells.last().expect("recent 单元存在").rect;
+            }
+        }
+        let mut outbox = Vec::new();
+        click_at(&ctx, &mut state, last.center(), &mut outbox);
+        assert_eq!(outbox, vec![Message::EmojiInserted("😀".to_owned())]);
+    }
+
+    /// E3 核验契约:出厂 NotoEmoji 的 cmap fmt12 剔除清单**恰好**是这
+    /// 7 枚「裸码位 + FE0F」的文本表现条目(独立脚本按同口径复核:4 枚
+    /// 增补平面 fmt12/fmt4 全无,3 枚 BMP 仅 fmt4 有而 harfrust 选表只认
+    /// fmt12)—— #52 入库清洗的漏网,由本防线兜住。把清单写死:egui
+    /// 升级致覆盖变化时此处红 = 期望中的警报,按 #52 口径重核后再更新
+    /// 本清单。断言的不是「碰真实渲染字体」,纯静态字节 + 纯函数,零抖动。
+    #[test]
+    fn factory_font_cmap12_prunes_exactly_the_text_presentation_entries() {
+        let defs = egui::FontDefinitions::default();
+        let bytes = defs
+            .font_data
+            .get(NOTO_EMOJI_FONT)
+            .expect("出厂字体链恒含 NotoEmoji(egui default_fonts)")
+            .font
+            .as_ref();
+        let set = emoji_data::GlyphSet::from_font_cmap12(bytes);
+        assert!(
+            !set.is_empty(),
+            "cmap 核验空结果:解析器或出厂字体键名失效(生产侧此情走全量放行兜底)"
+        );
+        // 侦探 / 台式机 / 键盘 / 鼠标 / 地图 / 沙滩伞 / 鸟居
+        let pruned: &[&str] = &["🕵️", "🖥️", "⌨️", "🖱️", "🗺️", "⛱️", "⛩️"];
+        let missing: Vec<&str> = emoji_data::GROUPS
+            .iter()
+            .flat_map(|g| g.entries.iter())
+            .map(|e| e.char)
+            .filter(|glyph| !set.allows(glyph))
+            .collect();
+        assert_eq!(missing, pruned, "剔除清单漂移:按 #52 口径重核后更新此清单");
+    }
+
+    /// E3 兜底口径:出厂链上 `probe_glyphs` 的产出 = 全表减 7 枚 fmt12
+    /// 未覆盖条目(见 `factory_font_cmap12_prunes_exactly_the_text_presentation_entries`);
+    /// 失败路径(键名缺失/坏字节 → 空集 → 全量放行)由 emoji_data 的
+    /// 合成字节测试覆盖。
+    #[test]
+    fn probe_glyphs_covers_table_on_factory_chain() {
+        assert_eq!(
+            probe_glyphs().iter().count(),
+            emoji_data::GROUPS
+                .iter()
+                .map(|g| g.entries.len())
+                .sum::<usize>()
+                - 7,
+            "出厂链上核验结果 = 全表 − 7 枚文本表现条目"
         );
     }
 }

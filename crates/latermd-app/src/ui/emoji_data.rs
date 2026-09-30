@@ -13,6 +13,22 @@
 //!
 //! 应用内由 NotoEmoji(egui 出厂字体链,fonts.rs 保序)黑白渲染;导出
 //! HTML / 粘贴到外部仍是系统彩色字体 —— 这是上游事实,不是 bug。
+//!
+//! ## E3 的口径:数据保留,渲染过滤
+//!
+//! 本模块只提供「字形可用集合」(`GlyphSet`)、出厂字体的 cmap format 12
+//! 核验(`from_font_cmap12`)与**注入谓词**的过滤函数(`visible_entries` /
+//! `visible_hits`);核验的组装与缓存在 `emoji_panel`(UI 侧)首帧做一次。
+//!
+//! **为什么不用 `Fonts::has_glyphs` 探测**(emoji-plan F4 / E3 原方案):
+//! epaint 0.36.2 的替换字形 ◻(U+25FB)恰好就在 NotoEmoji-Regular 里,
+//! `has_glyph` 判「字形脸 == 替换脸 → 没字形」,凡该脸拥有的字符一律
+//! 误报 false —— 实测全表 0/272 枚通过(decisions-pending #52,本棒在
+//! E3 复测同结果)。渲染 shaping 走 harfrust 独立解析,不受其害;故改
+//! 按 #52 的 cmap 直验口径运行时化,数据表的入库清洗(#52)由此获得
+//! 一道常驻回归防线。
+
+use std::collections::HashSet;
 
 /// 单枚条目:字符 + 中英双语名 + 短码。
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +89,186 @@ pub fn search(query: &str) -> Vec<(usize, &'static EmojiEntry)> {
         }
     }
     hits
+}
+
+/// 字形可用集合(E3):探测通过的字符白名单,面板据此把缺字形条目从
+/// 渲染中剔除,数据表本身不动。空集 = 全部缺字形(面板各分类显示占位),
+/// 与面板状态里的「未探测」(`None`)是两回事。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlyphSet(HashSet<String>);
+
+impl GlyphSet {
+    /// 收录一枚探测通过的字符(可能多码位:旗帜、带 FE0F 的条目)。
+    pub fn insert(&mut self, glyph: &str) {
+        self.0.insert(glyph.to_owned());
+    }
+
+    /// 该字符是否探测通过。
+    pub fn allows(&self, glyph: &str) -> bool {
+        self.0.contains(glyph)
+    }
+
+    /// 是否空集(核验失败/全缺的信号,调用方据此走兜底)。
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// 全量集:所有条目视为有字形。核验兜底(出厂字体键名缺失/解析失败
+    /// 时不报废面板)与无头测试注入用 —— 让「过滤行为」与「真实字形」
+    /// 解耦(emoji-plan §7 #7)。
+    pub fn all() -> Self {
+        Self(
+            GROUPS
+                .iter()
+                .flat_map(|g| g.entries.iter())
+                .map(|e| e.char.to_owned())
+                .collect(),
+        )
+    }
+
+    /// 按出厂字体的 cmap format 12 覆盖核验数据表(decisions-pending #52
+    /// 口径),收录每个实际需要字形的码位都被覆盖的条目。FE0F(VS16)与
+    /// U+200D(ZWJ)是 default-ignorable,shaping 时剥离、不产生字形
+    /// 需求,核验前剥掉。字体解析失败返回空集(调用方兜底)。
+    pub fn from_font_cmap12(font: &[u8]) -> Self {
+        let mut set = Self::default();
+        if let Some(cmap) = Cmap12::parse(font) {
+            for entry in GROUPS.iter().flat_map(|g| g.entries.iter()) {
+                let covered = entry
+                    .char
+                    .chars()
+                    .filter(|&c| c != '\u{FE0F}' && c != '\u{200D}')
+                    .all(|c| cmap.covers(c as u32));
+                if covered {
+                    set.insert(entry.char);
+                }
+            }
+        }
+        set
+    }
+
+    /// 已收录字符(测试契约用:核验输出必须是数据表的子集)。
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+}
+
+/// 大端 u16 / u32 读取,越界返回 `None`(不 panic,坏字体走兜底)。
+fn be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// 解析后的 sfnt cmap format 12 子表视图。只认 fmt12:运行时对 fmt4-only
+/// 的码位同样取不到字形,按「两张子表并集」口径会漏报豆腐块(#52)。
+struct Cmap12<'a> {
+    data: &'a [u8],
+    /// groups 数组的起始偏移(format 12 头 16 字节之后)。
+    groups: usize,
+    /// group 数量。
+    count: usize,
+}
+
+impl<'a> Cmap12<'a> {
+    /// 从 sfnt 容器解析:定位 cmap 表,再在 encoding records 里选
+    /// format 12 子表((3,10) Windows UCS-4 优先,(0,4..=6) Unicode 全库兜底)。
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        let num_tables = be_u16(data, 4)? as usize;
+        let mut cmap = None;
+        for i in 0..num_tables {
+            let record = 12 + i * 16;
+            if record + 16 > data.len() {
+                return None;
+            }
+            if &data[record..record + 4] == b"cmap" {
+                cmap = Some(be_u32(data, record + 8)? as usize);
+                break;
+            }
+        }
+        let cmap = cmap?;
+        let encodings = be_u16(data, cmap + 2)? as usize;
+        let mut best: Option<(usize, usize)> = None; // (优先级, 子表偏移)
+        for i in 0..encodings {
+            let record = cmap + 4 + i * 8;
+            if record + 8 > data.len() {
+                return None;
+            }
+            let rank = match (be_u16(data, record)?, be_u16(data, record + 2)?) {
+                (3, 10) => 2,
+                (0, 4..=6) => 1,
+                _ => 0,
+            };
+            if rank == 0 {
+                continue;
+            }
+            let sub = cmap + be_u32(data, record + 4)? as usize;
+            if sub + 4 > data.len() || be_u16(data, sub)? != 12 {
+                continue;
+            }
+            if best.is_none_or(|(r, _)| rank > r) {
+                best = Some((rank, sub));
+            }
+        }
+        let (_, sub) = best?;
+        // format 12 头:format/reserved(u16×2)+ length/language(u32×2)
+        // + nGroups(u32),共 16 字节;groups 每条 12 字节
+        let count = be_u32(data, sub + 12)? as usize;
+        let groups = sub + 16;
+        if groups + count * 12 > data.len() {
+            return None;
+        }
+        Some(Self {
+            data,
+            groups,
+            count,
+        })
+    }
+
+    /// 二分查码位是否落在某 group 的 [start, end] 区间内。
+    fn covers(&self, cp: u32) -> bool {
+        let mut lo = 0;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let record = self.groups + mid * 12;
+            let (Some(start), Some(end)) =
+                (be_u32(self.data, record), be_u32(self.data, record + 4))
+            else {
+                return false;
+            };
+            if cp < start {
+                hi = mid;
+            } else if cp > end {
+                lo = mid + 1;
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// E3 过滤:分类表剔除缺字形条目,保表序。`has` 注入 —— 生产侧是探测
+/// 缓存的 [`GlyphSet::allows`],单测给假谓词(不碰真实字体)。
+pub fn visible_entries(entries: &[EmojiEntry], has: impl Fn(&str) -> bool) -> Vec<&EmojiEntry> {
+    entries.iter().filter(|entry| has(entry.char)).collect()
+}
+
+/// E3 过滤:搜索命中按同一谓词剔除,保 (组号, 表序) —— 面板的来源
+/// 分段依赖该顺序。
+pub fn visible_hits(
+    hits: Vec<(usize, &'static EmojiEntry)>,
+    has: impl Fn(&str) -> bool,
+) -> Vec<(usize, &'static EmojiEntry)> {
+    hits.into_iter()
+        .filter(|(_, entry)| has(entry.char))
+        .collect()
 }
 
 /// 八个分类,顺序即面板标签页顺序。
@@ -545,6 +741,156 @@ mod tests {
         assert!(
             groups.windows(2).all(|pair| pair[0] <= pair[1]),
             "命中按分类顺序排列:{groups:?}"
+        );
+    }
+
+    /// E3 过滤(注入谓词,emoji-plan §7 #7):全真 = 等价原表(保序);
+    /// 只放行一枚 = 只留它;全假 = 空(面板据此显示「本机字体缺字形」
+    /// 占位而非空网格)。谓词一律假闭包,不碰真实字体。
+    #[test]
+    fn visible_entries_filters_by_injected_predicate() {
+        let entries = GROUPS[1].entries; // 手势,18 枚
+        let all = visible_entries(entries, |_| true);
+        assert_eq!(all.len(), entries.len());
+        assert!(
+            all.iter()
+                .map(|e| e.char)
+                .eq(entries.iter().map(|e| e.char)),
+            "全真谓词保表序"
+        );
+
+        let only_thumbs_up = visible_entries(entries, |g| g == "👍");
+        assert_eq!(only_thumbs_up.len(), 1);
+        assert_eq!(only_thumbs_up[0].char, "👍");
+
+        assert!(
+            visible_entries(entries, |_| false).is_empty(),
+            "全假谓词剔光"
+        );
+    }
+
+    /// E3 过滤(搜索命中):同一谓词作用于 `search` 结果,保 (组号, 表序)
+    /// —— 面板的来源分段依赖该顺序不因过滤而乱。
+    #[test]
+    fn visible_hits_filters_by_injected_predicate() {
+        let hits = search("手");
+        assert!(hits.len() >= 2, "前置:跨分类命中才谈得上保序");
+        let allowed: HashSet<&str> = hits.iter().map(|(_, e)| e.char).take(3).collect();
+        let kept = visible_hits(hits, |g| allowed.contains(g));
+        assert_eq!(kept.len(), 3);
+        assert!(
+            kept.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "过滤后仍按分类顺序:{kept:?}"
+        );
+        assert!(kept.iter().all(|(_, e)| allowed.contains(e.char)));
+    }
+
+    /// E3:`GlyphSet` 的收录 / 查询 / 全量语义。`all()` 是测试注入的
+    /// 全量集,必须覆盖数据表每一枚。
+    #[test]
+    fn glyph_set_allows_inserted_and_all_covers_table() {
+        let mut set = GlyphSet::default();
+        assert!(!set.allows("🚀"), "空集不放行任何字符");
+        set.insert("🚀");
+        assert!(set.allows("🚀"));
+        assert!(!set.allows("🎉"));
+
+        let all = GlyphSet::all();
+        for entry in all_entries() {
+            assert!(
+                all.allows(entry.char),
+                "{}(:{}) 不在全量集",
+                entry.name_zh,
+                entry.shortcode
+            );
+        }
+        assert_eq!(
+            all.iter().count(),
+            all_entries().count(),
+            "全量集与数据表一一对应"
+        );
+    }
+
+    /// 构造最小 sfnt:单 cmap 表,单 (3,10) encoding,format 12 子表,
+    /// groups 即传入区间。供解析器测试当对照字体。
+    fn build_min_font(groups: &[(u32, u32)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let put32 = |data: &mut Vec<u8>, v: u32| data.extend_from_slice(&v.to_be_bytes());
+        let put16 = |data: &mut Vec<u8>, v: u16| data.extend_from_slice(&v.to_be_bytes());
+        put32(&mut data, 0x0001_0000); // sfntVersion
+        put16(&mut data, 1); // numTables
+        data.extend_from_slice(&[0; 6]); // searchRange / entrySelector / rangeShift
+                                         // 表目录记录:tag + checksum + offset + length
+        data.extend_from_slice(b"cmap");
+        put32(&mut data, 0); // checksum
+        put32(&mut data, 28); // cmap 偏移
+        let cmap_len = 4 + 8 + 16 + groups.len() * 12;
+        put32(&mut data, cmap_len as u32);
+        assert_eq!(data.len(), 28);
+        // cmap 头 + 单条 encoding record (3,10)
+        put16(&mut data, 0); // version
+        put16(&mut data, 1); // numTables
+        put16(&mut data, 3); // platformID: Windows
+        put16(&mut data, 10); // encodingID: UCS-4
+        put32(&mut data, 12); // 子表相对 cmap 的偏移
+        assert_eq!(data.len(), 40);
+        // format 12 子表
+        put16(&mut data, 12); // format
+        put16(&mut data, 0); // reserved
+        put32(&mut data, (16 + groups.len() * 12) as u32); // length
+        put32(&mut data, 0); // language
+        put32(&mut data, groups.len() as u32); // nGroups
+        for &(start, end) in groups {
+            put32(&mut data, start);
+            put32(&mut data, end);
+            put32(&mut data, 0); // startGlyphID,核验用不到
+        }
+        data
+    }
+
+    /// E3 解析器:cmap fmt12 的命中 / 未命中 / 区间边界 / 二分多组。
+    #[test]
+    fn cmap12_parse_covers_groups() {
+        let font = build_min_font(&[(0x1F600, 0x1F601), (0x1F680, 0x1F680)]);
+        let set = GlyphSet::from_font_cmap12(&font);
+        assert!(set.allows("\u{1F600}"), "区间起点命中");
+        assert!(set.allows("\u{1F601}"), "区间终点命中");
+        assert!(!set.allows("\u{1F602}"), "区间之外不命中");
+        assert!(!set.allows("\u{1F67F}"), "下一区间之前不命中");
+        assert!(set.allows("\u{1F680}"), "单码位区间命中");
+        assert!(!set.allows("A"), "拉丁不在表内");
+    }
+
+    /// E3 解析器:多码位条目要求**每个**实际需要字形的码位都覆盖;
+    /// FE0F(VS16)与 ZWJ 是 default-ignorable(shaping 剥离),核验前
+    /// 剥掉 —— 不因修饰符把条目误剔。
+    #[test]
+    fn cmap12_requires_every_codepoint_but_strips_ignorables() {
+        let font = build_min_font(&[(0x270C, 0x270C)]); // ✌ 裸码位
+        let set = GlyphSet::from_font_cmap12(&font);
+        assert!(set.allows("✌️"), "裸码位 + FE0F:修饰符被剥离,不算缺字形");
+        assert!(!set.allows("😀"), "其它码位不命中");
+    }
+
+    /// E3 解析器:坏字节一律 `None` / 空集(不 panic),生产侧据此走
+    /// 全量放行兜底;fmt4-only 的字体不认(运行时同样解析不到,认了
+    /// 会漏报豆腐块,#52 口径)。
+    #[test]
+    fn cmap12_rejects_bad_bytes_and_fmt4_only() {
+        let good = build_min_font(&[(0x1F600, 0x1F600)]);
+        for cut in [0, 4, 12, 28, 40, 56, good.len() - 1] {
+            assert!(
+                GlyphSet::from_font_cmap12(&good[..cut]).is_empty(),
+                "截断到 {cut} 字节应得空集"
+            );
+        }
+        // fmt4-only:encoding record 指向 format 4 子表 → 解析失败
+        let mut fmt4 = build_min_font(&[]);
+        let sub = 40usize; // format 12 子表的位置
+        fmt4[sub..sub + 2].copy_from_slice(&4u16.to_be_bytes());
+        assert!(
+            GlyphSet::from_font_cmap12(&fmt4).is_empty(),
+            "fmt4-only 不认"
         );
     }
 }
