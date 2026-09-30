@@ -62,6 +62,7 @@
   ```
 
 - macOS 的 dmg 为 universal2 双架构(Intel / Apple Silicon 通用)。
+- **brew 拿不到新版本时**:cask 版本由发布流水线自动跟版(发版后回填;凭据未配置时由 tap 侧每小时任务兜底),可能有短暂延迟。急用可直接从 [Releases](https://github.com/ailater/LaterMd/releases/latest) 下载 macOS universal2 dmg 安装(资产名以 Release 页为准),拖入 `/Applications/` 后按上条执行一次 `xattr` 即可。
 - Windows 无签名直下会触发 SmartScreen,点「更多信息 → 仍要运行」,不视为缺陷。
 
 ## 平台支持

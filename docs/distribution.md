@@ -41,6 +41,7 @@ PR 合入 main(版本号已 bump)
 │ → hdiutil 合 dmg → sha256 写 step summary     │
 │ → gh release upload 回传同一 Release           │
 │ → 尾部清理冗余资产(mac 每架构 tar.xz 等,见 §2) │
+│ → 回填 tap cask(cask-bump 步,失败仅告警)      │
 └─────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────┐
 │ linux-deb.yml(自建 job,ubuntu-22.04)         │
@@ -225,9 +226,57 @@ auto-bump.yml 现含 `CASKS=("latermd:ailater/LaterMd" …)` 表(cron 每小时
 :23),注释明言「Cask 的 url 是 v#{version} 插值模板永不改动,只更新
 version + sha256 两行;sha256 从 GitHub Release asset 的 digest 字段直接读取
 (免下载)」,cask 已自动跟版至 0.0.3。发版后不再需要手动回填(§4 第 3 步已
-相应改写)。主仓 #22(cask-bump:Release workflow 里 gh api 更新 cask)与
-tap 侧自动跟版功能重复,撤与留留后续评审(decisions-pending #53 第三轮补全
-第 3 点只登记冲突,本文不代撤)。
+相应改写)。主仓 #22(cask-bump)已于 2026-09-30 落地:macos-dmg.yml 尾部
+cask-bump 步在 dmg 回传后**即时**回填同一 cask 文件(gh api PUT,
+HOMEBREW_TAP_TOKEN,无 token/4xx/行格式不匹配均只告警不阻塞发布)。与
+tap 侧 cron 双写同一文件但值同源同值(sha256 都取自同一 dmg 文件:本地
+shasum == GitHub asset digest),竞态最坏是 PUT 409,回填步告警跳过、由
+cron 兜底,无害;实测 tap 仓默认分支是 master(任务书原写 ref=main 会 404),
+步骤按默认分支读写,不钉分支名。两路是否撤其一仍留后续评审
+(decisions-pending #53 第三轮补全第 3 点、#57)。
+
+**cask 自动回填(#22 cask-bump 步)三要素**:
+
+- **触发时序**:release.yml host job dispatch macos-dmg.yml(`-f tag=<tag>`)
+  → dmg job 下载双架构 tar.xz → lipo 合一 → 组装 .app → hdiutil 合 dmg →
+  `gh release upload` 回传同一 Release → 清理冗余资产 → 尾部 cask-bump 步:
+  `gh api GET repos/crazykun/homebrew-ailater/contents/Casks/latermd.rb` 取
+  blob sha 与内容 → python 正则替换 version/sha256 两行 → `gh api PUT` 回写
+  tap **默认分支**(实测 master,不钉分支名)。
+- **所需凭据**:`HOMEBREW_TAP_TOKEN` = 对 tap 仓库有 `contents:write` 权限的
+  PAT,**需人工配置**到本仓(LaterMD)Settings → Secrets and variables →
+  Actions;`GITHUB_TOKEN` 跨仓库无写权限,不能替代。未配置时步走「告警+跳过」
+  分支(tap cron 兜底),本仓侧交付照常;**GitHub 侧实际生效(真发一版看 PUT
+  落地)留人工验证**,blocked_external。
+- **失败语义**:三类失败(无 token / gh api 读或写失败含 4xx 撞车 / version
+  或 sha256 行正则命中数 ≠ 1)各自 `::warning::` + 写 step summary,末尾
+  `trap EXIT` 强制 exit 0,step 恒绿,**仅告警不阻塞发布链**(dmg 回传与
+  资产清理已在本步之前完成)。
+
+**cask 真实行格式与替换规则**(2026-09-30 `gh api` 只读实测现网 Casks/latermd.rb):
+
+- 现网格式:version 行为 `  version "0.0.3"`、sha256 行为
+  `  sha256 "d86ec30a…"`(两空格缩进);url 是 `v#{version}` 插值模板永不改动,
+  livecheck `:github_latest` 自动发现新版本,回填只动 version/sha256 两行
+  (与上方空档段 tap 侧注释「只更新两行」的口径互证)。
+- 替换规则:与 cask-bump 步内嵌正则一致,`^( +version +")([^"]*)("$)` 与
+  `^( +sha256 +")([^"]*)("$)`(多行模式)各**恰好命中一行**才回写;命中数 ≠ 1
+  (cask 行格式被改/出现同名行)则告警跳过不盲写,避免把 tap 文件改坏。
+
+**brew 拿不到新版本时(手动路径)**:cask 跟版窗口 = 发版链正常时 cask-bump
+步在 dmg 回传后即时回填;`HOMEBREW_TAP_TOKEN` 未配置时由 tap auto-bump cron
+(每小时 :23)兜底,最长约 1 小时;两路同时失败(cron 故障、tap 改名/权限
+回收等)cask 才会停在旧版。此时:
+
+- **用户侧**:直接从 GitHub Release 页下载 universal2 dmg 安装(资产名模板
+  `latermd-v{version}-universal2-apple-darwin.dmg`,命名规范见 §2,具体
+  **以 Release 页为准**),拖入 `/Applications/` 后执行一次
+  `sudo xattr -dr com.apple.quarantine /Applications/LaterMD.app`(口径同 §5)。
+  README 安装节有同款面向用户的说明。
+- **维护者侧**:按上一段真实行格式改 tap 仓 `Casks/latermd.rb` 的
+  version/sha256 两行,push 默认分支即可(macos-dmg.yml 无 token 告警文案
+  「人工回填步骤见 docs/distribution.md §3.4」指的就是本段;`brew
+  bump-cask-pr` 对自定义 tap 的行为未实测,不写进口径)。
 
 ### 3.5 首发后回填(2026-09-30 纠偏回填;未做项如实保留,不随归档默认打勾)
 
@@ -247,11 +296,12 @@ tap 侧自动跟版功能重复,撤与留留后续评审(decisions-pending #53 �
    漏了 Release 页面就只剩一张下载表(v0.0.2 踩过一次,事后 `gh release edit`
    才补上)。
 2. 链路全自动(§3.2),无需打 tag。
-3. **发版后核对 tap(已自动化,原「必做手动回填」口径作废)**:tap 仓
-   auto-bump 已含 CASKS 表,cask 的 version/sha256 每小时自动跟版(源:
-   Release asset digest,E12/E13;§3.4 空档段已闭合)——发版后无需手动回填,
-   只需巡检 cask version 与新 tag 一致;主仓 #22 cask-bump 与其功能重复,
-   撤留留后续评审(decisions-pending #53 补全第 3 点)。
+3. **发版后核对 tap(已自动化,原「必做手动回填」口径作废)**:cask 的
+   version/sha256 走双路自动跟版——主仓 macos-dmg.yml 尾部 cask-bump 步在
+   dmg 回传后即时回填(#22,HOMEBREW_TAP_TOKEN,失败仅告警),tap 仓
+   auto-bump cron(每小时 :23)兜底(源:Release asset digest,E12/E13);
+   发版后只需巡检 cask version 与新 tag 一致。两路重复,是否撤其一留后续
+   评审(decisions-pending #53 第三轮补全第 3 点、#57)。
 4. dist 配置(dist-workspace.toml)改动后本地必须重跑 §3.1 第 3 步的
    manifest 校验,再 `dist generate` 重新生成 release.yml —— 重新生成会
    **覆盖三处 LOCAL PATCH**(§1),必须按清单重新打上;allow-dirty 见 §1

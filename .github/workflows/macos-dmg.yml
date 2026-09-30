@@ -6,7 +6,8 @@
 # (release.yml 用 GITHUB_TOKEN 建 Release,该事件不会触发 on: release ——
 # GitHub 防递归规则,workflow_dispatch 是唯一例外通道,详见 docs/distribution.md §1)。
 # on: release 保留给人工/PAT 场景(手动在 GitHub 页面发 Release 仍可触发)。
-# 本 job 下载两个架构的二进制 → lipo 合一 → 打成 .app bundle → 合成 dmg → 回传同一 Release。
+# 本 job 下载两个架构的二进制 → lipo 合一 → 打成 .app bundle → 合成 dmg →
+# 回传同一 Release → 尾部回填 tap cask(cask-bump 步,失败仅告警,见其注释)。
 #
 # 为什么要 .app 而不是裸二进制:macOS 的 GUI 应用必须走 bundle 才能正常获得
 # 窗口焦点与输入法上下文(直接跑命令行二进制会丢 IME 候选框跟随),这是
@@ -109,8 +110,8 @@ jobs:
             echo "- 文件: \`$DMG\`"
             echo "- sha256: \`$SHA\`"
             echo ""
-            echo "cask 更新需要这个 sha256(homebrew-ailater 的 auto-bump 目前只管 Formula,"
-            echo "Casks/ 需人工或后续扩展流水线填值)。"
+            echo "cask 回填(尾部 cask-bump 步)用该 version + sha256 更新"
+            echo "crazykun/homebrew-ailater 的 Casks/latermd.rb,失败仅告警。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 回传 Release
@@ -142,3 +143,103 @@ jobs:
               --repo "${{ github.repository }}" --yes \
               || echo "skip $A(不存在)"
           done
+
+      # 回填 Homebrew cask(#22,可选增强):把本次 version + dmg sha256 写回
+      # crazykun/homebrew-ailater 的 Casks/latermd.rb,把 cask 跟版延迟从 tap 侧
+      # auto-bump cron(每小时 :23)的最长 1 小时压到发版即时。
+      # 放「清理冗余资产」之后:本步只消费 ver/dmg 两个 step output,不碰任何
+      # Release 资产,与清理步零交互;放尾部让核心发布链(回传+清理)先跑完,
+      # 本步再慢再错也不拖累主链。与 tap cron 双写同一文件但值同源同值(同一
+      # dmg 的 sha256:本地 shasum == GitHub asset digest),contents API 带
+      # blob sha 原子覆盖,撞车最坏是 PUT 409 → 落到下面告警分支、由 cron 兜底,
+      # 无害(取舍登记 docs/decisions-pending.md #57)。
+      # 失败语义选「脚本内逐命令兜底 + 显式 exit 0」而非 continue-on-error:
+      # true——后者仍会在 UI 给 step 挂红叉,且分不出失败原因;前者按无 token /
+      # gh api 失败 / 行格式不匹配三类各自 ::warning:: 并写 step summary,
+      # 末尾 trap EXIT 强制 exit 0:step 恒绿,job 恒成功,发布链不受影响。
+      # HOMEBREW_TAP_TOKEN 是对 tap 仓库 contents:write 的 PAT(需人工配到本仓
+      # secrets;GITHUB_TOKEN 跨仓库无写权限);未配置走跳过分支,是人工项,
+      # 不算失败。GitHub 侧生效验证留人工(blocked_external)。
+      - name: 回填 Homebrew cask
+        id: cask-bump
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          DMG_SHA256: ${{ steps.dmg.outputs.sha256 }}
+          TAP_REPO: crazykun/homebrew-ailater
+          CASK_PATH: Casks/latermd.rb
+        run: |
+          set -uo pipefail
+          # 本步灵魂:任何路径都不许把 job 搞红——显式兜底之外再挂 EXIT 网
+          trap 'exit 0' EXIT
+
+          warn() {
+            echo "::warning::$1"
+            echo "- ⚠️ cask 回填:$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # 无 token = 人工项,不算失败;tap 侧 auto-bump cron 仍会跟版
+          if [ -z "${GH_TOKEN}" ]; then
+            warn "未配置 HOMEBREW_TAP_TOKEN,cask 回填跳过(人工项;tap 侧 auto-bump cron 仍会自动跟版,人工回填步骤见 docs/distribution.md §3.4)"
+            exit 0
+          fi
+
+          # 1) 读 cask 现状:tap 默认分支 HEAD 的 blob sha + base64 内容。
+          #    不钉 ref/branch( PUT 同理省略 branch 字段,均取默认分支):
+          #    tap 仓只有一个分支且叫 master,任务书写的 ?ref=main 实测 404
+          #    (2026-09-30 gh api 验证),以现状为准;默认分支改名也无需跟改。
+          RESP="$(gh api "repos/${TAP_REPO}/contents/${CASK_PATH}")" || {
+            warn "读取 ${TAP_REPO}/${CASK_PATH} 失败(gh api 出错/网络不可达),cask 回填跳过"
+            exit 0
+          }
+          printf '%s' "${RESP}" > "${RUNNER_TEMP}/cask.json"
+
+          # 2) 解码并替换 version / sha256 两行(各恰好命中一行,否则告警跳过)
+          PYERR="${RUNNER_TEMP}/cask-bump.err"
+          if ! python3 - "${VERSION}" "${DMG_SHA256}" "${RUNNER_TEMP}" <<'PY' 2> "${PYERR}"
+          import base64, json, re, sys
+
+          def die(msg):
+              sys.exit("cask 回填中止:" + msg)
+
+          version, dmg_sha, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              with open(f"{tmp}/cask.json") as fh:
+                  doc = json.load(fh)
+              text = base64.b64decode(doc["content"]).decode("utf-8")
+          except Exception as exc:
+              die(f"cask 内容读取/解码失败:{exc.__class__.__name__}: {exc}")
+
+          pat_ver = re.compile(r'^( +version +")([^"]*)("$)', re.M)
+          pat_sha = re.compile(r'^( +sha256 +")([^"]*)("$)', re.M)
+          for name, pat in (("version", pat_ver), ("sha256", pat_sha)):
+              n = len(pat.findall(text))
+              if n != 1:
+                  die(f"{name} 行命中 {n} 次(应为 1),cask 行格式与预期不符")
+
+          new = pat_ver.sub(lambda m: m.group(1) + version + m.group(3), text)
+          new = pat_sha.sub(lambda m: m.group(1) + dmg_sha + m.group(3), new)
+          with open(f"{tmp}/cask-payload.json", "w") as fh:
+              json.dump(
+                  {
+                      "message": f"latermd {version}: bump cask version and sha256",
+                      "content": base64.b64encode(new.encode("utf-8")).decode("ascii"),
+                      "sha": doc["sha"],
+                  },
+                  fh,
+              )
+          PY
+          then
+            warn "$(cat "${PYERR}")"
+            exit 0
+          fi
+
+          # 3) 回写:commit message 带版本,便于 tap 仓审计
+          NEW_SHA="$(gh api --method PUT "repos/${TAP_REPO}/contents/${CASK_PATH}" \
+            -H "Content-Type: application/json" \
+            --input "${RUNNER_TEMP}/cask-payload.json" --jq .commit.sha)" || {
+            warn "回写 ${TAP_REPO}/${CASK_PATH} 失败(gh api 4xx:并发撞车/权限不足/网络),cask 回填跳过"
+            exit 0
+          }
+          echo "cask 已回填:${TAP_REPO}/${CASK_PATH} → version ${VERSION},commit ${NEW_SHA}"
+          echo "- ✅ cask 回填:${TAP_REPO}/${CASK_PATH} 已跟版至 ${VERSION},sha256 取本次 dmg(tap 侧 commit ${NEW_SHA})" >> "$GITHUB_STEP_SUMMARY"
