@@ -178,8 +178,9 @@ impl LaterMdApp {
     }
 
     /// `App::ui` 的面板主体。独立成函数是为了测试能在同一 run_ui 帧里按
-    /// eframe 顺序(先 `reduce` 后绘制)跑完整帧。
-    fn draw(&mut self, ui: &mut egui::Ui) {
+    /// eframe 顺序(先 `reduce` 后绘制)跑完整帧(本模块测试与
+    /// `tab_switch_perf` 取证 harness 同用,故 `pub(crate)`)。
+    pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
         // 禅定模式(§7)是**另一整套面板组合**,不是给三栏各加一个 if:
         // 藏面板的最佳办法是从一开始就不添加它(侧栏宽度演算与 z 序全部
         // 让位),而不是添加了再把可见性摁掉。故在这里整体分叉。

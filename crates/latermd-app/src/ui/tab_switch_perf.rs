@@ -1,0 +1,470 @@
+//! #39 M1「切换卡顿取证」的无头测量 harness(纯测试模块,生产构建不编译)。
+//!
+//! 手法照抄库内测试的 egui 上下文用法:整帧走生产路径
+//! [`LaterMdApp::draw`](同 `ui/layout.rs` 测试的 `draw_frames`),单件预览/
+//! 编辑器走 `ctx.run_ui`(同 `ui/preview.rs` 测试)。不触碰 vendored 一行,
+//! 分段计时全部用公开 API(`egui_markdown::{heal, parse}`、
+//! `latermd_md::{expand_wikilinks, outline}`)在 app 侧复现同一变换。
+//!
+//! 四路测量:
+//! **A 归约/快照侧**(打开与编辑修订号前进时付,不在切换帧):expand_wikilinks /
+//! outline / open_tab 整篇换入;
+//! **B 预览渲染侧**(每帧):heal / parse / resolve_relative_images /
+//! [`MarkdownLabel`] 冷帧(缓存 miss 全量)与热帧(命中);
+//! **C 编辑器侧**:multiline `TextEdit` 冷帧(文本变化触发整篇 layout)与热帧;
+//! **D 整帧(生产路径)**:tab A 稳态 → `TabActivate` → B 首帧/次帧/稳态 →
+//! 往返 A 首帧,与 B/C 的微基准数字互相咬合,核验 vendored temp memory 缓存
+//! 在切换帧的命中/miss 行为。
+//!
+//! 跑法:`cargo test -p latermd-app --test-threads=1 tab_switch -- --ignored --nocapture`;
+//! 两个回归断言测试(不加 `--ignored`)随常规门禁跑,防缓存行为悄悄回归。
+
+use std::borrow::Cow;
+use std::fmt::Write as _;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, Id, RawInput, Rect, ScrollArea};
+use egui_markdown::MarkdownLabel;
+
+use crate::state::Message;
+use crate::LaterMdApp;
+
+/// 无头屏幕:与真实窗口(900×600 起,常规更大)同量级,保证 TextEdit 行数
+/// 与预览视口不是退化值。
+fn screen() -> Rect {
+    Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1280.0, 800.0))
+}
+
+/// 任务指定的样本规模:2000 行。
+const SAMPLE_LINES: usize = 2000;
+
+/// 中英混排样本(标题/段落/代码块/表格/列表/引用循环,含 wikilink 与相对
+/// 图片),`seed` 区分两个文档(同构不同文,模拟「tab A ↔ tab B」)。
+fn sample_doc(seed: u32, target_lines: usize) -> String {
+    let mut doc = String::with_capacity(160 * 1024);
+    let mut lines = 0;
+    let mut section = 0;
+    while lines < target_lines {
+        section += 1;
+        let zh = match section % 3 {
+            0 => "渲染层缓存与视口剔除",
+            1 => "解析器的分段契约",
+            _ => "编辑器缓冲与撤销栈",
+        };
+        let _ = writeln!(doc, "## 第 {seed}-{section} 节 {zh} (section {section})");
+        let _ = writeln!(doc);
+        let _ = writeln!(
+            doc,
+            "这是一段用于测量的中文正文,混排 English words 与 **加粗**、\
+             `行内代码`、[链接](https://example.com/{seed}/{section})、\
+             [[设计决策-{seed}-{section}]] 与 ![配图](./{seed}.assets/fig-{section}.png)。"
+        );
+        let _ = writeln!(doc);
+        let _ = writeln!(doc, "```rust");
+        let _ = writeln!(
+            doc,
+            "fn claim_{section}(log: &Log, seq: u64) -> Result<(), Error> {{"
+        );
+        for step in 0..12 {
+            let _ = writeln!(doc, "    let step_{step} = log.tail()?;");
+        }
+        let _ = writeln!(doc, "    log.insert(seq)");
+        let _ = writeln!(doc, "}}");
+        let _ = writeln!(doc, "```");
+        let _ = writeln!(doc);
+        let _ = writeln!(doc, "| 列甲 | 列乙 | 列丙 |");
+        let _ = writeln!(doc, "|---|---|---|");
+        for row in 1..=2 {
+            let _ = writeln!(doc, "| 单元 {row}-{seed} | cell {row} | {row}{row} |");
+        }
+        let _ = writeln!(doc);
+        let _ = writeln!(
+            doc,
+            "- 列表项一 {}\n- 列表项二\n  - 嵌套项 {section}\n- 列表项三",
+            section
+        );
+        let _ = writeln!(doc);
+        let _ = writeln!(
+            doc,
+            "> 引用块 {section}:检验块级容器的排版与换行开销,中英混排 mixed text。\n"
+        );
+        lines += 30;
+    }
+    doc
+}
+
+/// 预览单件一帧,生产同配置(ScrollArea + 常量 id + wrap + heal)。返回耗时。
+fn label_frame(ctx: &egui::Context, rendered: &str) -> Duration {
+    let start = Instant::now();
+    ctx.run_ui(
+        RawInput {
+            screen_rect: Some(screen()),
+            ..Default::default()
+        },
+        |ui| {
+            ScrollArea::vertical()
+                .id_salt("perf-preview-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // 与生产 preview.rs 同一 id("preview-md"):切换文本时的
+                    // 缓存行为(同 id 覆盖/hash 不匹配 → miss)与生产一致。
+                    MarkdownLabel::new(Id::new("preview-md"), rendered)
+                        .wrap()
+                        .heal(true)
+                        .show(ui);
+                });
+        },
+    )
+    .drop_without_applying_deltas();
+    start.elapsed()
+}
+
+/// 编辑器单件一帧,生产同配置(multiline + Monospace + 不限宽 + ScrollArea)。
+/// 文本 clone 在计时之外,只量 TextEdit 本身。返回耗时。
+fn editor_frame(ctx: &egui::Context, text: &str) -> Duration {
+    let mut buffer = text.to_owned();
+    let start = Instant::now();
+    ctx.run_ui(
+        RawInput {
+            screen_rect: Some(screen()),
+            ..Default::default()
+        },
+        |ui| {
+            ScrollArea::vertical()
+                .id_salt("perf-editor-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::TextEdit::multiline(&mut buffer)
+                        .id(Id::new("perf-editor"))
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(20)
+                        .show(ui);
+                });
+        },
+    )
+    .drop_without_applying_deltas();
+    start.elapsed()
+}
+
+/// 生产整帧一帧(LaterMdApp::draw,含全部面板)。返回耗时。
+fn app_frame(app: &mut LaterMdApp, ctx: &egui::Context) -> Duration {
+    let start = Instant::now();
+    ctx.run_ui(
+        RawInput {
+            screen_rect: Some(screen()),
+            ..Default::default()
+        },
+        |ui| app.draw(ui),
+    )
+    .drop_without_applying_deltas();
+    start.elapsed()
+}
+
+/// 连跑 `frames` 帧不计时(预热:字体图集、面板/控件持久状态)。
+fn warmup_frames(app: &mut LaterMdApp, ctx: &egui::Context, frames: usize) {
+    for _ in 0..frames {
+        app_frame(app, ctx);
+    }
+}
+
+fn median(mut samples: Vec<Duration>) -> Duration {
+    samples.sort();
+    samples[samples.len() / 2]
+}
+
+fn fmt_us(d: Duration) -> String {
+    let us = d.as_nanos() as f64 / 1_000.0;
+    if us < 1_000.0 {
+        format!("{us:.1} µs")
+    } else {
+        format!("{:.2} ms", us / 1_000.0)
+    }
+}
+
+fn row(name: &str, d: Duration) {
+    println!("  {name:<58} {}", fmt_us(d));
+}
+
+/// `#[ignore]` 完整取证:打印四路分段耗时表(证据与结论见
+/// docs/auto-plan.md #39 与本测试输出)。
+#[test]
+#[ignore = "M1 取证报告;跑法:cargo test -p latermd-app tab_switch -- --ignored --nocapture"]
+fn tab_switch_finding_report() {
+    let doc_a = sample_doc(1, SAMPLE_LINES);
+    let doc_b = sample_doc(2, SAMPLE_LINES);
+    println!(
+        "==== M1 切换卡顿取证:样本 {SAMPLE_LINES} 行(doc_a {} 字节 / doc_b {} 字节,同一 ctx)====",
+        doc_a.len(),
+        doc_b.len()
+    );
+
+    println!("[A] 归约/快照侧(打开与编辑时付,不在切换帧)");
+    let rendered_a = latermd_md::expand_wikilinks(&doc_a);
+    let rendered_b = latermd_md::expand_wikilinks(&doc_b);
+    row("expand_wikilinks(全文展开)", {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let out = latermd_md::expand_wikilinks(std::hint::black_box(&doc_a));
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+    row("outline(全文标题扫描)", {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let out = latermd_md::outline(std::hint::black_box(&doc_a));
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+
+    println!("[B] 预览渲染侧(每帧);heal 完整文档应为 Cow::Borrowed");
+    let healed = match egui_markdown::heal(&doc_a) {
+        Cow::Borrowed(_) => {
+            println!("  heal(完整文档) => Cow::Borrowed(恒等零拷贝)");
+            Cow::<str>::Borrowed(&doc_a)
+        }
+        Cow::Owned(owned) => {
+            println!("  heal(完整文档) => Cow::Owned(异常,本文档本不该被补闭合)");
+            Cow::Owned(owned)
+        }
+    };
+    row("heal(完整文档逐行扫描)", {
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            let out = egui_markdown::heal(std::hint::black_box(&doc_a));
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+    row("parse(heal 后全文)", {
+        let mut samples = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            let out = egui_markdown::parse(std::hint::black_box(healed.as_ref()));
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+    row("resolve_relative_images(有相对图,Some(base))", {
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            let out = crate::ui::preview::resolve_relative_images(
+                std::hint::black_box(&doc_a),
+                Some(std::path::Path::new("/home/u/docs")),
+            );
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+    row("resolve_relative_images(无相对图,借回)", {
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            let out = crate::ui::preview::resolve_relative_images(
+                std::hint::black_box(&doc_b),
+                Some(std::path::Path::new("/home/u/docs")),
+            );
+            std::hint::black_box(&out);
+            samples.push(start.elapsed());
+        }
+        median(samples)
+    });
+
+    println!("[B2] MarkdownLabel 单件(生产配置,id=preview-md,同一 ctx 连续帧)");
+    let ctx = egui::Context::default();
+    // 预热一帧:字体图集等一次性初始化不混进冷帧数字(只冷在文档缓存)。
+    ctx.run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+    let cold_a = label_frame(&ctx, &rendered_a);
+    row("冷首帧 A(parse+layout+高亮全量)", cold_a);
+    let hot_a = {
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            samples.push(label_frame(&ctx, &rendered_a));
+        }
+        median(samples)
+    };
+    row("稳态帧 A(缓存命中,7 帧中位)", hot_a);
+    let first_b = label_frame(&ctx, &rendered_b);
+    row("切到 B 首帧(同 id 换文本 = miss)", first_b);
+    let hot_b = {
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            samples.push(label_frame(&ctx, &rendered_b));
+        }
+        median(samples)
+    };
+    row("稳态帧 B(缓存命中)", hot_b);
+    let back_a = label_frame(&ctx, &rendered_a);
+    row("切回 A 首帧(往返:flush 段缓存残留与否)", back_a);
+    let ctx_fresh = egui::Context::default();
+    ctx_fresh
+        .run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+    let cold_b_fresh = label_frame(&ctx_fresh, &rendered_b);
+    row("对照:B 在全新 ctx 的冷首帧", cold_b_fresh);
+
+    println!("[C] TextEdit 单件(生产配置,同一 ctx)");
+    let ctx = egui::Context::default();
+    ctx.run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+    let editor_cold = editor_frame(&ctx, &doc_a);
+    row("冷首帧 A(整篇 layout)", editor_cold);
+    let editor_hot = {
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            samples.push(editor_frame(&ctx, &doc_a));
+        }
+        median(samples)
+    };
+    row("稳态帧 A(galley 缓存命中)", editor_hot);
+    let editor_switch = editor_frame(&ctx, &doc_b);
+    row("换到 B 首帧(文本变化 = 整篇 layout)", editor_switch);
+    let editor_back = editor_frame(&ctx, &doc_a);
+    row("换回 A 首帧(往返)", editor_back);
+
+    println!("[D] 整帧(生产路径 LaterMdApp::draw,含全部面板)");
+    let mut app = LaterMdApp::default();
+    let ctx = egui::Context::default();
+    let open_start = Instant::now();
+    let index_a = app.state.tabs.open_tab(None, &doc_a);
+    let open_a = open_start.elapsed();
+    let open_start = Instant::now();
+    let index_b = app.state.tabs.open_tab(None, &doc_b);
+    let open_b = open_start.elapsed();
+    row("open_tab A(读文本建预览快照,同步)", open_a);
+    row("open_tab B(同上)", open_b);
+    app.state.apply(Message::TabActivate(index_a));
+    warmup_frames(&mut app, &ctx, 3);
+    let steady_a = {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            samples.push(app_frame(&mut app, &ctx));
+        }
+        median(samples)
+    };
+    row("稳态帧 A(5 帧中位)", steady_a);
+    let reduce_start = Instant::now();
+    app.state.apply(Message::TabActivate(index_b));
+    let reduce = reduce_start.elapsed();
+    row("归约 TabActivate(1)(switch_active 本体)", reduce);
+    let first_frame = app_frame(&mut app, &ctx);
+    row("切换后首帧", first_frame);
+    let second_frame = app_frame(&mut app, &ctx);
+    row("切换后次帧", second_frame);
+    let steady_b = {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            samples.push(app_frame(&mut app, &ctx));
+        }
+        median(samples)
+    };
+    row("稳态帧 B(5 帧中位)", steady_b);
+    app.state.apply(Message::TabActivate(index_a));
+    let back_first = app_frame(&mut app, &ctx);
+    row("往返切回 A 首帧", back_first);
+
+    println!("[E] 规模放大(切换首帧是否随文档规模线性;用户的「明显卡顿」按此口径外推)");
+    let big_a = sample_doc(9, 20_000);
+    let big_rendered = latermd_md::expand_wikilinks(&big_a);
+    let ctx_big = egui::Context::default();
+    ctx_big
+        .run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+    let mut app_big = LaterMdApp::default();
+    let big_index_a = app_big.state.tabs.open_tab(None, &big_a);
+    let big_index_b = app_big.state.tabs.open_tab(None, &sample_doc(8, 20_000));
+    app_big.state.apply(Message::TabActivate(big_index_a));
+    warmup_frames(&mut app_big, &ctx_big, 3);
+    let big_steady = {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            samples.push(app_frame(&mut app_big, &ctx_big));
+        }
+        median(samples)
+    };
+    row("20000 行整帧稳态", big_steady);
+    app_big.state.apply(Message::TabActivate(big_index_b));
+    let big_first = app_frame(&mut app_big, &ctx_big);
+    row("20000 行切换后首帧", big_first);
+    let big_second = app_frame(&mut app_big, &ctx_big);
+    row("20000 行切换后次帧", big_second);
+    let label_big_steady = {
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            samples.push(label_frame(&ctx_big, &big_rendered));
+        }
+        median(samples)
+    };
+    row("20000 行 MarkdownLabel 稳态(单件)", label_big_steady);
+    let label_big_switch = label_frame(
+        &ctx_big,
+        &latermd_md::expand_wikilinks(&sample_doc(7, 20_000)),
+    );
+    row("20000 行 MarkdownLabel 换文本首帧(单件)", label_big_switch);
+
+    println!("==== 结论速读(数字解释见报告)====");
+    println!(
+        "  切换首帧 {}/稳态帧 = {:.1}×(A→B);往返首帧 {}/稳态帧 A = {:.1}×",
+        fmt_us(first_frame),
+        first_frame.as_secs_f64() / steady_a.as_secs_f64(),
+        fmt_us(back_first),
+        back_first.as_secs_f64() / steady_a.as_secs_f64(),
+    );
+}
+
+/// 完整文档(无残缺构造)上 `heal` 必须是恒等零拷贝(`Cow::Borrowed`):
+/// 它在预览路径**每帧**跑,一旦开始产出 `Owned`,每帧多一次全文拼接,且
+/// heal 产物的 hash 与源文本不同会连带放大下游成本。这是 heal 的语义契约
+/// (vendor parser.rs 测试同款口径),在此以 2000 行样本钉住。
+#[test]
+fn heal_complete_document_is_identity_and_borrowed() {
+    let doc = sample_doc(3, 400);
+    assert!(
+        matches!(egui_markdown::heal(&doc), Cow::Borrowed(_)),
+        "完整文档上的 heal 不应产出 Owned(零拷贝契约被破坏)"
+    );
+}
+
+/// 缓存行为的回归哨(#39 M1 测量结论的固化,数字口径见 `tab_switch_finding_report`):
+/// - **稳态帧必须命中 vendored temp memory 缓存**:热帧只做 galley/绘制,
+///   冷帧要做 heal+hash+parse+owned tokens+分段 layout+syntect 高亮,量级差
+///   两个数量级。稳态帧若贵到冷帧的两成以上,说明每帧在偷偷全量重解析。
+/// - **切换文本后首帧等于 miss 量级**:同 id 换文本必然 hash 不匹配 → 全量
+///   重建(当前实现的既定行为,M2 改造时此断言随新行为改向)。
+#[test]
+fn markdown_cache_hits_in_steady_state_and_misses_on_text_change() {
+    let rendered_a = latermd_md::expand_wikilinks(&sample_doc(4, 300));
+    let rendered_b = latermd_md::expand_wikilinks(&sample_doc(5, 300));
+    let ctx = egui::Context::default();
+    ctx.run_ui(RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+
+    let cold = label_frame(&ctx, &rendered_a);
+    let mut hot = Vec::new();
+    for _ in 0..7 {
+        hot.push(label_frame(&ctx, &rendered_a));
+    }
+    let hot = median(hot);
+    assert!(
+        hot.as_secs_f64() < cold.as_secs_f64() * 0.2,
+        "稳态帧 {hot:?} 应远低于冷帧 {cold:?}(缓存命中的时间证据;若红了说明每帧全量重解析)"
+    );
+
+    let switched = label_frame(&ctx, &rendered_b);
+    assert!(
+        switched.as_secs_f64() > hot.as_secs_f64() * 5.0,
+        "换文本首帧 {switched:?} 应是 miss 量级(≫ 稳态 {hot:?});若变快了,说明切文本路径已有缓存,回归断言需要跟着改向"
+    );
+}
