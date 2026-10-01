@@ -60,8 +60,9 @@ impl Shortcut {
         )
     }
 
-    /// 平台化显示:`Cmd` / `Ctrl` 随编译目标(与 egui 的 `format_shortcut`
-    /// 同一口径,但这里还要能被 [`parse_shortcut`] 反解)。
+    /// 平台化显示:`Cmd` / `Ctrl` / `⌥` 随编译目标(与 egui 的
+    /// `format_shortcut` 同一口径,但这里还要能被 [`parse_shortcut`] 反解;
+    /// mac 上 Alt 显示 ⌥,菜单里 egui 原生就是 ⌥T,#45 K1 对齐该口径)。
     pub fn platform_text(self) -> String {
         let mut text = String::new();
         let modifiers = self.modifiers;
@@ -73,7 +74,11 @@ impl Shortcut {
             });
         }
         if modifiers.alt {
-            text.push_str("Alt+");
+            text.push_str(if cfg!(target_os = "macos") {
+                "\u{2325}+"
+            } else {
+                "Alt+"
+            });
         }
         if modifiers.shift {
             text.push_str("Shift+");
@@ -92,8 +97,8 @@ impl fmt::Display for Shortcut {
 }
 
 /// 解析键位文本。宽松:修饰键别名(`Ctrl`/`Cmd`/`Control` 同义,
-/// `Alt`/`Option` 同义)与大小写都不敏感;`Ctrl+Shift+S` 与 `shift+ctrl+s`
-/// 等价。解析不了返回 `None`,由调用方落提示。
+/// `Alt`/`Option`/`⌥` 同义)与大小写都不敏感;`Ctrl+Shift+S` 与
+/// `shift+ctrl+s` 等价。解析不了返回 `None`,由调用方落提示。
 pub fn parse_shortcut(text: &str) -> Option<Shortcut> {
     let mut modifiers = Modifiers::NONE;
     let mut key = None;
@@ -104,7 +109,9 @@ pub fn parse_shortcut(text: &str) -> Option<Shortcut> {
         }
         match part.to_ascii_lowercase().as_str() {
             "ctrl" | "cmd" | "control" | "command" => modifiers |= Modifiers::COMMAND,
-            "alt" | "option" => modifiers |= Modifiers::ALT,
+            // ⌥ 是 mac 显示形态(platform_text),非 ASCII,to_ascii_lowercase
+            // 原样通过
+            "alt" | "option" | "\u{2325}" => modifiers |= Modifiers::ALT,
             "shift" => modifiers |= Modifiers::SHIFT,
             other => {
                 if key.is_some() {
@@ -386,6 +393,38 @@ impl Keymap {
                 // 完全不存在」才补;这样 Ctrl+D/Ctrl+Shift+D/Ctrl+F 随升级
                 // 自动可用,旧配置不需要手动点「全部恢复默认」。
                 let mut changed = false;
+                // #45 K1:主题默认键 Cmd/Ctrl+Shift+T → Alt+T。历史上增量
+                // 写回会让老档里躺着「值恰等于旧默认」的 toggle_theme 条目
+                // (那是当年落盘的出厂值,不是用户手笔)——不迁的话该键位
+                // 一直被占,TabRestore(#45 K2)对老用户永远是哑键,且消费
+                // 顺序在前的主题会抢先吞键。只迁「值 == 旧默认」的条目;
+                // 用户真正的自定义(别的键)与主动清除(空串)分毫不动,
+                // 与「不覆盖用户绑定」同口径。取舍全文见 decisions-pending
+                // #69。
+                let retired_theme_default = Shortcut {
+                    modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+                    key: egui::Key::T,
+                };
+                let new_theme_default =
+                    Command::ToggleTheme
+                        .default_shortcut()
+                        .map(|shortcut| Shortcut {
+                            modifiers: shortcut.modifiers,
+                            key: shortcut.logical_key,
+                        });
+                let stored_theme = keymap
+                    .bindings
+                    .get(Command::ToggleTheme.id())
+                    .and_then(|text| parse_shortcut(text));
+                if stored_theme == Some(retired_theme_default) {
+                    if let Some(shortcut) = new_theme_default {
+                        keymap.bindings.insert(
+                            Command::ToggleTheme.id().to_owned(),
+                            shortcut.platform_text(),
+                        );
+                        changed = true;
+                    }
+                }
                 for cmd in Command::ALL {
                     if !keymap.bindings.contains_key(cmd.id()) {
                         if let Some(shortcut) = cmd.default_shortcut() {
@@ -469,6 +508,15 @@ mod tests {
             Some(Shortcut {
                 modifiers: Modifiers::NONE,
                 key: Key::F5
+            })
+        );
+        // ⌥ 是 mac 显示形态(platform_text 在 mac 输出 ⌥+T),存档/手改
+        // 都要能反解
+        assert_eq!(
+            parse_shortcut("\u{2325}+T"),
+            Some(Shortcut {
+                modifiers: Modifiers::ALT,
+                key: Key::T
             })
         );
         assert_eq!(parse_shortcut(""), None, "空串");
@@ -597,6 +645,135 @@ mod tests {
             Some(shortcut(Key::R)),
             "用户绑定不被默认覆盖"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Alt 的平台显示(#45 K1):Win/Linux = `Alt+T`,mac = `⌥+T`(与 egui
+    /// `format_shortcut` 的 mac 符号口径对齐);按编译目标断言,两侧都在
+    /// 各自平台的 CI 上跑。
+    #[test]
+    fn alt_platform_text_per_target() {
+        let alt_t = Shortcut {
+            modifiers: Modifiers::ALT,
+            key: Key::T,
+        };
+        if cfg!(target_os = "macos") {
+            assert_eq!(alt_t.platform_text(), "\u{2325}+T");
+        } else {
+            assert_eq!(alt_t.platform_text(), "Alt+T");
+        }
+    }
+
+    /// 主题默认键改排(#45 K1)的旧档迁移回归:旧默认值(Cmd/Ctrl+Shift+T)
+    /// 迁到 Alt+T 且写回落盘;用户自定义与主动清除分毫不动;缺失 id 走
+    /// 既有增量补默认。取舍口径见 decisions-pending #69。
+    #[test]
+    fn theme_default_migration_on_load() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-keymap-theme-k1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let alt_t = Shortcut {
+            modifiers: Modifiers::ALT,
+            key: Key::T,
+        };
+        let ctrl_shift_t = Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+            key: Key::T,
+        };
+
+        // 形态 ①:老档躺着旧默认值(当年增量写回落盘的出厂值)→ 迁 Alt+T,
+        // 其他条目不动,迁移结果写回 keymap.json
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S", "toggle_theme": "Ctrl+Shift+T"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::ToggleTheme),
+            Some(alt_t),
+            "旧默认值迁到新默认 Alt+T"
+        );
+        assert_eq!(loaded.get(Command::Save), Some(shortcut(Key::S)));
+        // 迁移要写回落盘(下次启动不再重复迁移):按再次装载核验,不比对
+        // 原文文本——Alt 的显示文本随平台是 Alt+/⌥
+        let persisted = std::fs::read_to_string(dir.join(KEYMAP_FILE)).unwrap();
+        let reloaded: Keymap = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(
+            reloaded.get(Command::ToggleTheme),
+            Some(alt_t),
+            "迁移结果已写回 keymap.json:{persisted}"
+        );
+
+        // 形态 ②:别名/大小写变体的旧默认(手改档)同样按解析值识别迁移
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"toggle_theme": "cmd+shift+t"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ToggleTheme),
+            Some(alt_t),
+            "别名形态的旧默认同样迁移"
+        );
+
+        // 形态 ③:用户自定义键位 → 绝不覆盖(#17 同口径)
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"toggle_theme": "Ctrl+F9"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::ToggleTheme),
+            Some(Shortcut {
+                modifiers: Modifiers::COMMAND,
+                key: Key::F9
+            }),
+            "用户自定义不被默认覆盖"
+        );
+
+        // 形态 ④:主动清除(空串)→ 保持未绑定,不借迁移复活
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"toggle_theme": ""}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ToggleTheme),
+            None,
+            "主动清除的绑定不因默认改排复活"
+        );
+
+        // 形态 ⑤:老档没有该 id → 既有增量补默认直接补上新默认
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ToggleTheme),
+            Some(alt_t),
+            "缺失 id 补新默认"
+        );
+
+        // 迁移后的整表里 Cmd/Ctrl+Shift+T 已无人占用(该键位留给
+        // TabRestore,#45 K2)
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"toggle_theme": "Ctrl+Shift+T"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        for cmd in Command::ALL {
+            assert_ne!(
+                loaded.get(cmd),
+                Some(ctrl_shift_t),
+                "{cmd:?} 迁移后仍占 Cmd/Ctrl+Shift+T"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

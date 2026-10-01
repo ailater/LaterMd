@@ -285,9 +285,12 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::S)
             }
             Self::ExportHtml => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::E),
-            Self::ToggleTheme => {
-                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::T)
-            }
+            // 主题 → Alt+T(preview-typography-and-keymap-plan.md §3.2 定案):
+            // Cmd/Ctrl+Shift+T 让位给 TabRestore(浏览器「恢复关闭标签」同款,
+            // #45 K2)。Alt 系与 VS Code「颜色主题」习惯相通;Alt 是修饰键,
+            // `bindable()` 不需要开后门。旧 keymap.json 里值仍等于旧默认
+            // (Cmd/Ctrl+Shift+T)的条目由 `keymap::load_from` 迁移到新默认。
+            Self::ToggleTheme => egui::KeyboardShortcut::new(Modifiers::ALT, egui::Key::T),
             Self::ToggleSidebar => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
@@ -587,11 +590,7 @@ mod tests {
             (Command::New, Key::N, Modifiers::COMMAND),
             (Command::Open, Key::O, Modifiers::COMMAND),
             (Command::ExportHtml, Key::E, Modifiers::COMMAND),
-            (
-                Command::ToggleTheme,
-                Key::T,
-                Modifiers::COMMAND | Modifiers::SHIFT,
-            ),
+            (Command::ToggleTheme, Key::T, Modifiers::ALT),
             (Command::ToggleSidebar, Key::Backslash, Modifiers::COMMAND),
         ];
         for (cmd, key, modifiers) in bindings {
@@ -753,5 +752,68 @@ mod tests {
             Command::ReplaceInDoc.message(),
             Message::ReplaceBarToggled(true)
         );
+    }
+
+    /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T;
+    /// Alt+T 在出厂表无占用者;Cmd/Ctrl+Shift+T 让位给 TabRestore(#45 K2,
+    /// 浏览器「恢复关闭标签」同款)——K2 落地前它是空位,任何命令都不得
+    /// 占用。K2 给 `Command::TabRestore` 绑上 Cmd/Ctrl+Shift+T 时,把下面
+    /// 空位断言改为「占用者 == TabRestore」即可。
+    #[test]
+    fn theme_is_alt_t_and_restore_slot_is_free() {
+        let alt_t = crate::keymap::Shortcut {
+            modifiers: Modifiers::ALT,
+            key: Key::T,
+        };
+        assert_eq!(
+            Command::ToggleTheme.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(alt_t),
+            "ToggleTheme 出厂默认 = Alt+T"
+        );
+        assert_eq!(Keymap::builtin().get(Command::ToggleTheme), Some(alt_t));
+        // #9 口径的撞键核查:Alt+T 不撞任何出厂键位
+        assert_eq!(
+            Keymap::builtin().conflict(Command::ToggleTheme, alt_t),
+            None,
+            "Alt+T 不该撞任何出厂键位"
+        );
+
+        let restore_slot = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+            key: Key::T,
+        };
+        for cmd in Command::ALL {
+            assert_ne!(
+                Keymap::builtin().get(cmd),
+                Some(restore_slot),
+                "{cmd:?} 占了 Cmd/Ctrl+Shift+T,该键位留给 TabRestore(#45 K2)"
+            );
+        }
+    }
+
+    /// Alt+T 真按键只触发主题切换:`matches_logically` 对「显式不要
+    /// Ctrl/Cmd」的组合要求事件确实没按 Ctrl/Cmd,故 Cmd/Ctrl+Alt+T 不会
+    /// 误中;与 ToggleRightPreview(Cmd/Ctrl+Alt+R)不同键,互不抢。
+    #[test]
+    fn alt_t_fires_only_toggle_theme() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::T, Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::ToggleTheme]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
     }
 }
