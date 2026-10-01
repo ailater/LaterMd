@@ -177,6 +177,10 @@ impl TabState {
     }
 }
 
+/// 关闭栈(#45 TabRestore)容量上限:超出淘汰最旧(浏览器无上限,这里
+/// 封顶防长会话无限增长,规格见 preview-typography-and-keymap-plan §3.3)。
+const RECENTLY_CLOSED_CAP: usize = 20;
+
 /// 批量关闭的类别(#37 标签条右键菜单):以**被右键的标签**为基准,
 /// 左/右/其他都不含基准标签本身。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +214,12 @@ pub struct TabsState {
     /// 重命名浮窗(#37「重命名」)的输入状态;`Some` 时 UI 显示浮窗。
     /// 同一时间至多一个(新请求顶掉旧浮窗)。
     pub rename: Option<TabRename>,
+    /// 最近关闭标签的已落盘路径(#45 TabRestore 的关闭栈,后进先出):
+    /// [`TabsState::remove`](Self::remove)(唯一摘除点)入栈,**只记已落盘
+    /// 路径** —— 未落盘的新标签重开拿不回内容,不入栈;封顶
+    /// [`RECENTLY_CLOSED_CAP`] 淘汰最旧。不做跨会话持久化(标签会话本就
+    /// 不落盘)。
+    pub recently_closed: Vec<PathBuf>,
     /// 下一个标签的 id(自增,不复用 —— 关了再开新标签,编辑器 undo/光标
     /// 状态必须是全新的)。
     next_id: u64,
@@ -232,6 +242,7 @@ impl TabsState {
             confirm_close: None,
             pending_close: Vec::new(),
             rename: None,
+            recently_closed: Vec::new(),
             next_id: 2,
         }
     }
@@ -324,11 +335,21 @@ impl TabsState {
     /// 关闭/待改名的正是被移除的标签时,对应状态一并撤下 —— 目标已没了,
     /// 模态/浮窗不再显示,迟到的确认消息变成 no-op 而不是作用到漂移到该
     /// 索引的别的标签。
+    ///
+    /// 已落盘的被移除标签同时进关闭栈(#45 TabRestore):这里是唯一的
+    /// 摘除点,全部关闭入口(单发确认/批量/兜底)都经此入栈,无需在归约
+    /// 层到处打补丁。未落盘新标签不入栈(重开拿不回内容);封顶淘汰最旧。
     pub fn remove(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
         let removed = self.tabs[index].id;
+        if let Some(path) = self.tabs[index].document.path.clone() {
+            self.recently_closed.push(path);
+            if self.recently_closed.len() > RECENTLY_CLOSED_CAP {
+                self.recently_closed.remove(0);
+            }
+        }
         self.tabs.remove(index);
         if self.confirm_close == Some(removed) {
             self.confirm_close = None;
@@ -552,6 +573,54 @@ mod tests {
         assert!(
             tabs.rename.is_some_and(|rename| rename.tab_id == survivor),
             "关掉无关标签不动浮窗"
+        );
+    }
+
+    /// 关闭栈(#45):只记已落盘路径,后进先出;未落盘新标签不入栈;
+    /// 关空兜底补的空标签同样无路径不污染栈。
+    #[test]
+    fn remove_pushes_closed_paths_lifo_ignoring_unsaved() {
+        let mut tabs = TabsState::new("未落盘草稿");
+        tabs.open_tab(Some(PathBuf::from("/a.md")), "甲");
+        tabs.open_tab(None, "又一个未落盘");
+        tabs.open_tab(Some(PathBuf::from("/b.md")), "乙");
+        assert!(tabs.recently_closed.is_empty(), "未关闭前栈为空");
+
+        tabs.remove(0); // 未落盘草稿:不入栈
+        assert!(tabs.recently_closed.is_empty());
+        tabs.remove(0); // /a.md
+        tabs.remove(0); // 未落盘:不入栈
+        tabs.remove(0); // /b.md(关空,兜底补空标签)
+        assert_eq!(
+            tabs.recently_closed,
+            vec![PathBuf::from("/a.md"), PathBuf::from("/b.md")],
+            "后关的在栈顶,未落盘的两条都没进栈"
+        );
+    }
+
+    /// 封顶淘汰最旧:第 21 条入栈时第 1 条被挤掉,栈长恒 ≤ 20。
+    #[test]
+    fn recently_closed_cap_evicts_oldest() {
+        let mut tabs = TabsState::new("起点");
+        // 22 个带路径标签全部关掉(起点 + 22 个 doc 共 23 次移除;关空由
+        // remove 兜底补空标签,tabs 永不清零,故按固定次数关):
+        // 22 条路径入栈,超出上限 2 条
+        for i in 0..=(RECENTLY_CLOSED_CAP + 1) {
+            tabs.open_tab(Some(PathBuf::from(format!("/doc-{i}.md"))), "x");
+        }
+        for _ in 0..tabs.tabs.len() {
+            tabs.remove(0);
+        }
+        assert_eq!(tabs.recently_closed.len(), RECENTLY_CLOSED_CAP);
+        assert_eq!(
+            tabs.recently_closed.first(),
+            Some(&PathBuf::from("/doc-2.md")),
+            "最旧的 /doc-0.md 与 /doc-1.md 被淘汰"
+        );
+        assert_eq!(
+            tabs.recently_closed.last(),
+            Some(&PathBuf::from("/doc-21.md")),
+            "最新的一条在栈顶"
         );
     }
 }

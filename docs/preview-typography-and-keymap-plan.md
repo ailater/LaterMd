@@ -143,20 +143,21 @@ pub heading_space_above: f32,
 | `ToggleZen` | F11 | 与浏览器全屏一致 ✅ |
 | `FormatLink` | Cmd/Ctrl+Shift+K | 注：VS Code 是裸 Ctrl+K |
 
-### 3.2 定案（坤哥已选）
+### 3.2 定案（坤哥已选；①②已于 2026-10-01 落地，见 §3.3 对照）
 
-**① 主题 → `Alt+T`（Kun 选的选项 1）**
+**① 主题 → `Alt+T`（Kun 选的选项 1）—— ✅ 已落地（2026-10-01，commit 780a79c）**
 
 选它的理由：避开 `Cmd/Ctrl+Shift+T`（要让位给恢复标签）与 `Cmd+K` 系列；VS Code 的「颜色主题」也是 Alt 系，习惯相通。
 **`Alt+T` 是无 Cmd/Ctrl 的组合**，`Shortcut::bindable()` 要求「至少一个修饰键或是功能键」—— Alt 算修饰键，**满足条件**，不用开后门。
 
 > ⚠️ 实现时要确认 `Modifiers::ALT` + `Key::T` 在三个平台都不被系统吞（Windows 上 Alt+字母常触发菜单栏助记键）。egui 走 winit 的 `received_character` + 物理键，一般拿得到，但**要在 Win/mac 真机上按一次确认**。这是本条唯一的实机验证点。
+> **落地状态**：默认键已改排（`command.rs` `default_shortcut` 的 `ToggleTheme` 分支）；旧 `keymap.json` 里值等于旧默认的条目做**值感知迁移**到 Alt+T，用户自定义/主动清除不动（decisions-pending #69）；mac 显示 ⌥（菜单栏 egui 原生 ⌥T，设置页/tooltip `platform_text` 输出 `⌥+`，存档 `⌥` 别名可解析，#69 岔路二）。键位断言 `theme_is_alt_t_and_restore_slot_is_free`（`command.rs` 测试）钉死「Alt+T 不撞任何出厂键位」。**三平台真机按下不被系统吞尚未验证**，见 §3.4 真机项。
 
-**② `Cmd/Ctrl+Shift+T` → 留给 `TabRestore`（恢复刚关闭的标签）**
+**② `Cmd/Ctrl+Shift+T` → 留给 `TabRestore`（恢复刚关闭的标签）—— ✅ 已落地（2026-10-01，commit 881edfd）**
 
 浏览器（Chrome/Edge/Firefox）恢复关闭标签就是这个键，VS Code 同理。**现在是空位**：`default_shortcut` 里没人占 `Cmd+Shift+T`。
 
-**③ 其余键位不动** —— 已经与浏览器/VS Code 对齐了，没必要为改而改。
+**③ 其余键位不动** —— 已经与浏览器/VS Code 对齐了，没必要为改而改。（落地时未动任何其他出厂键位，K1 只改了 `ToggleTheme` 一行。）
 
 ### 3.3 TabRestore 的实现要点
 
@@ -182,11 +183,41 @@ pub heading_space_above: f32,
 参考现状实现：`remove_tab()`（`state.rs:1711`）是唯一的摘除点，在那里面入栈就行，不用到处打补丁。
 九套皮肤是 `Vec`，没有 [dead_code]警告吗？看看对了写了个 skin。算了不重要
 
+#### §3.3 落地对照（2026-10-01 核验，逐条对照仓库现状）
+
+表格五行与要点六条的全部落点：
+
+| 要点 | 落点（核验时行号） | 结果 |
+|---|---|---|
+| 枚举 `Command::TabRestore` 进 `ALL`（`TabNext`/`TabClose` 之后） | `command.rs:52`（枚举）、`:134-136`（`ALL` 序，紧跟 `TabClose`） | ✅ |
+| `id()` = `"tab_restore"`、`label()` = `"恢复关闭的标签"` | `command.rs:203`、`:246` | ✅ |
+| 快捷键 `Modifiers::COMMAND \| Modifiers::SHIFT, Key::T` | `command.rs:308-310` | ✅ |
+| 消息 `Message::TabRestore` | `state.rs:654`；`command.rs:441` 的 `message()` 映射 | ✅ |
+| 归约：关闭栈弹出最近一条 → `open_path()` 重开 | `state.rs:868` → `restore_tab`（`state.rs:2368-2374`） | ✅ |
+| 关闭栈 `recently_closed: Vec<PathBuf>` | `tabs.rs:217-222` | ✅ |
+
+六个「要想清楚的点」：
+
+- **只存已落盘路径** ✅ —— 唯一入栈点 `TabsState::remove`（`tabs.rs:342`，即上文「`remove_tab()` 是唯一的摘除点」的现状落点；#37 标签管理后摘除函数是 `TabsState::remove`，不再叫 `state.rs:1711` 的 `remove_tab`）里 `document.path.clone()` 命中才 push（`tabs.rs:347-352`），未落盘新标签不入栈。
+- **封顶 20 条** ✅ —— `RECENTLY_CLOSED_CAP = 20`（`tabs.rs:182`），超出 `remove(0)` 淘汰最旧（`tabs.rs:349-351`）。
+- **已在别处打开 → 激活不开第二个** ✅ —— 走 `open_path()` 的 `find_by_path` 既有语义（`state.rs:2353-2360`），单测 `tab_restore_activates_already_open_tab_instead_of_duplicating` 钉死。
+- **重开失败不静默不 panic** ✅ —— 失败落 `document.notice` 提示行（`open_in_tab` 的 Err 分支，`state.rs:2343-2346`）；条目**丢弃并继续下一条**（decisions-pending #70），单测 `tab_restore_failed_path_noticed_dropped_and_continues`。
+- **成功出栈、连续触发回走整条栈** ✅ —— `restore_tab` 的 `while let … pop()` 循环（`state.rs:2369-2373`），单测 `tab_restore_reopens_closed_tabs_lifo`（混合已落盘/未落盘）+ 空栈 no-op `tab_restore_empty_stack_is_noop`。
+- **不跨会话落盘** ✅ —— 无持久化字段（`tabs.rs:220-221` 注释明示，标签会话本就不落盘）。
+
+联动件：菜单入口在「文件」菜单尾部（`ui/menubar.rs:27`，与 Ctrl+Tab/Ctrl+W 同组）；K1 键位断言 `theme_is_alt_t_and_restore_slot_is_free`、K2 消费断言 `restore_shortcut_fires_only_tab_restore`（`command.rs` 测试，后者用 `poll_shortcuts` 实跑断言 Cmd/Ctrl+Shift+T 只触发 TabRestore 一条）。
+
 ### 3.4 验收
 
-- 单测：关 N 个标签后连续 restore N 次，顺序是**后进先出**且最终回到原状。
-- 单测：restore 未落盘标签（无路径）→ 栈里跳过它去取下一条，不 panic。
-- 真机：`Ctrl+Shift+T` 真按下能被 `poll_shortcuts` 接到（`keymap.rs` 的捕获测试会当它是「任意空闲键」，注意别撞那条回归）。
+- 单测：关 N 个标签后连续 restore N 次，顺序是**后进先出**且最终回到原状。✅ `tab_restore_reopens_closed_tabs_lifo`（混合已落盘/未落盘，`state.rs` 测试）。
+- 单测：restore 未落盘标签（无路径）→ 栈里跳过它去取下一条，不 panic。✅ 未落盘标签**不入栈**（`tabs.rs` 只记 `document.path`），混合用例即上面那条；失败路径另有 `tab_restore_failed_path_noticed_dropped_and_continues`、空栈 no-op `tab_restore_empty_stack_is_noop`。
+- 真机：`Ctrl+Shift+T` 真按下能被 `poll_shortcuts` 接到（`keymap.rs` 的捕获测试会当它是「任意空闲键」，注意别撞那条回归）。🟨 无头侧已有等价断言 `restore_shortcut_fires_only_tab_restore`（`poll_shortcuts` 收到该键事件只触发 TabRestore 一条）；真窗口三平台按下属真机项，见下。
+
+**真机项清单（留坤哥人工，blocked_external——本模块无法在本机代验）**：
+
+1. **Win11**：Alt+T 是否被菜单栏助记键吞（§3.2 ① 唯一的实机验证点）。若被吞，换键候选与迁移口径按 decisions-pending #69 的「如何改」走（改 `default_shortcut` + 迁移值同步换）。
+2. **macOS**：⌥T 行为——切主题是否生效、菜单栏显示 ⌥T、设置「快捷键」页显示 ⌥+T（#69 岔路二的口径）。
+3. **三平台**：Cmd/Ctrl+Shift+T 真按下被 `poll_shortcuts` 接住并恢复标签（§3.4 原文提醒的捕获回归：快捷键设置的捕获模式别把它当「任意空闲键」抢走）。
 
 ---
 
@@ -204,8 +235,8 @@ pub heading_space_above: f32,
 | # | 任务 | 交付物 | 门禁 |
 |---|---|---|---|
 | 1 | ✅ **预览行高修复**（已完成） | vendor 两文件 | vendor check.sh + 主仓 597 |
-| 2 | 键位改排（主题 → Alt+T，Cmd+Shift+T 空出） | `command.rs` | 主仓六项 |
-| 3 | TabRestore 完整实现 | `command.rs` / `state.rs` / `tabs.rs` | 主仓六项 + 新增单测 |
+| 2 | ✅ **键位改排**（已完成 2026-10-01，主题 → Alt+T，Cmd+Shift+T 空出给 TabRestore，commit 780a79c） | `command.rs` / `keymap.rs` | 主仓六项 |
+| 3 | ✅ **TabRestore 完整实现**（已完成 2026-10-01，commit 881edfd） | `command.rs` / `state.rs` / `tabs.rs` / `ui/menubar.rs` | 主仓六项 + 新增单测 |
 | 4 | heading scales 拉开 + 标题块间距 | vendor + `theme_presets.rs` | vendor check.sh + 主仓六项 |
 | 5 | 明暗两套真机截图对比 | 截图 | 目视验收 |
 
@@ -219,4 +250,7 @@ pub heading_space_above: f32,
 - [x] `MarkdownStyle::line_height_ratio` 字段（serde + Hash + UI）
 - [x] `line_height_for()` 替换写死常量，标题重算行高
 - [x] vendor 六项门禁 + 主仓 597 测试全绿
-- [ ] 键位改排 / TabRestore / 标题字号分级 / 块间距 —— 按 §5 排期
+- [x] 键位改排（2026-10-01，780a79c）：主题 → Alt+T，旧 `keymap.json` 值感知迁移「旧默认→新默认」不覆盖用户绑定，mac 显示 ⌥（取舍见 decisions-pending #69）
+- [x] TabRestore 完整实现（2026-10-01，881edfd）：关闭栈 LIFO / 只记已落盘 / 封顶 20 / 失败丢弃继续（取舍见 decisions-pending #70），「文件」菜单入口 + state 侧四条单测 + command 侧两条键位断言（K1/K2 联动）；对照明细见 §3.3 落地对照
+- [x] 真机项登记（2026-10-01）：Win11 Alt+T 助记键 / macOS ⌥T / 三平台 Cmd/Ctrl+Shift+T 捕获回归，三项留坤哥人工，见 §3.4 真机项清单
+- [ ] 标题字号分级 / 块间距 —— 按 §5 排期

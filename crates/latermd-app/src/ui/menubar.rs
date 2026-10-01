@@ -20,10 +20,11 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
                 item(ui, cmd, keymap, outbox);
             }
             // 标签命令挂在「文件」尾部(编辑器惯例:文件 → 关闭标签页),
-            // 与 Ctrl+Tab / Ctrl+W 的快捷键入口互为可发现性
+            // 与 Ctrl+Tab / Ctrl+W / Ctrl+Shift+T 的快捷键入口互为可发现性
             ui.separator();
             item(ui, Command::TabNext, keymap, outbox);
             item(ui, Command::TabClose, keymap, outbox);
+            item(ui, Command::TabRestore, keymap, outbox);
         });
         ui.menu_button("导出", |ui| {
             item(ui, Command::ExportHtml, keymap, outbox);

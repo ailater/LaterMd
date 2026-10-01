@@ -46,6 +46,10 @@ pub enum Command {
     TabNext,
     /// 关闭当前标签(脏则确认模态;Ctrl/Cmd+W)。
     TabClose,
+    /// 恢复最近关闭的标签(#45,Cmd/Ctrl+Shift+T,浏览器/VS Code 同款):
+    /// 从关闭栈弹出最近一条**已落盘**路径重开;未落盘新标签关闭不入栈,
+    /// 跨会话不恢复(取舍见 preview-typography-and-keymap-plan §3.3)。
+    TabRestore,
     /// 源码模式 ↔ Live Preview 互换(P3):共用一个 rope buffer,切模式不丢
     /// 光标也不丢 undo 栈。默认键 Cmd/Ctrl+/(与主流编辑器的「切换注释」
     /// 同键位,工作台里没有注释语义)。
@@ -116,7 +120,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 36] = [
+    pub const ALL: [Command; 37] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -129,6 +133,7 @@ impl Command {
         Self::AiSummary,
         Self::TabNext,
         Self::TabClose,
+        Self::TabRestore,
         Self::ToggleLivePreview,
         Self::FormatBold,
         Self::FormatItalic,
@@ -195,6 +200,7 @@ impl Command {
             Self::AiSummary => "ai_summary",
             Self::TabNext => "tab_next",
             Self::TabClose => "tab_close",
+            Self::TabRestore => "tab_restore",
             Self::ToggleLivePreview => "toggle_live_preview",
             Self::FormatBold => "format_bold",
             Self::FormatItalic => "format_italic",
@@ -237,6 +243,7 @@ impl Command {
             Self::AiSummary => "AI: 生成摘要",
             Self::TabNext => "下一个标签",
             Self::TabClose => "关闭标签",
+            Self::TabRestore => "恢复关闭的标签",
             Self::ToggleLivePreview => "切换 Live Preview",
             Self::FormatBold => FormatAction::Bold.label(),
             Self::FormatItalic => FormatAction::Italic.label(),
@@ -285,14 +292,22 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::S)
             }
             Self::ExportHtml => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::E),
-            Self::ToggleTheme => {
-                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::T)
-            }
+            // 主题 → Alt+T(preview-typography-and-keymap-plan.md §3.2 定案):
+            // Cmd/Ctrl+Shift+T 让位给 TabRestore(浏览器「恢复关闭标签」同款,
+            // #45 K2)。Alt 系与 VS Code「颜色主题」习惯相通;Alt 是修饰键,
+            // `bindable()` 不需要开后门。旧 keymap.json 里值仍等于旧默认
+            // (Cmd/Ctrl+Shift+T)的条目由 `keymap::load_from` 迁移到新默认。
+            Self::ToggleTheme => egui::KeyboardShortcut::new(Modifiers::ALT, egui::Key::T),
             Self::ToggleSidebar => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Backslash)
             }
             Self::TabNext => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Tab),
             Self::TabClose => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::W),
+            // 恢复关闭的标签(#45 K2):浏览器/VS Code 同款。K1 已把主题
+            // 改排 Alt+T 让出此键位,出厂表占用者就是本命令。
+            Self::TabRestore => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::T)
+            }
             Self::ToggleLivePreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Slash)
             }
@@ -377,7 +392,7 @@ impl Command {
             Self::ToggleTheme => Icon::Theme,
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
-            Self::TabNext | Self::TabClose => Icon::Files,
+            Self::TabNext | Self::TabClose | Self::TabRestore => Icon::Files,
             Self::ToggleLivePreview => Icon::Zen,
             Self::FormatBold
             | Self::FormatItalic
@@ -423,6 +438,7 @@ impl Command {
             Self::ToggleLivePreview => Message::ToggleLivePreview,
             Self::TabNext => Message::TabNext,
             Self::TabClose => Message::TabCloseActive,
+            Self::TabRestore => Message::TabRestore,
             Self::ToggleRightPreview => Message::RightPanelToggled,
             Self::ToggleZen => Message::ZenToggled,
             // 十六条格式动作一条 match 收干:动作枚举已经在 cmd 里定死了,
@@ -587,11 +603,7 @@ mod tests {
             (Command::New, Key::N, Modifiers::COMMAND),
             (Command::Open, Key::O, Modifiers::COMMAND),
             (Command::ExportHtml, Key::E, Modifiers::COMMAND),
-            (
-                Command::ToggleTheme,
-                Key::T,
-                Modifiers::COMMAND | Modifiers::SHIFT,
-            ),
+            (Command::ToggleTheme, Key::T, Modifiers::ALT),
             (Command::ToggleSidebar, Key::Backslash, Modifiers::COMMAND),
         ];
         for (cmd, key, modifiers) in bindings {
@@ -753,5 +765,92 @@ mod tests {
             Command::ReplaceInDoc.message(),
             Message::ReplaceBarToggled(true)
         );
+    }
+
+    /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T,
+    /// 不撞任何出厂键位;Cmd/Ctrl+Shift+T 的占用者 == TabRestore(#45 K2
+    /// 落地后的联动断言,浏览器「恢复关闭标签」同款),且不与任何其他
+    /// 出厂键位冲突。
+    #[test]
+    fn theme_is_alt_t_and_restore_slot_is_free() {
+        let alt_t = crate::keymap::Shortcut {
+            modifiers: Modifiers::ALT,
+            key: Key::T,
+        };
+        assert_eq!(
+            Command::ToggleTheme.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(alt_t),
+            "ToggleTheme 出厂默认 = Alt+T"
+        );
+        assert_eq!(Keymap::builtin().get(Command::ToggleTheme), Some(alt_t));
+        // #9 口径的撞键核查:Alt+T 不撞任何出厂键位
+        assert_eq!(
+            Keymap::builtin().conflict(Command::ToggleTheme, alt_t),
+            None,
+            "Alt+T 不该撞任何出厂键位"
+        );
+
+        let restore_slot = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+            key: Key::T,
+        };
+        assert_eq!(
+            Keymap::builtin().get(Command::TabRestore),
+            Some(restore_slot),
+            "Cmd/Ctrl+Shift+T 的占用者 = TabRestore(#45 K2)"
+        );
+        assert_eq!(
+            Keymap::builtin().conflict(Command::TabRestore, restore_slot),
+            None,
+            "Cmd/Ctrl+Shift+T 不该撞任何其他出厂键位"
+        );
+    }
+
+    /// #45 K2 默认键位:Cmd/Ctrl+Shift+T 真按下只触发 TabRestore 一条
+    /// (K1 已把主题挪到 Alt+T,该键位无第二个消费者);消息映射到
+    /// `Message::TabRestore`。
+    #[test]
+    fn restore_shortcut_fires_only_tab_restore() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::T, Modifiers::COMMAND | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::TabRestore]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(Command::TabRestore.message(), Message::TabRestore);
+    }
+
+    /// Alt+T 真按键只触发主题切换:`matches_logically` 对「显式不要
+    /// Ctrl/Cmd」的组合要求事件确实没按 Ctrl/Cmd,故 Cmd/Ctrl+Alt+T 不会
+    /// 误中;与 ToggleRightPreview(Cmd/Ctrl+Alt+R)不同键,互不抢。
+    #[test]
+    fn alt_t_fires_only_toggle_theme() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::T, Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::ToggleTheme]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
     }
 }

@@ -647,6 +647,11 @@ pub enum Message {
     TabTitleWidthChanged(crate::theme::TitleWidthMode),
     /// 切到下一个标签(Ctrl/Cmd+Tab 循环)。
     TabNext,
+    /// 恢复最近关闭的标签(#45,Cmd/Ctrl+Shift+T):从关闭栈弹出最近一条
+    /// 已落盘路径按 `open_path` 既有语义重开(已开则激活,不开第二个)。
+    /// 成功(含激活)出栈,连续触发逐条回走整条栈;失败(文件被外部删/移,
+    /// 提示行说明)同样出栈并继续下一条(decisions-pending #70);栈空 no-op。
+    TabRestore,
     /// 恢复条「恢复」(#18):载荷为标签稳定 id。把盘上孤儿 draft 的内容
     /// 读进该标签缓冲并置 dirty(整篇替换,Ctrl+Z 一步回退),随后删
     /// draft、清待恢复状态。读取失败不 panic,提示行说明(见
@@ -736,7 +741,9 @@ impl State {
             Message::FileTreeRootPick => self.pick_file_tree_root(),
             Message::FileTreeRootSelected(dir) => self.change_file_tree_root(dir),
             Message::FileTreeToggled(dir) => self.file_tree.toggle(&dir),
-            Message::FileSelected(path) => self.open_path(&path),
+            Message::FileSelected(path) => {
+                self.open_path(&path);
+            }
             Message::SearchQueryChanged => self.search.input_changed(DEBOUNCE),
             Message::SearchRequested => self.start_search(),
             Message::SearchResultClicked(path, line_no) => {
@@ -858,6 +865,7 @@ impl State {
                 let next = self.tabs.next_index();
                 self.switch_active(next);
             }
+            Message::TabRestore => self.restore_tab(),
             Message::DraftRecovered { tab_id } => self.recover_draft(tab_id),
             Message::DraftDiscarded { tab_id } => self.discard_draft(tab_id),
             Message::GitFileSelected(path) => self.git.select(&path),
@@ -2041,7 +2049,9 @@ impl State {
             return;
         };
         match crate::filetree::find_by_name(&root, target) {
-            Some(path) => self.open_path(&path),
+            Some(path) => {
+                self.open_path(&path);
+            }
             None => {
                 self.tabs.current_mut().document.notice =
                     Some(format!("文档库里没有「{target}」这篇文档"));
@@ -2318,28 +2328,48 @@ impl State {
     }
 
     /// 读盘并**开新标签**换入(多标签语义:打开不覆盖当前标签)。读取失败
-    /// 只落提示行,当前标签的缓冲与 dirty 不受影响。
+    /// 只落提示行,当前标签的缓冲与 dirty 不受影响。返回是否成功
+    /// (#45 TabRestore 据此决定关闭栈条目的去留)。
     ///
     /// 同时展开该文件在树内的祖先目录:无论从文件树、菜单还是搜索跳转打开,
     /// 该文件的高亮行都应当在 Files 页里可见。
-    fn open_in_tab(&mut self, path: &Path) {
+    fn open_in_tab(&mut self, path: &Path) -> bool {
         match file::read(path) {
             Ok(text) => {
                 self.spawn_tab(Some(path.to_path_buf()), &text);
                 self.file_tree.expand_ancestors_of(path);
+                true
             }
-            Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
+            Err(error) => {
+                self.tabs.current_mut().document.notice = Some(error.to_string());
+                false
+            }
         }
     }
 
     /// 按路径打开文档的统一入口(菜单「打开」/ 文件树点击 / 搜索跳转):
     /// 该路径已在某标签打开则**激活它**(路径去重,同一路径至多一个标签),
-    /// 否则读盘开新标签。
-    fn open_path(&mut self, path: &Path) {
+    /// 否则读盘开新标签。返回是否成功(已开激活也算成功)。
+    fn open_path(&mut self, path: &Path) -> bool {
         if let Some(index) = self.tabs.find_by_path(path) {
             self.switch_active(index);
+            true
         } else {
-            self.open_in_tab(path);
+            self.open_in_tab(path)
+        }
+    }
+
+    /// 恢复最近关闭的标签(`Message::TabRestore` 的归约,#45):关闭栈
+    /// 后进先出,栈顶路径按 [`State::open_path`] 既有语义重开 —— 已在别处
+    /// 打开则激活它,不开第二个。成功(含激活)即返回,该条出栈,连续
+    /// 触发可逐条回走完整条栈;失败(文件被外部删/移,提示行已说明)同样
+    /// 出栈并继续下一条 —— 死条目留在栈顶会让之后的每次恢复都先撞一次
+    /// 失败,「回走整条栈」被堵死(decisions-pending #70)。栈空 no-op。
+    fn restore_tab(&mut self) {
+        while let Some(path) = self.tabs.recently_closed.pop() {
+            if self.open_path(&path) {
+                return;
+            }
         }
     }
 
@@ -6899,5 +6929,166 @@ mod tests {
         assert_eq!(state.tabs.tabs.len(), 1);
         assert_eq!(state.find.hits.len(), 0, "移交后的当前标签按新文档重扫");
         assert_eq!(state.tabs.current().editor.text(), "甲甲");
+    }
+
+    /// #45 TabRestore 主链路:关 N 个(混合已落盘/未落盘)后连续 restore,
+    /// 后进先出且未落盘的被跳过(根本不入栈),已落盘的逐条回来到「回到
+    /// 原状」;栈走空后再按是 no-op。恢复 = 重新读盘,内容以盘上为准。
+    #[test]
+    fn tab_restore_reopens_closed_tabs_lifo() {
+        let dir = temp_path("tab-restore-lifo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.md");
+        let b = dir.join("b.md");
+        std::fs::write(&a, "甲的盘上内容").unwrap();
+        std::fs::write(&b, "乙的盘上内容").unwrap();
+
+        let mut state = State::default(); // 0 号 = SAMPLE_MD(未落盘)
+        state.spawn_tab(Some(a.clone()), "甲的旧缓冲");
+        state.spawn_tab(None, "未落盘草稿");
+        state.spawn_tab(Some(b.clone()), "乙的旧缓冲");
+        assert_eq!(state.tabs.tabs.len(), 4);
+
+        // 从右往左全关:b(已落盘)→ 草稿(未落盘)→ a(已落盘)→ SAMPLE(未落盘)
+        for index in (0..4).rev() {
+            state.apply(Message::TabCloseRequested(index));
+        }
+        assert_eq!(
+            state.tabs.recently_closed,
+            vec![b.clone(), a.clone()],
+            "只有已落盘的两条入栈,b 先关在栈底,a 后关在栈顶"
+        );
+        assert_eq!(state.tabs.tabs.len(), 1, "关空兜底补一个空标签");
+
+        // restore 1:栈顶 a 回来(最近关闭的先恢复;读的是盘上内容,不是
+        // 关闭前的旧缓冲 —— 重开 = 重新读盘)
+        state.apply(Message::TabRestore);
+        assert_eq!(state.tabs.tabs.len(), 2);
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(a.as_path())
+        );
+        assert_eq!(state.tabs.current().editor.text(), "甲的盘上内容");
+
+        // restore 2:b 回来,逐条回走整条栈
+        state.apply(Message::TabRestore);
+        assert_eq!(state.tabs.tabs.len(), 3);
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(b.as_path())
+        );
+        assert_eq!(state.tabs.current().editor.text(), "乙的盘上内容");
+        assert!(state.tabs.recently_closed.is_empty(), "两条都消费完");
+
+        // restore 3:栈空 no-op —— 标签数、当前标签、提示行都分毫不动
+        let notice_before = state.tabs.current().document.notice.clone();
+        state.apply(Message::TabRestore);
+        assert_eq!(state.tabs.tabs.len(), 3);
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(b.as_path())
+        );
+        assert_eq!(state.tabs.current().document.notice, notice_before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45:重开的路径已在别的标签打开 → 走 `open_path` 既有语义**激活它**,
+    /// 不开第二个;该栈条照样出栈(激活即成功)。
+    #[test]
+    fn tab_restore_activates_already_open_tab_instead_of_duplicating() {
+        let dir = temp_path("tab-restore-dup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("doc.md");
+        std::fs::write(&doc, "正文").unwrap();
+
+        let mut state = State::default();
+        state.spawn_tab(Some(doc.clone()), "正文");
+        state.apply(Message::TabCloseRequested(1)); // 关 doc → 栈 = [doc]
+        state.spawn_tab(None, "别的工作");
+        // 用户又通过别的入口(文件树/搜索)把同一文件打开了
+        state.apply(Message::FileSelected(doc.clone()));
+        let same_path = |tabs: &crate::tabs::TabsState| -> usize {
+            tabs.tabs
+                .iter()
+                .filter(|tab| tab.document.path.as_deref() == Some(doc.as_path()))
+                .count()
+        };
+        assert_eq!(same_path(&state.tabs), 1, "前置:该路径恰好一个标签");
+
+        state.apply(Message::TabRestore);
+        assert_eq!(same_path(&state.tabs), 1, "恢复不开第二个同路径标签");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(doc.as_path())
+        );
+        assert!(state.tabs.recently_closed.is_empty(), "激活即成功,条目出栈");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45:重开失败(文件被外部删/移)—— 提示行按既有口径说明,该条
+    /// **丢弃并继续下一条**(decisions-pending #70):一次触发跨过死条目
+    /// 把能恢复的恢复出来,死条目不留在栈顶堵住后续恢复。
+    #[test]
+    fn tab_restore_failed_path_noticed_dropped_and_continues() {
+        let dir = temp_path("tab-restore-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let alive = dir.join("alive.md");
+        let dead = dir.join("dead.md");
+        std::fs::write(&alive, "还活着").unwrap();
+        // dead.md 不落盘:模拟关闭后被外部删除
+
+        let mut state = State::default();
+        state.spawn_tab(Some(alive.clone()), "还活着");
+        state.spawn_tab(Some(dead.clone()), "已被外部删除");
+        state.apply(Message::TabCloseRequested(1)); // 关 alive → 栈 = [alive]
+        state.apply(Message::TabCloseRequested(1)); // 关 dead(漂移到 1)→ 栈 = [alive, dead]
+        assert_eq!(state.tabs.recently_closed.len(), 2);
+
+        state.apply(Message::TabRestore);
+        // dead 打不开:notice 落在失败时刻的当前标签(读盘失败不开新标签),
+        // 按既有「打开失败 <路径>」口径点名;条目已丢
+        let notice = state
+            .tabs
+            .tabs
+            .iter()
+            .find_map(|tab| tab.document.notice.clone())
+            .unwrap_or_default();
+        assert!(
+            notice.contains("打开失败") && notice.contains(dead.display().to_string().as_str()),
+            "提示行按既有口径点名失败路径,实际是:{notice}"
+        );
+        // 同一次触发继续往下走:alive 恢复成功
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(alive.as_path())
+        );
+        assert!(
+            state.tabs.recently_closed.is_empty(),
+            "死条目丢弃、活条目消费"
+        );
+
+        // 再按一次:栈已空,no-op(notice 不被清空也不叠加新失败)
+        let len = state.tabs.tabs.len();
+        state.apply(Message::TabRestore);
+        assert_eq!(state.tabs.tabs.len(), len);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45:从未关闭过任何标签(栈空)时 TabRestore 是 no-op,不弹提示、
+    /// 不动标签数与当前指针。
+    #[test]
+    fn tab_restore_empty_stack_is_noop() {
+        let mut state = State::default();
+        state.spawn_tab(None, "草稿");
+        state.apply(Message::TabActivate(0));
+        let before = state.tabs.tabs.len();
+        state.apply(Message::TabRestore);
+        assert_eq!(state.tabs.tabs.len(), before);
+        assert_eq!(state.tabs.active, 0);
+        assert_eq!(state.tabs.current().document.notice, None, "栈空不产生提示");
+        assert!(state.tabs.recently_closed.is_empty());
     }
 }
