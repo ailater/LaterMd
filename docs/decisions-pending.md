@@ -3,7 +3,7 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #68 为当前最新条目。
+> 编号 #70 为当前最新条目。
 
 ## #68 标签「缩短标题/完整标题」(#37)的三个口径:作用范围=整条标签条、默认=完整(既有观感)、收窄分配=保底+max-min 公平(2026-10-01,#37 tab-management 标题宽度显示模式·自动拍板;原编号 #67,因重命名条目重编号顺延为 #68,撞号事由见 #67 条头注)
 
@@ -586,3 +586,20 @@
 - **自动选择**:②——给查找/替换两个输入框 TextEdit 都加 `egui::EventFilter{ escape: true, .. }`(TextEdit 出厂默认 arrows 锁框内、escape 不锁),egui 官方为「Esc 应作用于控件而非交焦」提供的出口(builder.rs:351 注释原文举的例子就是 completion popup)。改动是两行 builder 参数,查找行的结构/逻辑零变化,不构成「重做」;修复后无头回归 `find_row_escape_closes_the_bar` / `replace_row_escape_closes_the_bar` 钉住两框行为。
 - **理由**:tooltip 与验收口径(acceptance-checklist §9 语境)都承诺 Esc 关闭;规格字面「沿用现状」的意图是保持行为,不是保持缺陷;两框必须同口径,否则用户按 Esc 结果取决于焦点在哪个框。
 - **如何改**:若认为这越过了「不顺手大改」边界,revert `ui/layout.rs` 中 `FIND_BAR_EVENT_FILTER` 常量及两处 `.event_filter(...)` 调用即可(查找条回到哑弹 Esc、替换行 Esc 检测保留但同样不触发),两个 Esc 回归测试需同步删。
+
+## #69 主题默认键改排 Alt+T(#45 K1)旧 keymap.json 的迁移口径:值感知迁移「旧默认值→新默认值」,用户自定义/主动清除不动;附带 mac 显示文本 ⌥ 口径(2026-10-01,#45 tab-restore-keymap K1·自动拍板)
+
+- **岔路一(迁移口径)**:任务书要求「旧 keymap.json 已有用户自定义 Theme 绑定的,加载时不覆盖(增量迁移语义,与 #17 同口径)」,但 #17 的字面机制(只给**缺失** command id 补默认、既有条目一律不动)与本任务目标「把 Cmd/Ctrl+Shift+T 空出来给 TabRestore」对存量用户冲突——历史上每次新增命令,`load_from` 的增量写回都会把**当时的全表默认值**落盘,老用户的 keymap.json 里几乎都躺着 `"toggle_theme": "Ctrl+Shift+T"`(当年出厂值,非用户手笔)。若严格不动它:老用户主题继续占 Cmd/Ctrl+Shift+T,K2 的 TabRestore 增量补进去后同键,而消费顺序(`poll_shortcuts` 修饰键位数降序 + `ALL` 序稳定排序)在前的 ToggleTheme 每次抢先吞键——TabRestore 对全部存量用户永久哑键,「空出来」只对全新安装生效。
+- **备选**:①严格 #17 字面口径,既有条目一律不动(代价:存量用户 TabRestore 哑键);②**值感知迁移**——仅当 toggle_theme 条目**解析值**== 旧默认(Cmd/Ctrl+Shift+T)时改写为新默认 Alt+T,其他值(用户自定义、主动清除的空串、解析不了的坏行)分毫不动;③启动时整表 reset_all 到新默认(覆盖一切用户自定义,最粗暴)。
+- **自动选择**:②——`load_from` 在增量补默认前先做一次「退役默认值」比对迁移(用 `parse_shortcut` 比**解析值**而非原文,`cmd+shift+t` 等别名/大小写手改档同样识别),迁移发生即走既有 `changed` 通路写回 keymap.json(下次启动不重复迁移)。任务书的保护条款「用户自定义 Theme 绑定不覆盖」在 ② 下字面与意图都成立。
+- **理由**:默认键变更的产品语义是「没自定义过的用户跟新默认走」,只有显式偏离应被保留;① 会让 K2 的核心验收(Cmd/Ctrl+Shift+T 恢复标签)对存量用户静默失效,比迁移更伤用户;③ 踩「不覆盖用户绑定」红线。已知局限:曾在旧版**显式**把主题改回旧默认的用户与「从未动过」不可区分,会被一并迁到 Alt+T——与「恢复出厂即新默认」的既有语义一致,接受。
+- **如何改**:想回 ①,删 `keymap.rs` `load_from` 中 `retired_theme_default` 迁移块及 `theme_default_migration_on_load` 测试(需接受存量用户 TabRestore 哑键或手动改绑);想区分「显式选过旧默认」的用户,需引入「用户改过键」持久标记,超出本轮范围。
+- **岔路二(附带口径,mac 显示文本)**:任务书要求「Win=Alt+T / mac=⌥T 三平台口径」。菜单栏走 egui `format_shortcut`,mac 上本就显示 ⌥T(符号集,`can_show_modifier_symbols` 自带字体回退);但设置「快捷键」页/工具条 tooltip 走自家的 `Shortcut::platform_text`,原先 mac 上也写死 "Alt+"。**自动选择**:`platform_text` 在 mac 输出 `⌥+`(保持与既有 `Cmd+` 同款「词+加号」形态,菜单 ⌥T 与设置页 ⌥+T 的差异同今天 ⌘S/Cmd+S 的差异,口径一致),`parse_shortcut` 增加 `⌥` 别名(与 alt/option 同义)保证存档往返与 mac 手改档可解析。副作用:mac 上含 Alt 组合的存档文本随之改变(ToggleRightPreview 由 `Cmd+Alt+R` 变 `Cmd+⌥+R`),旧档 `alt` 别名保留仍可解析,不受影响。**如何改**:不想要该口径,revert `platform_text` 的 mac 分支与 `parse_shortcut` 的 `⌥` 别名即可(mac 显示回 "Alt+")。
+
+## #70 TabRestore(#45 K2)重开失败条目的去留:失败即丢弃并继续下一条,不保留在栈顶(2026-10-01,#45 tab-restore-keymap K2·自动拍板)
+
+- **岔路**:任务书明确把「重开失败(文件被删/移动)时该栈条目是否出栈」列为二选一(①失败即丢弃并继续下一条 / ②失败保留在栈里),要求取舍登记 decisions-pending 并用单测钉住。失败时提示行已按既有口径写「打开失败 <路径>」(`file::read` 的 FileError 文案),分歧只在栈条目去留。
+- **备选**:①丢弃并继续——失败条目当场出栈,同一次触发接着尝试下一条,直到某条成功或栈空;②保留——条目留在栈顶,提示行说明后本次触发结束,下一条要再按一次才摸得到。
+- **自动选择**:①。`State::restore_tab` 的循环按「pop → open_path → 成功即停 / 失败继续 pop」实现,死条目绝不留在栈里。
+- **理由**:本产品心智是「重开=重新读盘」(preview-typography §3.3),文件被删/移走后该条目在**本会话内**永远无法恢复成功;若保留(②),它永远堵在栈顶,此后每次 Cmd/Ctrl+Shift+T 都先撞一次失败才能摸到下一条,任务书验收「连续按 Cmd/Ctrl+Shift+T 能逐条回走完整条栈」被死条目打断;用户已从提示行得知哪个文件打不开,信息不丢。②的辩护场景是「网络盘/外接盘暂时离线、之后又可用」,但该场景下用户重按一次快捷键即可,代价远小于①堵栈的代价;且不做跨会话持久化(已定案),「暂时不可用跨会话找回」本就不成立。
+- **如何改**:想改成②(失败保留),把 `state.rs` `restore_tab` 的 `while let Some(path) = self.tabs.recently_closed.pop()` 改为先 `last().cloned()` 试开、失败即 `return`(不出栈),并同步改 `tab_restore_failed_path_noticed_dropped_and_continues` 测试的断言(死条目留栈、alive 不在同一次触发里恢复)。
