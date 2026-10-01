@@ -13,7 +13,11 @@
 //!   静默丢稿的代价大于多一次点击;
 //! * 在途 AI 流**绑定发起标签的 id**(`State::ai_active_tab`):换标签/
 //!   开新标签不改写入目标也不中断;只有发起标签被关闭才作废(剩余块
-//!   无处可写,写进任何别的标签都是写错文档)。
+//!   无处可写,写进任何别的标签都是写错文档);
+//! * 批量关闭(#37 右键菜单)以**被右键的标签**为基准,队列存稳定 id、
+//!   归约逐个走单标签关闭的同一条脏确认通路(见
+//!   `State::advance_batch_close`):确认一个关一个,任一次取消立即
+//!   终止剩余队列 —— 已确认关闭的不回滚,被拒绝的保持打开。
 
 use crate::live::LiveState;
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
@@ -59,10 +63,27 @@ pub struct DraftRecovery {
     pub mtime: Option<std::time::SystemTime>,
 }
 
+/// 标签重命名(#37 右键菜单「重命名」,显示别名语义)的输入状态:
+/// 目标按**稳定 id** 记 + 草稿文本(UI 原地改,与 `ImageDialogState` 同款)。
+///
+/// 目标存 id 而非索引的理由与 `confirm_close` 相同:浮窗是非阻塞 Window,
+/// 打开期间其他关闭入口会使索引漂移。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabRename {
+    /// 正在改名的标签稳定 id。
+    pub tab_id: u64,
+    /// 输入草稿;开框时预填该标签当前显示基础名(不带 dirty 星)。
+    pub draft: String,
+}
+
 /// 单个标签的全部文档状态。
 pub struct TabState {
     /// 稳定 id:编辑器 widget id 与测试定位都用它,不随标签增删变化。
     pub id: u64,
+    /// 标签显示别名(#37「重命名」,**纯显示层**):`Some` = 标签条显示它
+    /// 而非文件名。恒为 trim 后非空(归约 `confirm_tab_rename` 保证);
+    /// `None` = 显示文件名/「未命名」。不动 path/缓冲/dirty/保存目标。
+    pub alias: Option<String>,
     /// 落盘身份 + dirty 镜像 + 提示行。
     pub document: DocumentState,
     /// 待恢复的孤儿 draft(#18 恢复条);`None` = 无待裁决草稿。
@@ -97,6 +118,7 @@ impl TabState {
         let editor = EditorBuffer::new(text);
         Self {
             id,
+            alias: None,
             document: DocumentState {
                 path,
                 dirty: false,
@@ -134,6 +156,39 @@ impl TabState {
             ..TabAutosave::default()
         };
     }
+
+    /// 标签显示基础名(**不带** dirty 星):别名优先,否则文件名/「未命名」。
+    /// 重命名浮窗的预填草稿取它(带星的名字回填进输入框会混入非用户输入)。
+    pub fn label_base(&self) -> String {
+        self.alias
+            .clone()
+            .unwrap_or_else(|| self.document.base_name())
+    }
+
+    /// 标签条显示名(#37 重命名):基础名 + dirty 星。别名是纯显示层,
+    /// 落盘身份的窗口标题仍走 [`DocumentState::window_title`],显示文件名。
+    pub fn display_name(&self) -> String {
+        let base = self.label_base();
+        if self.document.dirty {
+            format!("{base}*")
+        } else {
+            base
+        }
+    }
+}
+
+/// 批量关闭的类别(#37 标签条右键菜单):以**被右键的标签**为基准,
+/// 左/右/其他都不含基准标签本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchClose {
+    /// 关闭基准标签左侧的全部标签。
+    Left,
+    /// 关闭基准标签右侧的全部标签。
+    Right,
+    /// 关闭除基准标签外的全部标签。
+    Others,
+    /// 关闭全部标签(关空由 `TabsState::remove` 兜底补一个空标签)。
+    All,
 }
 
 /// 标签集合:全部标签 + 当前指针 + 关闭确认 + id 发放器。
@@ -147,6 +202,14 @@ pub struct TabsState {
     /// 动标签列表使索引漂移,按漂移索引确认会关错标签;id 不随增删漂移
     /// (与在途 AI 流的 `State::ai_active_tab` 同手法)。
     pub confirm_close: Option<u64>,
+    /// 批量关闭(#37)的剩余目标(稳定 id,按关闭顺序);非空即批量进行中。
+    /// 归约逐个消费:干净标签直接移除,脏标签把 `confirm_close` 指到它等
+    /// 确认;用户取消即清空本队列(已关闭的不回滚)。存 id 而非索引,与
+    /// `confirm_close` 同理由。
+    pub pending_close: Vec<u64>,
+    /// 重命名浮窗(#37「重命名」)的输入状态;`Some` 时 UI 显示浮窗。
+    /// 同一时间至多一个(新请求顶掉旧浮窗)。
+    pub rename: Option<TabRename>,
     /// 下一个标签的 id(自增,不复用 —— 关了再开新标签,编辑器 undo/光标
     /// 状态必须是全新的)。
     next_id: u64,
@@ -167,6 +230,8 @@ impl TabsState {
             tabs: vec![TabState::new(1, None, initial)],
             active: 0,
             confirm_close: None,
+            pending_close: Vec::new(),
+            rename: None,
             next_id: 2,
         }
     }
@@ -230,10 +295,35 @@ impl TabsState {
         }
     }
 
+    /// 批量关闭(#37)的目标 id 列表:`kind` 以 `index` 处的标签为基准,
+    /// 左/右/其他都不含基准;顺序即关闭顺序(从左到右)。索引过期(菜单
+    /// 弹出到点击之间标签已被关掉)返回空 —— 宁可 no-op 也不按漂移索引
+    /// 关错标签。
+    pub fn batch_close_targets(&self, kind: BatchClose, index: usize) -> Vec<u64> {
+        if index >= self.tabs.len() {
+            return Vec::new();
+        }
+        let ids =
+            |range: std::ops::Range<usize>| self.tabs[range].iter().map(|tab| tab.id).collect();
+        match kind {
+            BatchClose::Left => ids(0..index),
+            BatchClose::Right => ids(index + 1..self.tabs.len()),
+            BatchClose::Others => self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, tab)| tab.id)
+                .collect(),
+            BatchClose::All => ids(0..self.tabs.len()),
+        }
+    }
+
     /// 移除标签(调用方保证脏确认已过)。关掉最后一个即换入新的空标签;
     /// 当前指针跟着修正(关的是当前或更靠前的标签时前移一位)。待确认
-    /// 关闭的正是被移除的标签时,确认一并撤下 —— 目标已没了,模态不再
-    /// 显示,迟到的确认消息变成 no-op 而不是关掉漂移到该索引的别的标签。
+    /// 关闭/待改名的正是被移除的标签时,对应状态一并撤下 —— 目标已没了,
+    /// 模态/浮窗不再显示,迟到的确认消息变成 no-op 而不是作用到漂移到该
+    /// 索引的别的标签。
     pub fn remove(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -242,6 +332,13 @@ impl TabsState {
         self.tabs.remove(index);
         if self.confirm_close == Some(removed) {
             self.confirm_close = None;
+        }
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab_id == removed)
+        {
+            self.rename = None;
         }
         if self.tabs.is_empty() {
             let id = self.next_id;
@@ -338,5 +435,123 @@ mod tests {
         assert_eq!(tab.preview.outline.len(), 1, "大纲随换入重建");
         assert_eq!(tab.preview.outline[0].text, "新标题");
         assert_eq!(tab.document.path, Some(PathBuf::from("/x.md")));
+    }
+
+    /// 批量关闭目标(#37):以被右键的标签为基准,左/右/其他都不含基准,
+    /// 全部含基准;返回的是稳定 id。中间标签做基准覆盖非活动目标场景
+    /// (active 指向别处,目标计算与 active 无关)。
+    #[test]
+    fn batch_close_targets_around_anchor() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        tabs.open_tab(None, "丙");
+        tabs.open_tab(None, "丁");
+        tabs.activate(3); // active 在最右,基准取中间的乙(非活动)
+        let ids: Vec<u64> = tabs.tabs.iter().map(|tab| tab.id).collect();
+        let anchor = 1;
+
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Left, anchor),
+            ids[0..1]
+        );
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Right, anchor),
+            ids[2..4]
+        );
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Others, anchor),
+            vec![ids[0], ids[2], ids[3]]
+        );
+        assert_eq!(tabs.batch_close_targets(BatchClose::All, anchor), ids);
+    }
+
+    /// 首/尾边界:最左标签无「左侧」目标,最右标签无「右侧」目标;唯一
+    /// 标签的「其他」为空(菜单项据此禁用,归约侧空队列即 no-op)。
+    #[test]
+    fn batch_close_targets_first_last_boundaries() {
+        let mut tabs = TabsState::new("甲");
+        assert!(
+            tabs.batch_close_targets(BatchClose::Others, 0).is_empty(),
+            "唯一标签无「其他」目标"
+        );
+        assert!(
+            tabs.batch_close_targets(BatchClose::Left, 0).is_empty(),
+            "最左标签无「左侧」目标"
+        );
+        tabs.open_tab(None, "乙");
+        assert!(
+            tabs.batch_close_targets(BatchClose::Right, 1).is_empty(),
+            "最右标签无「右侧」目标"
+        );
+        // 关闭全部对唯一/多个标签都有目标(关空由 remove 兜底补空标签)
+        assert_eq!(tabs.batch_close_targets(BatchClose::All, 0).len(), 2);
+    }
+
+    /// 索引过期(菜单点击落到已被关闭的标签)→ 空队列,不误伤现存标签。
+    #[test]
+    fn batch_close_targets_stale_index_yields_empty() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        for kind in [
+            BatchClose::Left,
+            BatchClose::Right,
+            BatchClose::Others,
+            BatchClose::All,
+        ] {
+            assert!(
+                tabs.batch_close_targets(kind, 9).is_empty(),
+                "{kind:?} 过期索引一律空"
+            );
+        }
+        assert_eq!(tabs.tabs.len(), 2, "不误伤现存标签");
+    }
+
+    /// 显示名(#37 重命名,别名语义):别名优先于文件名;dirty 星照旧追加;
+    /// 无别名回归文件名行为;label_base(浮窗预填源)永不带星。
+    #[test]
+    fn display_name_prefers_alias_and_appends_dirty_star() {
+        let mut tab = TabState::new(1, Some(PathBuf::from("/docs/note.md")), "正文");
+        assert_eq!(tab.label_base(), "note.md", "无别名显示文件名");
+        tab.alias = Some("我的笔记".to_owned());
+        assert_eq!(tab.label_base(), "我的笔记", "别名优先");
+        assert_eq!(tab.display_name(), "我的笔记");
+        tab.document.dirty = true;
+        assert_eq!(tab.display_name(), "我的笔记*", "dirty 星照旧追加");
+        tab.alias = None;
+        assert_eq!(tab.label_base(), "note.md", "清除别名回到文件名");
+        assert_eq!(tab.display_name(), "note.md*");
+        // 未命名标签也可起别名(起名对象是标签,不是文件)
+        let mut unnamed = TabState::new(2, None, "");
+        unnamed.alias = Some("草稿".to_owned());
+        assert_eq!(unnamed.display_name(), "草稿");
+    }
+
+    /// 重命名浮窗目标被移除:浮窗状态一并撤下(与 confirm_close 同款),
+    /// 迟到的确认消息无从指认,不会把别名设到漂移到该索引的别的标签。
+    #[test]
+    fn remove_cancels_pending_rename_of_closed_tab() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        let target = tabs.tabs[1].id;
+        tabs.rename = Some(TabRename {
+            tab_id: target,
+            draft: "新名字".to_owned(),
+        });
+        tabs.remove(1);
+        assert_eq!(tabs.rename, None, "浮窗随目标移除撤下");
+        // 幸存标签不背别名
+        assert_eq!(tabs.tabs[0].alias, None);
+        // 移除别的标签不撤浮窗
+        tabs.rename = Some(TabRename {
+            tab_id: tabs.tabs[0].id,
+            draft: "甲的新名".to_owned(),
+        });
+        let survivor = tabs.tabs[0].id;
+        tabs.open_tab(None, "丙");
+        tabs.remove(2);
+        assert!(
+            tabs.rename.is_some_and(|rename| rename.tab_id == survivor),
+            "关掉无关标签不动浮窗"
+        );
     }
 }

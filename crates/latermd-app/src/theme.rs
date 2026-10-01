@@ -142,6 +142,32 @@ impl Density {
     }
 }
 
+/// 标签条标题宽度显示模式(#37 右键菜单「缩短标题/完整标题」,整条
+/// 标签条统一生效):`Short` 像浏览器标签一样**实际收窄 chip 宽**并按
+/// Unicode 字符边界加省略号;`Full` 按完整标题测宽,放不下沿既有单行
+/// 水平滚动(#11 口径)。纯显示偏好 —— 切换不动任何标签的路径/缓冲/
+/// dirty,也不改盘上文件名。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleWidthMode {
+    /// 缩短:chip 收窄到标签条可用空间,保留最小宽与可点的关闭按钮。
+    Short,
+    /// 完整:按完整标题测宽。默认值 —— 即 #11 已交付的既有观感,升级
+    /// 不改变默认行为,缩短模式由用户显式开启。
+    #[default]
+    Full,
+}
+
+impl TitleWidthMode {
+    /// 右键菜单条目文案(菜单显示名与本枚举同源,不再各写一份字面量)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "缩短标题",
+            Self::Full => "完整标题",
+        }
+    }
+}
+
 /// 主题设置:模式 + 皮肤 + 密度 + 正文样式覆盖。缺省字段(含整个
 /// `overrides`)回落默认,手改的配置文件缺项不致整体解析失败。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -153,6 +179,9 @@ pub struct ThemeSettings {
     pub skin: Option<String>,
     /// 界面密度。
     pub density: Density,
+    /// 标签条标题宽度模式(#37)。落 settings.json 与主题同路;旧文件缺
+    /// 该项由 `#[serde(default)]` 回落 `Full`(完整,既有观感)。
+    pub tab_title_width: TitleWidthMode,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
     /// Emoji 面板「最近使用」(docs/emoji-plan.md §6.3):新的在前、去重、
@@ -734,6 +763,30 @@ mod tests {
             .unwrap()
             .emoji_recent
             .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 标签条标题宽度模式(#37)随 settings.json 往返;旧文件缺该项回落
+    /// `Full`(完整 = #11 既有观感,升级不改变默认行为)。
+    #[test]
+    fn title_width_round_trips_and_old_settings_fall_back() {
+        let dir = temp_dir("title-width");
+        let settings = ThemeSettings {
+            tab_title_width: TitleWidthMode::Short,
+            ..ThemeSettings::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+        // 落盘的 JSON 里是可读的小写值(手改配置可辨认)
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(json.contains(r#""tab_title_width": "short""#), "{json}");
+
+        // 旧版 settings.json 没有 tab_title_width:serde(default) 兜底回 Full
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert_eq!(
+            ThemeSettings::load_from(&dir).unwrap().tab_title_width,
+            TitleWidthMode::Full
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
