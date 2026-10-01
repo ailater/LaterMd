@@ -389,11 +389,23 @@ impl LaterMdApp {
                 );
                 // min_rect 包括标签与可换行的工具条,浮层只能锚定它们之后的视口。
                 source_rect = Some(ui.available_rect_before_wrap());
+                // 保焦目标:焦点落在查找框或替换框上时,编辑器消费
+                // `pending_selection` 抢焦后要还回去(替换行 #17:替换词
+                // 没打完不能被跳转抢走)。
+                let focus_owner = if ui.memory(|memory| memory.has_focus(find_input_id())) {
+                    Some(find_input_id())
+                } else if state.find.replace_open
+                    && ui.memory(|memory| memory.has_focus(replace_input_id()))
+                {
+                    Some(replace_input_id())
+                } else {
+                    None
+                };
                 let keep_find_focus = state.find.open
                     && state.render_mode == crate::live::RenderMode::Source
                     && pending_selection.is_some()
                     && cursor.jump_to.is_none()
-                    && ui.memory(|memory| memory.has_focus(find_input_id()))
+                    && focus_owner.is_some()
                     && !ui.input(|input| input.pointer.any_pressed());
                 crate::ui::editor::ui(
                     ui,
@@ -410,7 +422,9 @@ impl LaterMdApp {
                 );
                 // 命中回填沿用编辑器的选区/滚动通道,但不能终止查找框的连续输入。
                 if keep_find_focus {
-                    ui.memory_mut(|memory| memory.request_focus(find_input_id()));
+                    if let Some(id) = focus_owner {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
                 }
             });
 
@@ -770,7 +784,25 @@ fn find_input_id() -> egui::Id {
     egui::Id::new("editor-find-input")
 }
 
-/// 查找卡内容与状态无关,可在 Window/无头测试中复用。
+fn replace_input_id() -> egui::Id {
+    egui::Id::new("editor-replace-input")
+}
+
+/// 查找/替换输入框的按键过滤:在 TextEdit 出厂默认(方向键留在框内、
+/// Tab 跳焦)之上打开 `escape` —— egui 0.36 的焦点导航把裸 Esc 当
+/// 「交出焦点」在 `Focus::begin_pass` 清焦,不清则框内 Esc 检测
+/// (`has_focus` 前提)永远不触发,「Esc 关闭查找条」成为哑弹
+/// (2026-10-01 #17 M1 无头实证,两框必须同口径)。
+const FIND_BAR_EVENT_FILTER: egui::EventFilter = egui::EventFilter {
+    tab: false,
+    horizontal_arrows: true,
+    vertical_arrows: true,
+    escape: true,
+};
+
+/// 查找卡内容与状态无关,可在 Window/无头测试中复用。替换行
+/// (`replace_open`,Ctrl+H)画在查找行之下:替换词输入只更新按钮可用性,
+/// 不自动改写文档。
 fn find_bar_contents(
     ui: &mut egui::Ui,
     find: &mut crate::state::FindBarState,
@@ -784,6 +816,7 @@ fn find_bar_contents(
         let response = ui.add(
             egui::TextEdit::singleline(&mut query_buf)
                 .id(find_input_id())
+                .event_filter(FIND_BAR_EVENT_FILTER)
                 .return_key(None::<egui::KeyboardShortcut>)
                 .desired_width(220.0)
                 .hint_text("输入即跳转;Enter 下一个"),
@@ -845,6 +878,51 @@ fn find_bar_contents(
             outbox.push(Message::FindBarToggled(false));
         }
     });
+    if find.replace_open {
+        replace_row(ui, find, total, pos, outbox);
+    }
+}
+
+/// 替换行:替换输入框 + 「替换」(当前命中)/「全部」按钮 + 命中计数。
+/// 返回两枚按钮的响应(无头测试断言可用性与点击用)。
+fn replace_row(
+    ui: &mut egui::Ui,
+    find: &mut crate::state::FindBarState,
+    total: usize,
+    pos: usize,
+    outbox: &mut Vec<Message>,
+) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        ui.label("替换");
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut find.replacement)
+                .id(replace_input_id())
+                .event_filter(FIND_BAR_EVENT_FILTER)
+                .return_key(None::<egui::KeyboardShortcut>)
+                .desired_width(220.0)
+                .hint_text("替换为"),
+        );
+        // 替换词输入不自动改写文档,只经由按钮可用性体现
+        let replace = ui.add_enabled(find.hit.is_some(), egui::Button::new("替换"));
+        if replace.clicked() {
+            outbox.push(Message::ReplaceCurrent);
+        }
+        let all = ui.add_enabled(total > 0, egui::Button::new("全部"));
+        if all.clicked() {
+            outbox.push(Message::ReplaceAllInDoc);
+        }
+        ui.weak(if total == 0 {
+            "无结果".to_owned()
+        } else {
+            format!("{pos}/{total}")
+        });
+        // Esc 在替换框上同样关整条(与查找框口径一致)
+        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            outbox.push(Message::FindBarToggled(false));
+        }
+        (replace, all)
+    })
+    .inner
 }
 
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · AI · MCP。
@@ -1335,6 +1413,215 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// 替换行(#17 M1):按钮可用性跟命中走;点击分别发出单个/全部替换
+    /// 消息(替换词输入不改写文档由归约侧消费,见 state 层测试)。
+    #[test]
+    fn replace_row_buttons_follow_hits_and_send_messages() {
+        let ctx = egui::Context::default();
+        let mut find = crate::state::FindBarState {
+            open: true,
+            replace_open: true,
+            query: "needle".to_owned(),
+            replacement: "pin".to_owned(),
+            hits: vec![std::ops::Range { start: 0, end: 6 }],
+            hit: Some(0),
+        };
+        let mut outbox = Vec::new();
+        let mut rects = (Rect::NOTHING, Rect::NOTHING);
+        for _ in 0..3 {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                let total = find.hits.len();
+                let (replace, all) = replace_row(ui, &mut find, total, 1, &mut outbox);
+                assert!(replace.enabled(), "有当前命中时「替换」可用");
+                assert!(all.enabled(), "有命中时「全部」可用");
+                rects = (replace.rect, all.rect);
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+
+        // 点击「替换」「全部」各自发一条消息(与 menubar 点击测试同节奏:
+        // 渲染拿 rect,下一帧合成按下/抬起)
+        let (replace_rect, all_rect) = rects;
+        for (rect, expected) in [
+            (replace_rect, Message::ReplaceCurrent),
+            (all_rect, Message::ReplaceAllInDoc),
+        ] {
+            let center = rect.center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            ctx.run_ui(
+                RawInput {
+                    events: vec![Event::PointerMoved(center), click(true), click(false)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let total = find.hits.len();
+                    replace_row(ui, &mut find, total, 1, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(outbox, vec![expected]);
+            outbox.clear();
+        }
+    }
+
+    /// 无命中时两枚替换按钮都禁用(替换词变化只改按钮可用性,不发消息)。
+    #[test]
+    fn replace_row_buttons_disable_without_hits() {
+        let ctx = egui::Context::default();
+        let mut find = crate::state::FindBarState {
+            open: true,
+            replace_open: true,
+            query: "needle".to_owned(),
+            replacement: "pin".to_owned(),
+            hits: Vec::new(),
+            hit: None,
+        };
+        let mut outbox = Vec::new();
+        for _ in 0..3 {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                let (replace, all) = replace_row(ui, &mut find, 0, 0, &mut outbox);
+                assert!(!replace.enabled(), "无命中时「替换」禁用");
+                assert!(!all.enabled(), "无命中时「全部」禁用");
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(outbox.is_empty(), "禁用态不产生消息");
+    }
+
+    /// Ctrl+H 整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
+    /// 输入只更新状态不改文档;替换框上 Esc 关整条。
+    #[test]
+    fn ctrl_h_opens_replace_row_typing_does_not_edit_and_esc_closes() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("ctrl-h");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+
+        // Ctrl+H → 命令层消费键位,查找条同开、替换行展开
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::H, Modifiers::COMMAND),
+        );
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        assert!(
+            app.state.find.open && app.state.find.replace_open,
+            "Ctrl+H 打开查找条与替换行"
+        );
+
+        // 替换框打字:只更新 replacement,文档不动
+        let input = replace_input_id();
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        for (step, text) in ["p", "i", "n"].into_iter().enumerate() {
+            let now = 2.0 + step as f64;
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Text(text.to_owned())],
+            );
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert!(
+                ctx.memory(|memory| memory.has_focus(input)),
+                "跳转不抢输入焦点"
+            );
+            assert_eq!(
+                app.state.tabs.current().editor.text(),
+                original,
+                "替换词输入不自动改写文档"
+            );
+        }
+        assert_eq!(app.state.find.replacement, "pin");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 替换框聚焦时 Esc 关整条(#17 M1,与查找框同口径):egui 0.36 焦点
+    /// 导航默认把裸 Esc 当「交出焦点」在 begin_pass 清焦,输入框必须以
+    /// `escape: true` 的 event_filter 锁住 Esc,框内检测才触得到
+    /// (2026-10-01 无头实证,修复前该链路在两框上都是哑弹)。
+    /// 注:无头 run_ui 下「Text 打字帧后紧跟 Esc 帧」会让浮层 Window 的
+    /// 内容闭包整帧不执行(egui 内部行为,与时间/焦点无关,真机帧调度
+    /// 不同),故 Esc 用空帧节奏单独钉;打字与 Esc 的连续操作留真机目视。
+    #[test]
+    fn replace_row_escape_closes_the_bar() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("esc-replace");
+        app.state.apply(Message::ReplaceBarToggled(true));
+        app.state
+            .apply(Message::FindQueryChanged("needle".to_owned()));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        assert!(app.state.find.replace_open, "前置:替换行展开");
+        let input = replace_input_id();
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        for step in 4..6 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        assert!(ctx.memory(|memory| memory.has_focus(input)), "替换框已聚焦");
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::Escape, Modifiers::NONE),
+        );
+        assert_eq!(app.outbox, vec![Message::FindBarToggled(false)]);
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        assert!(
+            !app.state.find.open && !app.state.find.replace_open,
+            "Esc 后整条关闭,替换行一并收起"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 查找框聚焦时 Esc 关整条(#17 M1 回归守护):同
+    /// [`replace_row_escape_closes_the_bar`] 的修复,查找框侧的守护。
+    #[test]
+    fn find_row_escape_closes_the_bar() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("esc-find");
+        app.state.apply(Message::FindBarToggled(true));
+        app.state
+            .apply(Message::FindQueryChanged("needle".to_owned()));
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let input = find_input_id();
+        ctx.memory_mut(|memory| memory.request_focus(input));
+        for step in 4..6 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        assert!(ctx.memory(|memory| memory.has_focus(input)), "查找框已聚焦");
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::Escape, Modifiers::NONE),
+        );
+        assert_eq!(app.outbox, vec![Message::FindBarToggled(false)]);
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        assert!(!app.state.find.open, "Esc 后整条关闭");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn key_s(modifiers: Modifiers) -> Event {

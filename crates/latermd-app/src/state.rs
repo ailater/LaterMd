@@ -191,12 +191,18 @@ pub struct OutlineCursor {
 }
 
 /// 应用根状态。
-/// 文档内查找条状态(#17 最小版):`hits` 是当前 query 的大小写不敏感
-/// 全量命中(字符区间);`hit` 是当前停在第几个(0-based,`None` 未定位)。
+/// 文档内查找条状态(#17):`hits` 是当前 query 的大小写不敏感全量命中
+/// (字符区间);`hit` 是当前停在第几个(0-based,`None` 未定位);替换行
+/// (Ctrl+H)是查找条的第二行,`replace_open` 只控制它展不展开。
 #[derive(Debug, Default, PartialEq)]
 pub struct FindBarState {
     pub open: bool,
+    /// 替换行是否展开。整条关闭(Esc / ✕)时随 `open` 一并收起。
+    pub replace_open: bool,
     pub query: String,
+    /// 替换词。输入只更新按钮可用性,不自动改写文档;点「替换 / 全部」
+    /// 才消费。
+    pub replacement: String,
     pub hits: Vec<Range<usize>>,
     pub hit: Option<usize>,
 }
@@ -510,6 +516,14 @@ pub enum Message {
     FindNext {
         backwards: bool,
     },
+    /// 替换行开/关(Ctrl+H):已全开时视为「再按一次」,收替换行、查找条
+    /// 保留;否则展开替换行,查找条未开则同开(选区预填与重扫复用
+    /// [`Message::FindBarToggled`] 的口径)。
+    ReplaceBarToggled(bool),
+    /// 替换当前命中(`find.hit` 指向)为替换词,随后跳下一个(环绕)。
+    ReplaceCurrent,
+    /// 全部替换:按当前命中一次写入(单条 undo),随后重扫。
+    ReplaceAllInDoc,
     SearchQueryChanged,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
@@ -634,6 +648,14 @@ pub enum Message {
     ThemeDensityChanged(Density),
 }
 
+/// 字符偏移 → 字节偏移(替换命中落 `String` 前的换算;落在多字节字符
+/// 中间时归到起点,与 `EditorBuffer::byte_to_char` 同口径,越界钳到末尾)。
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
 impl State {
     /// 消费一条消息,变更状态。只允许在 `App::logic` 调用。
     pub fn apply(&mut self, message: Message) {
@@ -658,6 +680,9 @@ impl State {
             Message::FindBarToggled(open) => self.toggle_find(open),
             Message::FindQueryChanged(query) => self.find_query_changed(query),
             Message::FindNext { backwards } => self.find_next(backwards),
+            Message::ReplaceBarToggled(open) => self.toggle_replace(open),
+            Message::ReplaceCurrent => self.replace_current(),
+            Message::ReplaceAllInDoc => self.replace_all_in_doc(),
             Message::ImageDialogOpened => self.open_image_dialog(),
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
@@ -1223,6 +1248,8 @@ impl State {
             self.find_rescan();
         } else {
             self.find.hit = None;
+            // 整条关闭(Esc / ✕):替换行随之收起,下次 Ctrl+F 打开不带它
+            self.find.replace_open = false;
         }
     }
 
@@ -1298,6 +1325,83 @@ impl State {
         self.find.hit = Some(next);
         let range = self.find.hits[next].clone();
         self.tabs.current_mut().pending_selection = Some((range.start, range.end));
+    }
+
+    /// 替换行开/关(Ctrl+H,#17)。`open = true` 且查找条与替换行都已展开
+    /// 时视为「再按一次」:收替换行、查找条保留;否则展开替换行,查找条
+    /// 未开则同开(选区预填与重扫复用 `toggle_find`)。`open = false`
+    /// 显式收替换行,查找条不动。
+    fn toggle_replace(&mut self, open: bool) {
+        if open && self.find.open && self.find.replace_open {
+            self.find.replace_open = false;
+            return;
+        }
+        if open && !self.find.open {
+            self.toggle_find(true);
+        }
+        self.find.replace_open = open;
+    }
+
+    /// 单个替换(#17):把当前命中替换为替换词,经 [`EditorBuffer::replace_range`]
+    /// 定点写入缓冲(dirty / rev 由 `touch` 维护,预览快照随 rev 联动);
+    /// 随后重扫并把定位推到**替换文本之后**的第一个命中 —— 锚点取替换词
+    /// 末尾而非命中起点,替换词自身含查找词(needle → needleX)时刚写入
+    /// 的命中不会被再次选中;之后无命中则环绕回首,全空则清定位。
+    fn replace_current(&mut self) {
+        let Some(index) = self.find.hit else { return };
+        let Some(range) = self.find.hits.get(index).cloned() else {
+            return;
+        };
+        let replacement = self.find.replacement.clone();
+        {
+            let tab = self.tabs.current_mut();
+            tab.editor
+                .replace_range(range.start..range.end, &replacement);
+            // 局部编辑改变长度,旧字节光标可能漂出字符边界(状态栏同帧
+            // 切片,`apply_format` 同款钳制)
+            if let Some(byte) = tab.cursor.byte {
+                tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+            }
+        }
+        let anchor = range.start + replacement.chars().count();
+        self.find_rescan();
+        self.find.hit = (!self.find.hits.is_empty()).then(|| {
+            self.find
+                .hits
+                .iter()
+                .position(|hit| hit.start >= anchor)
+                .unwrap_or(0)
+        });
+        if let Some(index) = self.find.hit {
+            let range = self.find.hits[index].clone();
+            self.tabs.current_mut().pending_selection = Some((range.start, range.end));
+        }
+    }
+
+    /// 全部替换(#17):按当前命中从后往前生成新文本,**一次** `replace_all`
+    /// 写入 —— 程序化变更一步 undo(egui undoer 看不到程序化写入,Ctrl+Z
+    /// 回到最近用户编辑快照,与 AI 流式追加同语义),绝无逐命中循环写入。
+    fn replace_all_in_doc(&mut self) {
+        if self.find.hits.is_empty() {
+            return;
+        }
+        let replacement = self.find.replacement.clone();
+        let mut text = self.tabs.current().editor.text().to_owned();
+        // 命中是字符区间,落 `String::replace_range` 前换算字节边界;从后
+        // 往前替换,前面的命中偏移不受影响
+        for range in self.find.hits.iter().rev() {
+            let byte_start = char_to_byte(&text, range.start);
+            let byte_end = char_to_byte(&text, range.end);
+            text.replace_range(byte_start..byte_end, &replacement);
+        }
+        {
+            let tab = self.tabs.current_mut();
+            tab.editor.replace_all(&text);
+            if let Some(byte) = tab.cursor.byte {
+                tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+            }
+        }
+        self.find_rescan();
     }
 
     /// 打开图片框(docs/image-plan.md A 段):alt 按当前选区预填 —— 选中
@@ -5593,5 +5697,189 @@ mod tests {
             .unwrap_or("");
         assert!(notice.contains("保存"), "{notice}");
         assert_eq!(state.tabs.current().editor.text(), "草稿");
+    }
+
+    /// 替换行开/关(#17 M1):Ctrl+H 查找条同开替换行展开,再按收替换行
+    /// 留查找条;Esc 关整条时替换行一并收起;Ctrl+F 不带出替换行。
+    #[test]
+    fn replace_bar_toggle_semantics() {
+        let mut state = State::default();
+        assert!(!state.find.open && !state.find.replace_open);
+
+        state.apply(Message::ReplaceBarToggled(true));
+        assert!(
+            state.find.open && state.find.replace_open,
+            "Ctrl+H:查找条同开、替换行展开"
+        );
+
+        state.apply(Message::ReplaceBarToggled(true));
+        assert!(
+            state.find.open && !state.find.replace_open,
+            "再按 Ctrl+H:收替换行,查找条保留"
+        );
+
+        state.apply(Message::ReplaceBarToggled(true));
+        assert!(state.find.open && state.find.replace_open);
+
+        state.apply(Message::FindBarToggled(false));
+        assert!(
+            !state.find.open && !state.find.replace_open,
+            "Esc 关整条,替换行随之收起"
+        );
+
+        state.apply(Message::FindBarToggled(true));
+        assert!(
+            state.find.open && !state.find.replace_open,
+            "Ctrl+F 打开不带替换行"
+        );
+    }
+
+    /// 单个替换(#17 M1):定点改写文本、置脏推进修订号、重扫计数回落、
+    /// hit 推进到下一个并经 `pending_selection` 跟过去;全部替换完清定位。
+    #[test]
+    fn replace_current_rewrites_text_advances_hit_and_rescans() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("needle one\nneedle two\nneedle three");
+        state.tabs.current_mut().editor.clear_dirty();
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        assert_eq!(state.find.hits.len(), 3);
+        state.find.replacement = "pin".to_owned();
+
+        let rev = state.tabs.current().editor.revision();
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "pin one\nneedle two\nneedle three"
+        );
+        assert!(state.tabs.current().editor.is_dirty(), "替换置脏");
+        assert!(
+            state.tabs.current().editor.revision() > rev,
+            "修订号推进(预览快照联动)"
+        );
+        assert_eq!(state.find.hits.len(), 2, "重扫计数回落");
+        assert_eq!(state.find.hit, Some(0), "定位推进到下一个命中");
+        assert_eq!(
+            state.tabs.current().pending_selection,
+            Some((8, 14)),
+            "选区跟到下一个命中"
+        );
+
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "pin one\npin two\nneedle three"
+        );
+        assert_eq!(state.find.hit, Some(0));
+
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "pin one\npin two\npin three"
+        );
+        assert_eq!(state.find.hits.len(), 0, "全部替换完清空");
+        assert_eq!(state.find.hit, None);
+    }
+
+    /// 最后一个命中替换后定位环绕回首(「替换并跳下一个」的末尾语义)。
+    #[test]
+    fn replace_current_wraps_to_first_after_last_hit() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("a X b X c X d");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("X".to_owned()));
+        state.apply(Message::FindNext { backwards: false });
+        state.apply(Message::FindNext { backwards: false });
+        assert_eq!(state.find.hit, Some(2));
+        state.find.replacement = "Y".to_owned();
+
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(state.tabs.current().editor.text(), "a X b X c Y d");
+        assert_eq!(state.find.hit, Some(0), "末尾替换后无更晚命中,环绕回首");
+        assert_eq!(state.tabs.current().pending_selection, Some((2, 3)));
+    }
+
+    /// 替换词自身含查找词(needle → needleX):锚点取替换词末尾,刚写入
+    /// 的命中不被再次选中,定位推进到真正的下一个。
+    #[test]
+    fn replace_current_skips_replacement_containing_query() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("needle one\nneedle two");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        state.find.replacement = "needleX".to_owned();
+
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "needleX one\nneedle two"
+        );
+        // 新文本里 needleX 的前缀也算命中,但 hit 必须跳过它
+        assert_eq!(state.find.hits.len(), 2);
+        assert_eq!(state.find.hit, Some(1), "不回吸刚写入的命中");
+        assert_eq!(state.tabs.current().pending_selection, Some((12, 18)));
+    }
+
+    /// 无命中时单个替换是幂等无操作:不改文本、不推进修订号。
+    #[test]
+    fn replace_current_without_hits_is_noop() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("稳定文本");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("zzz".to_owned()));
+        assert_eq!(state.find.hit, None);
+        state.find.replacement = "别的".to_owned();
+
+        let rev = state.tabs.current().editor.revision();
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(state.tabs.current().editor.text(), "稳定文本");
+        assert_eq!(state.tabs.current().editor.revision(), rev);
+    }
+
+    /// 全部替换(#17 M1 基础版):按命中一次写入(修订号恰 +1)、大小写
+    /// 不敏感全量覆盖、多字节替换词不错位、随后重扫。
+    #[test]
+    fn replace_all_rewrites_once_and_rescans() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("foo a\nfoo b\nFOO c");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("foo".to_owned()));
+        assert_eq!(state.find.hits.len(), 3);
+        state.find.replacement = "bar".to_owned();
+
+        let rev = state.tabs.current().editor.revision();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "bar a\nbar b\nbar c");
+        assert_eq!(
+            state.tabs.current().editor.revision(),
+            rev + 1,
+            "单次写入:整篇一次 replace_all,一次 touch"
+        );
+        assert_eq!(state.find.hits.len(), 0, "替换完重扫无残留");
+        assert!(state.tabs.current().editor.is_dirty());
+
+        // CJK:查找词与替换词都是多字节,偏移不错位
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("中文 换行\n替换 换行");
+        state.apply(Message::FindQueryChanged("换行".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+        state.find.replacement = "行尾".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "中文 行尾\n替换 行尾");
     }
 }

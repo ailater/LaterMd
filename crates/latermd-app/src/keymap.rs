@@ -553,4 +553,50 @@ mod tests {
         assert_eq!(Keymap::load_from(&dir), Keymap::builtin());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 替换命令(#17 M1)进出厂默认表;旧 `keymap.json` 增量迁移只给
+    /// **缺失**的 command id 补默认,用户已有绑定绝不覆盖。
+    #[test]
+    fn replace_in_doc_default_and_incremental_migration() {
+        // 出厂默认:Ctr/Cmd+H
+        assert_eq!(
+            Keymap::builtin().get(Command::ReplaceInDoc),
+            Some(shortcut(Key::H))
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("latermd-keymap-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧版 json(替换命令尚不存在时的形态):无 replace_in_doc 条目
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::ReplaceInDoc),
+            Some(shortcut(Key::H)),
+            "缺失 id 补默认,旧配置无需手动重置"
+        );
+        assert_eq!(
+            loaded.get(Command::Save),
+            Some(shortcut(Key::S)),
+            "既有条目原样保留"
+        );
+
+        // 用户已改绑:load_from 不得用默认值覆盖
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"replace_in_doc": "Ctrl+R"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::ReplaceInDoc),
+            Some(shortcut(Key::R)),
+            "用户绑定不被默认覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
