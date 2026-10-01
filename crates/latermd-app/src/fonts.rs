@@ -170,6 +170,17 @@ fn mark_installed(ctx: &egui::Context) {
     ctx.data_mut(|data| data.insert_temp(installed_id(), true));
 }
 
+/// 测试取证用:#43 M1 混排复现需要直接解析命中的 CJK 回退字体文件
+/// (路径 + 两个 face index),与 `install` 同一条候选探测路径。
+/// 未命中任何候选时返回 `None`(本机无 CJK 字体,如实跳过)。
+#[cfg(test)]
+pub(crate) fn cjk_source_for_test() -> Option<(&'static str, u32, u32)> {
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|(path, _, _)| Path::new(path).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
