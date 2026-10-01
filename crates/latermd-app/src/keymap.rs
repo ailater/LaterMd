@@ -758,21 +758,23 @@ mod tests {
             "缺失 id 补新默认"
         );
 
-        // 迁移后的整表里 Cmd/Ctrl+Shift+T 已无人占用(该键位留给
-        // TabRestore,#45 K2)
+        // 迁移后 Cmd/Ctrl+Shift+T 的占用者 = TabRestore(#45 K2 已落地,
+        // 该键位由它合法持有),主题不再抢键 —— 存量档迁移后两键各归其主
         std::fs::write(
             dir.join(KEYMAP_FILE),
             br#"{"bindings": {"toggle_theme": "Ctrl+Shift+T"}}"#,
         )
         .unwrap();
         let loaded = Keymap::load_from(&dir);
-        for cmd in Command::ALL {
-            assert_ne!(
-                loaded.get(cmd),
-                Some(ctrl_shift_t),
-                "{cmd:?} 迁移后仍占 Cmd/Ctrl+Shift+T"
-            );
-        }
+        let holders: Vec<Command> = Command::ALL
+            .into_iter()
+            .filter(|cmd| loaded.get(*cmd) == Some(ctrl_shift_t))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![Command::TabRestore],
+            "Cmd/Ctrl+Shift+T 只被 TabRestore 持有(增量补默认的合法占用)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
