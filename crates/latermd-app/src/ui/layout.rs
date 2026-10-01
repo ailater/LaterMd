@@ -520,14 +520,40 @@ impl LaterMdApp {
         // 脏标签关闭确认(标签条 × / Ctrl+W 触发):目标按稳定 id 存
         // (`TabsState::confirm_close`),打开期间其他关闭入口会使索引漂移;
         // 目标被别的路径关掉时 `TabsState::remove` 已撤下确认,这里自然
-        // 不再渲染。
+        // 不再渲染。文案用标签显示名(#37 别名优先)—— 用户在标签条上认
+        // 的是什么名字,模态就问什么名字。
         if let Some(tab) = self.state.tabs.confirm_close_tab() {
-            let (confirm, cancel) = tab_close_dialog(ui, &tab.document.display_name());
+            let (confirm, cancel) = tab_close_dialog(ui, &tab.display_name());
             if confirm.clicked() {
                 outbox.push(Message::TabCloseConfirmed);
             }
             if cancel.clicked() {
                 outbox.push(Message::TabCloseCancelled);
+            }
+        }
+
+        // 标签重命名(#37 右键菜单「重命名」,**显示别名**语义):目标按
+        // 稳定 id 存(`TabsState::rename`),被关掉时 `TabsState::remove` 已
+        // 撤下,这里自然不再渲染。浮窗只收草稿,置别名在归约
+        // (`State::confirm_tab_rename`);文件行明示作用范围(不改盘上文件)。
+        let rename_target = self.state.tabs.rename.as_ref().map(|rename| rename.tab_id);
+        if let Some(tab_id) = rename_target {
+            // 先结清只读借用再 as_mut 草稿(rename 字段与 tabs 整体的借用
+            // 不能并存);标签被关掉时 remove 已撤下浮窗,这里是防御占位。
+            let file_label = self
+                .state
+                .tabs
+                .index_by_id(tab_id)
+                .map(|index| self.state.tabs.tabs[index].document.base_name())
+                .unwrap_or_else(|| "未知(标签已关闭)".to_owned());
+            if let Some(rename) = self.state.tabs.rename.as_mut() {
+                let (confirm, cancel) = crate::ui::tabs::rename_dialog(ui, rename, &file_label);
+                if confirm.clicked() {
+                    outbox.push(Message::TabRenameConfirmed);
+                }
+                if cancel.clicked() {
+                    outbox.push(Message::TabRenameCancelled);
+                }
             }
         }
 
@@ -2439,6 +2465,45 @@ mod tests {
         app.state.settings.open = false;
         let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
         output.drop_without_applying_deltas();
+    }
+
+    /// 标签重命名浮窗装配(#37,**显示别名**语义):走完整归约开浮窗后,
+    /// 真实 draw 路径渲染出浮窗(标题 + 带真实文件名的作用范围说明行);
+    /// 确认置别名后标签条 chip 文本换成别名,而**窗口标题仍是文件名**
+    /// —— 别名是纯显示层,UI 各处不得把它冒充成文件改名。
+    #[test]
+    fn rename_dialog_wired_into_overlay_draw() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        let note = std::path::PathBuf::from("/docs/note.md");
+        app.state.tabs.open_tab(Some(note), "正文");
+        app.state.apply(Message::TabRenameRequested { index: 1 });
+        assert!(app.state.tabs.rename.is_some(), "前置:浮窗状态已置");
+
+        let text = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            text.iter().any(|t| t.contains("重命名标签")),
+            "浮窗标题渲染:{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t.contains("文件:note.md")),
+            "作用范围说明行带真实文件名:{text:?}"
+        );
+        assert!(app.outbox.is_empty(), "渲染帧本身不发消息");
+
+        // 确认(草稿预填 note.md,改写为别名):chip 文本换成别名
+        app.state.tabs.rename.as_mut().unwrap().draft = "我的笔记".to_owned();
+        app.state.apply(Message::TabRenameConfirmed);
+        let text = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            text.iter().any(|t| t == "我的笔记"),
+            "别名上了标签条 chip:{text:?}"
+        );
+        assert!(
+            !text.iter().any(|t| t.contains("LaterMD — 我的笔记")),
+            "窗口标题不跟随别名(仍显示落盘身份):{text:?}"
+        );
     }
 
     /// 快捷键捕获:设置页点「改键」后,本帧按键成为新键位并落 keymap;

@@ -63,10 +63,27 @@ pub struct DraftRecovery {
     pub mtime: Option<std::time::SystemTime>,
 }
 
+/// 标签重命名(#37 右键菜单「重命名」,显示别名语义)的输入状态:
+/// 目标按**稳定 id** 记 + 草稿文本(UI 原地改,与 `ImageDialogState` 同款)。
+///
+/// 目标存 id 而非索引的理由与 `confirm_close` 相同:浮窗是非阻塞 Window,
+/// 打开期间其他关闭入口会使索引漂移。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabRename {
+    /// 正在改名的标签稳定 id。
+    pub tab_id: u64,
+    /// 输入草稿;开框时预填该标签当前显示基础名(不带 dirty 星)。
+    pub draft: String,
+}
+
 /// 单个标签的全部文档状态。
 pub struct TabState {
     /// 稳定 id:编辑器 widget id 与测试定位都用它,不随标签增删变化。
     pub id: u64,
+    /// 标签显示别名(#37「重命名」,**纯显示层**):`Some` = 标签条显示它
+    /// 而非文件名。恒为 trim 后非空(归约 `confirm_tab_rename` 保证);
+    /// `None` = 显示文件名/「未命名」。不动 path/缓冲/dirty/保存目标。
+    pub alias: Option<String>,
     /// 落盘身份 + dirty 镜像 + 提示行。
     pub document: DocumentState,
     /// 待恢复的孤儿 draft(#18 恢复条);`None` = 无待裁决草稿。
@@ -101,6 +118,7 @@ impl TabState {
         let editor = EditorBuffer::new(text);
         Self {
             id,
+            alias: None,
             document: DocumentState {
                 path,
                 dirty: false,
@@ -138,6 +156,25 @@ impl TabState {
             ..TabAutosave::default()
         };
     }
+
+    /// 标签显示基础名(**不带** dirty 星):别名优先,否则文件名/「未命名」。
+    /// 重命名浮窗的预填草稿取它(带星的名字回填进输入框会混入非用户输入)。
+    pub fn label_base(&self) -> String {
+        self.alias
+            .clone()
+            .unwrap_or_else(|| self.document.base_name())
+    }
+
+    /// 标签条显示名(#37 重命名):基础名 + dirty 星。别名是纯显示层,
+    /// 落盘身份的窗口标题仍走 [`DocumentState::window_title`],显示文件名。
+    pub fn display_name(&self) -> String {
+        let base = self.label_base();
+        if self.document.dirty {
+            format!("{base}*")
+        } else {
+            base
+        }
+    }
 }
 
 /// 批量关闭的类别(#37 标签条右键菜单):以**被右键的标签**为基准,
@@ -170,6 +207,9 @@ pub struct TabsState {
     /// 确认;用户取消即清空本队列(已关闭的不回滚)。存 id 而非索引,与
     /// `confirm_close` 同理由。
     pub pending_close: Vec<u64>,
+    /// 重命名浮窗(#37「重命名」)的输入状态;`Some` 时 UI 显示浮窗。
+    /// 同一时间至多一个(新请求顶掉旧浮窗)。
+    pub rename: Option<TabRename>,
     /// 下一个标签的 id(自增,不复用 —— 关了再开新标签,编辑器 undo/光标
     /// 状态必须是全新的)。
     next_id: u64,
@@ -191,6 +231,7 @@ impl TabsState {
             active: 0,
             confirm_close: None,
             pending_close: Vec::new(),
+            rename: None,
             next_id: 2,
         }
     }
@@ -280,8 +321,9 @@ impl TabsState {
 
     /// 移除标签(调用方保证脏确认已过)。关掉最后一个即换入新的空标签;
     /// 当前指针跟着修正(关的是当前或更靠前的标签时前移一位)。待确认
-    /// 关闭的正是被移除的标签时,确认一并撤下 —— 目标已没了,模态不再
-    /// 显示,迟到的确认消息变成 no-op 而不是关掉漂移到该索引的别的标签。
+    /// 关闭/待改名的正是被移除的标签时,对应状态一并撤下 —— 目标已没了,
+    /// 模态/浮窗不再显示,迟到的确认消息变成 no-op 而不是作用到漂移到该
+    /// 索引的别的标签。
     pub fn remove(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -290,6 +332,13 @@ impl TabsState {
         self.tabs.remove(index);
         if self.confirm_close == Some(removed) {
             self.confirm_close = None;
+        }
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab_id == removed)
+        {
+            self.rename = None;
         }
         if self.tabs.is_empty() {
             let id = self.next_id;
@@ -455,5 +504,54 @@ mod tests {
             );
         }
         assert_eq!(tabs.tabs.len(), 2, "不误伤现存标签");
+    }
+
+    /// 显示名(#37 重命名,别名语义):别名优先于文件名;dirty 星照旧追加;
+    /// 无别名回归文件名行为;label_base(浮窗预填源)永不带星。
+    #[test]
+    fn display_name_prefers_alias_and_appends_dirty_star() {
+        let mut tab = TabState::new(1, Some(PathBuf::from("/docs/note.md")), "正文");
+        assert_eq!(tab.label_base(), "note.md", "无别名显示文件名");
+        tab.alias = Some("我的笔记".to_owned());
+        assert_eq!(tab.label_base(), "我的笔记", "别名优先");
+        assert_eq!(tab.display_name(), "我的笔记");
+        tab.document.dirty = true;
+        assert_eq!(tab.display_name(), "我的笔记*", "dirty 星照旧追加");
+        tab.alias = None;
+        assert_eq!(tab.label_base(), "note.md", "清除别名回到文件名");
+        assert_eq!(tab.display_name(), "note.md*");
+        // 未命名标签也可起别名(起名对象是标签,不是文件)
+        let mut unnamed = TabState::new(2, None, "");
+        unnamed.alias = Some("草稿".to_owned());
+        assert_eq!(unnamed.display_name(), "草稿");
+    }
+
+    /// 重命名浮窗目标被移除:浮窗状态一并撤下(与 confirm_close 同款),
+    /// 迟到的确认消息无从指认,不会把别名设到漂移到该索引的别的标签。
+    #[test]
+    fn remove_cancels_pending_rename_of_closed_tab() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        let target = tabs.tabs[1].id;
+        tabs.rename = Some(TabRename {
+            tab_id: target,
+            draft: "新名字".to_owned(),
+        });
+        tabs.remove(1);
+        assert_eq!(tabs.rename, None, "浮窗随目标移除撤下");
+        // 幸存标签不背别名
+        assert_eq!(tabs.tabs[0].alias, None);
+        // 移除别的标签不撤浮窗
+        tabs.rename = Some(TabRename {
+            tab_id: tabs.tabs[0].id,
+            draft: "甲的新名".to_owned(),
+        });
+        let survivor = tabs.tabs[0].id;
+        tabs.open_tab(None, "丙");
+        tabs.remove(2);
+        assert!(
+            tabs.rename.is_some_and(|rename| rename.tab_id == survivor),
+            "关掉无关标签不动浮窗"
+        );
     }
 }

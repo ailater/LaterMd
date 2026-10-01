@@ -315,14 +315,19 @@ impl DocumentState {
     /// 未落盘文档的显示名;另存为对话框预填名见 [`file::UNTITLED_FILE_NAME`]。
     const UNTITLED: &str = "未命名";
 
-    /// 文件名显示(未落盘为「未命名」),dirty 追加 `*`。
-    pub fn display_name(&self) -> String {
-        let name = self
-            .path
+    /// 文件名显示基础名(未落盘为「未命名」),**不带** dirty 星。标签的
+    /// 别名显示(#37 `TabState::label_base`)与重命名浮窗预填复用它。
+    pub fn base_name(&self) -> String {
+        self.path
             .as_deref()
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| Self::UNTITLED.to_owned());
+            .unwrap_or_else(|| Self::UNTITLED.to_owned())
+    }
+
+    /// 文件名显示(未落盘为「未命名」),dirty 追加 `*`。
+    pub fn display_name(&self) -> String {
+        let name = self.base_name();
         if self.dirty {
             format!("{name}*")
         } else {
@@ -624,6 +629,18 @@ pub enum Message {
         kind: crate::tabs::BatchClose,
         index: usize,
     },
+    /// 右键菜单「重命名」(#37,**显示别名**语义):打开重命名浮窗,目标
+    /// 是 `index` 处**被右键的标签**(菜单弹出帧的索引快照,归约立即转
+    /// 稳定 id)。过期索引 no-op。别名只改标签条显示文本 —— 不改盘上
+    /// 文件名、不影响保存目标。
+    TabRenameRequested {
+        index: usize,
+    },
+    /// 重命名浮窗「确定」:草稿 trim 后非空才置别名;空名拒绝并提示
+    /// (浮窗保留)。目标标签已被关掉时 no-op。
+    TabRenameConfirmed,
+    /// 重命名浮窗「取消」。
+    TabRenameCancelled,
     /// 切到下一个标签(Ctrl/Cmd+Tab 循环)。
     TabNext,
     /// 恢复条「恢复」(#18):载荷为标签稳定 id。把盘上孤儿 draft 的内容
@@ -824,6 +841,9 @@ impl State {
             Message::TabBatchCloseRequested { kind, index } => {
                 self.request_batch_close(kind, index)
             }
+            Message::TabRenameRequested { index } => self.request_tab_rename(index),
+            Message::TabRenameConfirmed => self.confirm_tab_rename(),
+            Message::TabRenameCancelled => self.tabs.rename = None,
             Message::TabNext => {
                 let next = self.tabs.next_index();
                 self.switch_active(next);
@@ -2422,6 +2442,40 @@ impl State {
             self.tabs.pending_close.remove(0);
             self.remove_tab(index);
         }
+    }
+
+    /// 打开标签重命名浮窗(#37 右键菜单「重命名」,**显示别名**语义):
+    /// 目标索引立即换算成稳定 id(菜单弹出帧的快照,归约时标签可能已变),
+    /// 草稿预填该标签当前显示基础名(不带 dirty 星)。新请求顶掉旧浮窗
+    /// (同一时间至多一个重命名)。过期索引 no-op。
+    fn request_tab_rename(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.tabs.get(index) {
+            let tab_id = tab.id;
+            let draft = tab.label_base();
+            self.tabs.rename = Some(crate::tabs::TabRename { tab_id, draft });
+        }
+    }
+
+    /// 确认重命名(#37):草稿 trim 后非空 → 置该标签的显示别名;空 →
+    /// 拒绝并提示(浮窗与草稿保留,UI 的「确定」按钮在空草稿时本就禁用,
+    /// 这里兜住绕过 UI 直发的消息)。别名是纯显示层,成功与否都**不动**
+    /// path/缓冲/dirty/保存目标。目标标签已被关掉(`TabsState::remove`
+    /// 已撤下浮窗,这里是防御)时 no-op。
+    fn confirm_tab_rename(&mut self) {
+        let Some(rename) = self.tabs.rename.take() else {
+            return;
+        };
+        let Some(index) = self.tabs.index_by_id(rename.tab_id) else {
+            return;
+        };
+        let name = rename.draft.trim();
+        if name.is_empty() {
+            self.tabs.rename = Some(rename);
+            self.tabs.tabs[index].document.notice =
+                Some("标签名不能为空;不改请点「取消」".to_owned());
+            return;
+        }
+        self.tabs.tabs[index].alias = Some(name.to_owned());
     }
 
     /// 去抖到点发起搜索(`Message::SearchRequested` 的归约)。无根目录
@@ -5107,6 +5161,184 @@ mod tests {
             "迟到 chunk 不得写入幸存标签"
         );
         assert_eq!(state.ai_active_tab, None);
+    }
+
+    /// 标签重命名(#37,**显示别名**语义)成功路径:右键非活动标签 → 浮窗
+    /// 预填其当前显示基础名 → 改草稿(UI 原地改的等价直写)→ 确认置别名,
+    /// 该标签显示名变为别名;**作用范围是纯显示层** —— path/缓冲/dirty
+    /// 逐一不变,别的标签不受影响。
+    #[test]
+    fn tab_rename_sets_alias_display_only() {
+        let mut state = State::default();
+        state.spawn_tab(Some(PathBuf::from("/docs/note.md")), "笔记正文");
+        state.apply(Message::TabActivate(0)); // active = 默认标签,右键目标是 note(非活动)
+        let (path_before, text_before, dirty_before) = (
+            state.tabs.tabs[1].document.path.clone(),
+            state.tabs.tabs[1].editor.text().to_owned(),
+            state.tabs.tabs[1].editor.is_dirty(),
+        );
+
+        state.apply(Message::TabRenameRequested { index: 1 });
+        let target_id = state.tabs.tabs[1].id;
+        let rename = state.tabs.rename.as_ref().unwrap();
+        assert_eq!(rename.tab_id, target_id, "目标按稳定 id 记(非活动标签)");
+        assert_eq!(rename.draft, "note.md", "预填显示基础名(不带 dirty 星)");
+
+        state.tabs.rename.as_mut().unwrap().draft = "  我的笔记  ".to_owned();
+        state.apply(Message::TabRenameConfirmed);
+        assert_eq!(state.tabs.tabs[1].alias.as_deref(), Some("我的笔记"));
+        assert_eq!(state.tabs.rename, None, "确认后浮窗撤下");
+        assert_eq!(state.tabs.tabs[1].display_name(), "我的笔记", "显示名=别名");
+        // 作用范围:纯显示层,三个不变式逐一核对
+        assert_eq!(state.tabs.tabs[1].document.path, path_before);
+        assert_eq!(state.tabs.tabs[1].editor.text(), text_before);
+        assert_eq!(state.tabs.tabs[1].editor.is_dirty(), dirty_before);
+        assert_eq!(state.tabs.tabs[0].alias, None, "别的标签不受影响");
+
+        // 落盘标签的预填:别名优先于文件名
+        state.apply(Message::TabRenameRequested { index: 0 });
+        assert_eq!(
+            state.tabs.rename.as_ref().unwrap().draft,
+            state.tabs.tabs[0].document.base_name(),
+            "无别名时预填文件名"
+        );
+        state.apply(Message::TabRenameCancelled);
+        assert_eq!(state.tabs.rename, None, "取消撤下浮窗");
+        assert_eq!(state.tabs.tabs[0].alias, None, "取消不置别名");
+    }
+
+    /// 重命名空白拒绝(#37 别名):草稿 trim 后为空 → 不置别名、浮窗与草稿
+    /// 保留(UI 的「确定」在空草稿时已禁用,这里兜直发消息),提示行说明;
+    /// path/缓冲/dirty 同样分毫不动。
+    #[test]
+    fn tab_rename_rejects_blank_name() {
+        let mut state = State::default();
+        let index = state.spawn_tab(Some(PathBuf::from("/docs/note.md")), "正文");
+        let (path_before, text_before, dirty_before) = (
+            state.tabs.tabs[index].document.path.clone(),
+            state.tabs.tabs[index].editor.text().to_owned(),
+            state.tabs.tabs[index].editor.is_dirty(),
+        );
+
+        state.apply(Message::TabRenameRequested { index });
+        state.tabs.rename.as_mut().unwrap().draft = "   ".to_owned();
+        state.apply(Message::TabRenameConfirmed);
+        assert_eq!(state.tabs.tabs[index].alias, None, "空名不置别名");
+        let rename = state.tabs.rename.as_ref().expect("浮窗保留");
+        assert_eq!(rename.draft, "   ", "草稿原样保留");
+        let notice = state.tabs.tabs[index].document.notice.as_deref().unwrap();
+        assert!(notice.contains("不能为空"), "提示说明原因:{notice}");
+        assert_eq!(state.tabs.tabs[index].document.path, path_before);
+        assert_eq!(state.tabs.tabs[index].editor.text(), text_before);
+        assert_eq!(state.tabs.tabs[index].editor.is_dirty(), dirty_before);
+
+        // 补上合法名再确认:一次拒绝不废整个流程
+        state.tabs.rename.as_mut().unwrap().draft = "新名".to_owned();
+        state.apply(Message::TabRenameConfirmed);
+        assert_eq!(state.tabs.tabs[index].alias.as_deref(), Some("新名"));
+    }
+
+    /// 重命名作用范围(#37 别名):别名盖住显示后,**保存目标不变** ——
+    /// Ctrl+S 仍写原路径、盘上文件名不变、目录里不出现以别名命名的文件;
+    /// 另存为对话框的预填名也不跟别名走(仍取文件名)。
+    #[test]
+    fn tab_rename_alias_keeps_save_target_and_disk_untouched() {
+        let dir = temp_path("rename-alias");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "盘上内容\n").unwrap();
+
+        let mut state = State::default();
+        state.open_path(&note);
+        state.apply(Message::TabRenameRequested {
+            index: state.tabs.active,
+        });
+        state.tabs.rename.as_mut().unwrap().draft = "我的笔记".to_owned();
+        state.apply(Message::TabRenameConfirmed);
+        assert_eq!(
+            state.tabs.current().display_name(),
+            "我的笔记",
+            "前置:别名生效"
+        );
+
+        // 编辑后保存:写盘目标必须是原路径(别名不是文件名)
+        state.tabs.current_mut().editor.insert_chars(0, "新内容 ");
+        state.apply(Message::FileCommand(FileCmd::Save));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "新内容 盘上内容\n");
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(note.as_path()),
+            "保存不改落盘身份"
+        );
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["note.md".to_owned()],
+            "目录里只有原文件,别名不落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重命名目标失效(#37 别名):浮窗开着时目标被其他入口关掉 → 浮窗随
+    /// 移除撤下,迟到的确认是 no-op;过期索引的请求也是 no-op。
+    #[test]
+    fn tab_rename_target_closed_or_stale_index_is_noop() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙");
+        state.apply(Message::TabRenameRequested { index: 1 });
+        let target_id = state.tabs.tabs[1].id;
+        assert_eq!(state.tabs.rename.as_ref().unwrap().tab_id, target_id);
+
+        // 浮窗非阻塞:用户顺手关掉目标(干净标签直关)
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.rename, None, "浮窗随目标移除撤下");
+        let survivors: Vec<Option<String>> = state
+            .tabs
+            .tabs
+            .iter()
+            .map(|tab| tab.alias.clone())
+            .collect();
+        state.apply(Message::TabRenameConfirmed);
+        assert_eq!(
+            state
+                .tabs
+                .tabs
+                .iter()
+                .map(|tab| tab.alias.clone())
+                .collect::<Vec<_>>(),
+            survivors,
+            "迟到确认不给任何标签置别名"
+        );
+
+        // 过期索引(菜单弹出帧到点击之间标签被关):no-op
+        state.apply(Message::TabRenameRequested { index: 99 });
+        assert_eq!(state.tabs.rename, None);
+    }
+
+    /// 重名别名不冲突(#37 别名 vs 文件改名):别名是纯显示文本,两个标签
+    /// 允许同名别名(文件改名的「同名已存在即拒绝」在别名语义下不存在),
+    /// 各自的落盘身份与缓冲互不牵连。
+    #[test]
+    fn tab_rename_duplicate_alias_is_allowed() {
+        let mut state = State::default();
+        let a = state.spawn_tab(Some(PathBuf::from("/docs/a.md")), "甲正文");
+        let b = state.spawn_tab(Some(PathBuf::from("/docs/b.md")), "乙正文");
+        for index in [a, b] {
+            state.apply(Message::TabRenameRequested { index });
+            state.tabs.rename.as_mut().unwrap().draft = "同名笔记".to_owned();
+            state.apply(Message::TabRenameConfirmed);
+        }
+        assert_eq!(state.tabs.tabs[a].alias.as_deref(), Some("同名笔记"));
+        assert_eq!(state.tabs.tabs[b].alias.as_deref(), Some("同名笔记"));
+        assert_eq!(
+            state.tabs.tabs[b].document.path,
+            Some(PathBuf::from("/docs/b.md")),
+            "各自的落盘身份不受同名别名影响"
+        );
+        assert_eq!(state.tabs.tabs[b].editor.text(), "乙正文");
     }
 
     /// 回归(独立评审 medium):另存为的目标已在**另一**标签打开时,拒绝

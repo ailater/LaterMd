@@ -6,12 +6,13 @@
 //!
 //! 交互:点击名字区 = 激活;点击 × = 请求关闭(脏标签由归约侧弹确认模态,
 //! 见 `State::request_close_tab`);右键 = 批量操作菜单(#37:关闭左侧/
-//! 右侧/全部/其他,以**被右键的标签**为基准;重命名与标题宽度模式由后续
+//! 右侧/全部/其他,以**被右键的标签**为基准;「重命名」是**显示别名**——
+//! 只改本条 chip 的显示文本,不改盘上文件名与保存路径;标题宽度模式由后续
 //! 模块交付,先入骨架禁用)。chip 自绘(与工具栏图标按钮同一套手法),
 //! 选中态用填充底色 —— 与侧边栏页签的下划线区分层级。
 
 use crate::state::Message;
-use crate::tabs::TabsState;
+use crate::tabs::{TabRename, TabsState};
 use crate::ui::tokens::{RADIUS_SM, SPACE_SM, SPACE_XS};
 use eframe::egui::{self, Align2, Sense};
 
@@ -58,7 +59,7 @@ pub(crate) struct TabMenuItems {
     pub full_title: egui::Response,
 }
 
-/// 后续模块交付的条目统一禁用文案(#37 菜单骨架)。
+/// 后续模块交付的条目统一禁用文案(#37 菜单骨架,现仅剩标题宽度两项)。
 const PENDING_HINT: &str = "后续版本交付";
 
 /// 单条菜单项:可用性由调用方判定(无目标即禁用),禁用态给悬停说明。
@@ -74,8 +75,8 @@ fn menu_item(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
 /// 右键标签的批量操作菜单(#37)。目标是**被右键的标签本身**(`index`,
 /// 菜单弹出帧的快照),不是当前活动标签;关闭左侧/右侧/其他都以它为
 /// 基准并保留它。无目标可关时(最左标签的「关闭左侧」等)禁用对应条目,
-/// 归约侧对空队列防御性 no-op。重命名/缩短标题/完整标题由后续模块交付,
-/// 本模块先入骨架(禁用)。
+/// 归约侧对空队列防御性 no-op。「重命名」(显示别名)对任何标签可用——
+/// 含未命名标签;缩短标题/完整标题由后续模块交付,先入骨架(禁用)。
 fn context_menu_items(
     ui: &mut egui::Ui,
     tabs: &TabsState,
@@ -111,7 +112,10 @@ fn context_menu_items(
         });
     }
     ui.separator();
-    let rename = menu_item(ui, "重命名", false);
+    let rename = menu_item(ui, "重命名", true);
+    if rename.clicked() {
+        outbox.push(Message::TabRenameRequested { index });
+    }
     ui.separator();
     let short_title = menu_item(ui, "缩短标题", false);
     let full_title = menu_item(ui, "完整标题", false);
@@ -130,7 +134,7 @@ fn context_menu_items(
 fn chip(ui: &mut egui::Ui, tabs: &TabsState, index: usize, outbox: &mut Vec<Message>) {
     let tab = &tabs.tabs[index];
     let selected = index == tabs.active;
-    let name = tab.document.display_name();
+    let name = tab.display_name();
     let text_color = if selected {
         ui.visuals().text_color()
     } else {
@@ -222,6 +226,45 @@ fn chip(ui: &mut egui::Ui, tabs: &TabsState, index: usize, outbox: &mut Vec<Mess
     response.clone().context_menu(|ui| {
         context_menu_items(ui, tabs, index, outbox);
     });
+}
+
+/// 重命名浮窗(#37「重命名」,**显示别名**语义):单行输入 + 确定/取消。
+/// 草稿由 UI 原地改(`TabRename.draft`,与 `ImageDialogState` 同款);草稿
+/// trim 后为空时「确定」禁用(归约侧对绕过 UI 的消息仍防御性拒绝)。
+///
+/// `file_label` 是目标标签的落盘身份(文件名或「尚未保存」),原样展示在
+/// 浮窗里 —— 既明示本操作**不改盘上文件**的作用范围,也让别名盖住 chip
+/// 后用户仍有地方看见真实文件名。返回(确定, 取消)响应供测试定位
+/// (与 `image_dialog::dialog` 同款手法)。
+pub(crate) fn rename_dialog(
+    ui: &mut egui::Ui,
+    rename: &mut TabRename,
+    file_label: &str,
+) -> (egui::Response, egui::Response) {
+    let mut buttons = None;
+    egui::Window::new("重命名标签")
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ui.ctx().viewport_rect().center())
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label("标签显示名");
+            ui.text_edit_singleline(&mut rename.draft)
+                .on_hover_text("只改此标签的显示名;文件名与保存路径不变");
+            ui.add_space(crate::ui::tokens::SPACE_XS);
+            ui.weak(format!("文件:{file_label}(重命名不改动它)"));
+            ui.add_space(crate::ui::tokens::SPACE_SM);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let ready = !rename.draft.trim().is_empty();
+                let confirm = ui
+                    .add_enabled(ready, egui::Button::new("确定"))
+                    .on_disabled_hover_text("名称不能为空;不改请点「取消」");
+                let cancel = ui.button("取消");
+                buttons = Some((confirm, cancel));
+            });
+        });
+    buttons.expect("浮窗必然绘制确定/取消按钮")
 }
 
 #[cfg(test)]
@@ -480,32 +523,31 @@ mod tests {
         assert_items(&tabs, 2, [true, false, true, true]);
     }
 
-    /// 菜单骨架(#37):重命名与缩短/完整标题由后续模块交付,本模块渲染
-    /// 出来但一律禁用(点击不发消息)。
+    /// 菜单骨架(#37):「重命名」已交付(显示别名)—— 恒可用,点击发
+    /// `TabRenameRequested` 且携带**被右键标签**的索引;缩短/完整标题仍由
+    /// 后续模块交付,渲染出来但禁用(点击不发消息)。
     #[test]
-    fn context_menu_skeleton_items_are_disabled() {
+    fn context_menu_rename_clicks_request_with_right_clicked_index() {
         let ctx = egui::Context::default();
-        let tabs = TabsState::new("甲");
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        tabs.activate(1); // active = 乙,右键目标是甲(索引 0,非活动)
         let mut outbox = Vec::new();
-        let rects = Cell::new(Vec::<Rect>::new());
+        let rename_rect = Cell::new(Rect::NOTHING);
+        let pending_rects = Cell::new(Vec::<Rect>::new());
         ctx.run_ui(RawInput::default(), |ui| {
             let items = context_menu_items(ui, &tabs, 0, &mut outbox);
-            assert!(!items.rename.enabled());
-            assert!(!items.short_title.enabled());
-            assert!(!items.full_title.enabled());
-            rects.set(
-                [
-                    items.rename.rect,
-                    items.short_title.rect,
-                    items.full_title.rect,
-                ]
-                .to_vec(),
-            );
+            assert!(items.rename.enabled(), "重命名对任何标签可用");
+            assert!(!items.short_title.enabled(), "缩短标题未交付,禁用");
+            assert!(!items.full_title.enabled(), "完整标题未交付,禁用");
+            rename_rect.set(items.rename.rect);
+            pending_rects.set(vec![items.short_title.rect, items.full_title.rect]);
         })
         .drop_without_applying_deltas();
-        assert!(outbox.is_empty());
+        assert!(outbox.is_empty(), "仅渲染不发消息");
 
-        for rect in rects.take() {
+        // 缩短/完整标题:禁用,点击零消息
+        for rect in pending_rects.take() {
             let center = rect.center();
             let click = |pressed| Event::PointerButton {
                 pos: center,
@@ -525,6 +567,67 @@ mod tests {
             .drop_without_applying_deltas();
         }
         assert!(outbox.is_empty(), "骨架项禁用,点击零消息");
+
+        // 「重命名」点击 → TabRenameRequested { index: 被右键的 0 }
+        let center = rename_rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                context_menu_items(ui, &tabs, 0, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::TabRenameRequested { index: 0 }],
+            "重命名点击携带被右键标签的索引"
+        );
+    }
+
+    /// 重命名浮窗(#37):空/纯空白草稿禁用「确定」(禁用态有说明),非空
+    /// 启用;「取消」恒可点。渲染不 panic。
+    #[test]
+    fn rename_dialog_blank_draft_disables_confirm() {
+        let ctx = egui::Context::default();
+        for draft in ["", "   \t"] {
+            let mut rename = TabRename {
+                tab_id: 7,
+                draft: draft.to_owned(),
+            };
+            let mut seen = None;
+            for _ in 0..3 {
+                let output = ctx.run_ui(RawInput::default(), |ui| {
+                    let (confirm, cancel) = rename_dialog(ui, &mut rename, "a.md");
+                    seen = Some((confirm.enabled(), cancel.enabled()));
+                });
+                output.drop_without_applying_deltas();
+            }
+            let (confirm_enabled, cancel_enabled) = seen.expect("至少跑了一帧");
+            assert!(!confirm_enabled, "空白草稿 {draft:?} 禁用确定");
+            assert!(cancel_enabled, "取消恒可点");
+        }
+        let mut rename = TabRename {
+            tab_id: 7,
+            draft: "  笔记  ".to_owned(),
+        };
+        let mut confirm_enabled = false;
+        for _ in 0..3 {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                let (confirm, _) = rename_dialog(ui, &mut rename, "a.md");
+                confirm_enabled = confirm.enabled();
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(confirm_enabled, "trim 后非空即可确定");
     }
 
     /// 右键标签弹菜单(#37 装配):secondary 点击**标签条上**的标签(chip
