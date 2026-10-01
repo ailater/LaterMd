@@ -205,6 +205,13 @@ pub struct FindBarState {
     pub replacement: String,
     pub hits: Vec<Range<usize>>,
     pub hit: Option<usize>,
+    /// 命中缓存的**新鲜度见证**:`find_rescan` 扫描那一刻当前标签的
+    /// (tab id, revision)。`EditorBuffer` 的全部内容写路径(键入/undo/
+    /// redo/`replace_all`/外部重载)都推修订号,故「同标签同 rev ⇒ 文本
+    /// 未变」;替换入口据此判缓存过期,过期先重扫(见
+    /// [`State::refresh_stale_find_hits`])。crate 内可见只因 UI 无头
+    /// 测试要用 struct 字面量构造本结构,外部无消费者。
+    pub(crate) scanned_for: Option<(u64, u64)>,
 }
 
 pub struct State {
@@ -1263,6 +1270,10 @@ impl State {
     /// 重扫命中:大小写不敏感的子串全量扫描,命中是**字符区间**
     /// (`pending_selection` 的契约单位)。query 为空只清结果。
     fn find_rescan(&mut self) {
+        // 本函数是命中缓存的唯一生产者,扫前先记新鲜度见证 —— 空结果的
+        // 缓存同样「对当前文本新鲜」。替换入口据此判过期。
+        let tab = self.tabs.current();
+        self.find.scanned_for = Some((tab.id, tab.editor.revision()));
         let query = self.find.query.clone();
         self.find.hits.clear();
         self.find.hit = None;
@@ -1342,12 +1353,53 @@ impl State {
         self.find.replace_open = open;
     }
 
+    /// 替换前刷新过期的命中缓存(#17 评审修复):`hits`/`hit` 只在查找词
+    /// 变化与切/关标签时重扫,同标签文本被格式化(`apply_format` 整篇
+    /// 改写)、undo/redo 或外部重载改写后**不重扫** —— 旧字符偏移在新文本
+    /// 上可能仍界内但已错位,`replace_all_in_doc` 的越界防线只挡 `end`
+    /// 超长,挡不住界内漂移,替换词会写进错误位置(查找侧同款过期只让
+    /// 光标跳错,替换把它升级成破坏性写入)。
+    ///
+    /// 按 `scanned_for` 见证判过期(`EditorBuffer` 全部写路径都推 rev,
+    /// 「同标签同 rev ⇒ 文本未变」),新鲜则零扰动返回。过期先重扫;
+    /// `find_rescan` 会把定位重置回首命中,先记下当前命中的字符锚点,
+    /// 扫完按「start ≥ 锚点」找回原定位 —— 找不到(该命中已被改写消失)
+    /// 顺取首条,写入位置永远是当前文本上的真实命中。重扫附带的
+    /// `pending_selection` 定位副作用存还,替换后的选区行为不变。
+    fn refresh_stale_find_hits(&mut self) {
+        let tab = self.tabs.current();
+        let scanned_for = (tab.id, tab.editor.revision());
+        if self.find.scanned_for == Some(scanned_for) {
+            return;
+        }
+        let anchor = self
+            .find
+            .hit
+            .and_then(|index| self.find.hits.get(index))
+            .map(|range| range.start);
+        let selection = self.tabs.current().pending_selection;
+        self.find_rescan();
+        self.tabs.current_mut().pending_selection = selection;
+        if let Some(anchor) = anchor {
+            if !self.find.hits.is_empty() {
+                self.find.hit = Some(
+                    self.find
+                        .hits
+                        .iter()
+                        .position(|hit| hit.start >= anchor)
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+
     /// 单个替换(#17):把当前命中替换为替换词,经 [`EditorBuffer::replace_range`]
     /// 定点写入缓冲(dirty / rev 由 `touch` 维护,预览快照随 rev 联动);
     /// 随后重扫并把定位推到**替换文本之后**的第一个命中 —— 锚点取替换词
     /// 末尾而非命中起点,替换词自身含查找词(needle → needleX)时刚写入
     /// 的命中不会被再次选中;之后无命中则环绕回首,全空则清定位。
     fn replace_current(&mut self) {
+        self.refresh_stale_find_hits();
         let Some(index) = self.find.hit else { return };
         let Some(range) = self.find.hits.get(index).cloned() else {
             return;
@@ -1384,6 +1436,9 @@ impl State {
     /// 落,与 AI 流式追加同语义;无头实证见 `ui::editor` 的 replace_all
     /// undo 测试),绝无逐命中循环写入。
     fn replace_all_in_doc(&mut self) {
+        // 缓存可能对着被格式化/撤销/重载改写前的文本,先刷新再消费 ——
+        // 旧偏移错位时下面的越界防线挡不住界内漂移
+        self.refresh_stale_find_hits();
         if self.find.hits.is_empty() {
             return;
         }
@@ -6004,6 +6059,84 @@ mod tests {
         );
         assert_eq!(state.find.hits.len(), 0, "重扫按新文本与真 query 走");
         assert_eq!(state.find.hit, None);
+    }
+
+    /// 格式动作改写同标签文本后的缓存过期(#17 评审修复):查找条开着有
+    /// 命中 → 对命中之前的内容应用格式(`apply_format` 整篇 replace_all,
+    /// 推 rev 不重扫)→ 点「全部」—— 旧偏移在新文本上**仍界内但错位**,
+    /// 越界防线只挡 end 超长挡不住界内漂移。入口按 `scanned_for` 见证
+    /// 判过期先重扫,替换词落在当前文本的真实命中上。
+    #[test]
+    fn replace_all_refreshes_stale_hits_after_format_rewrites_text() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("plain needle x");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        assert_eq!(state.find.hits.len(), 1);
+        state.find.replacement = "pin".to_owned();
+
+        // 选中 plain 加粗:文本变长 4 字符,needle 后移 —— 旧命中区间
+        // 6..12 在新文本上界内但指向 "**eedl" 附近,正是防线挡不住的漂移
+        state.tabs.current_mut().selection = Some((0, 5));
+        state.apply(Message::FormatRequested(crate::compose::FormatAction::Bold));
+        assert_eq!(state.tabs.current().editor.text(), "**plain** needle x");
+
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "**plain** pin x",
+            "替换按重扫后的新命中走,不按旧偏移错位写入"
+        );
+    }
+
+    /// 整篇缓冲被改写(undo/外部重载/恢复条都落 `EditorBuffer` 的整篇
+    /// replace_all,`load` 内部同款)后的双入口过期重扫:「替换当前」按
+    /// 旧命中的字符锚点找回定位(文本在命中前变长时锚点精确命中),不再
+    /// 依赖过期索引;「全部」按新命中全量走。
+    #[test]
+    fn replace_refreshes_stale_hits_after_whole_buffer_rewrite() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("aa needle bb needle");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        state.apply(Message::FindNext { backwards: false });
+        assert_eq!(state.find.hit, Some(1), "定位推进到第二个命中");
+        state.find.replacement = "pin".to_owned();
+
+        // 命中之前加一个字符:第二个 needle 后移到 14,旧定位区间 13..19
+        // 在新文本上界内但错位(会切进 " needl")
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("aaa needle bb needle");
+        state.apply(Message::ReplaceCurrent);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "aaa needle bb pin",
+            "锚点找回定位,替换词落在真实命中上"
+        );
+
+        // 再整篇改写后点「全部」:同样先重扫再消费
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("xx needle yy needle zz");
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "xx pin yy pin zz",
+            "全部替换按重扫后的新命中走"
+        );
     }
 
     /// 全部替换后的状态维护(#17 M2):替换词不含查找词 → 计数清零、定位

@@ -1427,6 +1427,7 @@ mod tests {
             replacement: "pin".to_owned(),
             hits: vec![std::ops::Range { start: 0, end: 6 }],
             hit: Some(0),
+            ..Default::default()
         };
         let mut outbox = Vec::new();
         let mut rects = (Rect::NOTHING, Rect::NOTHING);
@@ -1483,6 +1484,7 @@ mod tests {
             replacement: "pin".to_owned(),
             hits: Vec::new(),
             hit: None,
+            ..Default::default()
         };
         let mut outbox = Vec::new();
         for _ in 0..3 {
