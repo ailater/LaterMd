@@ -344,8 +344,10 @@ impl LaterMdApp {
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
             .show(ui, |ui| {
-                // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作
-                crate::ui::tabs::ui(ui, &state.tabs, outbox);
+                // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作。
+                // 标题宽度模式(#37)来自持久化偏好,缩短模式按可用空间收窄
+                // chip、完整模式按完整标题测宽(溢出走既有单行滚动)。
+                crate::ui::tabs::ui(ui, &state.tabs, state.theme.tab_title_width, outbox);
                 // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
                 // decisions-pending #32)
                 notice_bar(ui, &state.tabs.current().document, outbox);

@@ -641,6 +641,10 @@ pub enum Message {
     TabRenameConfirmed,
     /// 重命名浮窗「取消」。
     TabRenameCancelled,
+    /// 切换标签条标题宽度模式(#37 右键菜单「缩短标题/完整标题」):
+    /// 整条标签条统一生效。只改显示偏好并落盘 settings.json —— 不动
+    /// 任何标签的路径/缓冲/dirty/别名,更不触碰盘上文件。
+    TabTitleWidthChanged(crate::theme::TitleWidthMode),
     /// 切到下一个标签(Ctrl/Cmd+Tab 循环)。
     TabNext,
     /// 恢复条「恢复」(#18):载荷为标签稳定 id。把盘上孤儿 draft 的内容
@@ -844,6 +848,12 @@ impl State {
             Message::TabRenameRequested { index } => self.request_tab_rename(index),
             Message::TabRenameConfirmed => self.confirm_tab_rename(),
             Message::TabRenameCancelled => self.tabs.rename = None,
+            Message::TabTitleWidthChanged(mode) => {
+                // 纯显示偏好:只动 theme 字段并落盘(与切密度同款),任何
+                // 标签的路径/缓冲/dirty/别名一概不碰
+                self.theme.tab_title_width = mode;
+                self.persist_theme();
+            }
             Message::TabNext => {
                 let next = self.tabs.next_index();
                 self.switch_active(next);
@@ -5339,6 +5349,103 @@ mod tests {
             "各自的落盘身份不受同名别名影响"
         );
         assert_eq!(state.tabs.tabs[b].editor.text(), "乙正文");
+    }
+
+    /// 标题宽度模式切换(#37):偏好落 settings.json 且重启(重新 load)后
+    /// 保持;切换前后每个标签的路径/缓冲/dirty/别名逐项不变 —— 纯显示层,
+    /// 不碰任何文档状态,更不触碰盘上文件(目录里只有 settings.json)。
+    #[test]
+    fn tab_title_width_switch_persists_without_touching_tabs() {
+        let dir = temp_path("title-width-state");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        let a = state.spawn_tab(Some(PathBuf::from("/docs/甲.md")), "甲正文");
+        state.tabs.tabs[a].document.dirty = true;
+        state.tabs.tabs[a].alias = Some("甲的别名".to_owned());
+        let _b = state.spawn_tab(None, "未落盘草稿");
+        let before: Vec<(Option<PathBuf>, String, bool, Option<String>)> = state
+            .tabs
+            .tabs
+            .iter()
+            .map(|tab| {
+                (
+                    tab.document.path.clone(),
+                    tab.editor.text().to_owned(),
+                    tab.document.dirty,
+                    tab.alias.clone(),
+                )
+            })
+            .collect();
+        let ids_before: Vec<u64> = state.tabs.tabs.iter().map(|tab| tab.id).collect();
+
+        state.apply(Message::TabTitleWidthChanged(
+            crate::theme::TitleWidthMode::Short,
+        ));
+        assert_eq!(
+            state.theme.tab_title_width,
+            crate::theme::TitleWidthMode::Short
+        );
+        state.apply(Message::TabTitleWidthChanged(
+            crate::theme::TitleWidthMode::Full,
+        ));
+        assert_eq!(
+            state.theme.tab_title_width,
+            crate::theme::TitleWidthMode::Full
+        );
+
+        let after: Vec<(Option<PathBuf>, String, bool, Option<String>)> = state
+            .tabs
+            .tabs
+            .iter()
+            .map(|tab| {
+                (
+                    tab.document.path.clone(),
+                    tab.editor.text().to_owned(),
+                    tab.document.dirty,
+                    tab.alias.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(after, before, "切换不动路径/缓冲/dirty/别名");
+        assert_eq!(
+            state.tabs.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            ids_before,
+            "标签 id 不变"
+        );
+        assert!(
+            state.tabs.tabs[a].document.notice.is_none(),
+            "落盘成功不落提示"
+        );
+
+        // 持久化:settings.json 里落了最后一次切换的值,重新 load 拿回 Short
+        state.apply(Message::TabTitleWidthChanged(
+            crate::theme::TitleWidthMode::Short,
+        ));
+        let json = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            json.contains(r#""tab_title_width": "short""#),
+            "settings.json 落了缩短模式:{json}"
+        );
+        assert_eq!(
+            crate::theme::ThemeSettings::load_from(&dir)
+                .unwrap()
+                .tab_title_width,
+            crate::theme::TitleWidthMode::Short,
+            "重启后保持用户选择"
+        );
+        let entries = std::fs::read_dir(&dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.file_name() == "settings.json"),
+            "切换不写任何文档文件,目录里只有 settings.json"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归(独立评审 medium):另存为的目标已在**另一**标签打开时,拒绝
