@@ -562,3 +562,11 @@
 - **取证(探测棒实读)**：块体复用所需的 `scrolling_code_galley` / `StreamingCodeCache` / `theme_identity_ptr` 在 vendor/egui_markdown/src/layout.rs 尾部(`pub(crate) use syntect_code::{scrolling_code_galley, theme_identity_ptr, StreamingCodeCache}`)均为 **`pub(crate)`,app 侧不可见**;公开的 `highlight_code` 只有裸 LayoutJob,无横向滚动包装与流式缓存。乙案要走通必须先做 vendor ①类改 pub——比直接消费既有挂载点还重。
 - **自动选择**：**零 vendor(与 #61① 同结论,独立取证)**——消费上游既有 `MarkdownLabel::code_block_buttons` 挂载点;源文本由 vendored 回调直接透传 `Token::CodeBlock.text`(与 ```ai 指令卡同法)。另记录任务口径出入:auto-plan #38 写「经 code_block_spans 偏移切 rendered」,但 ```ai 先例的实际机制是 vendored 回调透传文本(label.rs `block_code_widget(ui, text, …)`),不经偏移换算;按「以现状为准」取后者。
 - **如何改**：若将来确需乙案接管(如块体上方独立行),在 vendor ①类里把上述三件套提为 `pub`(上游可合的通用能力)并登记 vendor/README.md 变更表;落地口径见 #61。
+
+## #66 查找条 Esc 关闭在 egui 0.36 下是哑弹的修复口径(#17 M1,2026-10-01 自动选择)
+
+- **岔路**:#17 M1 规格「Esc 整条关闭沿用现状」,但无头实证发现已合入的查找浮层里 Esc 关闭**本来就是坏的**——egui 0.36 的 `Focus::begin_pass`(egui/src/memory/mod.rs:595-598)把裸 Esc 当「交出焦点」在帧首清焦,而 `find_bar_contents` 的 Esc 检测以 `response.has_focus()` 为前提,永不触发(探针:聚焦查找框发 Esc,outbox 空、`find_open` 保持 true、焦点被 egui 拿走;只有 ✕ 按钮真能关)。M1 红线「不得重做已合入查找浮层、发现缺陷如实交人工不顺手大改」与「Esc 关整条」规格在此冲突:沿用现状=交付一个哑弹键位。
+- **备选**:①只修替换行、查找框留缺陷——两框 Esc 行为不一致(替换框行、查找框不行),比统一坏更怪;②两框都修(各加一行 builder 参数);③都不修,Esc 全部交人工。
+- **自动选择**:②——给查找/替换两个输入框 TextEdit 都加 `egui::EventFilter{ escape: true, .. }`(TextEdit 出厂默认 arrows 锁框内、escape 不锁),egui 官方为「Esc 应作用于控件而非交焦」提供的出口(builder.rs:351 注释原文举的例子就是 completion popup)。改动是两行 builder 参数,查找行的结构/逻辑零变化,不构成「重做」;修复后无头回归 `find_row_escape_closes_the_bar` / `replace_row_escape_closes_the_bar` 钉住两框行为。
+- **理由**:tooltip 与验收口径(acceptance-checklist §9 语境)都承诺 Esc 关闭;规格字面「沿用现状」的意图是保持行为,不是保持缺陷;两框必须同口径,否则用户按 Esc 结果取决于焦点在哪个框。
+- **如何改**:若认为这越过了「不顺手大改」边界,revert `ui/layout.rs` 中 `FIND_BAR_EVENT_FILTER` 常量及两处 `.event_filter(...)` 调用即可(查找条回到哑弹 Esc、替换行 Esc 检测保留但同样不触发),两个 Esc 回归测试需同步删。
