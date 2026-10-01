@@ -167,6 +167,8 @@ impl Icon {
             }
             point(steps)
         };
+        // 极坐标取点(齿轮齿圈用;中心在原点,调用方自行平移)
+        let polar = |r: f32, a: f32| (r * a.cos(), r * a.sin());
 
         match self {
             Self::New => {
@@ -246,11 +248,24 @@ impl Icon {
                 seg((-0.28, 0.12), (0.28, 0.02));
             }
             Self::Settings => {
-                ring((0.0, 0.0), 0.16);
-                seg((0.0, -0.44), (0.0, -0.28));
-                seg((0.0, 0.28), (0.0, 0.44));
-                seg((-0.44, 0.0), (-0.28, 0.0));
-                seg((0.28, 0.0), (0.44, 0.0));
+                // 标准齿轮(2026-09-30 用户反馈:原「环形 + 四正向辐条」呈
+                // 十字星芒,不像齿轮):8 齿波浪外圈 + 中心孔。外圈半径随
+                // 角度按余弦在齿顶(0.44)/齿根(0.28)两档间起伏,4 齿正向、
+                // 4 齿斜向;平滑轮廓没有尖角,描边不会在拐点长出斜接凸块,
+                // 齿形在 ICON_SM 档也不糊成圆。中心孔 ring 与外圈间的空档
+                // 守住「齿轮」而非「圆盘/太阳」的辨识(Theme 太阳是细长
+                // 射线,与此区分)。
+                let (r_tip, r_root, r_hole) = (0.44, 0.28, 0.12);
+                let amp = (r_tip - r_root) / 2.0;
+                let steps = 12usize; // 每齿 12 段折线,段间转角小
+                let mut pts = Vec::with_capacity(8 * steps + 1);
+                for i in 0..8 * steps {
+                    let a = i as f32 * std::f32::consts::TAU / (8.0 * steps as f32);
+                    pts.push(polar(r_root + amp * (1.0 + (8.0 * a).cos()), a));
+                }
+                pts.push(pts[0]);
+                path(&pts);
+                ring((0.0, 0.0), r_hole);
             }
             Self::Reset => {
                 // 3/4 圆弧 + 末端箭头:260° → -40°(顺时针收口)
@@ -690,6 +705,167 @@ mod tests {
                     );
                     output.drop_without_applying_deltas();
                 }
+            }
+        }
+    }
+
+    /// 点是否落在三角形内(含边界)。零面积三角形直接判外,避免退化
+    /// 三角形把整条直线上的点都算成「覆盖」。行列式手写(Vec2 无 cross)。
+    fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+        let det = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
+        if det(b - a, c - a).abs() < 1e-9 {
+            return false;
+        }
+        let d = |u: Pos2, v: Pos2| det(v - u, p - u);
+        let (d1, d2, d3) = (d(a, b), d(b, c), d(c, a));
+        (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0) || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0)
+    }
+
+    /// 无头像素取样(#41):把一帧 shapes 曲面细分(feathering 关掉,三角
+    /// 形即硬边、不依赖 GPU),对采样点做三角形覆盖测试 —— 等价于把图标
+    /// 画在纯色画布上读该点像素。返回覆盖该点的颜色,None = 露背景。
+    fn covered_color(primitives: &[egui::ClippedPrimitive], p: Pos2) -> Option<Color32> {
+        for cp in primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &cp.primitive else {
+                continue;
+            };
+            for tri in mesh.indices.as_chunks::<3>().0 {
+                let v = |i: u32| mesh.vertices[i as usize].pos;
+                let (a, b, c) = (v(tri[0]), v(tri[1]), v(tri[2]));
+                if point_in_tri(p, a, b, c) {
+                    return Some(mesh.vertices[tri[0] as usize].color);
+                }
+            }
+        }
+        None
+    }
+
+    /// 两色的通道距离和(0 = 同色)。
+    fn color_dist(a: Color32, b: Color32) -> i32 {
+        let ch = |x: u8, y: u8| (i32::from(x) - i32::from(y)).abs();
+        ch(a.r(), b.r()) + ch(a.g(), b.g()) + ch(a.b(), b.b())
+    }
+
+    /// #41 齿轮像素验收:明暗两套 visuals × ICON / ICON_SM 两档尺寸,各
+    /// 渲染一帧齿轮并按归一化坐标采样 ——
+    /// - 中心孔存在:圆心露背景,孔环着前景,两者颜色可分;
+    /// - 齿数特征:齿顶带(r=0.42)圆周上齿角(每 45°)着前景、齿间(22.5°
+    ///   偏移)露背景,沿圆周数覆盖弧段恰 8 段(小尺寸不糊成圆的硬证据);
+    /// - 护栏(照 #32 快照手法):画布上不得出现任何文本字形。
+    #[test]
+    fn settings_gear_pixels_in_both_visuals() {
+        // 探针半径:齿顶带(0.398..0.482)内侧、避开折线顶点接缝(浮点
+        // 误差可能留亚像素发丝缝);齿间处该半径已越过齿根带外缘,糊成
+        // 整圆在这里就露不出背景
+        let probe_r = 0.42;
+        let (r_root, r_hole) = (0.28, 0.12);
+        for dark in [true, false] {
+            for size in [ICON, crate::ui::tokens::ICON_SM] {
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                });
+                // 关抗锯齿羽化:边三角形带透明渐变,采样会读到半透明假前景
+                ctx.options_mut(|o| o.tessellation_options.feathering = false);
+                // 前景/背景色从 visuals 取真值(Cell 递出闭包;0.36 无 ctx.style)
+                let colors = std::cell::Cell::new((Color32::BLACK, Color32::BLACK));
+                let center = egui::pos2(8.0 + size / 2.0, 8.0 + size / 2.0);
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let v = ui.visuals();
+                    colors.set((v.text_color(), v.panel_fill));
+                    Icon::Settings.draw(ui.painter(), center, size, v.text_color());
+                });
+                let (fg, bg) = colors.get();
+                assert!(
+                    color_dist(fg, bg) > 100,
+                    "{} 主题前景背景应可分:fg={fg:?} bg={bg:?}",
+                    if dark { "暗色" } else { "亮色" }
+                );
+                for clipped in &output.shapes {
+                    assert!(
+                        !matches!(clipped.shape, egui::epaint::Shape::Text(_)),
+                        "{} size={size} 图标画布不得出现文本字形",
+                        if dark { "暗色" } else { "亮色" }
+                    );
+                }
+                let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), 1.0);
+                let probe = |r: f32, a: f32| {
+                    covered_color(
+                        &primitives,
+                        center + Vec2::new(r * size * a.cos(), r * size * a.sin()),
+                    )
+                };
+
+                // 中心孔:圆心露背景、孔环着前景 —— 「中心采样与齿圈采样
+                // 颜色可分」
+                assert_eq!(
+                    probe(0.0, 0.0),
+                    None,
+                    "{} size={size} 中心孔内应露背景",
+                    if dark { "暗色" } else { "亮色" }
+                );
+                assert_eq!(
+                    probe(r_hole, 0.0),
+                    Some(fg),
+                    "{} size={size} 孔环应着前景",
+                    if dark { "暗色" } else { "亮色" }
+                );
+
+                // 齿圈本体(齿根带内、离中心线半步避开接缝)着前景;齿角
+                // 着前景、齿间露背景
+                for k in 0..8_u32 {
+                    let tooth = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let gap = tooth + std::f32::consts::FRAC_PI_8;
+                    assert_eq!(
+                        probe(r_root + 0.01, gap),
+                        Some(fg),
+                        "{} size={size} 第 {k} 段齿根弧应着前景",
+                        if dark { "暗色" } else { "亮色" }
+                    );
+                    assert_eq!(
+                        probe(probe_r, tooth),
+                        Some(fg),
+                        "{} size={size} 第 {k} 齿应探到前景",
+                        if dark { "暗色" } else { "亮色" }
+                    );
+                    assert_eq!(
+                        probe(probe_r, gap),
+                        None,
+                        "{} size={size} 第 {k} 齿间应露背景(糊成圆即红)",
+                        if dark { "暗色" } else { "亮色" }
+                    );
+                }
+
+                // 齿数特征:沿 r=probe_r 圆周每 0.5° 采样数覆盖弧段。从齿
+                // 间中心(22.5°)起绕一圈,避免同一齿跨首尾被数成两段;弧
+                // 段宽度 ≥3°(6 步)才计入:真齿 ≥20°,接缝发丝缝 ≤1°,
+                // 过滤的是细分伪影不是齿形本身
+                let mut arcs = 0;
+                let mut run = 0_i32;
+                for step in 0..720 {
+                    let a =
+                        std::f32::consts::FRAC_PI_8 + step as f32 * (std::f32::consts::TAU / 720.0);
+                    if probe(probe_r, a).is_some() {
+                        run += 1;
+                    } else if run > 0 {
+                        if run >= 6 {
+                            arcs += 1;
+                        }
+                        run = 0;
+                    }
+                }
+                if run >= 6 {
+                    arcs += 1;
+                }
+                assert_eq!(
+                    arcs,
+                    8,
+                    "{} size={size} 齿轮外缘应有 8 个独立齿",
+                    if dark { "暗色" } else { "亮色" }
+                );
+                output.drop_without_applying_deltas();
             }
         }
     }
