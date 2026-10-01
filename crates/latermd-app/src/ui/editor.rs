@@ -1865,4 +1865,85 @@ mod tests {
             "空闲帧不请求滚动,内容纹丝不动"
         );
     }
+
+    /// #17 M2 全部替换的单条 undo 契约(真实 undoer,无头):经消息路径
+    /// (`State::apply`)一次写入后,TextEdit 内建 undoer 的快照只多一份
+    /// —— **一次** Ctrl+Z 整体回原状(不是逐命中回退),Ctrl+Shift+Z
+    /// 一步重做恢复全部替换结果。undoer 看不到程序化写入,快照按绘制帧
+    /// 落(与 AI 流式追加同语义);「全部」绝无逐命中循环写入,undo 粒度
+    /// 必然是一整次操作。
+    #[test]
+    fn undo_after_replace_all_reverts_whole_operation_in_one_step() {
+        use crate::state::{Message, State};
+
+        // 帧驱动借用当前标签的三件套(与生产同一绘制路径、同一 widget id:
+        // State 首标签稳定 id = 1,与 frame 辅助硬编码的 tab_editor_id(1) 对上)
+        fn draw(ctx: &egui::Context, events: Vec<Event>, now: f64, state: &mut State) -> egui::Id {
+            let tab = state.tabs.current_mut();
+            frame(
+                ctx,
+                events,
+                now,
+                &mut tab.editor,
+                &mut tab.preview,
+                &mut tab.cursor,
+            )
+        }
+
+        let ctx = test_ctx();
+        let mut state = State::default();
+        // 可控文本:needle ×2,前后夹 CJK(多字节内容与命中混排)
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("甲 needle 乙 needle 丙");
+
+        let id = draw(&ctx, Vec::new(), 0.0, &mut state); // undoer 首喂:原文快照
+        ctx.memory_mut(|m| m.request_focus(id));
+        draw(&ctx, vec![Event::Text("首".into())], 0.1, &mut state); // 用户编辑(生产 TextEdit 光标默认在文末,追加)
+        draw(&ctx, Vec::new(), 1.5, &mut state); // 稳定 ≥1s:已提交撤销点
+        let before = "甲 needle 乙 needle 丙首".to_owned();
+        assert_eq!(state.tabs.current().editor.text(), before);
+
+        // 全部替换走真实消息路径:一次写入,一次撤销组
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+        state.find.replacement = "针".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        let replaced = "甲 针 乙 针 丙首".to_owned();
+        assert_eq!(state.tabs.current().editor.text(), replaced);
+
+        draw(&ctx, Vec::new(), 1.6, &mut state); // undoer 看到替换结果(进 flux)
+        draw(&ctx, Vec::new(), 3.0, &mut state); // 稳定:替换结果成为一份新快照
+
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        draw(&ctx, vec![undo], 3.1, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            before,
+            "一次 Ctrl+Z 整体回原状,不是逐命中回退"
+        );
+
+        let redo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        };
+        draw(&ctx, vec![redo], 3.2, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            replaced,
+            "一步重做恢复全部替换结果(整次操作 = 单个撤销组)"
+        );
+    }
 }

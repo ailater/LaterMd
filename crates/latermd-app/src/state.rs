@@ -1379,8 +1379,10 @@ impl State {
     }
 
     /// 全部替换(#17):按当前命中从后往前生成新文本,**一次** `replace_all`
-    /// 写入 —— 程序化变更一步 undo(egui undoer 看不到程序化写入,Ctrl+Z
-    /// 回到最近用户编辑快照,与 AI 流式追加同语义),绝无逐命中循环写入。
+    /// 写入(整篇替换路径,与 `apply_format` 同款)—— undo 栈只多一份快照,
+    /// 一次 Ctrl+Z 整体回原状(egui undoer 看不到程序化写入,快照按绘制帧
+    /// 落,与 AI 流式追加同语义;无头实证见 `ui::editor` 的 replace_all
+    /// undo 测试),绝无逐命中循环写入。
     fn replace_all_in_doc(&mut self) {
         if self.find.hits.is_empty() {
             return;
@@ -1388,8 +1390,14 @@ impl State {
         let replacement = self.find.replacement.clone();
         let mut text = self.tabs.current().editor.text().to_owned();
         // 命中是字符区间,落 `String::replace_range` 前换算字节边界;从后
-        // 往前替换,前面的命中偏移不受影响
+        // 往前替换,前面的命中偏移不受影响。越界命中(扫描后文档又变短,
+        // 如大小写折叠错位或换标签竞态)整条跳过:`char_to_byte` 会把越界
+        // 钳到文末,不跳就是把替换词追加到结尾 —— 宁可少报不错报,不 panic。
+        let char_count = text.chars().count();
         for range in self.find.hits.iter().rev() {
+            if range.end > char_count {
+                continue;
+            }
             let byte_start = char_to_byte(&text, range.start);
             let byte_end = char_to_byte(&text, range.end);
             text.replace_range(byte_start..byte_end, &replacement);
@@ -1402,6 +1410,18 @@ impl State {
             }
         }
         self.find_rescan();
+    }
+
+    /// 换入不同标签后按「query 变化」同口径重扫命中(#17 M2):`hits`/
+    /// `hit` 缓存对着**旧标签的文本**,不重扫则计数与「替换/全部」作用的
+    /// 区间都指向旧文档 —— 越界命中还会被钳到文末,把替换词追加进新文档
+    /// (见 `replace_all_in_doc` 的跳过防线,这里从源头掐掉)。查找条收起
+    /// 时不扫:重新展开(Ctrl+F/Ctrl+H)必经 `toggle_find` 重扫,关闭期
+    /// 扫描只是白付。
+    fn rescan_find_after_tab_switch(&mut self, previous_tab: u64) {
+        if self.find.open && self.tabs.current().id != previous_tab {
+            self.find_rescan();
+        }
     }
 
     /// 打开图片框(docs/image-plan.md A 段):alt 按当前选区预填 —— 选中
@@ -2230,13 +2250,15 @@ impl State {
     /// 未命名新标签无路径可锚,不检测 —— 其 draft 按标签 id 命名,跨会话
     /// 对不上号(decisions-pending #63 已登记该局限)。
     fn spawn_tab(&mut self, path: Option<PathBuf>, text: &str) -> usize {
-        self.autosave_switch_out = Some(self.tabs.current().id);
+        let previous = self.tabs.current().id;
+        self.autosave_switch_out = Some(previous);
         let index = self.tabs.open_tab(path, text);
         if let Some(tab) = self.tabs.tabs.get_mut(index) {
             if let Some(doc) = tab.document.path.clone() {
                 tab.recover = Self::detect_orphan_draft(&doc);
             }
         }
+        self.rescan_find_after_tab_switch(previous);
         index
     }
 
@@ -2244,10 +2266,12 @@ impl State {
     /// 与当前标签无关(多标签 #11 的核心不变量)。切出脏标签时记下它的
     /// 稳定 id —— 帧末 `autosave_pass` 为它落 draft(#18 切换即落)。
     fn switch_active(&mut self, index: usize) {
+        let previous = self.tabs.current().id;
         if index != self.tabs.active && index < self.tabs.tabs.len() {
-            self.autosave_switch_out = Some(self.tabs.current().id);
+            self.autosave_switch_out = Some(previous);
         }
         self.tabs.activate(index);
+        self.rescan_find_after_tab_switch(previous);
     }
 
     /// 关闭请求(标签条 × / Ctrl+W):脏标签先弹确认模态,干净标签直接关。
@@ -2282,10 +2306,12 @@ impl State {
             }
         }
         let closing_stream_origin = self.ai_stream_tab_index() == Some(index);
+        let previous = self.tabs.current().id;
         self.tabs.remove(index);
         if closing_stream_origin {
             self.abort_ai_stream();
         }
+        self.rescan_find_after_tab_switch(previous);
     }
 
     /// 去抖到点发起搜索(`Message::SearchRequested` 的归约)。无根目录
@@ -5881,5 +5907,232 @@ mod tests {
         state.find.replacement = "行尾".to_owned();
         state.apply(Message::ReplaceAllInDoc);
         assert_eq!(state.tabs.current().editor.text(), "中文 行尾\n替换 行尾");
+    }
+
+    /// 全部替换的偏移换算(#17 M2):查找词/替换词含 CJK(3 字节)与
+    /// emoji(4 字节)时**逐字符**断言结果 —— 字节口径错位会切坏相邻
+    /// 字符,字符向量一个不差才算对;并覆盖「替换比查找长」方向(后续
+    /// 命中偏移整体推移)与替换后仍有尾随内容的情形。
+    #[test]
+    fn replace_all_multibyte_offsets_are_char_accurate() {
+        let mut state = State::default();
+        // 命中跨「文(3B)+ 🎉(4B)」= 字节 3..10 的非对齐区间,替换词同构
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("文🎉甲 文🎉乙 文🎉丙");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("文🎉".to_owned()));
+        assert_eq!(state.find.hits.len(), 3);
+        state.find.replacement = "字✨".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .chars()
+                .collect::<Vec<_>>(),
+            "字✨甲 字✨乙 字✨丙".chars().collect::<Vec<_>>(),
+            "CJK+emoji 混排逐字符正确"
+        );
+
+        // 替换比查找长(中 3B → 日本語 9B):后续命中与尾随内容不错位
+        state.tabs.current_mut().editor.replace_all("中a中b中c尾巴");
+        state.apply(Message::FindQueryChanged("中".to_owned()));
+        assert_eq!(state.find.hits.len(), 3);
+        state.find.replacement = "日本語".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .chars()
+                .collect::<Vec<_>>(),
+            "日本語a日本語b日本語c尾巴".chars().collect::<Vec<_>>(),
+            "增长替换后的命中与尾随内容逐字符正确"
+        );
+
+        // 反向:emoji 查找词收缩为单字节 ASCII(4B → 1B)
+        state.tabs.current_mut().editor.replace_all("x🎉y🎉z末");
+        state.apply(Message::FindQueryChanged("🎉".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+        state.find.replacement = "!".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .chars()
+                .collect::<Vec<_>>(),
+            "x!y!z末".chars().collect::<Vec<_>>(),
+            "收缩替换逐字符正确"
+        );
+    }
+
+    /// 越界命中(#17 M2):命中缓存比文档新(扫描后文本变短的竞态)时
+    /// 整条跳过,不把替换词钳到文末追加 —— 宁可少报不错报,不 panic;
+    /// 界内命中照常替换。
+    #[test]
+    fn replace_all_skips_out_of_bounds_hits_without_appending() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("短文");
+        state.apply(Message::FindBarToggled(true));
+        // 不经扫描直接塞入过期命中:首条在界内,后两条越界
+        state.find.query = "过期".to_owned();
+        state.find.hits = vec![0..2, 5..7, 100..102];
+        state.find.hit = Some(0);
+        state.find.replacement = "新".to_owned();
+
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state
+                .tabs
+                .current()
+                .editor
+                .text()
+                .chars()
+                .collect::<Vec<_>>(),
+            "新".chars().collect::<Vec<_>>(),
+            "界内命中替换,越界命中不追加(无防线会变「短文新…」)"
+        );
+        assert_eq!(state.find.hits.len(), 0, "重扫按新文本与真 query 走");
+        assert_eq!(state.find.hit, None);
+    }
+
+    /// 全部替换后的状态维护(#17 M2):替换词不含查找词 → 计数清零、定位
+    /// 清空;含查找词(needle→needleX)→ 按新文本重扫计数、定位回首条、
+    /// `pending_selection` 仍是字符区间,Enter 前进并在末项后环绕。
+    #[test]
+    fn replace_all_recounts_hits_and_keeps_navigation_legal() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("foo a\nfoo b");
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("foo".to_owned()));
+        state.find.replacement = "bar".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "bar a\nbar b");
+        assert_eq!(state.find.hits.len(), 0, "替换词不含查找词:清零");
+        assert_eq!(state.find.hit, None, "定位清空");
+
+        // needle → needleX:新文本里的 needleX 前缀也是命中
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("needle a\nneedle b");
+        state.apply(Message::FindQueryChanged("needle".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+        state.find.replacement = "needleX".to_owned();
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "needleX a\nneedleX b");
+        assert_eq!(state.find.hits.len(), 2, "按新文本重扫");
+        assert_eq!(state.find.hit, Some(0), "定位回首条");
+        assert_eq!(
+            state.tabs.current().pending_selection,
+            Some((0, 6)),
+            "pending_selection 仍是字符区间"
+        );
+
+        state.apply(Message::FindNext { backwards: false });
+        assert_eq!(state.find.hit, Some(1));
+        state.apply(Message::FindNext { backwards: false });
+        assert_eq!(state.find.hit, Some(0), "末项后环绕回首");
+    }
+
+    /// 空 query / 无命中(#17 M2):全部替换是幂等无操作 —— 文本不动、
+    /// 修订号不推、不置脏,再次触发仍无副作用。
+    #[test]
+    fn replace_all_without_hits_is_idempotent_noop() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("稳定文本");
+        state.tabs.current_mut().editor.clear_dirty();
+
+        // 空 query:重扫即清,hits 恒空
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged(String::new()));
+        state.find.replacement = "别的".to_owned();
+        let rev = state.tabs.current().editor.revision();
+        state.apply(Message::ReplaceAllInDoc);
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "稳定文本");
+        assert_eq!(state.tabs.current().editor.revision(), rev, "不推修订号");
+        assert!(!state.tabs.current().editor.is_dirty(), "不置脏");
+
+        // 有 query 无命中:同口径
+        state.apply(Message::FindQueryChanged("zzz".to_owned()));
+        assert_eq!(state.find.hits.len(), 0);
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(state.tabs.current().editor.text(), "稳定文本");
+        assert_eq!(state.tabs.current().editor.revision(), rev);
+    }
+
+    /// 切标签的命中缓存失效(#17 M2):作用于 active tab —— 换入标签即按
+    /// 「query 变化」同口径对新文本重扫,旧文档的命中不跨标签携带;越界
+    /// 旧命中不会经「全部」把替换词追加进更短的新文档;关掉查找条期间
+    /// 切换不扫,重开(Ctrl+F/Ctrl+H)时补扫。
+    #[test]
+    fn switching_tabs_rescans_find_hits_for_new_document() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("aaa aaa");
+        state.tabs.open_tab(None, "短"); // 直接开第二个(不经消息,见 #18 测试同款)
+        state.apply(Message::TabActivate(0));
+
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("aaa".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+        state.find.replacement = "b".to_owned();
+
+        state.apply(Message::TabActivate(1));
+        assert_eq!(state.find.hits.len(), 0, "换入短文档即按新文本重扫");
+        state.apply(Message::ReplaceAllInDoc);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "短",
+            "无命中无操作,不追加污染"
+        );
+
+        state.apply(Message::TabActivate(0));
+        assert_eq!(state.find.hits.len(), 2, "换回原文档命中恢复");
+
+        // 关条期间切换不扫;重开走 toggle_find 补扫,替换用的必是新计数
+        state.apply(Message::FindBarToggled(false));
+        assert_eq!(state.find.hits.len(), 2, "关条只清定位,缓存留着也无害");
+        state.apply(Message::TabActivate(1));
+        state.apply(Message::TabActivate(0));
+        assert_eq!(
+            state.find.hits.len(),
+            2,
+            "关条期间切换未重扫(计数仍是旧文档的)"
+        );
+        state.apply(Message::FindBarToggled(true));
+        assert_eq!(state.find.hits.len(), 2, "重开补扫同一文档,计数一致");
+        state.apply(Message::TabActivate(1));
+        assert_eq!(state.find.hits.len(), 0, "重开后切走照常失效");
+    }
+
+    /// 关闭当前标签(#17 M2):当前指针移交给邻标签时,命中缓存同样按
+    /// 新文档重扫 —— remove 路径与 activate 路径一个口径。
+    #[test]
+    fn closing_tab_rescans_find_hits_for_new_document() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("甲甲");
+        state.tabs.open_tab(None, "乙乙");
+        state.apply(Message::TabActivate(1));
+        state.apply(Message::FindBarToggled(true));
+        state.apply(Message::FindQueryChanged("乙".to_owned()));
+        assert_eq!(state.find.hits.len(), 2);
+
+        // 干净标签直接关(脏确认模态不涉),当前指针落到 0 号
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.tabs.len(), 1);
+        assert_eq!(state.find.hits.len(), 0, "移交后的当前标签按新文档重扫");
+        assert_eq!(state.tabs.current().editor.text(), "甲甲");
     }
 }
