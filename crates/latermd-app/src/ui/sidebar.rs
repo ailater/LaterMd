@@ -441,7 +441,7 @@ fn files_panel(
 
     egui::ScrollArea::vertical()
         .id_salt("file-tree-scroll")
-        // 不收缩宽度,让长文件名换行而不是把面板撑宽
+        // 不收缩宽度:长文件名在行内省略号截断(#40),不换行也不撑宽面板
         .auto_shrink([false, false])
         .show(panel, |ui| match tree.root.as_deref() {
             Some(root) => match tree.children.get(root) {
@@ -542,7 +542,8 @@ fn tree_row(
     } else {
         git.badge_for(&entry.path)
     };
-    let response = badged_row_label(ui, selected, tree_row_text(ui, &entry.name), badge);
+    let response = badged_row_label(ui, selected, tree_row_text(ui, &entry.name), badge)
+        .on_hover_text(row_tooltip(&entry.name, badge));
     if entry.is_dir {
         paint_tree_arrow(ui, &response, open);
     }
@@ -726,7 +727,8 @@ fn git_status_row(
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let selected = git.selected.as_deref() == Some(entry.path.as_str());
-    let response = badged_row_label(ui, selected, entry.path.clone(), Some(entry.code));
+    let response = badged_row_label(ui, selected, entry.path.clone(), Some(entry.code))
+        .on_hover_text(row_tooltip(&entry.path, Some(entry.code)));
     if response.clicked() {
         outbox.push(Message::GitFileSelected(entry.path.clone()));
     }
@@ -786,23 +788,45 @@ const DIFF_ADDED: egui::Color32 = egui::Color32::from_rgb(96, 200, 120);
 const DIFF_REMOVED: egui::Color32 = egui::Color32::from_rgb(235, 96, 96);
 const DIFF_HUNK: egui::Color32 = egui::Color32::from_rgb(96, 150, 235);
 
-/// 「正文 + 彩色单字母角标」的可选中行,文件树文件行与 Git 页改动行共用
-/// (egui 0.36 的 `IntoAtoms` 元组语法:正文正常前景,角标按状态着色)。
+/// 「正文 + 彩色单字母角标」的可选中行,文件树文件行与 Git 页改动行共用。
+///
+/// 单行截断(#40):两态(有/无角标)都走 `TextWrapMode::Truncate`——窄栏里
+/// 名字省略号截尾不换行,行高恒定;角标经 `Button::right_text`(内部
+/// `Atom::grow`)贴行尾,名字的截断宽度先扣除角标固有宽,省略号永远挤
+/// 不掉角标。选中/悬停样式与 `ui.selectable_label` 同源——后者在 egui 0.36
+/// 就是 `Button::selectable(..).ui(..)` 的别名,本函数只是同一颗 Button 多
+/// 挂了截断与右侧原子。
 fn badged_row_label(
     ui: &mut egui::Ui,
     selected: bool,
     text: String,
     badge: Option<StatusKind>,
 ) -> egui::Response {
+    let mut button = egui::Button::selectable(selected, text).truncate();
+    if let Some(kind) = badge {
+        button =
+            button.right_text(egui::RichText::new(format!("{kind}")).color(status_color(kind)));
+    }
+    ui.add(button)
+}
+
+/// 行 hover tooltip(#40):完整文件名——截断行由此看全名(recents 下拉的
+/// 先例同款口径);带 Git 角标的行附状态说明,角标字母不必心算。
+fn row_tooltip(name: &str, badge: Option<StatusKind>) -> String {
     match badge {
-        Some(kind) => ui.selectable_label(
-            selected,
-            (
-                text,
-                egui::RichText::new(format!(" {kind}")).color(status_color(kind)),
-            ),
-        ),
-        None => ui.selectable_label(selected, text),
+        Some(kind) => format!("{name}({})", status_label(kind)),
+        None => name.to_owned(),
+    }
+}
+
+/// Git 角标字母的中文说明(M/A/U/D/?)。
+fn status_label(kind: StatusKind) -> &'static str {
+    match kind {
+        StatusKind::Modified => "已修改",
+        StatusKind::Added => "已暂存",
+        StatusKind::Unmerged => "冲突",
+        StatusKind::Deleted => "已删除",
+        StatusKind::Untracked => "未跟踪",
     }
 }
 
@@ -1032,6 +1056,27 @@ mod tests {
             .iter()
             .filter_map(|clipped| match &clipped.shape {
                 egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 一帧里全部文本 shape 的**可见**字符串:按 glyph 层逐字拼接(#40 起
+    /// 截断行走 elide 路径,`galley.job.text` 恒保留完整原文——Label 的
+    /// elided-tooltip 正是靠它;省略号 `…` 在字形层是真实字符)。可见层
+    /// 断言(截没截、截断后的样子)必须用这份,不能拿 job.text 恒真。
+    fn visible_shape_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(text) => Some(
+                    text.galley
+                        .rows
+                        .iter()
+                        .map(|row| row.row.text())
+                        .collect::<String>(),
+                ),
                 _ => None,
             })
             .collect()
@@ -1329,6 +1374,197 @@ mod tests {
             git_panel(ui, &truncated, &mut Vec::new());
         })
         .drop_without_applying_deltas();
+    }
+
+    /// #40 单行截断:窄栏(120px)下长中文文件名行不换行——行高与同栏
+    /// 短名目录行、宽栏同名行一致恒定,名字文本以省略号截尾且全名不进
+    /// 可见层;Git 角标仍可见、画在名字右侧且贴行尾(名字的截断宽度先
+    /// 扣除角标固有宽,省略号挤不掉角标);宽栏下全名完整显示。
+    #[test]
+    fn tree_row_truncates_long_names_in_narrow_panel() {
+        let long_name = format!("{}笔记.md", "超长中文文件名".repeat(3));
+        let root = PathBuf::from("/vault");
+        let mut tree = FileTreeState {
+            root: Some(root.clone()),
+            ..FileTreeState::default()
+        };
+        let dir = TreeEntry {
+            path: root.join("docs"),
+            name: "docs".to_owned(),
+            is_dir: true,
+        };
+        let file = TreeEntry {
+            path: root.join(&long_name),
+            name: long_name.clone(),
+            is_dir: false,
+        };
+        tree.children.insert(
+            root.clone(),
+            DirChildren {
+                entries: vec![dir, file.clone()],
+                truncated: 0,
+            },
+        );
+        let mut git = GitPanelState::default();
+        git.badges.insert(file.path.clone(), StatusKind::Modified);
+
+        let run = |width: f32| {
+            let ctx = egui::Context::default();
+            let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let children = tree.children.get(&root).unwrap();
+                    let outbox = &mut Vec::new();
+                    let dir_rect = tree_row(ui, &tree, &children.entries[0], None, &git, outbox);
+                    let file_rect = tree_row(ui, &tree, &children.entries[1], None, &git, outbox);
+                    rects.set((dir_rect.rect, file_rect.rect));
+                },
+            );
+            // 可见文本按 glyph 层拼接;文本矩形按可见文本匹配(job.text 恒含
+            // 完整原文,拿它匹配会把被 elide 掉的名字也算「画出来了」)
+            let texts = visible_shape_texts(&output);
+            let text_rect = |pred: &dyn Fn(&str) -> bool| -> Rect {
+                let mut found = Rect::NOTHING;
+                for clipped in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                        let visible: String =
+                            text.galley.rows.iter().map(|row| row.row.text()).collect();
+                        if pred(&visible) {
+                            found = text.visual_bounding_rect();
+                        }
+                    }
+                }
+                found
+            };
+            let badge = text_rect(&|t: &str| t.trim() == "M");
+            let truncated_name = text_rect(&|t: &str| t.trim_start().starts_with("超长"));
+            output.drop_without_applying_deltas();
+            (texts, rects.get(), badge, truncated_name)
+        };
+
+        // —— 窄栏 120px:名字只容得下前几个字,省略号截尾 ——
+        let (narrow_texts, (narrow_dir, narrow_file), badge, truncated_name) = run(120.0);
+        let name = narrow_texts
+            .iter()
+            .find(|t| t.trim_start().starts_with("超长"))
+            .expect("长名字应仍在文本层");
+        assert!(name.ends_with('…'), "窄栏名字以省略号截尾:{name:?}");
+        assert!(
+            !name.contains(&long_name),
+            "全名不得整体进窄栏可见层:{name:?}"
+        );
+        assert!(
+            narrow_texts.iter().any(|t| t.trim() == "M"),
+            "角标仍可见:{narrow_texts:?}"
+        );
+        // 行高恒定:目录短名行 == 文件长名行(长名不再换行撑高)
+        assert!(
+            (narrow_dir.height() - narrow_file.height()).abs() < 0.5,
+            "窄栏行高恒定:目录 {narrow_dir:?} vs 文件 {narrow_file:?}"
+        );
+        // 角标贴行尾:画在名字右侧,距行右沿只剩按钮内边距量级
+        assert!(badge != Rect::NOTHING && truncated_name != Rect::NOTHING);
+        assert!(
+            badge.left() > truncated_name.right(),
+            "角标在名字右侧:角标 {badge:?} 名字 {truncated_name:?}"
+        );
+        assert!(
+            badge.right() <= narrow_file.right() && narrow_file.right() - badge.right() < 12.0,
+            "角标贴行尾:角标右沿 {} 行右沿 {}",
+            badge.right(),
+            narrow_file.right()
+        );
+
+        // —— 宽栏 500px:全名完整,行高与窄栏一致(不随栏宽/名字长度变化)——
+        let (wide_texts, (_, wide_file), _, _) = run(500.0);
+        let full = wide_texts
+            .iter()
+            .find(|t| t.contains(&long_name))
+            .expect("宽栏应显示全名");
+        assert!(!full.ends_with('…'), "宽栏不截断:{full:?}");
+        assert!(
+            (wide_file.height() - narrow_file.height()).abs() < 0.5,
+            "行高不随栏宽变化:宽 {wide_file:?} 窄 {narrow_file:?}"
+        );
+    }
+
+    /// #40 hover tooltip:窄栏截断行的完整文件名只出现在 tooltip 文本层
+    /// (`everything_is_visible` 是 egui 自己的 UI 测试手法,免 tooltip 延迟,
+    /// 同 top_actions 先例);带 Git 角标的行 tooltip 附状态说明。
+    #[test]
+    fn hovering_truncated_tree_row_shows_full_name_tooltip() {
+        let long_name = format!("{}笔记.md", "超长中文文件名".repeat(3));
+        let root = PathBuf::from("/vault");
+        let mut tree = FileTreeState {
+            root: Some(root.clone()),
+            ..FileTreeState::default()
+        };
+        let file = TreeEntry {
+            path: root.join(&long_name),
+            name: long_name.clone(),
+            is_dir: false,
+        };
+        tree.children.insert(
+            root.clone(),
+            DirChildren {
+                entries: vec![file.clone()],
+                truncated: 0,
+            },
+        );
+        let mut git = GitPanelState::default();
+        git.badges.insert(file.path.clone(), StatusKind::Modified);
+
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 400.0));
+        let render = |ui: &mut egui::Ui| {
+            let children = tree.children.get(&root).unwrap();
+            tree_row(ui, &tree, &children.entries[0], None, &git, &mut Vec::new())
+        };
+        let ctx = egui::Context::default();
+        let row_rect = Cell::new(Rect::NOTHING);
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| row_rect.set(render(ui).rect),
+        )
+        .drop_without_applying_deltas();
+        let center = row_rect.get().center();
+
+        ctx.memory_mut(|mem| mem.set_everything_is_visible(true));
+        // 两帧:hover 判定用上一帧的指针位置,tooltip 在下一帧才渲染。
+        // 断言用**可见**文本:行自身的名字在 120px 下被 elide,可见层没有
+        // 全名,全名只能来自 tooltip 的字形(job.text 恒留原文,拿它断言恒真)
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![Event::PointerMoved(center)],
+                    ..Default::default()
+                },
+                |ui| {
+                    render(ui);
+                },
+            );
+            texts = visible_shape_texts(&output);
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            texts.iter().any(|t| t.contains(&long_name)),
+            "截断行的全名进 tooltip:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("已修改")),
+            "带角标行 tooltip 附状态说明:{texts:?}"
+        );
     }
 
     /// 相对时间:单位逐级放大,时钟偏移的负差按「刚刚」。

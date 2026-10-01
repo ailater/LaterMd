@@ -603,3 +603,11 @@
 - **自动选择**:①。`State::restore_tab` 的循环按「pop → open_path → 成功即停 / 失败继续 pop」实现,死条目绝不留在栈里。
 - **理由**:本产品心智是「重开=重新读盘」(preview-typography §3.3),文件被删/移走后该条目在**本会话内**永远无法恢复成功;若保留(②),它永远堵在栈顶,此后每次 Cmd/Ctrl+Shift+T 都先撞一次失败才能摸到下一条,任务书验收「连续按 Cmd/Ctrl+Shift+T 能逐条回走完整条栈」被死条目打断;用户已从提示行得知哪个文件打不开,信息不丢。②的辩护场景是「网络盘/外接盘暂时离线、之后又可用」,但该场景下用户重按一次快捷键即可,代价远小于①堵栈的代价;且不做跨会话持久化(已定案),「暂时不可用跨会话找回」本就不成立。
 - **如何改**:想改成②(失败保留),把 `state.rs` `restore_tab` 的 `while let Some(path) = self.tabs.recently_closed.pop()` 改为先 `last().cloned()` 试开、失败即 `return`(不出栈),并同步改 `tab_restore_failed_path_noticed_dropped_and_continues` 测试的断言(死条目留栈、alive 不在同一次触发里恢复)。
+
+## #71 文件树带 Git 角标行改「整行宽+整行可点」(#40 filetree-truncate,2026-10-02·自动拍板)
+
+- **岔路**:角标要「贴行尾」且不被省略号挤掉,egui 0.36 的标准做法是 `Button::right_text`(内部 `Atom::grow`)。grow 原子在空间富余时把块撑满可用宽,于是带角标的行从旧 `selectable_label` 的「内容宽」变成「整行宽」,选中/hover 底色与命中区域随行铺满——这是用户可见的行为变化,不是纯内部改写。
+- **备选**:①`Button::selectable(selected, name).truncate().right_text(角标)`——角标真·贴行尾(宽栏窄栏都成立),带角标行整行宽/整行可点,无角标行维持内容宽;②手绘整行(仿 `nav_row` 的 `allocate_exact_size` + `Sense::click`)再自绘名字 galley 与角标——行宽口径全部自控,但要复刻 `Button::selectable` 的选中/hover 样式与无障碍信息,表面积大。
+- **自动选择**:①。
+- **理由**:①复用 `selectable_label` 的同一条渲染路径(后者在 egui 0.36 就是 `Button::selectable(..).ui(..)` 的别名),选中/悬停样式零漂移;「角标贴行尾」由布局原子保证,名字的截断宽度先扣除角标固有宽,省略号永远挤不掉角标;整行可点/整行高亮是树形列表的通行预期(VSCode 同款),把旧行为里「点名字才算点行」的偏差顺带修掉。git 页改动行(`git_status_row` 同走 `badged_row_label`)一并受益。②为了行宽口径自控引入约 60 行手绘样式代码,违背小表面积。
+- **如何改**:想回「内容宽」,把 `badged_row_label` 里 `right_text` 的 grow 语义换掉——不用 `Button::right_text`,改在 `ui.horizontal` 里先 `add(角标 Label)` 再倒排名字,或走②手绘;同时改 `tree_row_truncates_long_names_in_narrow_panel` 里「角标贴行尾(距行右沿 < 12px)」的断言。角标与名字的间距现在是 2×`icon_spacing`(出厂 8px,grow 原子两侧各一个 gap),嫌宽可给 `Button::gap(…)` 传更小值。
