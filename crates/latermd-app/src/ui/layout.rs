@@ -8,6 +8,12 @@ use crate::ui::tokens;
 use crate::LaterMdApp;
 use eframe::egui;
 
+/// 停顿落盘到点仍未清(写盘失败/未命名无状态目录)时的重试要帧间隔:
+/// 慢重试而不是满帧空转重写——`request_repaint_after(ZERO)` 意为立即
+/// 重绘,过期到点若不钳制会把失焦窗口推成满帧速率的写盘重试(search
+/// 去抖的同款空转教训,见本模块空转回归测试)。
+const AUTOSAVE_WRITE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl LaterMdApp {
     /// `logic` 帧的全部归约逻辑。单独成函数是因为 [`eframe::Frame`] 的字段
     /// 是 `pub(crate)`,测试里造不出来;归约本身不碰 frame。
@@ -157,6 +163,21 @@ impl LaterMdApp {
         // 归约;收尾清接收端后自然停。
         if state.clipboard.is_reading() {
             ctx.request_repaint();
+        }
+        // 自动保存的重绘驱动(#18 帧饥饿修复):停顿落盘不能指望输入来帧
+        // ——用户切去别的窗口后 egui 收敛深度空闲,30s 到点没有帧可跑
+        // `autosave_pass`,draft 悬到下一次无关重绘(真机实证失焦 6 分钟
+        // 未落,docs/autosave-acceptance.md §5)。有待落的停顿计时就按
+        // 剩余时长显式要一帧;到点帧落盘后 `saved_rev` 追平,这里自然
+        // 不再排程。到点仍未清(写盘失败)时钳 [`AUTOSAVE_WRITE_RETRY`]
+        // 慢重试,不满帧空转。
+        if let Some(due) = state.next_autosave_due() {
+            let wait = due.saturating_duration_since(std::time::Instant::now());
+            ctx.request_repaint_after(if wait.is_zero() {
+                AUTOSAVE_WRITE_RETRY
+            } else {
+                wait
+            });
         }
 
         // 窗口标题只在变化时下发,避免每帧一次原生 set_title
@@ -1655,6 +1676,140 @@ mod tests {
             "到点清空后不再安排任何重绘(过期 due 曾致满帧空转)"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 一帧归约输出里最小(最早到点)的重绘等待;`Duration::MAX` = 无任何
+    /// 未偿付的要帧请求(egui 深度空闲)。
+    fn min_repaint_delay(output: &FullOutput) -> std::time::Duration {
+        output
+            .viewport_output
+            .values()
+            .map(|viewport| viewport.repaint_delay)
+            .min()
+            .unwrap()
+    }
+
+    /// 自动保存的重绘驱动(#18 帧饥饿修复):编辑置脏后,归约帧按「距停顿
+    /// 到点的剩余时长」显式要一帧——失焦且无输入时 egui 深度空闲不来帧,
+    /// 没有这个驱动,30s 到点就没有帧跑 `autosave_pass`,draft 悬到下一次
+    /// 无关重绘(真机实证失焦 6 分钟未落,docs/autosave-acceptance.md §5)。
+    /// 落盘后 `saved_rev` 追平,排程收敛回深度空闲(MAX)。
+    #[test]
+    fn autosave_deadline_drives_repaint_without_input() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-autosave-repaint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "停顿待落的稿");
+
+        let ctx = egui::Context::default();
+        // 帧 1:输入刚发生过的帧,end_of_logic 记账 last_edit 并排程到点帧
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+
+        // 帧 2-4:越过视口首帧 settle(约两帧 0ns)后,在途排程应恰为
+        // 「距 30s 停顿的剩余时长」——失焦场景由它独自把下一帧带到到点
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        let delay = delay.unwrap();
+        assert!(
+            delay > std::time::Duration::from_secs(29)
+                && delay <= std::time::Duration::from_secs(30),
+            "排程落在停顿到点上(30s 内,且不是立即/满帧空转):{delay:?}"
+        );
+
+        // 拨回 31s 前模拟停顿已满(不真等 30s):到点帧 autosave_pass 落盘,
+        // 帧本身由上面的排程驱动,与任何输入无关——这正是修复的场景
+        app.state.tabs.current_mut().autosave.last_edit =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            app.state.tabs.current().editor.text(),
+            "到点帧落 draft"
+        );
+
+        // 落盘后(saved_rev 追平)不再有待落:越过 settle 后无未偿付要帧
+        // 请求,repaint_delay 回 MAX——驱动只服务落盘承诺,不引入常驻轮询
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            delay,
+            Some(std::time::Duration::MAX),
+            "落盘后不再安排任何重绘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写盘失败时的重试节奏钳制:到点仍未清(saved_rev 不追平,落点被
+    /// 目录占据)不进满帧空转,要帧间隔钳在 1s——驱动存在的意义是兑现
+    /// 落盘承诺,不是把失焦窗口烧成满帧速率的写盘重试。
+    #[test]
+    fn autosave_write_failure_retries_at_bounded_cadence() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-autosave-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // draft 落点被同名目录占据:rename 顶不动目录,原子写必失败
+        // (state::tests 的同款手法)
+        std::fs::create_dir_all(dir.join("doc.md.latermd-draft")).unwrap();
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "写不出去的稿");
+
+        let ctx = egui::Context::default();
+        // 帧 1:记账 last_edit(真实时刻)
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        // 拨回 31s 前:停顿已满,此后的帧写失败(saved_rev 永不追平)
+        app.state.tabs.current_mut().autosave.last_edit =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+
+        // 帧 2-4(越过 settle):要帧间隔钳在 1s,而不是 0ns 满帧空转。
+        // egui 会从请求里扣掉帧间真实流逝的时间,断言取 (0.5s, 1s] 区间
+        // ——既区别于满帧空转的 0ns,也区别于正常排程的 ~30s。
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        let delay = delay.unwrap();
+        assert!(
+            delay > std::time::Duration::from_millis(500) && delay <= AUTOSAVE_WRITE_RETRY,
+            "过期到点钳 1s 慢重试,不退化成立即重绘满帧空转:{delay:?}"
+        );
+        assert!(
+            app.state
+                .tabs
+                .current()
+                .document
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("自动保存失败")),
+            "重试帧照常走提示行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// AI 流式收流接线:reduce 每帧从 AI channel 取 chunk 翻成 Message 归约,

@@ -1917,6 +1917,19 @@ impl State {
         tab.editor.is_dirty() && tab.autosave.saved_rev != Some(tab.editor.revision())
     }
 
+    /// 活动标签下一次「停顿落盘」的到点时刻(#18 帧饥饿修复的重绘驱动
+    /// 数据源,`ui::layout::reduce` 消费):有待落的 draft 且已记到上次
+    /// 编辑时刻,才存在值得醒着等的帧;`None` = 无事可等(不脏 / 同修订
+    /// 号已落 / 尚无编辑时刻)。**只看活动标签**——停顿路径只写它,非活动
+    /// 标签的落盘走切出即写,而切出必发生在用户动作的帧里,天然有帧。
+    pub fn next_autosave_due(&self) -> Option<std::time::Instant> {
+        let tab = self.tabs.current();
+        if !Self::tab_needs_draft(tab) {
+            return None;
+        }
+        tab.autosave.last_edit.map(|at| at + AUTOSAVE_IDLE)
+    }
+
     /// 孤儿 draft 检测(#18 恢复条):文档旁是否遗留 `<doc>.latermd-draft`。
     /// 一次 `metadata` 同时回答存在性与 mtime(比 exists + metadata 少一半
     /// 系统调用,也免去两步之间文件消失的竞态);mtime 取不到(平台不支持)
@@ -2843,6 +2856,41 @@ mod tests {
             std::fs::read_to_string(&first_draft).unwrap(),
             first_text,
             "旧 draft 保留,失败不破坏既有文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 下次停顿落盘到点(`next_autosave_due`,#18 帧饥饿修复的重绘驱动
+    /// 数据源):干净缓冲、尚未跑过帧末归约(无编辑时刻)、落盘后修订号
+    /// 追平——三种状态都无事可等;唯独「脏且未落且已记时刻」给出
+    /// `last_edit + AUTOSAVE_IDLE`。写失败(saved_rev 不追平)时到点已
+    /// 过期,返回值仍是该过期时刻,由调用方决定钳制重试节奏。
+    #[test]
+    fn autosave_next_due_reports_pending_deadline_only() {
+        let dir = temp_path("autosave-due");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = State::default();
+        assert_eq!(state.next_autosave_due(), None, "干净缓冲无事可等");
+        state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        state.tabs.current_mut().editor.insert_chars(0, "待落");
+        assert_eq!(
+            state.next_autosave_due(),
+            None,
+            "尚无编辑时刻(停顿判定本就不成立,与 autosave_pass 同口径)"
+        );
+        let t0 = std::time::Instant::now();
+        state.autosave_pass(t0); // 帧末记账 last_edit
+        assert_eq!(
+            state.next_autosave_due(),
+            Some(t0 + AUTOSAVE_IDLE),
+            "待落 + 已记时刻 → 上次编辑加停顿阈值"
+        );
+        state.autosave_pass(t0 + Duration::from_secs(30)); // 到点落盘
+        assert_eq!(
+            state.next_autosave_due(),
+            None,
+            "saved_rev 追平后不再有待落,重绘驱动自然收敛到深度空闲"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
