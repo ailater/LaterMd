@@ -8,6 +8,12 @@ use crate::ui::tokens;
 use crate::LaterMdApp;
 use eframe::egui;
 
+/// 停顿落盘到点仍未清(写盘失败/未命名无状态目录)时的重试要帧间隔:
+/// 慢重试而不是满帧空转重写——`request_repaint_after(ZERO)` 意为立即
+/// 重绘,过期到点若不钳制会把失焦窗口推成满帧速率的写盘重试(search
+/// 去抖的同款空转教训,见本模块空转回归测试)。
+const AUTOSAVE_WRITE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl LaterMdApp {
     /// `logic` 帧的全部归约逻辑。单独成函数是因为 [`eframe::Frame`] 的字段
     /// 是 `pub(crate)`,测试里造不出来;归约本身不碰 frame。
@@ -157,6 +163,21 @@ impl LaterMdApp {
         // 归约;收尾清接收端后自然停。
         if state.clipboard.is_reading() {
             ctx.request_repaint();
+        }
+        // 自动保存的重绘驱动(#18 帧饥饿修复):停顿落盘不能指望输入来帧
+        // ——用户切去别的窗口后 egui 收敛深度空闲,30s 到点没有帧可跑
+        // `autosave_pass`,draft 悬到下一次无关重绘(真机实证失焦 6 分钟
+        // 未落,docs/autosave-acceptance.md §5)。有待落的停顿计时就按
+        // 剩余时长显式要一帧;到点帧落盘后 `saved_rev` 追平,这里自然
+        // 不再排程。到点仍未清(写盘失败)时钳 [`AUTOSAVE_WRITE_RETRY`]
+        // 慢重试,不满帧空转。
+        if let Some(due) = state.next_autosave_due() {
+            let wait = due.saturating_duration_since(std::time::Instant::now());
+            ctx.request_repaint_after(if wait.is_zero() {
+                AUTOSAVE_WRITE_RETRY
+            } else {
+                wait
+            });
         }
 
         // 窗口标题只在变化时下发,避免每帧一次原生 set_title
@@ -328,6 +349,17 @@ impl LaterMdApp {
                 // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
                 // decisions-pending #32)
                 notice_bar(ui, &state.tabs.current().document, outbox);
+                // 孤儿 draft 恢复条(#18,存在才显示):与提示行同为编辑区
+                // 顶部的行内条,把编辑器整体下推一行 —— 它是需要持续在场的
+                // 裁决入口,不与查找浮层/对话框抢「浮动层」语义。载荷带标签
+                // 稳定 id,归约按 id 定位(消息是下一帧才消费的,届时活动
+                // 标签理论上可能已变,与 confirm_close 同手法)。
+                {
+                    let current = state.tabs.current();
+                    if let Some(recover) = current.recover.as_ref() {
+                        recovery_bar(ui, recover, current.id, outbox);
+                    }
+                }
                 let tab = state.tabs.current_mut();
                 let crate::tabs::TabState {
                     editor,
@@ -877,6 +909,62 @@ fn notice_bar(
         dismiss = Some(button);
     });
     dismiss
+}
+
+/// 恢复条里「保存于何时」的文案:相对时刻(「5 分钟前」)。时刻基准由
+/// 调用方传入(生产 `SystemTime::now()`,测试注入定点)。无 mtime 或时钟
+/// 倒流(`duration_since` 出错)一律「保存时间未知」—— 展示字段不值得
+/// 猜,更不值得为此引一个时间依赖(无 chrono 的既定依赖面)。
+fn draft_saved_label(mtime: Option<std::time::SystemTime>, now: std::time::SystemTime) -> String {
+    let Some(at) = mtime else {
+        return "保存时间未知".to_owned();
+    };
+    let Ok(elapsed) = now.duration_since(at) else {
+        return "保存时间未知".to_owned();
+    };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "刚刚保存".to_owned()
+    } else if secs < 3600 {
+        format!("保存于 {} 分钟前", secs / 60)
+    } else if secs < 86400 {
+        format!("保存于 {} 小时前", secs / 3600)
+    } else {
+        format!("保存于 {} 天前", secs / 86400)
+    }
+}
+
+/// 编辑器面板顶部的草稿恢复条(#18,存在才显示):文档旁发现遗留
+/// `<doc>.latermd-draft` 时请用户裁决 —— 「恢复」把草稿读进缓冲(undo 可
+/// 回退),「丢弃」删盘上草稿。返回(恢复, 丢弃)按钮的响应(`None` = 本帧
+/// 无待恢复;测试定位用,与 `notice_bar` 同款手法)。真正的恢复/丢弃都
+/// 在归约,这里只收集点击。
+fn recovery_bar(
+    ui: &mut egui::Ui,
+    recover: &crate::tabs::DraftRecovery,
+    tab_id: u64,
+    outbox: &mut Vec<Message>,
+) -> Option<(egui::Response, egui::Response)> {
+    let mut buttons = None;
+    ui.horizontal_wrapped(|ui| {
+        // 与提示行的错误红区分:这是可行动的告知,不是错误(与回滚确认
+        // 文案同档的警示黄,tokens::WARN)。
+        let label = format!(
+            "发现未保存草稿({})",
+            draft_saved_label(recover.mtime, std::time::SystemTime::now())
+        );
+        ui.colored_label(tokens::WARN, label);
+        let restore = ui.button("恢复");
+        if restore.clicked() {
+            outbox.push(Message::DraftRecovered { tab_id });
+        }
+        let discard = ui.button("丢弃");
+        if discard.clicked() {
+            outbox.push(Message::DraftDiscarded { tab_id });
+        }
+        buttons = Some((restore, discard));
+    });
+    buttons
 }
 /// 光标行列(1 起):行按换行数,列按该行字符数(中文按字计,与编辑器
 /// 的视觉列一致)。
@@ -1588,6 +1676,140 @@ mod tests {
             "到点清空后不再安排任何重绘(过期 due 曾致满帧空转)"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 一帧归约输出里最小(最早到点)的重绘等待;`Duration::MAX` = 无任何
+    /// 未偿付的要帧请求(egui 深度空闲)。
+    fn min_repaint_delay(output: &FullOutput) -> std::time::Duration {
+        output
+            .viewport_output
+            .values()
+            .map(|viewport| viewport.repaint_delay)
+            .min()
+            .unwrap()
+    }
+
+    /// 自动保存的重绘驱动(#18 帧饥饿修复):编辑置脏后,归约帧按「距停顿
+    /// 到点的剩余时长」显式要一帧——失焦且无输入时 egui 深度空闲不来帧,
+    /// 没有这个驱动,30s 到点就没有帧跑 `autosave_pass`,draft 悬到下一次
+    /// 无关重绘(真机实证失焦 6 分钟未落,docs/autosave-acceptance.md §5)。
+    /// 落盘后 `saved_rev` 追平,排程收敛回深度空闲(MAX)。
+    #[test]
+    fn autosave_deadline_drives_repaint_without_input() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-autosave-repaint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc.md.latermd-draft");
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "停顿待落的稿");
+
+        let ctx = egui::Context::default();
+        // 帧 1:输入刚发生过的帧,end_of_logic 记账 last_edit 并排程到点帧
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+
+        // 帧 2-4:越过视口首帧 settle(约两帧 0ns)后,在途排程应恰为
+        // 「距 30s 停顿的剩余时长」——失焦场景由它独自把下一帧带到到点
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        let delay = delay.unwrap();
+        assert!(
+            delay > std::time::Duration::from_secs(29)
+                && delay <= std::time::Duration::from_secs(30),
+            "排程落在停顿到点上(30s 内,且不是立即/满帧空转):{delay:?}"
+        );
+
+        // 拨回 31s 前模拟停顿已满(不真等 30s):到点帧 autosave_pass 落盘,
+        // 帧本身由上面的排程驱动,与任何输入无关——这正是修复的场景
+        app.state.tabs.current_mut().autosave.last_edit =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            app.state.tabs.current().editor.text(),
+            "到点帧落 draft"
+        );
+
+        // 落盘后(saved_rev 追平)不再有待落:越过 settle 后无未偿付要帧
+        // 请求,repaint_delay 回 MAX——驱动只服务落盘承诺,不引入常驻轮询
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            delay,
+            Some(std::time::Duration::MAX),
+            "落盘后不再安排任何重绘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写盘失败时的重试节奏钳制:到点仍未清(saved_rev 不追平,落点被
+    /// 目录占据)不进满帧空转,要帧间隔钳在 1s——驱动存在的意义是兑现
+    /// 落盘承诺,不是把失焦窗口烧成满帧速率的写盘重试。
+    #[test]
+    fn autosave_write_failure_retries_at_bounded_cadence() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-autosave-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // draft 落点被同名目录占据:rename 顶不动目录,原子写必失败
+        // (state::tests 的同款手法)
+        std::fs::create_dir_all(dir.join("doc.md.latermd-draft")).unwrap();
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(dir.join("doc.md"));
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "写不出去的稿");
+
+        let ctx = egui::Context::default();
+        // 帧 1:记账 last_edit(真实时刻)
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        // 拨回 31s 前:停顿已满,此后的帧写失败(saved_rev 永不追平)
+        app.state.tabs.current_mut().autosave.last_edit =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+
+        // 帧 2-4(越过 settle):要帧间隔钳在 1s,而不是 0ns 满帧空转。
+        // egui 会从请求里扣掉帧间真实流逝的时间,断言取 (0.5s, 1s] 区间
+        // ——既区别于满帧空转的 0ns,也区别于正常排程的 ~30s。
+        let mut delay = None;
+        for _ in 2..=4 {
+            let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+            delay = Some(min_repaint_delay(&output));
+            output.drop_without_applying_deltas();
+        }
+        let delay = delay.unwrap();
+        assert!(
+            delay > std::time::Duration::from_millis(500) && delay <= AUTOSAVE_WRITE_RETRY,
+            "过期到点钳 1s 慢重试,不退化成立即重绘满帧空转:{delay:?}"
+        );
+        assert!(
+            app.state
+                .tabs
+                .current()
+                .document
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("自动保存失败")),
+            "重试帧照常走提示行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// AI 流式收流接线:reduce 每帧从 AI channel 取 chunk 翻成 Message 归约,
@@ -2691,6 +2913,133 @@ mod tests {
             assert!(notice_bar(ui, &clean, &mut Vec::new()).is_none());
         })
         .drop_without_applying_deltas();
+    }
+
+    /// 恢复条时间文案的档位与未知兜底:`now` 定点注入,不真等钟。
+    #[test]
+    fn draft_saved_label_buckets_relative_time() {
+        use std::time::Duration as WallDuration;
+        use std::time::SystemTime;
+
+        let now = SystemTime::UNIX_EPOCH + WallDuration::from_secs(1_000_000);
+        let at = |secs_ago: u64| Some(now - WallDuration::from_secs(secs_ago));
+        assert_eq!(draft_saved_label(None, now), "保存时间未知");
+        assert_eq!(
+            draft_saved_label(Some(now + WallDuration::from_secs(5)), now),
+            "保存时间未知",
+            "时钟倒流(mtime 在未来)不猜"
+        );
+        assert_eq!(draft_saved_label(at(30), now), "刚刚保存");
+        assert_eq!(draft_saved_label(at(300), now), "保存于 5 分钟前");
+        assert_eq!(draft_saved_label(at(2 * 3600 + 59), now), "保存于 2 小时前");
+        assert_eq!(draft_saved_label(at(3 * 86400), now), "保存于 3 天前");
+    }
+
+    /// 恢复条(#18):有待恢复草稿时渲染「发现未保存草稿」文案与(恢复,
+    /// 丢弃)两按钮,点击各发**带标签 id** 的消息(id 定位而非当前标签,
+    /// 消息归约晚一帧,期间活动标签可能已切走)。
+    #[test]
+    fn recovery_bar_buttons_send_tab_scoped_messages() {
+        use crate::tabs::DraftRecovery;
+
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let recover = DraftRecovery {
+            path: std::path::PathBuf::from("/tmp/doc.md.latermd-draft"),
+            mtime: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(300)),
+        };
+        let mut rects = None;
+
+        // 帧 1:渲染拿两按钮位置,再从本帧 shapes 里核文案
+        let first = ctx.run_ui(RawInput::default(), |ui| {
+            let (restore, discard) =
+                recovery_bar(ui, &recover, 7, &mut outbox).expect("有待恢复必有按钮");
+            rects = Some((restore.rect, discard.rect));
+        });
+        let painted = painted_text(&first.shapes).join("\n");
+        first.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产消息");
+        assert!(
+            painted.contains("发现未保存草稿") && painted.contains("保存于 5 分钟前"),
+            "文案含关键字与保存时间: {painted}"
+        );
+
+        // 帧 2-4:点「恢复」→ DraftRecovered(载荷 = 标签 id 7)
+        let (restore_rect, discard_rect) = rects.expect("两按钮有实测矩形");
+        let click = |rect: Rect, pressed| {
+            let center = rect.center();
+            vec![
+                Event::PointerMoved(center),
+                Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        for events in [click(restore_rect, true), click(restore_rect, false)] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    recovery_bar(ui, &recover, 7, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::DraftRecovered { tab_id: 7 }]);
+        outbox.clear();
+
+        for events in [click(discard_rect, true), click(discard_rect, false)] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    recovery_bar(ui, &recover, 7, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(outbox, vec![Message::DraftDiscarded { tab_id: 7 }]);
+    }
+
+    /// 恢复条接线(#18):标签有待恢复状态时,整帧 `draw` 真的把恢复条画
+    /// 进编辑区顶部(上一条只测 `recovery_bar` 函数本体,这里测
+    /// CentralPanel 的接线与撤下后的消失);mtime 缺失走「保存时间未知」。
+    #[test]
+    fn recovery_bar_wired_into_central_panel_draw() {
+        use crate::tabs::DraftRecovery;
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().recover = Some(DraftRecovery {
+            path: std::path::PathBuf::from("/tmp/doc.md.latermd-draft"),
+            mtime: None,
+        });
+        let painted = draw_frame(&mut app, &ctx, screen).join("\n");
+        assert!(
+            painted.contains("发现未保存草稿"),
+            "整帧绘制出现恢复条文案: {painted}"
+        );
+        assert!(painted.contains("保存时间未知"), "mtime 缺失走未知兜底");
+        assert!(
+            painted.matches("恢复").count() >= 1 && painted.contains("丢弃"),
+            "两按钮都在场"
+        );
+
+        // 待恢复状态撤下后不再绘制(编辑裁决/恢复/丢弃都会走到这一步)
+        app.state.tabs.current_mut().recover = None;
+        let painted = draw_frame(&mut app, &ctx, screen).join("\n");
+        assert!(
+            !painted.contains("发现未保存草稿"),
+            "撤下后恢复条消失: {painted}"
+        );
     }
 
     /// 跑若干帧 draw(sizing pass 之后 widget 才参与命中测试)。

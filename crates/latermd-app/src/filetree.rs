@@ -407,6 +407,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// draft 镜像不入文件树(#18):`x.md.latermd-draft` 的扩展名是
+    /// latermd-draft,不在 Markdown 清单里,被 `is_markdown` 天然排除 ——
+    /// 钉住该行为,防止将来清单口径变化把防丢镜像漏进导航树。
+    #[test]
+    fn list_children_excludes_draft_files() {
+        let dir = temp_tree("draft");
+        touch(&dir, "x.md");
+        touch(&dir, "x.md.latermd-draft");
+
+        let children = list_children(&dir, MAX_CHILDREN);
+        assert_eq!(entry_names(&children), ["x.md"], "draft 不入树");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 截断:超出 cap 的子项计数进 `truncated`,排序在前 cap 项保留。
     #[test]
     fn list_children_truncates_beyond_cap() {

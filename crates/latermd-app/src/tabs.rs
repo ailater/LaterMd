@@ -19,6 +19,45 @@ use crate::live::LiveState;
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
 use latermd_editor::EditorBuffer;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// 单个标签的自动保存记忆(#18):draft 落点、已落盘修订号、上次缓冲改动
+/// 时刻。判定与写入都在 [`crate::state::State`] 的帧末归约
+/// (`State::autosave_pass`),本结构只记账,不含任何 IO。
+#[derive(Debug, Default)]
+pub struct TabAutosave {
+    /// 上次成功写出的 draft 落点;`None` = 本标签从未写过。保存/关闭的
+    /// 清理钩子按它删文件 —— 不从落盘身份现算,「另存为换路径后旧位置的
+    /// draft」才找得回来。
+    pub draft_path: Option<PathBuf>,
+    /// 已落盘的缓冲修订号;与当前修订号相同即跳过重写(防每帧空转重写)。
+    /// 写失败不记 —— 下次触发照常重试。
+    pub saved_rev: Option<u64>,
+    /// 上次缓冲改动时刻(手敲/IME/AI 流式都算);`None` = 尚无编辑,
+    /// 停顿判定不满足。
+    pub last_edit: Option<Instant>,
+    /// 帧末比对用的「上次见到的修订号」:与当前修订号不同即发生过改动,
+    /// 刷新 `last_edit`。AI 流可写非活动标签,故按标签各自记账。
+    pub(crate) seen_rev: u64,
+}
+
+/// 孤儿 draft 的待恢复状态(#18 恢复条)。
+///
+/// 新标签认领文档路径时若文档旁有遗留的 `<doc>.latermd-draft`,检测结果
+/// 挂在标签上,编辑区上方的恢复条据此渲染;「恢复 / 丢弃」的归约消费即清
+/// ([`crate::state::State::recover_draft`] / [`discard_draft`](crate::state::State::discard_draft))。
+/// 用户无视恢复条直接编辑(缓冲变脏)时也在帧末撤下 —— 那是隐性选择了
+/// 以盘上版本续写,条留着只会诱导一次「拿旧稿盖掉新稿」的误点;draft
+/// **文件**不随撤条删除,停顿/切出路径照常接管。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftRecovery {
+    /// draft 落点(检测时已确认存在)。
+    pub path: PathBuf,
+    /// 检测时刻的 mtime,恢复条显示「保存于何时」用。文件系统不给
+    /// (`modified()` 失败)以「存在」为准,`None` 容之(文案落「保存时间
+    /// 未知」),不为一个展示字段放弃整条恢复能力。
+    pub mtime: Option<std::time::SystemTime>,
+}
 
 /// 单个标签的全部文档状态。
 pub struct TabState {
@@ -26,12 +65,16 @@ pub struct TabState {
     pub id: u64,
     /// 落盘身份 + dirty 镜像 + 提示行。
     pub document: DocumentState,
+    /// 待恢复的孤儿 draft(#18 恢复条);`None` = 无待裁决草稿。
+    pub recover: Option<DraftRecovery>,
     /// 编辑器缓冲(该标签的正文真源)。
     pub editor: EditorBuffer,
     /// 预览快照(含大纲)。
     pub preview: PreviewState,
     /// 大纲↔编辑器光标协调。
     pub cursor: OutlineCursor,
+    /// 自动保存记忆(#18)。
+    pub autosave: TabAutosave,
     /// 编辑器选区的**字符**区间`(起, 止)`,由 `ui::editor` 每帧回填。
     ///
     /// 存在的理由:工具条按钮被点中的时候编辑器已经失焦,而 `TextEdit` 的
@@ -59,8 +102,10 @@ impl TabState {
                 dirty: false,
                 notice: None,
             },
+            recover: None,
             preview: PreviewState::new(&editor),
             cursor: OutlineCursor::default(),
+            autosave: TabAutosave::default(),
             selection: None,
             pending_selection: None,
             live: LiveState::default(),
@@ -70,12 +115,24 @@ impl TabState {
 
     /// 整篇换入并复位文档身份(读盘成功后的换入;同 `State::load_document`
     /// 的旧语义,但只作用于本标签)。
+    ///
+    /// 自动保存记忆随换入重置内容侧(`saved_rev`/`last_edit`/`seen_rev`),
+    /// `draft_path` **保留** —— 它是清理钩子找回旧位置 draft 的唯一线索
+    /// (回滚后保存一次即清)。`recover`(待恢复的孤儿 draft)同样不动:
+    /// 换入的是磁盘内容,盘旁的遗留草稿与「用户还没裁决」这一事实都还在。
+    /// 盘上的 draft 文件不动:换入意味着旧编辑已被用户确认丢弃,但误删
+    /// 防丢镜像的代价远大于多留一份冗余。
     pub fn load(&mut self, path: Option<PathBuf>, text: &str) {
         self.editor.load(text);
         self.document.path = path;
         self.document.notice = None;
         self.preview.rebuild(&self.editor);
         self.live.reset();
+        let kept_draft = self.autosave.draft_path.take();
+        self.autosave = TabAutosave {
+            draft_path: kept_draft,
+            ..TabAutosave::default()
+        };
     }
 }
 

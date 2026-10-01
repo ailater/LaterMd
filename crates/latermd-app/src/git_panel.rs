@@ -100,7 +100,17 @@ impl GitPanelState {
             }
         };
         let snapshot = match latermd_git::status(&repo_root, latermd_git::DEFAULT_STATUS_LIMIT) {
-            Ok(snapshot) => snapshot,
+            Ok(mut snapshot) => {
+                // draft 是编辑器的私有防丢镜像(#18),不是用户眼里的「仓库
+                // 改动」:git2 的 untracked 会如实列出它(git status 同样列),
+                // 这里按产品口径滤掉 —— 与文件树/搜索的过滤同一精神。被滤
+                // 条目仍占 status 的条数上限槽位;draft 数量至多等于打开的
+                // 脏标签数,不为它引入第二次 status 查询。
+                snapshot
+                    .entries
+                    .retain(|entry| !entry.path.ends_with(crate::state::DRAFT_SUFFIX));
+                snapshot
+            }
             Err(error) => {
                 self.degrade(Some(error));
                 return;
@@ -278,6 +288,28 @@ mod tests {
         git.refresh(Some(&dir.join("docs")));
         assert_eq!(git.repo_root.as_deref(), Some(dir.as_path()));
         assert_eq!(git.badge_for(&dir.join("a.md")), Some(StatusKind::Modified));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// draft 镜像不入改动列表(#18):git status 的 untracked 如实列出
+    /// `*.latermd-draft`(2026-10-01 实测 `?? a.md.latermd-draft`),刷新处
+    /// 按产品口径滤掉 —— 改动列表与文件树角标都不出现。
+    #[test]
+    fn refresh_hides_draft_files_from_changes_and_badges() {
+        let dir = temp_repo("draft-filter");
+        std::fs::write(dir.join("a.md"), "改\n").unwrap(); // M
+        std::fs::write(dir.join("a.md.latermd-draft"), "自动保存的镜像\n").unwrap(); // ??
+
+        let mut git = GitPanelState::default();
+        git.refresh(Some(&dir));
+        let paths: Vec<&str> = git.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md"], "draft 不入改动列表");
+        assert_eq!(git.badge_for(&dir.join("a.md")), Some(StatusKind::Modified));
+        assert_eq!(
+            git.badge_for(&dir.join("a.md.latermd-draft")),
+            None,
+            "draft 无角标,文件树不标脏"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
