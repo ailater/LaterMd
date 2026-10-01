@@ -100,6 +100,8 @@ pub enum Command {
     DuplicateLine,
     /// 打开文档内查找条(Ctrl+F)。
     FindInDoc,
+    /// 打开查找条的替换行(Ctrl+H,查找条同开);已展开时再按收起替换行。
+    ReplaceInDoc,
     /// 右侧只读预览栏展开/折叠(§3.1)。
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
@@ -114,7 +116,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 35] = [
+    pub const ALL: [Command; 36] = [
         Self::New,
         Self::Open,
         Self::Save,
@@ -148,6 +150,7 @@ impl Command {
         Self::DuplicateSelection,
         Self::DuplicateLine,
         Self::FindInDoc,
+        Self::ReplaceInDoc,
         Self::ToggleRightPreview,
         Self::ToggleZen,
     ];
@@ -213,6 +216,7 @@ impl Command {
             Self::DuplicateSelection => "duplicate_selection",
             Self::DuplicateLine => "duplicate_line",
             Self::FindInDoc => "find_in_doc",
+            Self::ReplaceInDoc => "replace_in_doc",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
         }
@@ -257,6 +261,7 @@ impl Command {
             Self::DuplicateSelection => "复制选中(Ctrl+D)",
             Self::DuplicateLine => "复制当前行",
             Self::FindInDoc => "查找",
+            Self::ReplaceInDoc => "替换",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
         }
@@ -342,6 +347,8 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::D)
             }
             Self::FindInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F),
+            // Ctrl/Cmd+H:主流编辑器的替换键位,出厂表无占用者
+            Self::ReplaceInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::H),
             Self::ToggleRightPreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
@@ -389,7 +396,10 @@ impl Command {
             Self::FormatTask => Icon::TaskList,
             Self::ImageInsert => Icon::Image,
             Self::EmojiPicker => Icon::Emoji,
-            Self::DuplicateSelection | Self::DuplicateLine | Self::FindInDoc => Icon::Search,
+            Self::DuplicateSelection
+            | Self::DuplicateLine
+            | Self::FindInDoc
+            | Self::ReplaceInDoc => Icon::Search,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
         }
@@ -435,6 +445,7 @@ impl Command {
             | Self::DuplicateSelection
             | Self::DuplicateLine => Message::FormatRequested(self.format_action().unwrap()),
             Self::FindInDoc => Message::FindBarToggled(true),
+            Self::ReplaceInDoc => Message::ReplaceBarToggled(true),
         }
     }
 }
@@ -718,5 +729,29 @@ mod tests {
             },
         );
         output.drop_without_applying_deltas();
+    }
+
+    /// 替换命令(#17):Ctrl/Cmd+H 出厂即绑且只触发这一条;命令映射到
+    /// 替换条打开消息(开/关语义在归约侧翻转发)。
+    #[test]
+    fn replace_shortcut_fires_replace_command() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::H, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::ReplaceInDoc]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            Command::ReplaceInDoc.message(),
+            Message::ReplaceBarToggled(true)
+        );
     }
 }
