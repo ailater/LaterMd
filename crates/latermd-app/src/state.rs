@@ -616,6 +616,14 @@ pub enum Message {
     TabCloseConfirmed,
     /// 确认模态取消,不关。
     TabCloseCancelled,
+    /// 批量关闭(#37 标签条右键菜单):`kind` 以 `index` 处的**被右键标签**
+    /// 为基准(菜单弹出帧的索引快照,归约里立即换算成稳定 id 队列,不等
+    /// 索引存活到下一帧)。目标为空时(如最左标签的「关闭左侧」)UI 侧
+    /// 已禁用,这里防御性 no-op。
+    TabBatchCloseRequested {
+        kind: crate::tabs::BatchClose,
+        index: usize,
+    },
     /// 切到下一个标签(Ctrl/Cmd+Tab 循环)。
     TabNext,
     /// 恢复条「恢复」(#18):载荷为标签稳定 id。把盘上孤儿 draft 的内容
@@ -803,8 +811,19 @@ impl State {
                 {
                     self.remove_tab(index);
                 }
+                // 批量关闭进行中:确认一个继续下一个(队首正是刚确认的 id,
+                // 已被移除,推进循环自然跳过它)。单发关闭时队列已空,空转。
+                self.advance_batch_close();
             }
-            Message::TabCloseCancelled => self.tabs.confirm_close = None,
+            Message::TabCloseCancelled => {
+                self.tabs.confirm_close = None;
+                // 任一次取消(#37 批量):立即终止剩余队列 —— 已确认关闭的
+                // 保持关闭,不假装可回滚;被拒绝的标签保持打开。
+                self.tabs.pending_close.clear();
+            }
+            Message::TabBatchCloseRequested { kind, index } => {
+                self.request_batch_close(kind, index)
+            }
             Message::TabNext => {
                 let next = self.tabs.next_index();
                 self.switch_active(next);
@@ -2367,6 +2386,42 @@ impl State {
             self.abort_ai_stream();
         }
         self.rescan_find_after_tab_switch(previous);
+    }
+
+    /// 批量关闭请求(`Message::TabBatchCloseRequested` 的归约,#37 右键
+    /// 菜单):以被右键的标签为基准换算目标 id 队列,然后逐个走**单标签
+    /// 关闭的同一条通路**(`remove_tab` / `confirm_close`):干净标签直接
+    /// 关,脏标签弹同一个确认模态,确认一个关一个。
+    ///
+    /// 新的批量请求取代旧队列与进行中的确认模态:被顶掉的模态目标若属
+    /// 新队列会再次弹出 —— 没有确认被吞,也没有标签被悄悄关掉。空的
+    /// 目标队列(UI 已禁用对应菜单项)是 no-op,但仍会顶掉旧批量:菜单
+    /// 动作本身就是新的用户意图。
+    fn request_batch_close(&mut self, kind: crate::tabs::BatchClose, index: usize) {
+        self.tabs.pending_close = self.tabs.batch_close_targets(kind, index);
+        self.tabs.confirm_close = None;
+        self.advance_batch_close();
+    }
+
+    /// 推进批量关闭队列(#37):队首 id 已不在(被其他路径关掉)跳过;干净
+    /// 标签直接移除(同单标签关闭);脏标签把 `confirm_close` 指到它并
+    /// 停下,由 [`Message::TabCloseConfirmed`] 确认后再回到这里继续、
+    /// [`Message::TabCloseCancelled`] 清空队列终止。队列走空即批量自然
+    /// 结束。AI 流保护继承自 `remove_tab`:关到发起标签即作废流,迟到
+    /// chunk 在 `append_ai_delta` 里被丢弃,不落到别的标签。
+    fn advance_batch_close(&mut self) {
+        while let Some(&id) = self.tabs.pending_close.first() {
+            let Some(index) = self.tabs.index_by_id(id) else {
+                self.tabs.pending_close.remove(0);
+                continue;
+            };
+            if self.tabs.tabs[index].editor.is_dirty() {
+                self.tabs.confirm_close = Some(id);
+                return;
+            }
+            self.tabs.pending_close.remove(0);
+            self.remove_tab(index);
+        }
     }
 
     /// 去抖到点发起搜索(`Message::SearchRequested` 的归约)。无根目录
@@ -4814,6 +4869,244 @@ mod tests {
         // 模态已不存在:迟到的确认消息不得关掉任何标签
         state.apply(Message::TabCloseConfirmed);
         assert_eq!(state.tabs.tabs.len(), 1, "no-op,兜底标签未被误伤");
+    }
+
+    /// 批量关闭干净标签(#37):右键非活动的中间标签「关闭左侧」→ 左侧
+    /// 全部移除、基准与右侧幸存,幸存者 TabId 不变(id 是编辑器 widget 与
+    /// undo 状态的锚,批量关闭不得重排)。
+    #[test]
+    fn batch_close_left_of_non_active_anchor_keeps_survivor_ids() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙");
+        state.spawn_tab(None, "丙"); // active = 2(丙)
+        let ids: Vec<u64> = state.tabs.tabs.iter().map(|tab| tab.id).collect();
+
+        // 右键乙(索引 1,非活动)关闭其左侧:只有甲
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Left,
+            index: 1,
+        });
+        assert!(state.tabs.pending_close.is_empty(), "全干净,队列一次走完");
+        assert_eq!(state.tabs.tabs.len(), 2, "只关甲");
+        assert_eq!(state.tabs.tabs[0].id, ids[1], "乙幸存且 id 不变");
+        assert_eq!(state.tabs.tabs[1].id, ids[2], "丙幸存且 id 不变");
+        assert!(state.tabs.tabs[0].editor.text().contains("乙"));
+        assert!(state.tabs.current().editor.text().contains("丙"));
+    }
+
+    /// 多脏标签逐个确认(#37):队列按顺序停在第一个脏标签的确认模态上,
+    /// 确认一个关一个、模态挪到下一个;每个模态只问它自己的目标,后续
+    /// 弹窗不得影响已完成的关闭;基准标签(丙,右键目标)始终保留。
+    #[test]
+    fn batch_close_confirms_each_dirty_tab_in_turn() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙");
+        state.spawn_tab(None, "丙");
+        let dirty0 = state.tabs.tabs[0].id; // 甲(SAMPLE)
+        let dirty1 = state.tabs.tabs[1].id; // 乙
+        let anchor = state.tabs.tabs[2].id; // 丙:右键目标,干净
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.insert_chars(0, "甲的草稿");
+        state.apply(Message::TabActivate(1));
+        state.tabs.current_mut().editor.insert_chars(0, "乙的草稿");
+        assert!(state.tabs.tabs[0].editor.is_dirty());
+        assert!(state.tabs.tabs[1].editor.is_dirty());
+        assert!(!state.tabs.tabs[2].editor.is_dirty());
+
+        // 右键丙「关闭其他」:队列 = [甲, 乙](基准不含)
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Others,
+            index: 2,
+        });
+        // 队头甲脏 → 模态问甲,一个都不先关
+        assert_eq!(state.tabs.confirm_close, Some(dirty0));
+        assert_eq!(state.tabs.tabs.len(), 3, "确认前不移除");
+
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 2, "甲确认后移除");
+        assert_eq!(state.tabs.confirm_close, Some(dirty1), "模态挪到乙");
+
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 1, "乙确认后移除");
+        assert_eq!(state.tabs.tabs[0].id, anchor, "留下的正是基准丙");
+        assert!(state.tabs.pending_close.is_empty(), "队列走空");
+        assert_eq!(state.tabs.confirm_close, None);
+    }
+
+    /// 批量关闭中取消(#37):任一次取消立即终止剩余队列,已确认关闭的
+    /// 保持关闭(不回滚),未处理的标签保持打开;迟到的确认消息 no-op。
+    #[test]
+    fn batch_close_cancel_stops_remaining_and_keeps_confirmed() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙");
+        state.spawn_tab(None, "丙");
+        let a = state.tabs.tabs[0].id;
+        let b = state.tabs.tabs[1].id;
+        let c = state.tabs.tabs[2].id;
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.insert_chars(0, "甲的草稿");
+        state.apply(Message::TabActivate(1));
+        state.tabs.current_mut().editor.insert_chars(0, "乙的草稿");
+        state.apply(Message::TabActivate(2)); // active 回丙
+
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::All,
+            index: 0,
+        });
+        assert_eq!(state.tabs.confirm_close, Some(a), "模态先问甲");
+        state.apply(Message::TabCloseConfirmed); // 甲确认关闭
+        assert_eq!(state.tabs.confirm_close, Some(b), "模态再问乙");
+
+        state.apply(Message::TabCloseCancelled); // 用户拒关乙
+        assert_eq!(state.tabs.confirm_close, None);
+        assert!(state.tabs.pending_close.is_empty(), "剩余队列终止");
+        assert_eq!(state.tabs.tabs.len(), 2, "已确认的甲保持关闭");
+        assert_eq!(state.tabs.tabs[0].id, b, "乙保持打开");
+        assert_eq!(state.tabs.tabs[1].id, c, "丙保持打开");
+
+        state.apply(Message::TabCloseConfirmed);
+        assert_eq!(state.tabs.tabs.len(), 2, "迟到确认不再关任何标签");
+    }
+
+    /// 关闭全部到最后(#37):最后一批移除把标签关空,`TabsState::remove`
+    /// 兜底补一个新的空标签 —— 「关掉全部仍留一个空标签」与单标签时代
+    /// 同口径,且新标签 id 不与任何旧 id 复用。
+    #[test]
+    fn batch_close_all_leaves_single_fresh_empty_tab() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙");
+        let old_ids: Vec<u64> = state.tabs.tabs.iter().map(|tab| tab.id).collect();
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::All,
+            index: 0,
+        });
+        // 首标签 SAMPLE 起始不脏 → 直接关;乙干净 → 直接关;关空兜底
+        assert_eq!(state.tabs.tabs.len(), 1, "关空后剩一个兜底标签");
+        assert_eq!(state.tabs.current().editor.text(), "", "兜底标签为空");
+        assert_eq!(state.tabs.current().document.path, None, "兜底标签未命名");
+        assert!(
+            !old_ids.contains(&state.tabs.current().id),
+            "兜底标签 id 不复用"
+        );
+    }
+
+    /// 批量确认与单发关闭交错(#37「确认结果不可被后续弹窗覆盖」):批量
+    /// 模态开着时,用户经 × / Ctrl+W 关掉别的**干净**标签 —— 单发直关不
+    /// 动批量模态;随后确认批量目标,剩余队列继续走完,每个确认只关它
+    /// 问的那个标签。
+    #[test]
+    fn batch_close_modal_survives_interleaved_clean_close() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙(干净)");
+        state.spawn_tab(None, "丙(基准)");
+        let a = state.tabs.tabs[0].id;
+        let c = state.tabs.tabs[2].id;
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.insert_chars(0, "甲的草稿");
+
+        // 右键丙「关闭其他」:队列 [甲(脏), 乙(净)],模态先问甲
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Others,
+            index: 2,
+        });
+        assert_eq!(state.tabs.confirm_close, Some(a));
+
+        // 模态非阻塞:用户顺手关掉干净的乙(单发直关)
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.tabs.len(), 2, "乙单发直关");
+        assert_eq!(state.tabs.confirm_close, Some(a), "批量模态目标不受影响");
+
+        state.apply(Message::TabCloseConfirmed); // 确认的正是模态所问的甲
+        assert_eq!(state.tabs.tabs.len(), 1);
+        assert_eq!(state.tabs.tabs[0].id, c, "基准丙幸存");
+        assert!(
+            state.tabs.pending_close.is_empty(),
+            "队列里的乙已被单发关掉,自然跳过"
+        );
+    }
+
+    /// 批量模态被单发**脏**关闭顶掉(#37):确认先答单发的那个,批量随后
+    /// 从自己的队首继续 —— 被顶掉的模态目标重新弹出,没有任何标签未经
+    /// 自己的确认被关掉。
+    #[test]
+    fn batch_close_resumes_after_interleaved_dirty_close() {
+        let mut state = State::default();
+        state.spawn_tab(None, "乙(脏)");
+        state.spawn_tab(None, "丙(基准)");
+        let a = state.tabs.tabs[0].id;
+        let b = state.tabs.tabs[1].id;
+        let c = state.tabs.tabs[2].id;
+        state.apply(Message::TabActivate(0));
+        state.tabs.current_mut().editor.insert_chars(0, "甲的草稿");
+        state.apply(Message::TabActivate(1));
+        state.tabs.current_mut().editor.insert_chars(0, "乙的草稿");
+
+        // 右键丙「关闭其他」:队列 [甲(脏), 乙(脏)],模态先问甲
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Others,
+            index: 2,
+        });
+        assert_eq!(state.tabs.confirm_close, Some(a));
+
+        // 模态非阻塞:用户 × 掉脏的乙 → 单发模态顶掉批量模态
+        state.apply(Message::TabCloseRequested(1));
+        assert_eq!(state.tabs.confirm_close, Some(b), "单发请求顶掉批量模态");
+
+        state.apply(Message::TabCloseConfirmed); // 先答单发的乙
+        assert_eq!(state.tabs.tabs.len(), 2, "乙确认关闭");
+        assert_eq!(
+            state.tabs.confirm_close,
+            Some(a),
+            "批量从自己的队首(甲)重新弹模态"
+        );
+
+        state.apply(Message::TabCloseConfirmed); // 再答批量问的甲
+        assert_eq!(state.tabs.tabs.len(), 1);
+        assert_eq!(state.tabs.tabs[0].id, c, "基准丙幸存");
+        assert!(state.tabs.pending_close.is_empty());
+    }
+
+    /// 批量关闭携带 AI 流的标签(#37):发起标签被移除即作废流(复用
+    /// `remove_tab` 的既有作废),迟到的 chunk 丢弃,绝不落到幸存标签,
+    /// 幸存标签 id 稳定。
+    #[test]
+    fn batch_close_aborts_stream_and_late_chunk_misses_survivors() {
+        let mut state = State::default();
+        // 慢 provider 保证流在批量关闭发起时仍在途
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(20),
+        ));
+        state.spawn_tab(None, "幸存者"); // active = 1,流发起标签是 0
+        state.apply(Message::TabActivate(0));
+        state.apply(Message::AiStart);
+        assert!(state.ai.is_streaming());
+        let origin_id = state.ai_active_tab.expect("发起时锁定标签 id");
+        let survivor_id = state.tabs.tabs[1].id;
+
+        // 右键幸存者(索引 1,非活动)「关闭其他」:队列 = [发起标签]。
+        // 发起标签因流式补行/写入变脏 → 先弹确认;确认移除即作废流。
+        state.apply(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Others,
+            index: 1,
+        });
+        assert_eq!(state.tabs.confirm_close, Some(origin_id));
+        state.apply(Message::TabCloseConfirmed);
+        assert!(!state.ai.is_streaming(), "发起标签被关,流随之作废");
+        assert_eq!(state.ai_active_tab, None, "绑定一并清除");
+        assert_eq!(state.tabs.tabs.len(), 1, "幸存者保留");
+        assert_eq!(state.tabs.current().id, survivor_id, "幸存者 id 稳定");
+
+        // 迟到 chunk:写入目标已失效,丢弃,不写进幸存标签
+        let before = state.tabs.current_mut().editor.text().to_owned();
+        state.apply(Message::AiChunk {
+            delta: "迟到的续写".into(),
+        });
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            before,
+            "迟到 chunk 不得写入幸存标签"
+        );
+        assert_eq!(state.ai_active_tab, None);
     }
 
     /// 回归(独立评审 medium):另存为的目标已在**另一**标签打开时,拒绝

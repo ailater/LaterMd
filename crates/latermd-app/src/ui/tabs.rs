@@ -5,8 +5,10 @@
 //! 当前文档落盘,条即出现,关闭入口(× 与 Ctrl+W)随之可用。
 //!
 //! 交互:点击名字区 = 激活;点击 × = 请求关闭(脏标签由归约侧弹确认模态,
-//! 见 `State::request_close_tab`)。chip 自绘(与工具栏图标按钮同一套
-//! 手法),选中态用填充底色 —— 与侧边栏页签的下划线区分层级。
+//! 见 `State::request_close_tab`);右键 = 批量操作菜单(#37:关闭左侧/
+//! 右侧/全部/其他,以**被右键的标签**为基准;重命名与标题宽度模式由后续
+//! 模块交付,先入骨架禁用)。chip 自绘(与工具栏图标按钮同一套手法),
+//! 选中态用填充底色 —— 与侧边栏页签的下划线区分层级。
 
 use crate::state::Message;
 use crate::tabs::TabsState;
@@ -40,6 +42,88 @@ pub fn ui(panel: &mut egui::Ui, tabs: &TabsState, outbox: &mut Vec<Message>) -> 
             });
         });
     true
+}
+
+/// 右键菜单条目的响应组(`context_menu_items` 的返回值;生产闭包忽略,
+/// 无头测试借此定位各条目矩形,与 `image_dialog::dialog` 返回按钮响应
+/// 同款手法)。字段只在测试读取(与 `PreviewState::text` 同款豁免)。
+#[allow(dead_code)]
+pub(crate) struct TabMenuItems {
+    pub close_left: egui::Response,
+    pub close_right: egui::Response,
+    pub close_all: egui::Response,
+    pub close_others: egui::Response,
+    pub rename: egui::Response,
+    pub short_title: egui::Response,
+    pub full_title: egui::Response,
+}
+
+/// 后续模块交付的条目统一禁用文案(#37 菜单骨架)。
+const PENDING_HINT: &str = "后续版本交付";
+
+/// 单条菜单项:可用性由调用方判定(无目标即禁用),禁用态给悬停说明。
+fn menu_item(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new(label));
+    if enabled {
+        response
+    } else {
+        response.on_disabled_hover_text(PENDING_HINT)
+    }
+}
+
+/// 右键标签的批量操作菜单(#37)。目标是**被右键的标签本身**(`index`,
+/// 菜单弹出帧的快照),不是当前活动标签;关闭左侧/右侧/其他都以它为
+/// 基准并保留它。无目标可关时(最左标签的「关闭左侧」等)禁用对应条目,
+/// 归约侧对空队列防御性 no-op。重命名/缩短标题/完整标题由后续模块交付,
+/// 本模块先入骨架(禁用)。
+fn context_menu_items(
+    ui: &mut egui::Ui,
+    tabs: &TabsState,
+    index: usize,
+    outbox: &mut Vec<Message>,
+) -> TabMenuItems {
+    let close_left = menu_item(ui, "关闭左侧", index > 0);
+    if close_left.clicked() {
+        outbox.push(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Left,
+            index,
+        });
+    }
+    let close_right = menu_item(ui, "关闭右侧", index + 1 < tabs.tabs.len());
+    if close_right.clicked() {
+        outbox.push(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Right,
+            index,
+        });
+    }
+    let close_all = menu_item(ui, "关闭全部", true);
+    if close_all.clicked() {
+        outbox.push(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::All,
+            index,
+        });
+    }
+    let close_others = menu_item(ui, "关闭其他", tabs.tabs.len() > 1);
+    if close_others.clicked() {
+        outbox.push(Message::TabBatchCloseRequested {
+            kind: crate::tabs::BatchClose::Others,
+            index,
+        });
+    }
+    ui.separator();
+    let rename = menu_item(ui, "重命名", false);
+    ui.separator();
+    let short_title = menu_item(ui, "缩短标题", false);
+    let full_title = menu_item(ui, "完整标题", false);
+    TabMenuItems {
+        close_left,
+        close_right,
+        close_all,
+        close_others,
+        rename,
+        short_title,
+        full_title,
+    }
 }
 
 /// 单个标签 chip:名字区点击激活,× 区点击请求关闭。
@@ -131,6 +215,13 @@ fn chip(ui: &mut egui::Ui, tabs: &TabsState, index: usize, outbox: &mut Vec<Mess
             outbox.push(Message::TabActivate(index));
         }
     }
+
+    // 右键菜单(#37):挂在被右键的 chip 上(目标即该标签,非当前活动)。
+    // `context_menu` 消费 Response,借 clone 注册、原 response 继续供上面的
+    // 点击判定用(与标题栏设置键右键直达同手法)。
+    response.clone().context_menu(|ui| {
+        context_menu_items(ui, tabs, index, outbox);
+    });
 }
 
 #[cfg(test)]
@@ -261,5 +352,227 @@ mod tests {
             .drop_without_applying_deltas();
         }
         assert_eq!(outbox, vec![Message::TabCloseRequested(0)]);
+    }
+
+    /// 右键菜单动作消息(#37):四个批量动作都携带**被右键标签**的索引
+    /// (非当前活动标签),点击才发消息。菜单直接渲染(与 menubar::item
+    /// 的测法同款):条目响应里有矩形,按中心点击。
+    #[test]
+    fn context_menu_actions_carry_right_clicked_tab_index() {
+        let ctx = egui::Context::default();
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        tabs.open_tab(None, "丙");
+        tabs.activate(2); // active = 丙,右键目标是乙(索引 1,非活动)
+        let cases = [
+            ("左", crate::tabs::BatchClose::Left),
+            ("右", crate::tabs::BatchClose::Right),
+            ("全", crate::tabs::BatchClose::All),
+            ("他", crate::tabs::BatchClose::Others),
+        ];
+        for (name, kind) in cases {
+            let mut outbox = Vec::new();
+            let rect = Cell::new(Rect::NOTHING);
+            ctx.run_ui(RawInput::default(), |ui| {
+                let items = context_menu_items(ui, &tabs, 1, &mut outbox);
+                rect.set(match kind {
+                    crate::tabs::BatchClose::Left => items.close_left.rect,
+                    crate::tabs::BatchClose::Right => items.close_right.rect,
+                    crate::tabs::BatchClose::All => items.close_all.rect,
+                    crate::tabs::BatchClose::Others => items.close_others.rect,
+                });
+            })
+            .drop_without_applying_deltas();
+            assert!(outbox.is_empty(), "{name}:仅渲染不发消息");
+
+            let center = rect.get().center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            ctx.run_ui(
+                RawInput {
+                    events: vec![Event::PointerMoved(center), click(true), click(false)],
+                    ..Default::default()
+                },
+                |ui| {
+                    context_menu_items(ui, &tabs, 1, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(
+                outbox,
+                vec![Message::TabBatchCloseRequested { kind, index: 1 }],
+                "{name}:消息携带被右键标签的索引"
+            );
+        }
+    }
+
+    /// 首/尾/唯一边界(#37):无目标可关的菜单项禁用(点击也不发消息),
+    /// 有目标的照常可用。顺序 = 左侧 / 右侧 / 全部 / 其他。
+    #[test]
+    fn context_menu_disables_items_without_targets() {
+        let ctx = egui::Context::default();
+
+        let assert_items = |tabs: &TabsState, index: usize, want: [bool; 4]| {
+            let mut outbox = Vec::new();
+            let rects = Cell::new(Vec::<Rect>::new());
+            ctx.run_ui(RawInput::default(), |ui| {
+                let items = context_menu_items(ui, tabs, index, &mut outbox);
+                assert_eq!(
+                    [
+                        items.close_left.enabled(),
+                        items.close_right.enabled(),
+                        items.close_all.enabled(),
+                        items.close_others.enabled()
+                    ],
+                    want
+                );
+                rects.set(
+                    [
+                        items.close_left.rect,
+                        items.close_right.rect,
+                        items.close_all.rect,
+                        items.close_others.rect,
+                    ]
+                    .to_vec(),
+                );
+            })
+            .drop_without_applying_deltas();
+            // 逐条点击**禁用**项:一律不发消息
+            for (rect, enabled) in rects.take().into_iter().zip(want) {
+                if enabled {
+                    continue;
+                }
+                let center = rect.center();
+                let click = |pressed| Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                ctx.run_ui(
+                    RawInput {
+                        events: vec![Event::PointerMoved(center), click(true), click(false)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        context_menu_items(ui, tabs, index, &mut outbox);
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+            assert!(outbox.is_empty(), "禁用项点击零消息,实际 {outbox:?}");
+        };
+
+        // 唯一标签:左/右/其他无目标;全部仍有目标(关空兜底补空标签)
+        let single = TabsState::new("仅此一篇");
+        assert_items(&single, 0, [false, false, true, false]);
+
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        tabs.open_tab(None, "丙");
+        // 最左:左侧无目标;最右:右侧无目标;中间:全有目标
+        assert_items(&tabs, 0, [false, true, true, true]);
+        assert_items(&tabs, 1, [true, true, true, true]);
+        assert_items(&tabs, 2, [true, false, true, true]);
+    }
+
+    /// 菜单骨架(#37):重命名与缩短/完整标题由后续模块交付,本模块渲染
+    /// 出来但一律禁用(点击不发消息)。
+    #[test]
+    fn context_menu_skeleton_items_are_disabled() {
+        let ctx = egui::Context::default();
+        let tabs = TabsState::new("甲");
+        let mut outbox = Vec::new();
+        let rects = Cell::new(Vec::<Rect>::new());
+        ctx.run_ui(RawInput::default(), |ui| {
+            let items = context_menu_items(ui, &tabs, 0, &mut outbox);
+            assert!(!items.rename.enabled());
+            assert!(!items.short_title.enabled());
+            assert!(!items.full_title.enabled());
+            rects.set(
+                [
+                    items.rename.rect,
+                    items.short_title.rect,
+                    items.full_title.rect,
+                ]
+                .to_vec(),
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty());
+
+        for rect in rects.take() {
+            let center = rect.center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            ctx.run_ui(
+                RawInput {
+                    events: vec![Event::PointerMoved(center), click(true), click(false)],
+                    ..Default::default()
+                },
+                |ui| {
+                    context_menu_items(ui, &tabs, 0, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(outbox.is_empty(), "骨架项禁用,点击零消息");
+    }
+
+    /// 右键标签弹菜单(#37 装配):secondary 点击**标签条上**的标签(chip
+    /// 经 `ui` 的真实入口渲染,含 ScrollArea)后 egui 侧确有弹层打开。
+    /// 菜单条目本身的行为由上面的直渲染测试覆盖。
+    #[test]
+    fn right_click_on_chip_opens_context_menu() {
+        let ctx = egui::Context::default();
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        ctx.run_ui(RawInput::default(), |ui| {
+            assert!(super::ui(ui, &tabs, &mut outbox), "多标签必画条");
+            rect.set(ui.min_rect());
+        })
+        .drop_without_applying_deltas();
+        assert!(!egui::containers::Popup::is_any_open(&ctx), "前置:无弹层");
+
+        // 标签条最左侧必是第一个 chip(名字区靠左):取条左端内侧一点
+        let pos = egui::pos2(rect.get().left() + 2.0, rect.get().top() + CHIP_H / 2.0);
+        let click = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // 右键帧:secondary 点击让 context_menu 置开;下一帧空输入渲染,
+        // 弹层内容(菜单条目)实际画出来。
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(pos), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(ui, &tabs, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        ctx.run_ui(RawInput::default(), |ui| {
+            super::ui(ui, &tabs, &mut outbox);
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            egui::containers::Popup::is_any_open(&ctx),
+            "右键后菜单弹层打开"
+        );
+        assert!(outbox.is_empty(), "右键本身不发消息");
     }
 }

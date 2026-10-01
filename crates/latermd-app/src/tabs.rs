@@ -13,7 +13,11 @@
 //!   静默丢稿的代价大于多一次点击;
 //! * 在途 AI 流**绑定发起标签的 id**(`State::ai_active_tab`):换标签/
 //!   开新标签不改写入目标也不中断;只有发起标签被关闭才作废(剩余块
-//!   无处可写,写进任何别的标签都是写错文档)。
+//!   无处可写,写进任何别的标签都是写错文档);
+//! * 批量关闭(#37 右键菜单)以**被右键的标签**为基准,队列存稳定 id、
+//!   归约逐个走单标签关闭的同一条脏确认通路(见
+//!   `State::advance_batch_close`):确认一个关一个,任一次取消立即
+//!   终止剩余队列 —— 已确认关闭的不回滚,被拒绝的保持打开。
 
 use crate::live::LiveState;
 use crate::state::{DocumentState, OutlineCursor, PreviewState};
@@ -136,6 +140,20 @@ impl TabState {
     }
 }
 
+/// 批量关闭的类别(#37 标签条右键菜单):以**被右键的标签**为基准,
+/// 左/右/其他都不含基准标签本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchClose {
+    /// 关闭基准标签左侧的全部标签。
+    Left,
+    /// 关闭基准标签右侧的全部标签。
+    Right,
+    /// 关闭除基准标签外的全部标签。
+    Others,
+    /// 关闭全部标签(关空由 `TabsState::remove` 兜底补一个空标签)。
+    All,
+}
+
 /// 标签集合:全部标签 + 当前指针 + 关闭确认 + id 发放器。
 pub struct TabsState {
     /// 打开的标签(至少一个;关闭最后一个即换入新的空标签)。
@@ -147,6 +165,11 @@ pub struct TabsState {
     /// 动标签列表使索引漂移,按漂移索引确认会关错标签;id 不随增删漂移
     /// (与在途 AI 流的 `State::ai_active_tab` 同手法)。
     pub confirm_close: Option<u64>,
+    /// 批量关闭(#37)的剩余目标(稳定 id,按关闭顺序);非空即批量进行中。
+    /// 归约逐个消费:干净标签直接移除,脏标签把 `confirm_close` 指到它等
+    /// 确认;用户取消即清空本队列(已关闭的不回滚)。存 id 而非索引,与
+    /// `confirm_close` 同理由。
+    pub pending_close: Vec<u64>,
     /// 下一个标签的 id(自增,不复用 —— 关了再开新标签,编辑器 undo/光标
     /// 状态必须是全新的)。
     next_id: u64,
@@ -167,6 +190,7 @@ impl TabsState {
             tabs: vec![TabState::new(1, None, initial)],
             active: 0,
             confirm_close: None,
+            pending_close: Vec::new(),
             next_id: 2,
         }
     }
@@ -227,6 +251,30 @@ impl TabsState {
             0
         } else {
             (self.active + 1) % self.tabs.len()
+        }
+    }
+
+    /// 批量关闭(#37)的目标 id 列表:`kind` 以 `index` 处的标签为基准,
+    /// 左/右/其他都不含基准;顺序即关闭顺序(从左到右)。索引过期(菜单
+    /// 弹出到点击之间标签已被关掉)返回空 —— 宁可 no-op 也不按漂移索引
+    /// 关错标签。
+    pub fn batch_close_targets(&self, kind: BatchClose, index: usize) -> Vec<u64> {
+        if index >= self.tabs.len() {
+            return Vec::new();
+        }
+        let ids =
+            |range: std::ops::Range<usize>| self.tabs[range].iter().map(|tab| tab.id).collect();
+        match kind {
+            BatchClose::Left => ids(0..index),
+            BatchClose::Right => ids(index + 1..self.tabs.len()),
+            BatchClose::Others => self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, tab)| tab.id)
+                .collect(),
+            BatchClose::All => ids(0..self.tabs.len()),
         }
     }
 
@@ -338,5 +386,74 @@ mod tests {
         assert_eq!(tab.preview.outline.len(), 1, "大纲随换入重建");
         assert_eq!(tab.preview.outline[0].text, "新标题");
         assert_eq!(tab.document.path, Some(PathBuf::from("/x.md")));
+    }
+
+    /// 批量关闭目标(#37):以被右键的标签为基准,左/右/其他都不含基准,
+    /// 全部含基准;返回的是稳定 id。中间标签做基准覆盖非活动目标场景
+    /// (active 指向别处,目标计算与 active 无关)。
+    #[test]
+    fn batch_close_targets_around_anchor() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        tabs.open_tab(None, "丙");
+        tabs.open_tab(None, "丁");
+        tabs.activate(3); // active 在最右,基准取中间的乙(非活动)
+        let ids: Vec<u64> = tabs.tabs.iter().map(|tab| tab.id).collect();
+        let anchor = 1;
+
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Left, anchor),
+            ids[0..1]
+        );
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Right, anchor),
+            ids[2..4]
+        );
+        assert_eq!(
+            tabs.batch_close_targets(BatchClose::Others, anchor),
+            vec![ids[0], ids[2], ids[3]]
+        );
+        assert_eq!(tabs.batch_close_targets(BatchClose::All, anchor), ids);
+    }
+
+    /// 首/尾边界:最左标签无「左侧」目标,最右标签无「右侧」目标;唯一
+    /// 标签的「其他」为空(菜单项据此禁用,归约侧空队列即 no-op)。
+    #[test]
+    fn batch_close_targets_first_last_boundaries() {
+        let mut tabs = TabsState::new("甲");
+        assert!(
+            tabs.batch_close_targets(BatchClose::Others, 0).is_empty(),
+            "唯一标签无「其他」目标"
+        );
+        assert!(
+            tabs.batch_close_targets(BatchClose::Left, 0).is_empty(),
+            "最左标签无「左侧」目标"
+        );
+        tabs.open_tab(None, "乙");
+        assert!(
+            tabs.batch_close_targets(BatchClose::Right, 1).is_empty(),
+            "最右标签无「右侧」目标"
+        );
+        // 关闭全部对唯一/多个标签都有目标(关空由 remove 兜底补空标签)
+        assert_eq!(tabs.batch_close_targets(BatchClose::All, 0).len(), 2);
+    }
+
+    /// 索引过期(菜单点击落到已被关闭的标签)→ 空队列,不误伤现存标签。
+    #[test]
+    fn batch_close_targets_stale_index_yields_empty() {
+        let mut tabs = TabsState::new("甲");
+        tabs.open_tab(None, "乙");
+        for kind in [
+            BatchClose::Left,
+            BatchClose::Right,
+            BatchClose::Others,
+            BatchClose::All,
+        ] {
+            assert!(
+                tabs.batch_close_targets(kind, 9).is_empty(),
+                "{kind:?} 过期索引一律空"
+            );
+        }
+        assert_eq!(tabs.tabs.len(), 2, "不误伤现存标签");
     }
 }
