@@ -19,6 +19,8 @@ mod bed;
 mod clipboard;
 mod command;
 mod compose;
+#[cfg(test)]
+mod editor_typography_acceptance;
 mod export;
 mod file;
 mod filetree;
