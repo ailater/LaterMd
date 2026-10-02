@@ -3,7 +3,7 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #70 为当前最新条目。
+> 编号 #76 为当前最新条目。
 
 ## #68 标签「缩短标题/完整标题」(#37)的三个口径:作用范围=整条标签条、默认=完整(既有观感)、收窄分配=保底+max-min 公平(2026-10-01,#37 tab-management 标题宽度显示模式·自动拍板;原编号 #67,因重命名条目重编号顺延为 #68,撞号事由见 #67 条头注)
 
@@ -619,6 +619,7 @@
 - **自动选择**:①。#43 条目的症状与验收全部落在预览排版;UI 密度是全局产品决策(+19.6% 行高影响每一屏),单方面改掉超出本任务边界,也不是「预览字体修复」的题中之义。
 - **理由**:预览与 UI 的排版需求本就不同源(预览是长文阅读排版,CJK 行距下限 1.448em+ 合理;UI 是控件密度,Inter 原生行高是刻意保留);①把修复面精确对准症状面,降级路径(无 CJK 候选/表值解析失败)全部回落现状行为。编辑器混排基线偏差(同根因,TextEdit 走 Proportional)如实保留,现状与修复前一致——不劣化,只是没顺手修。
 - **如何改**:若拍板要全局对齐,把 `fonts.rs` `build_definitions` 里 Proportional 链头从 `NAME_REGULAR` 换成 `PREVIEW_REGULAR`(SemiBold/Medium 同理),`preview_body_family` 即可退役回落 Proportional;UI 行高变化的观感需真机人工复核后定。编辑器单独修则按 ① 的同款手法注册 TextEdit 专用族,由 #23(字号行距设置)一并考虑。附带说明:代码块(Monospace 族)的中文注释行高/基线同样未修(代码块 format 的 line_height=None 走链头行高,不经过 vendored floor;链头是 epui 内置等宽字体,与 CJK Mono 的表值差同根因),一并留给 #23 或后续。
+- **2026-10-02 坤哥反馈拍板**:编辑器混排基线修理由 #50 M1 落地(`97a701e`)——坤哥 2026-10-02 反馈截图「源码页面字体大小不一,高低不一致」即本条登记的同根因症状在源码页的呈现;采用本条「如何改」预留的「编辑器单独注册 TextEdit 专用族」路径(`fonts.rs` 新增 `editor-mono` 族,经 `TextStyle::Monospace` 档投影统一源码 TextEdit/行号槽/Live 活动块),实测混排基线偏差 +1~+3px→+0.000px(12-24pt 全档×明暗两主题)。实现与任务书有一处方向偏差:反向 override(CJK 等宽 face 副本对齐链头 Hack 表值、链头不动,保「纯 ASCII 行盒不变」否决线),全文见 #75;上文附带说明的代码块面因 vendored 硬编码 `FontId::monospace` 未能一并换族,保留现状,全文见 #76;预览侧与 vendored 均零改动。
 
 ## #73 #23 F3 行距滑杆只作用于预览正文,源码编辑器的行距(行盒倍率)不在本轮投影(2026-10-02,#23 font-prefs F3·自动拍板)
 
@@ -627,6 +628,7 @@
 - **自动选择**:①。
 - **理由**:子任务清单是实现权威(行距若要双投影,会像字号一样写「→编辑器」「→预览」两条);②把行距语义(字号倍率)翻译成绝对像素加值需要依赖运行时 `Fonts::row_height`(字体链与 CJK face 相关,与 `apply` 的 staleness 投影模型耦合更深——size 与 ratio 任一变化都要重算),是一块独立改动,不该以「顺手可做」混进本棒;且 #72 已定源码编辑器的混排基线/行高本就未修(TextEdit 行 metrics 取等宽族链头出厂值),单独拉行距投影会制造「行距对齐了、基线没对齐」的半吊子状态,不如与 #72 的「如何改」里预留的 TextEdit 专用族排版面一起做。写作面(编辑器)行距的体验感知也弱于阅读面(预览)。
 - **如何改**:若拍板编辑器也要行距,在 `theme.rs::ThemeSettings::apply` 里追加 `extra_text_line_spacing` 投影(值 = `(size × ratio − row_height).max(0)`,row_height 用 `ctx.fonts(|f| f.row_height(&FontId::monospace(size)))` 现算,与 `apply_font_size` 共用 staleness 槽),并确认 `ui/editor.rs:167` 的行高估算公式(`row_height + extra_text_line_spacing`,既有已含 extra,无需改)、行号槽 `gutter.rs` 与 `live.rs` 活动块的 desired_rows 同步;补「行距调低不裁切 CJK」的边界测试(clamp ≥ 自然行高)。建议与 #72 的编辑器行 metrics 对齐(TextEdit 专用族/override 副本)同棒做,排版面一次对齐。
+- **2026-10-02 坤哥反馈拍板**:岔路转正——坤哥 2026-10-02 反馈「源码页面…每行间距也太小感觉」,原自动拍板①(行距只进预览,理由之一是「写作面行距的体验感知弱于阅读面」)被真机体验推翻,按本条「如何改」预留的方案②落地(#50 M2,`0a7f4be`):`theme.rs::apply_font_size` 扩为字号+行距联合投影,`extra_text_line_spacing = max(0, 字号×行距−自然行高)`(自然行高经 `ctx.fonts` 现算投影后 Monospace 档的 FontId,与 F3 共用按值键控 staleness 槽,size/ratio 任一变化当帧重投影),行盒精确=字号×行距(15pt 实测 1.2 档 18.000px/2.0 档 30.000px),clamp≥0 兜底自然行高(「行距调低不裁切 CJK」边界测试已钉);「与 #72 同棒做、排版面一次对齐」的建议同棒兑现——M1 的 editor-mono 族(混排基线 +0.000px)与 M2 行距投影同在 feature/editor-typography 先后落地,不出现「行距对齐了、基线没对齐」的半吊子状态。
 
 ## #74 #23 F4 标题呼吸间距的实现落点:任务书指定 `render_token_range` 层 add_space,实际落在 `build_layout` 层透明 spacer 行(2026-10-02,#23 font-prefs F4·自动拍板)
 
@@ -635,3 +637,19 @@
 - **自动选择**:①。
 - **理由**:产品目标(标题上下有明显大于段落间距的呼吸)与两条硬约束(正文观感不变、两条渲染路径行为一致)都指向同一落点。①的数值语义是「叠加」:标题上方总呼吸 ≈ 空行(16.9px)+ spacer(8+4=12px)≈ 28.9px,明显大于段落间距且可通过一个字段全局调;机制先例是同文件 `HorizontalRule` 的透明 spacer 行做法,新增面极小。触发条件保守:文档/flush 段首标题与紧邻块元素的标题(after_block 已 trim 掉空行,heading 是段内首 token)不插 spacer,顶部不撑空、块间距一视同仁;字段归零时 spacer 行高恰等于 `block_spacing`,语义完全回落到现状。无头实证(egui 0.36.2):spacer 行高三档(8/12/48px)精确等于 `block_spacing + heading_space_above`,总高度随标题数×Δ 精确线性,纯正文文档 rows 数与高度对该字段**完全不变**;「纯正文零影响」已钉成测试(否决线)。
 - **如何改**:若想要「12px 纯间距」的替代式观感,把 `layout.rs` heading 分支里 spacer 行高从 `block_spacing + heading_space_above` 改为只 `heading_space_above`(触发条件不变);若想要块元素(表格等)后紧跟的标题也吃呼吸,在 `render_token_range` 的 `after_block` 跳完换行后、下一 token 是 heading 时补一段 `add_space(heading_space_above)`(flush 段首无 spacer,不会双计),该情形当前保持普通 `block_spacing`,已有测试钉死该保守语义。出厂 `line_height_ratio=1.30` 本轮未动;真机目视后微调只需改 `heading_space_above` 一个出厂值(app 侧接线见 F5,皮肤 ron 兼容:已存在的预设文件不含新字段走 serde default 4.0 兜底,显式 0.0 是合法偏好会原样保留)。
+
+## #75 #50 M1 编辑器等宽族的 override 方向:任务书指定「链头 override 对齐 CJK 表值」,实际反向「CJK 副本 override 对齐链头」(2026-10-02,#50 editor-typography M1·自动拍板)
+
+- **岔路**:任务书 M1 写「链头=当前编辑器等宽拉丁 face 的副本(行 metrics override/FontTweak 对齐本机 CJK face 表值,同 #43 M2 手法)」——把链头(Hack,行高 1.164em)的表值改写为 CJK 等宽 face 同款(1.448em);但同一任务书的否决线写「纯 ASCII 文档编辑器 rows 数与行盒高度对新族完全不变」。TextEdit 行盒高(desired_rows 的输入)直接由链头行 metrics 决定,链头被 override 则纯 ASCII 行盒必然从 1.164em 涨到 1.448em(15pt 实测 17px→21.7px,+24%),两条指令不可同时满足。
+- **备选**:①照任务书字面,链头副本 override 到 CJK 表值——基线归零但纯 ASCII 行盒 +24%,否决线破;②链头不动,在 CJK face 上用 `FontTweak::y_offset_factor` 平移墨迹——layout 基线仍差(y_offset 只移墨迹不移布局基线),且偏差随字号在 +1~+3px 间变化(本机实测 12-24pt),单个 em 比例因子无法在整数字号档全域精确归零;③**反向 override**:CJK 等宽 face **副本**的表值改写为链头 Hack 同款 em 值(#43 M2 同一套 `override_vertical_metrics` 机制、方向相反),链头分毫不动。
+- **自动选择**:③。副本只挂 `editor-mono` 专用族(`fonts::FAMILY_EDITOR_MONO`)并替换链尾原生 CJK 等宽条目(链内混入原生 face 会先命中、override 白做,与 #43 M2 预览族同一纪律);字号仍走 #23 F3 的 `TextStyle::Monospace` 档投影,族由 `apply_font_size` 一并投影(`fonts::editor_mono_family`,未注册回落 `Monospace`)。
+- **理由**:否决线的本意是把「行距太小」的改动留给 #50 M2(行距滑杆投影 `extra_text_line_spacing`),M1 只对齐基线;③使链头与 fallback 行 metrics 全等,基线公式(`ascent + valign·(行盒−line_height) + 0.5×(链头行高−face行高)`)残差与 #43 M2 同理精确归零,且 advance/outline/win 表不动 → 纯 ASCII 的行盒/折行/行数逐像素不变。无头实证(egui 0.36.2,本机 Noto CJK face 7):混排基线偏差旧族 +1~+3px → 新族在 12-24pt 全档 × 明暗两主题下 +0.000px,纯 ASCII 文档 rows/逐行行盒/总高与旧族全等(`editor_typography_acceptance` 三测试);`#43 M2 手法`的机制一致性与否决线在此不冲突——冲突的只是改写方向。CJK 与拉丁的墨迹高比(1.25@15pt,face 设计值)未动:任务书第 3 条的「视觉尺寸均衡」经基线对齐后已达「同行无高低差」,进一步缩放 CJK 观感(如 `FontTweak::scale`)需连动 override 目标值(否则破坏基线恒等),留真机目视后再定。
+- **如何改**:若拍板要 #43 M2 原方向(链头对齐 CJK、行高随 CJK 涨),把 `fonts.rs` `build_definitions` 编辑器族分支的目标/源头对调(patch "Hack" 字节到 CJK mono face 表值作链头副本),并重锚 `install_registers_editor_mono_family_with_aligned_baseline` 与 `editor_typography_acceptance` 的行盒不变断言(纯 ASCII 行盒将 +24%,需与 #50 M2 的 `extra_text_line_spacing` 语义对表,避免行距双重放大)。
+
+## #76 #50 M1 的「源码高亮代码块」等宽面未能指向新族:vendored 硬编码 `FontId::monospace` 且预览代码块共用同一族,app 侧单独换族不可达(2026-10-02,#50 editor-typography M1·自动拍板)
+
+- **岔路**:任务书第 2 条要求编辑器全部等宽渲染面(源码 TextEdit、行号槽、Live 活动块、**源码高亮代码块**)统一指向新族。前三者都经 `TextStyle::Monospace` 档,族投影一处生效;第四个(带 syntect 高亮的代码块 widget)由 vendored 层渲染,`vendor/egui_markdown/src/layout.rs`(626/643/732/969 等处)硬编码 `FontId::monospace(code_font_size)` = `FontFamily::Monospace` 族,**且预览面板的代码块走同一硬编码路径**——app 侧没有任何可单独给「编辑器里的代码块」换族的扩展点。任务书同时规定本棒「全程不触碰 vendor/egui_markdown/」与否决线「预览侧零改动」。
+- **备选**:①给 vendored `MarkdownStyle` 加 code 族字段或在 layout 读 context 标记(①类 vendored 补丁)——触碰 vendor 红线;②直接把 `FontFamily::Monospace` 的链头换成 override 副本——预览代码块纯 ASCII 行盒同步 +24%、含 CJK 注释的代码渲染变化,否决线二破;③不换,现状保留。
+- **自动选择**:③。
+- **理由**:①违反本棒「不触碰 vendor」的显式约束;②把编辑器修复外溢到预览(预览行距/行盒是 #23/#50 M2 的领地,代码块拉丁行从 17px 涨 21.7px 是可见回归);③的代价可控——代码块拉丁字形与新族链头同为内置 Hack face,纯拉丁代码渲染逐像素一致,唯一保留的现状缺陷是「代码块内 CJK 注释与拉丁的基线差」(同根因,#72 已登记),不影响坤哥反馈的源码 TextEdit 主症状。
+- **如何改**:若拍板代码块也要基线对齐,走①类 vendored 最小补丁(`MarkdownStyle` 增 `code_font_family: Option<String>` 之类字段,layout 的 `FontId::monospace` 处改读字段、None 回落现行为,独立 `vendor:` commit + vendor/README 登记),app 侧把编辑器语境的 `MarkdownStyle` 填 `editor-mono`、预览填 `Inter-Preview` 或 None;或拍板全局换 `FontFamily::Monospace` 链头(一行改动,预览代码块与全部 UI 等宽文本随之变化,需真机目视行盒 +24% 的观感)。
