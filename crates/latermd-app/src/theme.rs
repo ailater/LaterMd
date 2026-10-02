@@ -6,6 +6,9 @@
 //!   `Style`/`Visuals`(egui 0.36 按主题各持一份,面板/控件全部跟随);
 //! - **外壳 token**:密度(标准/紧凑)改写 spacing 与圆角 —— 批次 B 的视觉
 //!   打磨落点,不做每控件粒度自定义(roadmap 专题「明确不做」);
+//! - **编辑器**:字号(#23 F3)投 `TextStyle::Monospace` 档;行距(#50 M2)
+//!   投 `spacing.extra_text_line_spacing`(TextEdit 行盒的绝对像素加值,
+//!   `max(0, 字号×行距 − 自然行高)`,自然行高经 `ctx.fonts` 现算);
 //! - **正文**:vendored `MarkdownStyle` 装进 context 默认槽
 //!   (`egui_markdown_style::set_style`),其颜色字段本就成对设计
 //!   (`color_dark`/`color_light`),渲染时按 `ui.visuals().dark_mode` 自动取值;
@@ -25,6 +28,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui::Color32;
@@ -229,11 +233,14 @@ pub struct ThemeSettings {
     /// 比例放大,行高随字号重算)。
     pub editor_font_size: f32,
     /// 正文行距倍率(#23),有效范围 1.2..=2.0(闭区间),默认 1.5。
-    /// 是**用户偏好**:`apply` 在皮肤/overrides 之上再覆盖 vendored
+    /// 是**用户偏好**:预览侧 `apply` 在皮肤/overrides 之上再覆盖 vendored
     /// `MarkdownStyle::line_height_ratio`(出厂 1.30,preview-typography
-    /// §1.2 的「正文观感不变」口径,见 F3 的行距覆盖决策)。用户调低
+    /// §1.2 的「正文观感不变」口径,见 F3 的行距覆盖决策),用户调低
     /// (如 1.2)时 `effective_markdown_style` 的 CJK 行高下限(本机
-    /// CJK face 行高,约 1.448em)在更下层兜底。
+    /// CJK face 行高,约 1.448em)在更下层兜底;编辑器侧(#50 M2,坤哥
+    /// 2026-10-02 反馈「每行间距也太小」,decisions-pending #73 方案②
+    /// 转正)经 `apply_font_size` 投影成 `spacing.extra_text_line_spacing`
+    /// 的绝对像素加值,调低时被自然行高 clamp 到 0。
     pub line_height: f32,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
@@ -317,10 +324,10 @@ impl ThemeSettings {
         }
     }
 
-    /// 把主题投影到 context:切 egui 主题(外壳)+ 密度 token + 字号档
-    /// (编辑器)+ 安装正文样式(预览,含行距覆盖)。幂等且带 staleness
-    /// 检查,每帧调用时空闲帧近零开销。egui 0.36 中 theme 属于 options
-    /// 数据,`logic` 阶段写入合法(不是绘制)。
+    /// 把主题投影到 context:切 egui 主题(外壳)+ 密度 token + 字号档与
+    /// 行距投影(编辑器)+ 安装正文样式(预览,含行距覆盖)。幂等且带
+    /// staleness 检查,每帧调用时空闲帧近零开销。egui 0.36 中 theme 属于
+    /// options 数据,`logic` 阶段写入合法(不是绘制)。
     ///
     /// `resolved` 是 [`ThemeMode::resolve`] 的结果(已把 `System` 落到确定的
     /// 明暗):本模块不做系统检测 —— 那要查 dbus/注册表,不该每帧发生。
@@ -334,7 +341,11 @@ impl ThemeSettings {
         }
         apply_shell(ctx);
         apply_density(ctx, self.density);
-        apply_font_size(ctx, clamp_editor_font_size(self.editor_font_size));
+        apply_font_size(
+            ctx,
+            clamp_editor_font_size(self.editor_font_size),
+            clamp_line_height(self.line_height),
+        );
         // #23 F3:行距倍率在皮肤/overrides 选出的生效样式**之上**再覆盖
         // —— 滑杆是显式用户意图,优先级高于「皮肤是一整套显式选择」。
         // 由此生效的 ratio 恒等于 `theme.line_height`(默认 1.5,vendored
@@ -637,10 +648,12 @@ fn apply_density(ctx: &egui::Context, density: Density) {
     });
 }
 
-/// 字号偏好(#23 F3)在 egui data 槽的键:`apply_font_size` 写入(经
-/// staleness 检查),预览正文侧的 [`editor_font_size`] 读取。槽值是
-/// `(字号, 投影族)`:族随字体安装状态而变(#50 M1),staleness 按两者
-/// 联合键控,族翻转的下一帧即重投影。
+/// 字号偏好(#23 F3)与行距投影(#50 M2)在 egui data 槽的键:
+/// `apply_font_size` 写入(经 staleness 检查),预览正文侧的
+/// [`editor_font_size`] 读取。槽值是 `(字号, 行距, 投影族, fonts 就绪)`:
+/// 族随字体安装状态而变(#50 M1),行距与 fonts 就绪标志(#50 M2,见
+/// [`apply_font_size`])进同一键控 —— size/ratio/族任一变化或 fonts
+/// 转为就绪的当帧即重投影。
 fn font_size_id() -> egui::Id {
     egui::Id::new("latermd-editor-font-size")
 }
@@ -654,10 +667,67 @@ fn font_size_id() -> egui::Id {
 /// (#43 系列)不受本读侧影响。
 pub fn editor_font_size(ctx: &egui::Context) -> f32 {
     ctx.data(|data| {
-        data.get_temp::<(f32, egui::FontFamily)>(font_size_id())
-            .map(|(size, _)| size)
+        data.get_temp::<(f32, f32, egui::FontFamily, bool)>(font_size_id())
+            .map(|(size, _, _, _)| size)
             .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
     })
+}
+
+/// 编辑器档在 `size` 字号下的自然行高(pt,#50 M2):与 egui TextEdit
+/// 行高公式的输入同源(builder.rs `row_height(font_id)`,同一 FontId 同一
+/// ppp 同一取整),投影后的行盒因此精确等于「自然行高 + extra」。
+/// `None` = fonts 未就绪(首帧前,见 [`fonts_ready`]),调用方跳过本轮
+/// 行距投影。
+fn natural_row_height(ctx: &egui::Context, size: f32) -> Option<f32> {
+    if !fonts_ready(ctx) {
+        return None;
+    }
+    let font = egui::FontId::new(size, crate::fonts::editor_mono_family(ctx));
+    Some(ctx.fonts_mut(|fonts| fonts.row_height(&font)))
+}
+
+/// 行距投影的像素换算(#50 M2,纯函数,单测锚点):字号 × 用户行距超出
+/// 自然行高的部分才是可加值。clamp ≥ 0:自然行高是行盒物理下限,用户
+/// 调低(如 1.2)时投影为 0,绝不为负 —— 负 extra 会压缩行盒造成行间
+/// 重叠与字形裁切,与预览侧 `min_line_height_em` 的兜底同语义。
+fn editor_extra_line_spacing(size: f32, ratio: f32, natural: f32) -> f32 {
+    (size * ratio - natural).max(0.0)
+}
+
+/// fonts 就绪标志(egui data 槽):`ctx.fonts` 自首个 run_ui 的
+/// begin_pass 实例化字体起才可用(egui 0.36 契约,提前调用 panic),
+/// 首个 pass 开始时由 [`install_fonts_ready_hook`] 注册的回调置位。
+/// 行距投影以此区分「首帧前的启动装载」(main 创建回调,fonts 未就绪)
+/// 与「帧内 logic」(每帧,fonts 已就绪)。
+fn fonts_ready(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(fonts_ready_id()).unwrap_or(false))
+}
+
+fn fonts_ready_id() -> egui::Id {
+    egui::Id::new("latermd-fonts-ready")
+}
+
+/// 注册「首个 pass 置位 fonts 就绪」的回调(幂等:标志槽已存在则不再
+/// 注册)。回调触发点在 begin_pass(字体实例化)之后、当帧 logic 之前,
+/// 因此首帧 logic 的 `apply_font_size` 即可经 `ctx.fonts` 现算自然行高,
+/// 首帧渲染(TextEdit 读 spacing)之前行距投影必然补上。
+fn install_fonts_ready_hook(ctx: &egui::Context) {
+    let id = fonts_ready_id();
+    let installed = ctx.data_mut(|data| {
+        let installed = data.get_temp::<bool>(id).is_some();
+        if !installed {
+            data.insert_temp(id, false);
+        }
+        installed
+    });
+    if !installed {
+        ctx.on_begin_pass(
+            "latermd-fonts-ready",
+            Arc::new(move |ui: &mut egui::Ui| {
+                ui.ctx().data_mut(|data| data.insert_temp(id, true));
+            }),
+        );
+    }
 }
 
 /// 字号偏好(#23 F3)→ egui style 的 `TextStyle::Monospace` 档投影:编辑器
@@ -670,28 +740,48 @@ pub fn editor_font_size(ctx: &egui::Context) -> f32 {
 /// 行为)。字号语义不变:唯一事实源仍是本档位的 size 字段,行号槽与
 /// Live 活动块经 `FontSelection::Style(Monospace)` 自动跟随。
 ///
+/// #50 M2 起行距(`ratio`,坤哥 2026-10-02「每行间距也太小」,#73 方案②
+/// 转正)随同槽键控一并投影:`spacing.extra_text_line_spacing` =
+/// `editor_extra_line_spacing(size, ratio, 自然行高)`。TextEdit 的行盒
+/// = 自然行高 + extra(egui builder.rs 同一公式同一输入),因此精确等于
+/// `字号 × 行距`;行号槽/Live 活动块读同一 TextEdit galley,自动跟随。
+///
 /// 与 [`apply_density`] 同款 staleness 检查:`apply` 每帧调用,值没变就
 /// 不写 style(`style_mut_of` 即使值相同也推进 style 版本、作废布局缓存,
-/// 滑杆拖动帧之外不得付这笔开销);字号或族变了(滑杆/载入新 settings/
-/// 字体安装完成)当帧即重投影 —— 不放进 `apply_shell` 那类一次性投影
-/// (ui.data 标志只挡第一次,后续滑杆变化会哑掉),而是像密度一样按值
-/// 键控。
-fn apply_font_size(ctx: &egui::Context, size: f32) {
+/// 滑杆拖动帧之外不得付这笔开销);字号/行距/族任一变化(滑杆/载入新
+/// settings/字体安装完成)当帧即重投影 —— 不放进 `apply_shell` 那类
+/// 一次性投影(ui.data 标志只挡第一次,后续滑杆变化会哑掉),而是像密度
+/// 一样按值键控。fonts 就绪标志在键控里:自然行高必须经 `ctx.fonts`
+/// 现算,而 egui 契约它在首个 run_ui 之前不可用 —— 首帧前的启动装载
+/// (main 创建回调)本轮跳过行距投影(字号档不依赖 fonts,照常投影),
+/// fonts 就绪的下一帧(即首个 pass 的 logic,回调已在 begin_pass 后置位)
+/// 因键控差异必然重投影,赶在首帧渲染之前。
+fn apply_font_size(ctx: &egui::Context, size: f32, ratio: f32) {
     let family = crate::fonts::editor_mono_family(ctx);
+    let ready = fonts_ready(ctx);
     let id = font_size_id();
     let changed = ctx.data_mut(|data| {
-        let changed = data.get_temp::<(f32, egui::FontFamily)>(id) != Some((size, family.clone()));
-        data.insert_temp(id, (size, family.clone()));
+        let changed = data.get_temp::<(f32, f32, egui::FontFamily, bool)>(id)
+            != Some((size, ratio, family.clone(), ready));
+        data.insert_temp(id, (size, ratio, family.clone(), ready));
         changed
     });
     if !changed {
         return;
+    }
+    let extra = natural_row_height(ctx, size)
+        .map(|natural| editor_extra_line_spacing(size, ratio, natural));
+    if extra.is_none() {
+        install_fonts_ready_hook(ctx);
     }
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         ctx.style_mut_of(theme, |style| {
             if let Some(mono) = style.text_styles.get_mut(&egui::TextStyle::Monospace) {
                 mono.size = size;
                 mono.family = family.clone();
+            }
+            if let Some(extra) = extra {
+                style.spacing.extra_text_line_spacing = extra;
             }
         });
     }
@@ -1703,5 +1793,143 @@ mod tests {
                 "{theme:?}: 输入框高度有效(实际 {edit_height})"
             );
         }
+    }
+
+    /// #50 M2 测试 context:与生产同构的两步投影 —— 先「启动装载」
+    /// apply(此时 fonts 未就绪,egui 契约 `ctx.fonts` 自首个 run_ui 起
+    /// 才可用,行距投影本轮跳过并布防 fonts-ready 回调),再跑一帧
+    /// run_ui 且在闭包内 apply(= 每帧 logic:fonts 已在 begin_pass
+    /// 实例化、回调已置位,行距投影当帧补上)。行距投影因此已生效。
+    fn projected_ctx(size: f32, ratio: f32, dark: bool) -> egui::Context {
+        let settings = || ThemeSettings {
+            editor_font_size: size,
+            line_height: ratio,
+            ..ThemeSettings::default()
+        };
+        let mode = if dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        let ctx = egui::Context::default();
+        settings().apply(&ctx, mode);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            settings().apply(ui.ctx(), mode);
+        })
+        .drop_without_applying_deltas();
+        ctx
+    }
+
+    /// 滑杆拖动当帧生效(#50 M2,#23 F3 手法):投影值精确等于
+    /// `max(0, 字号×行距 − 自然行高)` 且非零(出厂 15pt/1.5 在内置
+    /// Hack 链头 1.164em 行高下投影为正 —— 值非恒真);字号/行距任一
+    /// 变化不 run_ui 直接 apply 即当帧重投影;来回拖动不累积;明暗两套
+    /// style 同值。
+    #[test]
+    fn line_spacing_projects_exact_value_and_reprojects_same_frame() {
+        let extra_of = |ctx: &egui::Context| {
+            for theme in [egui::Theme::Light, egui::Theme::Dark] {
+                let extra = ctx.style_of(theme).spacing.extra_text_line_spacing;
+                assert_eq!(
+                    extra,
+                    ctx.style_of(egui::Theme::Dark)
+                        .spacing
+                        .extra_text_line_spacing,
+                    "{theme:?}: 行距投影必须明暗同值(与字号档同款两套齐写)"
+                );
+            }
+            ctx.style_of(egui::Theme::Dark)
+                .spacing
+                .extra_text_line_spacing
+        };
+        let settings = |size: f32, ratio: f32| ThemeSettings {
+            editor_font_size: size,
+            line_height: ratio,
+            ..ThemeSettings::default()
+        };
+
+        let ctx = projected_ctx(15.0, 1.5, true);
+        let natural = natural_row_height(&ctx, 15.0).expect("首帧后 fonts 已就绪");
+        let expected = editor_extra_line_spacing(15.0, 1.5, natural);
+        assert_eq!(extra_of(&ctx), expected, "投影值与公式精确一致");
+        assert!(
+            expected > 0.0,
+            "出厂 15pt/1.5 在编辑器等宽链头下投影应为正,实测 {expected}"
+        );
+
+        // 行距拖动(1.5 → 2.0 → 1.2):不 run_ui,当帧即重投影
+        for ratio in [2.0, 1.2, 1.5] {
+            settings(15.0, ratio).apply(&ctx, ThemeMode::Dark);
+            assert_eq!(
+                extra_of(&ctx),
+                editor_extra_line_spacing(15.0, ratio, natural),
+                "行距 {ratio}: 拖动当帧生效(非一次性投影)"
+            );
+        }
+        assert_eq!(extra_of(&ctx), expected, "回拖到出厂值不累积");
+
+        // 字号拖动(15 → 18 → 12):自然行高随字号重算,行距同帧跟随
+        for size in [18.0, 12.0] {
+            settings(size, 1.5).apply(&ctx, ThemeMode::Dark);
+            let natural = natural_row_height(&ctx, size).expect("fonts 已就绪");
+            assert_eq!(
+                extra_of(&ctx),
+                editor_extra_line_spacing(size, 1.5, natural),
+                "字号 {size}: 字号×行距与自然行高都在变,投影当帧换算"
+            );
+        }
+    }
+
+    /// #50 M2 clamp 下限:纯函数在「字号×行距不足自然行高」的域内投影
+    /// 为 0、绝不为负(负值会压缩行盒,行间重叠与字形裁切的根源);
+    /// 边界(恰好等于)为 0,正值域保持差值。
+    #[test]
+    fn extra_line_spacing_clamps_at_zero_below_natural_row_height() {
+        assert_eq!(
+            editor_extra_line_spacing(15.0, 1.5, 17.5),
+            5.0,
+            "正差值原样保留"
+        );
+        assert_eq!(
+            editor_extra_line_spacing(15.0, 1.2, 18.0),
+            0.0,
+            "字号×行距恰等于自然行高 → 投影 0"
+        );
+        assert_eq!(
+            editor_extra_line_spacing(12.0, 1.2, 20.0),
+            0.0,
+            "字号×行距低于自然行高 → 钳 0,不产生负 extra"
+        );
+        for size in [12.0, 15.0, 24.0] {
+            for ratio in [1.2, 1.5, 2.0] {
+                for natural in [0.5, 13.0, 17.5, 30.0] {
+                    let extra = editor_extra_line_spacing(size, ratio, natural);
+                    assert!(
+                        extra >= 0.0,
+                        "{size}×{ratio} vs 自然行高 {natural}: extra {extra} 不得为负"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #50 M2:行距投影不影响键控槽的读侧语义 —— [`editor_font_size`]
+    /// 仍从共用槽取字号(槽扩容后读侧同步);未投影 context 回落默认。
+    #[test]
+    fn shared_staleness_slot_keeps_editor_font_size_reader_working() {
+        let ctx = projected_ctx(18.0, 1.7, true);
+        assert_eq!(editor_font_size(&ctx), 18.0, "共用槽扩容后读侧仍取字号");
+
+        // 行距变化(字号不变)也走同一槽:读侧不受扰动
+        ThemeSettings {
+            editor_font_size: 18.0,
+            line_height: 1.3,
+            ..ThemeSettings::default()
+        }
+        .apply(&ctx, ThemeMode::Dark);
+        assert_eq!(editor_font_size(&ctx), 18.0);
+
+        let fresh = egui::Context::default();
+        assert_eq!(editor_font_size(&fresh), EDITOR_FONT_SIZE_DEFAULT);
     }
 }
