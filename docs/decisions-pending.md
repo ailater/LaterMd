@@ -611,3 +611,11 @@
 - **自动选择**:①。
 - **理由**:①复用 `selectable_label` 的同一条渲染路径(后者在 egui 0.36 就是 `Button::selectable(..).ui(..)` 的别名),选中/悬停样式零漂移;「角标贴行尾」由布局原子保证,名字的截断宽度先扣除角标固有宽,省略号永远挤不掉角标;整行可点/整行高亮是树形列表的通行预期(VSCode 同款),把旧行为里「点名字才算点行」的偏差顺带修掉。git 页改动行(`git_status_row` 同走 `badged_row_label`)一并受益。②为了行宽口径自控引入约 60 行手绘样式代码,违背小表面积。
 - **如何改**:想回「内容宽」,把 `badged_row_label` 里 `right_text` 的 grow 语义换掉——不用 `Button::right_text`,改在 `ui.horizontal` 里先 `add(角标 Label)` 再倒排名字,或走②手绘;同时改 `tree_row_truncates_long_names_in_narrow_panel` 里「角标贴行尾(距行右沿 < 12px)」的断言。角标与名字的间距现在是 2×`icon_spacing`(出厂 8px,grow 原子两侧各一个 gap),嫌宽可给 `Button::gap(…)` 传更小值。
+
+## #72 #43 M2 混排基线修复只作用于预览族,编辑器/全局 UI 的同根因基线偏差不在本轮修(2026-10-02,#43 preview-font-metrics M2·自动拍板)
+
+- **岔路**:M1 取证确认混排基线偏差的根因是「链头 Inter 与 CJK 回退 face 的行 metrics 表值差」(残差 ≈0.072em,与任何 line_height 设置无关),修法是把链头 override 成 CJK 同款。但 override 挂到哪个族有两条路:①只挂预览专用族(`Inter-Preview` 正文族 + `bold` 别名族链头,本轮实现)——Proportional/SemiBold/Medium 原生族不动,UI 外壳与编辑器的行高维持现状;②把 Proportional 链头直接换成 override 副本——编辑器(TextEdit)与全部 UI 控件的中英混排基线一并对齐,但**所有 UI 文本行高从 Inter 原生 1.21em 涨到 CJK 同款 ≈1.448em(+19.6%)**,菜单/按钮/标签全套界面密度变松。
+- **备选**:①预览族隔离(本轮);②Proportional 全局 override(界面密度全局变化);③编辑器单独再开一个 TextEdit 专用族(编辑器基线对齐且 UI 不动,但编辑器与预览行距不同源,且 TextEdit 的字体配置面要单独拉一遍)。
+- **自动选择**:①。#43 条目的症状与验收全部落在预览排版;UI 密度是全局产品决策(+19.6% 行高影响每一屏),单方面改掉超出本任务边界,也不是「预览字体修复」的题中之义。
+- **理由**:预览与 UI 的排版需求本就不同源(预览是长文阅读排版,CJK 行距下限 1.448em+ 合理;UI 是控件密度,Inter 原生行高是刻意保留);①把修复面精确对准症状面,降级路径(无 CJK 候选/表值解析失败)全部回落现状行为。编辑器混排基线偏差(同根因,TextEdit 走 Proportional)如实保留,现状与修复前一致——不劣化,只是没顺手修。
+- **如何改**:若拍板要全局对齐,把 `fonts.rs` `build_definitions` 里 Proportional 链头从 `NAME_REGULAR` 换成 `PREVIEW_REGULAR`(SemiBold/Medium 同理),`preview_body_family` 即可退役回落 Proportional;UI 行高变化的观感需真机人工复核后定。编辑器单独修则按 ① 的同款手法注册 TextEdit 专用族,由 #23(字号行距设置)一并考虑。附带说明:代码块(Monospace 族)的中文注释行高/基线同样未修(代码块 format 的 line_height=None 走链头行高,不经过 vendored floor;链头是 epui 内置等宽字体,与 CJK Mono 的表值差同根因),一并留给 #23 或后续。
