@@ -168,9 +168,48 @@ impl TitleWidthMode {
     }
 }
 
-/// 主题设置:模式 + 皮肤 + 密度 + 正文样式覆盖。缺省字段(含整个
-/// `overrides`)回落默认,手改的配置文件缺项不致整体解析失败。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// 排版偏好(#23)的字号取值域(pt,闭区间):下限 12 是中文可读性下限
+/// (auto-plan #23),上限 24。默认 15。F2 的滑杆 range 与本常量同源。
+pub const EDITOR_FONT_SIZE_MIN: f32 = 12.0;
+pub const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
+pub const EDITOR_FONT_SIZE_DEFAULT: f32 = 15.0;
+
+/// 排版偏好(#23)的正文行距倍率取值域(闭区间):下限 1.2,上限 2.0,
+/// 默认 1.5(中文可读区间,preview-typography §2.2(3))。
+pub const LINE_HEIGHT_MIN: f32 = 1.2;
+pub const LINE_HEIGHT_MAX: f32 = 2.0;
+pub const LINE_HEIGHT_DEFAULT: f32 = 1.5;
+
+/// f32 偏好值钳制:`NaN` 回落默认(`f32::clamp` 对 NaN 是穿透的,这里
+/// 是渲染前的最后防线);inf 与越界值钳到闭区间端点。
+fn clamp_pref(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else {
+        value.clamp(min, max)
+    }
+}
+
+/// 字号钳制(纯函数,单测锚点;#23):把任意手改值收进
+/// [`EDITOR_FONT_SIZE_MIN`]..=[`EDITOR_FONT_SIZE_MAX`]。
+pub fn clamp_editor_font_size(value: f32) -> f32 {
+    clamp_pref(
+        value,
+        EDITOR_FONT_SIZE_MIN,
+        EDITOR_FONT_SIZE_MAX,
+        EDITOR_FONT_SIZE_DEFAULT,
+    )
+}
+
+/// 行距倍率钳制(纯函数,单测锚点;#23):把任意手改值收进
+/// [`LINE_HEIGHT_MIN`]..=[`LINE_HEIGHT_MAX`]。
+pub fn clamp_line_height(value: f32) -> f32 {
+    clamp_pref(value, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_DEFAULT)
+}
+
+/// 主题设置:模式 + 皮肤 + 密度 + 排版偏好 + 正文样式覆盖。缺省字段(含
+/// 整个 `overrides`)回落默认,手改的配置文件缺项不致整体解析失败。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeSettings {
     /// 明暗模式(外壳与正文共同跟随)。
@@ -182,6 +221,16 @@ pub struct ThemeSettings {
     /// 标签条标题宽度模式(#37)。落 settings.json 与主题同路;旧文件缺
     /// 该项由 `#[serde(default)]` 回落 `Full`(完整,既有观感)。
     pub tab_title_width: TitleWidthMode,
+    /// 编辑器与预览正文的**基准字号**(pt,#23):标题按比例放大,本字段
+    /// 只定正文基准。有效范围 12..=24(闭区间,CJK 可读性下限),默认 15。
+    /// 本期只交持久化底座,F2 滑杆读写、F3 才投影到渲染 —— 当前渲染路径
+    /// 不消费本字段。
+    pub editor_font_size: f32,
+    /// 正文行距倍率(#23),有效范围 1.2..=2.0(闭区间),默认 1.5。
+    /// 是**用户偏好**:`vendored` 的 `MarkdownStyle::line_height_ratio`
+    /// (出厂 1.30,preview-typography §1.2 已定「正文观感不变」)才是
+    /// 当前生效值,用户显式调整在 F3 覆盖之。
+    pub line_height: f32,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
     /// Emoji 面板「最近使用」(docs/emoji-plan.md §6.3):新的在前、去重、
@@ -195,6 +244,26 @@ pub struct ThemeSettings {
     /// 不跟着变)。
     #[serde(skip)]
     pub skin_style: Option<MarkdownStyle>,
+}
+
+/// 手动实现而非 derive:f32 字段的派生默认只能是 0.0,而 #23 的排版偏好
+/// 默认是 15.0/1.5(serde 的 struct 级 `#[serde(default)]` 缺字段时正从
+/// 这里取值,旧 settings.json 的回落路径与 Rust 侧 `ThemeSettings::default()`
+/// 因此同源)。枚举字段仍取各自 `#[default]`,与派生语义一致。
+impl Default for ThemeSettings {
+    fn default() -> Self {
+        Self {
+            mode: ThemeMode::default(),
+            skin: None,
+            density: Density::default(),
+            tab_title_width: TitleWidthMode::default(),
+            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
+            line_height: LINE_HEIGHT_DEFAULT,
+            overrides: None,
+            emoji_recent: Vec::new(),
+            skin_style: None,
+        }
+    }
 }
 
 /// 出厂默认正文样式:vendored 默认之上开表格边框与底色(#30)。
@@ -321,16 +390,29 @@ impl ThemeSettings {
         })
     }
 
+    /// 把排版偏好(字号/行距,#23)钳进合法范围。settings.json 可手改,
+    /// 越界值(99/0 等)直进渲染会失控 —— F2 滑杆自带 range,但这里是不
+    /// 依赖 UI 的防线,语义集中在 [`clamp_editor_font_size`]/
+    /// [`clamp_line_height`] 一处。
+    pub fn clamp_font_prefs(&mut self) {
+        self.editor_font_size = clamp_editor_font_size(self.editor_font_size);
+        self.line_height = clamp_line_height(self.line_height);
+    }
+
     /// 从指定目录读取;`dir` 存在性由调用方保证语义(不存在 = 首次运行)。
     /// `pub(crate)`:测试与启动路径都按目录注入,不走平台默认目录。
+    /// 读取后经 [`ThemeSettings::clamp_font_prefs`] 统一钳制 —— 手改盘上
+    /// 文件写出的越界字号/行距不进渲染。
     pub(crate) fn load_from(dir: &Path) -> Result<Self, LoadError> {
         let path = dir.join(SETTINGS_FILE);
         let bytes = std::fs::read(&path).map_err(|source| match source.kind() {
             io::ErrorKind::NotFound => LoadError::Missing,
             _ => LoadError::Corrupt(format!("{}: {}", path.display(), source)),
         })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|source| LoadError::Corrupt(format!("{}: {}", path.display(), source)))
+        let mut settings: Self = serde_json::from_slice(&bytes)
+            .map_err(|source| LoadError::Corrupt(format!("{}: {}", path.display(), source)))?;
+        settings.clamp_font_prefs();
+        Ok(settings)
     }
 }
 
@@ -801,6 +883,106 @@ mod tests {
             TitleWidthMode::Full
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #23 排版偏好默认值:字号 15.0pt、行距 1.5 —— 默认值落在手动
+    /// `Default` 实现里(derive 给不出非零 f32),手动实现既服务 Rust 侧
+    /// `default()`,也是 serde 缺字段回落的取值源,断言钉住两头共用的值。
+    #[test]
+    fn font_prefs_default_to_15pt_and_1_5() {
+        assert_eq!(
+            ThemeSettings::default().editor_font_size,
+            EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(ThemeSettings::default().line_height, LINE_HEIGHT_DEFAULT);
+    }
+
+    /// #23 排版偏好随 settings.json 往返:界内自定义值逐项一致(在界内,
+    /// `load_from` 的钳制是恒等变换,不吞用户的合法选择);落盘 JSON 字段
+    /// 名与数值可读,手改可辨认。
+    #[test]
+    fn font_prefs_round_trip_preserves_in_range_values() {
+        let dir = temp_dir("font-prefs-roundtrip");
+        let settings = ThemeSettings {
+            editor_font_size: 18.0,
+            line_height: 1.7,
+            ..ThemeSettings::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        let loaded = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(loaded.editor_font_size, 18.0);
+        assert_eq!(loaded.line_height, 1.7);
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(json.contains(r#""editor_font_size": 18.0"#), "{json}");
+        assert!(json.contains(r#""line_height": 1.7"#), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #23 旧版 settings.json(升级前落盘)没有这两个新字段:`#[serde(default)]`
+    /// 兜底,解析不失败且回落默认 —— 与 `emoji_recent`/`tab_title_width`
+    /// 当时的升级路径同口径。
+    #[test]
+    fn font_prefs_missing_fields_fall_back_to_defaults() {
+        let dir = temp_dir("font-prefs-legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            br#"{"mode":"dark","density":"compact"}"#,
+        )
+        .unwrap();
+        let loaded = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(loaded.editor_font_size, EDITOR_FONT_SIZE_DEFAULT);
+        assert_eq!(loaded.line_height, LINE_HEIGHT_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #23 手改 settings.json 写出越界值(字号 99/0/负数、行距 99/0):
+    /// `load_from` 反序列化后统一钳进界 —— 越界值不得进渲染。
+    #[test]
+    fn font_prefs_out_of_range_are_clamped_on_load() {
+        for (json, want_font, want_line_height) in [
+            (r#"{"editor_font_size": 99, "line_height": 99}"#, 24.0, 2.0),
+            (r#"{"editor_font_size": 0, "line_height": 0}"#, 12.0, 1.2),
+            (
+                r#"{"editor_font_size": -5.0, "line_height": -3.0}"#,
+                12.0,
+                1.2,
+            ),
+            // 端点本身合法,clamp 不动
+            (r#"{"editor_font_size": 12, "line_height": 1.2}"#, 12.0, 1.2),
+            (r#"{"editor_font_size": 24, "line_height": 2.0}"#, 24.0, 2.0),
+        ] {
+            let dir = temp_dir("font-prefs-clamp");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SETTINGS_FILE), json.as_bytes()).unwrap();
+            let loaded = ThemeSettings::load_from(&dir).unwrap();
+            assert_eq!(loaded.editor_font_size, want_font, "{json}");
+            assert_eq!(loaded.line_height, want_line_height, "{json}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #23 钳制纯函数的边界行为(不经过 JSON,直接调函数):闭区间的
+    /// 端点保留;`inf` 钳到端点;`NaN` 回落默认 —— `f32::clamp` 对 NaN 是
+    /// 穿透的,不设防线 NaN 会一路进渲染。
+    #[test]
+    fn clamp_font_prefs_functions_handle_bounds_inf_and_nan() {
+        assert_eq!(clamp_editor_font_size(15.0), 15.0, "界内恒等");
+        assert_eq!(clamp_editor_font_size(f32::INFINITY), 24.0);
+        assert_eq!(clamp_editor_font_size(f32::NEG_INFINITY), 12.0);
+        assert_eq!(
+            clamp_editor_font_size(f32::NAN),
+            EDITOR_FONT_SIZE_DEFAULT,
+            "NaN 回落默认而非穿透"
+        );
+        assert_eq!(clamp_line_height(1.5), 1.5, "界内恒等");
+        assert_eq!(clamp_line_height(f32::INFINITY), 2.0);
+        assert_eq!(
+            clamp_line_height(f32::NAN),
+            LINE_HEIGHT_DEFAULT,
+            "NaN 回落默认而非穿透"
+        );
+        assert_eq!(clamp_line_height(f32::NEG_INFINITY), 1.2, "负无穷钳到下界");
     }
 
     /// 首次运行:目录/文件不存在 → Missing;`load` 语义是回落默认,这里只测
