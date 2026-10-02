@@ -138,7 +138,7 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 
 ## 9. 不做
 
-- **编辑器/预览正文的彩色 emoji 渲染**（epaint 字形管线恒纯白填充，等上游接通 skrifa 彩色模块；#48 预览内联彩色走 `emoji://` 改写 + inline_widget，不经字形管线）。
+- **编辑器正文彩色 emoji 维持黑白**（上游限制，见可行性调查 §4）。面板/预览走纹理路径（见 E-C1/E-C2 与可行性调查；#48 预览内联彩色走 `emoji://` 改写 + inline_widget，不经字形管线），不在本条禁区。
 - 自定义表情包 / 图片 emoji（那是 image-plan 的地盘）。
 - 肤色选择器、性别变体、长按展开。
 - `:shortcode:` 自动补全 → 放进可选的 E4。
