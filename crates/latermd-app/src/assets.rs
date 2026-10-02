@@ -231,22 +231,18 @@ pub fn store_pasted_image(doc_path: &Path, name: &str, bytes: &[u8]) -> Result<S
     store(doc_path, name, bytes).map_err(|error| error.to_string())
 }
 
-// —— 窗口图标(auto-plan #16 M1,纯解码不接线)——
-// 本节只把 PNG 素材解成 `egui::IconData` 纯数据:不碰 `ViewportBuilder`
-// (接线归 M2),MCP stdio headless 分支也不经过这里。
+// —— 窗口图标(auto-plan #16,M1 纯解码 + M2 接线)——
+// 本节把 PNG 素材解成 `egui::IconData` 纯数据;接线点在 main.rs 的
+// `viewport_builder`(M2),MCP stdio headless 分支不经过这里。
 
 /// 窗口图标素材字节:`assets/logo/deliverables/png/icon-64.png`。
 /// 相对路径由 `include_bytes!` 编译期校验 —— 素材被挪走即编译红。
-// M1 交付纯函数、M2 才接线(`ViewportBuilder::with_icon`),bin crate 里
-// pub 无消费者会被 dead_code 点名;接线落地后本豁免随之删除。
-#[allow(dead_code)]
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../../assets/logo/deliverables/png/icon-64.png");
 
 /// 解码窗口图标为 RGBA(64×64)。
 ///
-/// 解码任一步失败返回 `None` 并终端告警,调用方(M2 接线点)回落 egui
-/// 默认图标,不拦启动;本函数绝不 unwrap/expect/panic。
-#[allow(dead_code)] // 同上:M2 接线后删除
+/// 解码任一步失败返回 `None` 并终端告警,调用方(main.rs `viewport_builder`)
+/// 回落 egui 默认图标,不拦启动;本函数绝不 unwrap/expect/panic。
 pub fn window_icon() -> Option<egui::IconData> {
     let image = match image::load_from_memory(WINDOW_ICON_PNG) {
         Ok(image) => image,

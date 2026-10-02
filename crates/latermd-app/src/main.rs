@@ -99,11 +99,8 @@ fn main() -> eframe::Result<()> {
     let boot_layout = layout::LayoutSettings::load();
     let opts = eframe::NativeOptions {
         renderer,
-        // 三栏的最小可用宽度:侧边栏下限 160 + 编辑器 500 + 预览余量(docs/adr-005)
-        viewport: egui::ViewportBuilder::default()
-            .with_min_inner_size([900.0, 600.0])
-            .with_decorations(native_chrome)
-            .with_maximized(boot_layout.maximized),
+        // 窗口图标(auto-plan #16):解码成功才挂,失败回落 egui 默认图标
+        viewport: viewport_builder(assets::window_icon(), boot_layout.maximized, native_chrome),
         ..Default::default()
     };
     eframe::run_native(
@@ -190,6 +187,25 @@ fn native_decorations(env: Option<&str>) -> bool {
     env == Some("1")
 }
 
+/// 视口构建(与 `main` 的启动选择同源):窗口图标仅在解码成功(`Some`)时
+/// 挂上,失败回落无图标的默认 builder,启动路径零额外风险(auto-plan #16)。
+/// 三个入参由调用方传入,Some/None 两分支因此可在无头单测里穷尽。
+fn viewport_builder(
+    icon: Option<egui::IconData>,
+    maximized: bool,
+    native_chrome: bool,
+) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        // 三栏的最小可用宽度:侧边栏下限 160 + 编辑器 500 + 预览余量(docs/adr-005)
+        .with_min_inner_size([900.0, 600.0])
+        .with_decorations(native_chrome)
+        .with_maximized(maximized);
+    match icon {
+        Some(icon) => builder.with_icon(icon),
+        None => builder,
+    }
+}
+
 /// 应用根:状态 + 待归约消息队列。归约在 [`eframe::App::logic`],绘制在
 /// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
 #[derive(Default)]
@@ -240,7 +256,7 @@ impl LaterMdApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_decorations, renderer_label, MCP_STDIO_ARG};
+    use super::{native_decorations, renderer_label, viewport_builder, MCP_STDIO_ARG};
 
     /// 判定与 `main` 的启动选择同规则:认不认 `glow` 取决于 glow feature
     /// (两条产线都会跑到对应分支);值精确匹配小写,大小写变体不认。
@@ -277,5 +293,36 @@ mod tests {
         assert!(args(&["latermd", "--mcp-stdio"]));
         assert!(!args(&["latermd"]));
         assert!(!args(&["latermd", "--mcp-stdio=1"]), "精确匹配");
+    }
+
+    /// 视口构建的图标分支(auto-plan #16):`Some` → 图标挂上且像素原样;
+    /// `None` → icon 缺位回落默认 builder,不 panic。最小尺寸/装饰/最大化
+    /// 三个既有启动参数接线前后同值,Some/None 两分支一致 —— 接线不改
+    /// 变原启动语义。
+    #[test]
+    fn viewport_builder_attaches_icon_only_when_some() {
+        let icon = super::egui::IconData {
+            width: 2,
+            height: 2,
+            rgba: vec![7; 16],
+        };
+
+        let with = viewport_builder(Some(icon.clone()), true, false);
+        let attached = with.icon.as_ref().expect("Some 应挂上图标");
+        assert_eq!((attached.width, attached.height), (2, 2));
+        assert_eq!(attached.rgba, icon.rgba, "像素原样透传");
+
+        let without = viewport_builder(None, true, false);
+        assert!(without.icon.is_none(), "None 回落默认 builder,无图标");
+
+        for builder in [with, without] {
+            assert_eq!(builder.maximized, Some(true));
+            assert_eq!(builder.decorations, Some(false));
+            assert_eq!(
+                builder.min_inner_size,
+                Some(super::egui::vec2(900.0, 600.0)),
+                "既有最小尺寸不动"
+            );
+        }
     }
 }
