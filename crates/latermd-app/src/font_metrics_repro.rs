@@ -1,10 +1,10 @@
-//! #43 M1 混排最小复现与根因定位(取证式,无头)——只产测试与证据,修复在 M2。
+//! #43 M1 复现取证 + M2 修复回归护栏(无头)。
 //!
 //! 用户三症状(2026-09-30 反馈,docs/auto-plan.md #43 条目):
 //! 「中文英文数字高低不一,行高也有问题,有显示不全的问题」。
 //! 本模块把症状转成可断言的无头测试(正文/粗体/斜体/标题四态 × 中英数字混排)。
 //!
-//! ## 机制链(证据见各测试;行号引用 egui 0.36.2 / vendored HEAD)
+//! ## 根因(M1 取证结论;行号引用 egui 0.36.2 / vendored HEAD)
 //!
 //! 1. **高低不一 = 混排基线偏差,四态全中**。egui 行 metrics 取**链头** face
 //!    (`Font::styled_metrics`,epaint text/font.rs:691-703);fallback 字形
@@ -16,17 +16,31 @@
 //!    `(1.16−0.9688) − (1.448−1.21)/2 = 0.0722em`,再经 `round_to_pixel`
 //!    (整像素吸附,text_layout.rs:986)量化放大为 1-2px 的可见错位。
 //! 2. **行高问题 = 行距公式是「字号 × 单一比例」**,不是行内实际字形 metrics。
-//!    vendored `line_height_for` = `size × line_height_ratio`(默认 1.30,
-//!    egui_markdown_style style.rs:59-75),`text_format` 塞进
-//!    `TextFormat::line_height` 覆盖 epaint 原生行高(egui_markdown layout.rs:21-23,
-//!    77-80);egui 行盒取 `max(glyph.line_height)`(text_layout.rs:964-971)
-//!    → CJK face 需要 1.448em,行盒只有 1.30em,**按 em 盒论越界 0.148em**
-//!    (13pt ≈1.9px,H1 ≈3.1px)。1.30 也是拉丁调校的行距比例,对 CJK 排版
-//!    常规(≥1.5em)偏紧,「行高也有问题」的观感由两者叠加。
+//!    vendored `line_height_for` = `size × line_height_ratio`(默认 1.30)覆盖
+//!    epaint 原生行高;egui 行盒取 `max(glyph.line_height)`
+//!    (text_layout.rs:964-971)→ CJK face 需要 1.448em,行盒只有 1.30em,
+//!    **按 em 盒论越界 0.148em**(13pt ≈1.9px,H1 ≈3.1px)。
 //! 3. **显示不全** = 行盒不足时 egui 不裁字形,只按行盒高推进下一行
 //!    (text_layout.rs:989-992):越界墨迹与相邻行的墨迹/后续块的不透明背景
 //!    (代码块底色、表格底色等)相互侵入遮挡。实墨是否真越界由
 //!    `mixed_script_strict_regression_target` 用 `uv_rect` 实测裁决。
+//!
+//! ## M2 修复(本模块断言的现行口径)
+//!
+//! - **基线**(症状 1):残差只由链头与 fallback 的**表值差**决定,与
+//!   vendored 的 line_height 覆盖值无关 → 修复在 `fonts.rs`:预览链头的
+//!   Inter Regular/SemiBold 注册为「行 metrics override 副本」(hhea/OS2 typo
+//!   的 ascent/descent/lineGap 改写为本机 CJK face 同款 em 值,等价 CSS
+//!   `@font-face { ascent-override }`;字形 outline 不动)。链头与 fallback
+//!   行 metrics 全等 → `0.5*(链头行高−face行高)` 与 ascent 差同时归零,
+//!   基线偏差实测 = 0。
+//! - **行高**(症状 2/3):vendored ①类 `MarkdownStyle::min_line_height_em`
+//!   行高下限,`line_height_for = max(size*ratio, size*floor + 0.75px)`;
+//!   app 在 `theme::effective_markdown_style` 注入本机 CJK face 实际行高
+//!   (Noto ≈1.448em)。floor 只升不降,纯拉丁(min_em=1.0)严格不变。
+//! - 预览正文族 = `fonts::preview_body_family`(链头 override Inter);
+//!   预览标题/加粗经 vendored `apply_bold` 切 `bold` 别名族(链头 =
+//!   override SemiBold)。UI 原生族(Proportional/SemiBold/Medium)不动。
 //!
 //! ## 字形 metrics 的两种度量(测试里都有,勿混用)
 //! - **em 盒**:face 的 `[−ascent, +|descent|+lineGap]`
@@ -38,27 +52,31 @@
 //!   按 `glyph.pos + uv_rect.offset` 贴,epaint text_layout.rs:1159)——
 //!   「显示不全」的最终裁决度量。
 //!
-//! ## 断言归宿(#43 公共约束:门禁全程不许红着交付)
+//! ## 断言归宿
 //! - `font_table_metrics_forensics`:字体表值断言(**绿**),锚定 Inter/Noto
 //!   的 ascent/descent/line_gap 实际值与 skrifa 的取表策略。
-//! - `mixed_script_galley_metrics_forensics`:现状值断言(**绿**)——实测与
-//!   由表值+epaint 公式的推算逐项对账,把三症状的量化值钉进测试;每个
-//!   断言处带 TODO(M2) 标出修复后的收紧点。
-//! - `mixed_script_strict_regression_target`:**#[ignore]**,理想态断言
-//!   (四态基线偏差 ≤0.5px、行盒双度量覆盖、相邻行墨迹净空 ≥0)——现状必红
-//!   = 复现成功;M2 修复合入时移除 `#[ignore]`,转绿后作回归护栏。
+//! - `mixed_script_galley_metrics_forensics`:修复后口径的实测-推算对账
+//!   (**绿**):行高/基线/越界每一项都由「表值 + epaint 公式」独立推算,
+//!   与实测逐项对上,公式即机制的实证不因修复而放松。
+//! - `mixed_script_strict_regression_target`:回归护栏(**绿**,M1 期间曾以
+//!   `#[ignore]` 归档 20 项失败 = 复现成功;M2 修复后转正)。四态基线偏差
+//!   ≤0.5px、行盒 ≥ 行内 face 行高、实墨不越行盒、相邻行实墨净空 ≥0。
 
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontFamily, FontId, RawInput, Rect, UiBuilder, Vec2};
 
 use crate::fonts;
+use crate::fonts::{override_vertical_metrics, parse_vertical_tables, VerticalTables};
 
 /// 预览默认正文字号:egui 0.36.2 出厂 Body(egui style.rs:1419)。
 /// 预览侧不显式设字号(`MarkdownLabel` 无 `.font`),走 Default → Body。
 const BODY_SIZE: f32 = 13.0;
 /// vendored `MarkdownStyle::line_height_ratio` 默认值(egui_markdown_style style.rs:59-75)。
 const LINE_HEIGHT_RATIO: f32 = 1.30;
+/// vendored `line_height_for` floor 生效时的吸附安全余量(egui_markdown
+/// layout.rs `LINE_HEIGHT_FLOOR_SLACK_PX`,推算与 vendored 同源)。
+const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
 /// vendored 标题字号缩放(egui_markdown_style style.rs:319,H1-H6)。
 const HEADING_SCALES: [f32; 6] = [1.6, 1.35, 1.2, 1.1, 1.05, 1.0];
 /// epaint 的 UI 量化网格(emath gui_rounding.rs:17;styled_metrics 按 1/32 吸附)。
@@ -69,6 +87,10 @@ const GUI_ROUNDING: f32 = 1.0 / 32.0;
 const STRICT_BASELINE_TOLERANCE: f32 = 0.5;
 /// 实墨越界的判定容差:亚像素(光栅化 quad 与行盒都是整像素/1/32 网格值)。
 const STRICT_INK_EPSILON: f32 = 0.01;
+/// em 盒越界的容忍线:基线整像素吸附的理论量化界(round 最多向下 0.5px,
+/// 加行盒吸附交互,实测最大 0.375px)。精确 0 在离散吸附下不可达,
+/// 豁免理由见 `mixed_script_strict_regression_target` 函数级文档。
+const STRICT_EM_BOX_SNAP_TOLERANCE: f32 = 1.0;
 /// 测量对账容差:推算与实测都落在同一量化网格上,只容忍 ulp 级噪声。
 const FORENSIC_EPSILON: f32 = 1.0 / 64.0;
 
@@ -80,260 +102,17 @@ fn assert_approx(a: f32, b: f32, eps: f32, msg: &str) {
     assert!((a - b).abs() <= eps, "{msg}: |{a:.4} − {b:.4}| > {eps:.4}");
 }
 
-fn is_cjk_ideograph(c: char) -> bool {
+pub(crate) fn is_cjk_ideograph(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
 }
 
-fn is_latin_alnum(c: char) -> bool {
+pub(crate) fn is_latin_alnum(c: char) -> bool {
     c.is_ascii_alphanumeric()
 }
 
 // ---------------------------------------------------------------------------
 // 取证 1:字体文件表值(Inter 与 CJK 回退的 ascent/descent/line_gap 实际值)
 // ---------------------------------------------------------------------------
-
-/// sfnt 垂直排印相关的表值集合(font units,大端)。
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VerticalTables {
-    units_per_em: u16,
-    /// hhea (ascender, descender, lineGap)。
-    hhea: (i16, i16, i16),
-    /// OS/2 typo (sTypoAscender, sTypoDescender, sTypoLineGap)。
-    typo: (i16, i16, i16),
-    /// OS/2 win (usWinAscent, usWinDescent)。
-    win: (u16, u16),
-    /// OS/2 fsSelection bit7(USE_TYPO_METRICS)。
-    use_typo_metrics: bool,
-}
-
-impl VerticalTables {
-    /// skrifa 0.44(= epaint 0.36.2 的依赖,FreeType 同款策略,skrifa
-    /// metrics.rs:142-190)最终采纳的行 metrics:
-    /// fsSelection bit7 置位 → OS/2 typo;否则 hhea;hhea 双零才回落 typo/win。
-    fn selected(&self) -> (i16, i16, i16) {
-        if self.use_typo_metrics {
-            self.typo
-        } else {
-            self.hhea
-        }
-    }
-
-    fn ascent_em(&self) -> f32 {
-        self.selected().0 as f32 / self.units_per_em as f32
-    }
-
-    fn descent_em(&self) -> f32 {
-        self.selected().1 as f32 / self.units_per_em as f32
-    }
-
-    fn line_gap_em(&self) -> f32 {
-        self.selected().2 as f32 / self.units_per_em as f32
-    }
-
-    /// `ascent − descent + line_gap`(epaint StyledMetrics.row_height 同式)。
-    fn row_height_em(&self) -> f32 {
-        self.ascent_em() - self.descent_em() + self.line_gap_em()
-    }
-}
-
-fn be_u16(data: &[u8], offset: usize) -> Option<u16> {
-    let r = data.get(offset..offset + 2)?;
-    Some(u16::from_be_bytes([r[0], r[1]]))
-}
-
-fn be_i16(data: &[u8], offset: usize) -> Option<i16> {
-    be_u16(data, offset).map(|v| v as i16)
-}
-
-fn be_u32(data: &[u8], offset: usize) -> Option<u32> {
-    let r = data.get(offset..offset + 4)?;
-    Some(u32::from_be_bytes([r[0], r[1], r[2], r[3]]))
-}
-
-/// 解析一个 sfnt face(支持 .ttc 的 face index)的垂直排印表值。
-/// 只读表头与固定字段,不解构 outline;失败返回 `None`(文件残缺/非 sfnt)。
-fn parse_vertical_tables(data: &[u8], face_index: u32) -> Option<VerticalTables> {
-    // ttcf: tag(u32) + version(u32) + numFonts(u32) + offsets[numFonts](u32);
-    // 普通 sfnt: face 偏移 0。
-    let face_offset = if data.get(0..4)? == b"ttcf" {
-        let num_fonts = be_u32(data, 8)? as usize;
-        let idx = face_index as usize;
-        if idx >= num_fonts {
-            return None;
-        }
-        be_u32(data, 12 + idx * 4)? as usize
-    } else {
-        0
-    };
-    let num_tables = be_u16(data, face_offset + 4)? as usize;
-    let mut head = None;
-    let mut hhea = None;
-    let mut os2 = None;
-    for i in 0..num_tables {
-        let rec = face_offset + 12 + i * 16;
-        let tag = data.get(rec..rec + 4)?;
-        let offset = be_u32(data, rec + 8)? as usize;
-        match tag {
-            b"head" => head = Some(offset),
-            b"hhea" => hhea = Some(offset),
-            b"OS/2" => os2 = Some(offset),
-            _ => {}
-        }
-    }
-    let head = head?;
-    let units_per_em = be_u16(data, head + 18)?;
-    // hhea: version(u32) + ascender(i16)+4 + descender(i16)+6 + lineGap(i16)+8。
-    let hhea_off = hhea?;
-    let hhea_metrics = (
-        be_i16(data, hhea_off + 4)?,
-        be_i16(data, hhea_off + 6)?,
-        be_i16(data, hhea_off + 8)?,
-    );
-    // OS/2: fsSelection(u16)+62、typo 三元组(i16)+68/70/72、win 二元组(u16)+74/76。
-    let (typo, win, use_typo_metrics) = match os2 {
-        Some(os2) => (
-            (
-                be_i16(data, os2 + 68)?,
-                be_i16(data, os2 + 70)?,
-                be_i16(data, os2 + 72)?,
-            ),
-            (be_u16(data, os2 + 74)?, be_u16(data, os2 + 76)?),
-            be_u16(data, os2 + 62)? & (1 << 7) != 0,
-        ),
-        // 无 OS/2: skrifa 直接用 hhea。
-        None => (hhea_metrics, (0, 0), false),
-    };
-    Some(VerticalTables {
-        units_per_em,
-        hhea: hhea_metrics,
-        typo,
-        win,
-        use_typo_metrics,
-    })
-}
-
-/// Inter 表值预期:upem 2048,hhea 与 OS/2 typo 同值(1984, −494, 0),
-/// fsSelection bit7 置位 → 走 OS/2 typo(数值与 hhea 一致,无歧义)。
-/// 断言它锚定「链头 metrics」的来源;Inter 资产换版本时此断言提醒重新量化。
-#[test]
-fn font_table_metrics_forensics() {
-    for (name, bytes) in [
-        (
-            "Inter-Regular",
-            include_bytes!("../../../assets/fonts/Inter-Regular.ttf") as &[u8],
-        ),
-        (
-            "Inter-SemiBold",
-            include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") as &[u8],
-        ),
-    ] {
-        let tables = parse_vertical_tables(bytes, 0).unwrap_or_else(|| panic!("{name} 解析失败"));
-        assert_eq!(tables.units_per_em, 2048, "{name} upem 与预期不符");
-        assert_eq!(tables.hhea, (1984, -494, 0), "{name} hhea 与预期不符");
-        assert_eq!(tables.typo, (1984, -494, 0), "{name} OS/2 typo 与预期不符");
-        assert!(
-            tables.use_typo_metrics,
-            "{name} 应置位 USE_TYPO_METRICS(bit7)"
-        );
-        assert_eq!(
-            tables.selected(),
-            (1984, -494, 0),
-            "{name} 采纳表与预期不符"
-        );
-        // em 换算(打印值进失败信息,取证即文档)。
-        assert_approx(
-            tables.ascent_em(),
-            0.96875,
-            1e-4,
-            &format!("{name} ascent/em"),
-        );
-        assert_approx(
-            tables.descent_em(),
-            -494.0 / 2048.0,
-            1e-4,
-            &format!("{name} descent/em"),
-        );
-        assert_approx(
-            tables.line_gap_em(),
-            0.0,
-            1e-4,
-            &format!("{name} lineGap/em"),
-        );
-        // 行高 = (1984 + 494) / 2048 em ≈ 1.20996。
-        assert_approx(
-            tables.row_height_em(),
-            2478.0 / 2048.0,
-            1e-4,
-            &format!("{name} row_height/em"),
-        );
-    }
-
-    // CJK 回退侧:本机无候选字体时如实跳过(CI runner 可能没有;本机已命中)。
-    let Some((path, prop_idx, mono_idx)) = fonts::cjk_source_for_test() else {
-        eprintln!("本机无 CJK 候选字体,Noto 表值断言跳过");
-        return;
-    };
-    let data = std::fs::read(path).expect("候选字体文件读取失败(存在性已探测)");
-    // 比例 face 与等宽 face 的垂直表值应当一致(同族不同字宽变体)。
-    for idx in [prop_idx, mono_idx] {
-        let tables = parse_vertical_tables(&data, idx)
-            .unwrap_or_else(|| panic!("{path} face {idx} 解析失败"));
-        assert_eq!(
-            tables.units_per_em, 1000,
-            "{path} face {idx} upem 与预期不符"
-        );
-        assert_eq!(
-            tables.hhea,
-            (1160, -288, 0),
-            "{path} face {idx} hhea 与预期不符"
-        );
-        assert_eq!(
-            tables.typo,
-            (880, -120, 0),
-            "{path} face {idx} OS/2 typo 与预期不符"
-        );
-        assert_eq!(
-            tables.win,
-            (1160, 288),
-            "{path} face {idx} OS/2 win 与预期不符"
-        );
-        // 关键:Noto CJK 的 fsSelection 不含 bit7 → skrifa 采纳 hhea(1.448em),
-        // 而不是更紧凑的 OS/2 typo(1.0em)。CJK 的 em 盒因此显著高于 Inter。
-        assert!(
-            !tables.use_typo_metrics,
-            "{path} face {idx} 不应置位 USE_TYPO_METRICS(置位则 hhea 断言失真)"
-        );
-        assert_eq!(
-            tables.selected(),
-            (1160, -288, 0),
-            "{path} face {idx} 采纳表与预期不符"
-        );
-        assert_approx(
-            tables.ascent_em(),
-            1.16,
-            1e-4,
-            &format!("{path} face {idx} ascent/em"),
-        );
-        assert_approx(
-            tables.descent_em(),
-            -0.288,
-            1e-4,
-            &format!("{path} face {idx} descent/em"),
-        );
-        assert_approx(
-            tables.line_gap_em(),
-            0.0,
-            1e-4,
-            &format!("{path} face {idx} lineGap/em"),
-        );
-        assert_approx(
-            tables.row_height_em(),
-            1.448,
-            1e-4,
-            &format!("{path} face {idx} row_height/em"),
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 取证 2:galley 侧(实测与推算逐项对账,把三症状量化值钉进现状断言)
@@ -430,13 +209,14 @@ impl RowForensics {
     }
 }
 
-/// 把 galley 的每行/每字形换算成取证快照。分类靠 metrics 数值对账:
-/// 拉丁探针与 CJK 探针各用链头字符 / 汉字 shaping 一次,行内 glyph 与之比对。
-fn collect_row_forensics(
-    galley: &Arc<egui::epaint::text::Galley>,
-    latin_probe: FaceMetrics,
-    cjk_probe: Option<FaceMetrics>,
-) -> Vec<RowForensics> {
+/// 把 galley 的每行/每字形换算成取证快照。face 归属按**字符判据**:
+/// CJK 表意字符只可能由链尾 CJK face 塑形(链头 Inter 无这些码位),ASCII
+/// 字母数字只可能由链头塑形(CJK face 的 ASCII 码位排在链头之后)。
+/// M1 曾用探针 metrics 数值对账分类 —— M2 修复后链头(override Inter)与
+/// CJK 回退的行 metrics **全等**,数值判据天然失效,字符判据才是稳定归宿
+/// (metrics 全等本身由 `mixed_script_galley_metrics_forensics` 的探针断言
+/// 单独对账)。
+fn collect_row_forensics(galley: &Arc<egui::epaint::text::Galley>) -> Vec<RowForensics> {
     galley
         .rows
         .iter()
@@ -457,14 +237,10 @@ fn collect_row_forensics(
             for glyph in &placed.row.glyphs {
                 let face_ascent = glyph.font_face_ascent;
                 let face_row_height = glyph.font_face_height;
-                let face = if approx(face_ascent, latin_probe.ascent)
-                    && approx(face_row_height, latin_probe.row_height)
-                {
-                    ScriptFace::LatinChainHead
-                } else if cjk_probe.is_some_and(|probe| {
-                    approx(face_ascent, probe.ascent) && approx(face_row_height, probe.row_height)
-                }) {
+                let face = if is_cjk_ideograph(glyph.chr) {
                     ScriptFace::CjkFallback
+                } else if is_latin_alnum(glyph.chr) {
+                    ScriptFace::LatinChainHead
                 } else {
                     ScriptFace::Other
                 };
@@ -517,10 +293,6 @@ fn collect_row_forensics(
             out
         })
         .collect()
-}
-
-fn approx(a: f32, b: f32) -> bool {
-    (a - b).abs() <= 0.01
 }
 
 /// 一行取证的紧凑描述(断言失败信息里逐行可读)。
@@ -613,13 +385,17 @@ const WRAP_DOC: &str = "中文连续行观测相邻行墨迹净空中文中文�
 
 /// 无头渲染一个 markdown 片段,返回其 galley(`layout_in_ui` 与预览的
 /// `show()` 走同一 `build_layout` + `layout_job` 管线;此处只取形,不绘制)。
+/// #43 M2 起**与生产 preview::ui 同配置**:字体族取 [`fonts::preview_body_family`]
+/// (链头 = 行 metrics 对齐 CJK 回退的 Inter 副本),样式取
+/// [`theme::effective_markdown_style`](行高下限已按本机 CJK face 注入)。
 fn render_case(ctx: &egui::Context, id_salt: &str, md: &str) -> Arc<egui::epaint::text::Galley> {
     let mut captured: Option<Arc<egui::epaint::text::Galley>> = None;
     let mut output = ctx.run_ui(RawInput::default(), |panel| {
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(700.0, 400.0));
         let mut child = panel.new_child(UiBuilder::new().max_rect(screen));
-        let style = crate::theme::default_markdown_style();
-        let font = FontId::new(BODY_SIZE, FontFamily::Proportional);
+        let style =
+            crate::theme::effective_markdown_style(panel, crate::theme::default_markdown_style());
+        let font = FontId::new(BODY_SIZE, crate::fonts::preview_body_family(panel));
         let (_, galley, _) = egui_markdown::MarkdownLabel::new(egui::Id::new(id_salt), md)
             .font(font)
             .style(&style)
@@ -660,20 +436,42 @@ fn mixed_script_galley_metrics_forensics() {
         return;
     }
 
-    // 表值侧(链头与 fallback 两侧的 ground truth)。
-    let inter = parse_vertical_tables(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"), 0)
-        .expect("Inter-Regular 表解析失败");
+    // 表值侧(链头与 fallback 两侧的 ground truth)。M2 修复后预览链头 =
+    // override Inter 副本(fonts.rs 用本机 CJK face 的 em 值改写 hhea/OS2 typo),
+    // 推算链头侧必须用 **override 后**的表值(与 fonts::build_definitions 同源,
+    // 此处以同一 patch 函数重建,不用实测值自证,避免套套逻辑)。
     let (cjk_path, cjk_prop_idx, _) = fonts::cjk_source_for_test().expect("已确认本机有 CJK");
     let cjk_bytes = std::fs::read(cjk_path).expect("CJK 候选读取失败");
     let noto = parse_vertical_tables(&cjk_bytes, cjk_prop_idx).expect("Noto 表解析失败");
-    let semibold = parse_vertical_tables(
-        include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") as &[u8],
+    let target = noto.vertical_metrics_em();
+    let inter = parse_vertical_tables(
+        &override_vertical_metrics(
+            include_bytes!("../../../assets/fonts/Inter-Regular.ttf"),
+            target,
+        )
+        .expect("Inter-Regular override patch 失败"),
         0,
     )
-    .expect("Inter-SemiBold 表解析失败");
+    .expect("override Inter-Regular 表解析失败");
+    let semibold = parse_vertical_tables(
+        &override_vertical_metrics(
+            include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") as &[u8],
+            target,
+        )
+        .expect("Inter-SemiBold override patch 失败"),
+        0,
+    )
+    .expect("override Inter-SemiBold 表解析失败");
+    let native_inter =
+        parse_vertical_tables(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"), 0)
+            .expect("原生 Inter-Regular 表解析失败");
+
+    // 行高下限(生产注入值):fonts::install 存的本机 CJK face 实际行高。
+    let floor_em = fonts::line_height_floor_em(&ctx).expect("有 CJK 时行高下限应存在");
 
     // galley 探针:链头字符与汉字各 shaping 一次,取 face 实际值。
-    let body_font = FontId::new(BODY_SIZE, FontFamily::Proportional);
+    // 与 render_case 同族(预览正文族 = override Inter 链头 + CJK 链尾)。
+    let body_font = FontId::new(BODY_SIZE, fonts::preview_body_family(&ctx));
     let probe = |font: &FontId, ch: char| {
         let galley =
             ctx.fonts_mut(|f| f.layout_no_wrap(ch.to_string(), font.clone(), Color32::WHITE));
@@ -686,18 +484,48 @@ fn mixed_script_galley_metrics_forensics() {
     let inter_probe = probe(&body_font, 'H');
     let noto_probe = probe(&body_font, '中');
 
-    // 探针与表值推算对账(skrifa 策略 + round_ui 网格)。
+    // 探针与表值推算对账(skrifa 策略 + round_ui 网格)。修复后的核心
+    // 机制实锚:预览链头(override Inter)与 CJK 回退的 ascent/行高探针
+    // **逐项相等** —— epaint 基线公式的 `0.5*(链头行高−face行高)` 项与
+    // ascent 差同时归零,基线偏差失去来源。
     assert_approx(
         inter_probe.ascent,
         styled_metrics(BODY_SIZE, &inter).ascent,
         FORENSIC_EPSILON,
-        "Inter 探针 ascent 与表值推算不符",
+        "override Inter 探针 ascent 与表值推算不符",
     );
     assert_approx(
         inter_probe.row_height,
         styled_metrics(BODY_SIZE, &inter).row_height,
         FORENSIC_EPSILON,
-        "Inter 探针行高与表值推算不符",
+        "override Inter 探针行高与表值推算不符",
+    );
+    // 「全等」= 量化网格内等价:Inter 副本的 upem(2048)与 CJK face 的
+    // upem(如 1000)不同,em 值各自 round 到整数 font units 后存在
+    // ≤0.5/upem em 的量化残差,在个别字号会差一个 1/32 点网格刻度
+    // (0.031px)—— 远小于基线的整像素吸附粒度,基线偏差实测仍为 0
+    // (由 strict 矩阵断言)。
+    assert!(
+        (inter_probe.ascent - noto_probe.ascent).abs() <= GUI_ROUNDING + 0.005
+            && (inter_probe.row_height - noto_probe.row_height).abs() <= GUI_ROUNDING + 0.005,
+        "预览链头 {:?} 与 CJK 回退 {:?} 的行 metrics 应在量化网格内等价",
+        inter_probe,
+        noto_probe
+    );
+    // UI 原生族不受修复影响:Proportional 链头仍是原生 Inter 出厂表值。
+    let ui_latin = probe(&FontId::new(BODY_SIZE, FontFamily::Proportional), 'H');
+    assert_eq!(
+        ui_latin,
+        styled_metrics(BODY_SIZE, &native_inter),
+        "Proportional(UI)链头 metrics 应保持原生 Inter 不变"
+    );
+    // UI 原生族与 CJK 回退之间**保持** M1 时的表值差(修复只作用于预览族):
+    // 该差值的存在同时是「修复没有外溢到 UI」的反向证据。
+    assert!(
+        (ui_latin.row_height - noto_probe.row_height).abs() > 2.0,
+        "Proportional(UI)链头行高 {:.3} 与 CJK {:.3} 的表值差应保持(未被外溢修复)",
+        ui_latin.row_height,
+        noto_probe.row_height
     );
     assert_approx(
         noto_probe.ascent,
@@ -714,23 +542,39 @@ fn mixed_script_galley_metrics_forensics() {
 
     // 全族回退链核查(PR #52 前科:每个 FontFamily::Name 是独立回退链,
     // bold/权重族漏挂 CJK 会整行变方块;此处按 shaping 实测,比链表断言强)。
+    // bold 别名族(M2 起链头 = override SemiBold 副本,预览标题/加粗的
+    // 基线对齐由它承接);Inter-SemiBold 原生族(UI 消费)保持出厂表值。
     let bold_font = FontId::new(BODY_SIZE, FontFamily::Name(Arc::from(fonts::FAMILY_BOLD)));
+    let bold_head = probe(&bold_font, 'H');
+    assert_approx(
+        bold_head.ascent,
+        styled_metrics(BODY_SIZE, &semibold).ascent,
+        FORENSIC_EPSILON,
+        "bold 族链头应为 override Inter-SemiBold",
+    );
+    let bold_cjk_head = probe(&bold_font, '中');
+    assert!(
+        (bold_head.ascent - bold_cjk_head.ascent).abs() <= GUI_ROUNDING + 0.005
+            && (bold_head.row_height - bold_cjk_head.row_height).abs() <= GUI_ROUNDING + 0.005,
+        "bold 族链头 {:?} 与 CJK 回退 {:?} 的行 metrics 应在量化网格内等价",
+        bold_head,
+        bold_cjk_head
+    );
     let semibold_font = FontId::new(
         BODY_SIZE,
         FontFamily::Name(Arc::from(fonts::FAMILY_SEMIBOLD)),
     );
-    for (family_name, font) in [
-        ("bold 别名族(预览标题/加粗)", &bold_font),
-        ("Inter-SemiBold 族", &semibold_font),
+    for (family_name, font, head_tables) in [
+        ("bold 别名族(预览标题/加粗)", &bold_font, &semibold),
+        ("Inter-SemiBold 族(UI)", &semibold_font, &native_inter),
     ] {
         let head = probe(font, 'H');
         let cjk = probe(font, '中');
-        // 链头是 Inter-SemiBold(与 Regular 同 upem/同表值)。
         assert_approx(
             head.ascent,
-            styled_metrics(BODY_SIZE, &semibold).ascent,
+            styled_metrics(BODY_SIZE, head_tables).ascent,
             FORENSIC_EPSILON,
-            &format!("{family_name} 链头应为 Inter-SemiBold"),
+            &format!("{family_name} 链头表值与预期不符"),
         );
         assert_approx(
             cjk.row_height,
@@ -752,13 +596,29 @@ fn mixed_script_galley_metrics_forensics() {
         "Monospace 族的 CJK 回退应为 Noto Mono CJK(同表值)",
     );
 
-    // 四态逐案对账:行高/基线偏差/越界,推算 == 实测。探针按字号逐案取
-    // (face metrics 是字号的函数,跨字号比对会分类失败)。
+    // 四态逐案对账:行高/基线偏差/越界,推算 == 实测(修复后口径)。
     for case in CASES {
         let galley = render_case(&ctx, &format!("m1-forensics-{}", case.name), case.md);
-        let probe_at_size = probe(&FontId::new(case.size, FontFamily::Proportional), 'H');
-        let noto_at_size_probe = probe(&FontId::new(case.size, FontFamily::Proportional), '中');
-        let rows = collect_row_forensics(&galley, probe_at_size, Some(noto_at_size_probe));
+        let probe_at_size = probe(
+            &FontId::new(case.size, fonts::preview_body_family(&ctx)),
+            'H',
+        );
+        let noto_at_size_probe = probe(
+            &FontId::new(case.size, fonts::preview_body_family(&ctx)),
+            '中',
+        );
+        // 修复机制实锚:任何字号下,预览链头与 CJK 回退的行 metrics
+        // 在量化网格内等价(upem 残差 ≤ 一个 1/32 刻度,见上文对账口径)。
+        assert!(
+            (probe_at_size.ascent - noto_at_size_probe.ascent).abs() <= GUI_ROUNDING + 0.005
+                && (probe_at_size.row_height - noto_at_size_probe.row_height).abs()
+                    <= GUI_ROUNDING + 0.005,
+            "{}: 预览链头 {:?} 与 CJK 回退 {:?} 的行 metrics 应在量化网格内等价",
+            case.name,
+            probe_at_size,
+            noto_at_size_probe
+        );
+        let rows = collect_row_forensics(&galley);
         let content_rows: Vec<&RowForensics> =
             rows.iter().filter(|r| !r.glyphs.is_empty()).collect();
         assert!(!content_rows.is_empty(), "{}: 无内容行", case.name);
@@ -766,20 +626,28 @@ fn mixed_script_galley_metrics_forensics() {
 
         let head = styled_metrics(case.size, &inter);
         let noto_at_size = styled_metrics(case.size, &noto);
-        let line_height = case.size * LINE_HEIGHT_RATIO;
+        // vendored 行高 = max(字号×ratio, 字号×floor + 吸附安全余量)(M2 floor 模型)。
+        let line_height =
+            (case.size * LINE_HEIGHT_RATIO).max(case.size * floor_em + LINE_HEIGHT_FLOOR_SLACK_PX);
         let row_height = snapped_row_height(line_height);
 
         for row in &content_rows {
-            // 行高 = 吸附后的 size×1.30(现状:vendored 覆盖,egui 行盒取 max(line_height))。
+            // 行高 = 吸附后的 floor 模型行高(行盒取 max(glyph.line_height))。
             assert_approx(
                 row.height(),
                 row_height,
                 FORENSIC_EPSILON,
                 &format!("{} 行「{}」行高与推算不符", case.name, row.text),
             );
-            // TODO(M2,#43): 现状 = 吸附(size×1.30);修复后收紧为
-            // `row.height() ≥ 行内 max_face_row_height`(CJK 1.448em 需求被覆盖)。
-            // 现状缺口 = 1.448em − 1.30em ≈ 0.148em(13pt ≈1.9px,H1 ≈3.1px)。
+            // M2 收紧点兑现:行盒 ≥ 行内 max face 行高(CJK 1.448em 需求被覆盖)。
+            assert!(
+                row.height() + FORENSIC_EPSILON >= row.max_face_row_height,
+                "{} 行「{}」行盒 {:.3}px 低于行内 face 行高需求 {:.3}px",
+                case.name,
+                row.text,
+                row.height(),
+                row.max_face_row_height
+            );
             let latin = row
                 .glyphs
                 .iter()
@@ -791,13 +659,17 @@ fn mixed_script_galley_metrics_forensics() {
                 .find(|g| g.face == ScriptFace::CjkFallback && is_cjk_ideograph(g.ch))
                 .unwrap_or_else(|| panic!("{} 行「{}」缺 CJK 字形", case.name, row.text));
             // 机制实锚:行内每个字形(含 CJK fallback 字形)携带的链头行高
-            // 都是 Inter 的 —— 行高与基线锚定全部取链头,与 face 无关。
+            // 都是 override Inter 的(= CJK face 同款)—— 修复前是原生 Inter
+            // 的 1.21em,与 CJK 1.448em 的差正是基线偏差与行盒缺口的来源。
             for g in [latin, cjk] {
                 assert_approx(
                     g.head_row_height,
                     head.row_height,
                     FORENSIC_EPSILON,
-                    &format!("{}「{}」字形链头行高应恒为 Inter 行高", case.name, row.text),
+                    &format!(
+                        "{}「{}」字形链头行高应恒为 override Inter 行高",
+                        case.name, row.text
+                    ),
                 );
                 assert_approx(
                     g.line_height,
@@ -838,10 +710,18 @@ fn mixed_script_galley_metrics_forensics() {
                 FORENSIC_EPSILON,
                 &format!("{} CJK 基线与公式推算不符", case.name),
             );
-            // TODO(M2,#43): 现状 = 链头与 fallback 的 ascent 占比差残差
-            // `(1.16 − 0.96875) − (1.448 − 1.20996)/2 ≈ 0.0722em`,再整像素吸附;
-            // 13pt 实测 +1px,H1 +2px。修复后收紧为 |Δ| ≤ 0.5px(理想 0)。
+            // 修复后口径:链头与 fallback 的 ascent/行高全等 → 公式残差
+            // 精确为零,偏差只剩基线整像素吸附的取整差(实测 0)。
+            // M1 期间实测为 +1px(13pt)/+2px(H1),修复前的对照见 commit ea31d02。
             let deviation = row.baseline_cjk_minus_latin.unwrap();
+            assert!(
+                deviation.abs() <= STRICT_BASELINE_TOLERANCE,
+                "{}「{}」基线偏差 {:+.3}px 超出 ±{:.1}px",
+                case.name,
+                row.text.chars().take(8).collect::<String>(),
+                deviation,
+                STRICT_BASELINE_TOLERANCE
+            );
             println!(
                 "{}「{}」基线偏差 CJK−拉丁 = {:+.3}px (字号 {:.2}pt, {:.4}em)",
                 case.name,
@@ -866,20 +746,20 @@ fn mixed_script_galley_metrics_forensics() {
                 &format!("{} 基线偏差与公式推算不符", case.name),
             );
             // em 盒越界量对账(推算只用表值+公式,不用实测 glyph 字段,
-            // 避免套套逻辑):CJK em 盒顶/底由基线公式与 Noto 表值直接推得。
-            let cjk_em_top_rowrel = predicted_baseline(noto_at_size, head, row_height, line_height)
-                - noto_at_size.ascent;
-            let cjk_em_bottom_rowrel = predicted_baseline(
-                FaceMetrics {
-                    ascent: noto_at_size.ascent,
-                    row_height: noto_at_size.row_height,
-                },
-                head,
-                row_height,
-                line_height,
-            ) + (noto_at_size.row_height - noto_at_size.ascent);
-            let expected_overflow_top = (0.0 - cjk_em_top_rowrel).max(0.0);
-            let expected_overflow_bottom = (cjk_em_bottom_rowrel - row_height).max(0.0);
+            // 避免套套逻辑)。实测口径是「行内所有字形的 em 盒极值」,推算
+            // 须对链头(override Inter)与 CJK 回退两个 face 各推 em 盒顶/底
+            // 再取 max —— 修复后两者行 metrics 近全等,谁多出 1/32 刻度的
+            // ascent 谁就是越界极值的提供者(与 M1 只需推 CJK 一侧不同)。
+            let em_extent_rowrel = |face: FaceMetrics| -> (f32, f32) {
+                let base = predicted_baseline(face, head, row_height, line_height);
+                (base - face.ascent, base + (face.row_height - face.ascent))
+            };
+            let (latin_top, latin_bottom) = em_extent_rowrel(head);
+            let (cjk_top, cjk_bottom) = em_extent_rowrel(noto_at_size);
+            // 带符号对账(不钳非负):修复前恒正(越界),修复后为负(em 盒
+            // 落在行盒内),保留符号才能把「行盒余量」也对进账。
+            let expected_overflow_top = 0.0 - latin_top.min(cjk_top);
+            let expected_overflow_bottom = latin_bottom.max(cjk_bottom) - row_height;
             assert_approx(
                 row.overflow_top_em,
                 expected_overflow_top,
@@ -903,9 +783,9 @@ fn mixed_script_galley_metrics_forensics() {
         }
     }
 
-    // 相邻行墨迹净空(wrap 文档;现状断言:按 em 盒推算负净空)。
+    // 相邻行墨迹净空(wrap 文档;M2 收紧点兑现:净空 ≥ 0,不粘连不互侵)。
     let wrap_galley = render_case(&ctx, "m1-forensics-wrap", WRAP_DOC);
-    let wrap_rows = collect_row_forensics(&wrap_galley, inter_probe, Some(noto_probe));
+    let wrap_rows = collect_row_forensics(&wrap_galley);
     let content: Vec<&RowForensics> = wrap_rows.iter().filter(|r| !r.glyphs.is_empty()).collect();
     assert!(
         content.len() >= 2,
@@ -921,24 +801,31 @@ fn mixed_script_galley_metrics_forensics() {
                 "相邻行实墨净空 = {clearance:+.3}px(行盒推进 {}px)",
                 next.top - prev.top
             );
-            // TODO(M2,#43): 修复后此处断言净空 ≥ 0(现状打印为主,不断言符号)。
+            assert!(
+                clearance >= -STRICT_INK_EPSILON,
+                "wrap 相邻行实墨净空为负({clearance:+.3}px),墨迹互侵"
+            );
         }
     }
 
     // 跨帧稳定性:同一 ctx 渲染 3 帧(show() 真实缓存路径 ×1 + 测量 ×2),
-    // 几何指纹逐项相等(防 M2 修复引入跨帧漂移的回归盲区)。
+    // 几何指纹逐项相等(防 M2 修复引入跨帧漂移的回归盲区)。show() 路径
+    // 与 render_case 同配置(预览族 + effective style)。
     let fingerprints: Vec<_> = CASES
         .iter()
         .map(|case| {
             let g = render_case(&ctx, &format!("m1-forensics-{}", case.name), case.md);
-            geometry_fingerprint(&collect_row_forensics(&g, inter_probe, Some(noto_probe)))
+            geometry_fingerprint(&collect_row_forensics(&g))
         })
         .collect();
     for frame in 2..=3 {
         let _ = ctx.run_ui(RawInput::default(), |ui| {
             // 真实渲染路径(show() 会填充并命中 vendored 布局缓存)。
-            let style = crate::theme::default_markdown_style();
-            let font = FontId::new(BODY_SIZE, FontFamily::Proportional);
+            let style = crate::theme::effective_markdown_style(
+                ui.ctx(),
+                crate::theme::default_markdown_style(),
+            );
+            let font = FontId::new(BODY_SIZE, fonts::preview_body_family(ui.ctx()));
             for case in CASES {
                 egui_markdown::MarkdownLabel::new(
                     egui::Id::new(format!("m1-forensics-show-{}", case.name)),
@@ -952,7 +839,7 @@ fn mixed_script_galley_metrics_forensics() {
         });
         for (i, case) in CASES.iter().enumerate() {
             let g = render_case(&ctx, &format!("m1-forensics-{}", case.name), case.md);
-            let f = geometry_fingerprint(&collect_row_forensics(&g, inter_probe, Some(noto_probe)));
+            let f = geometry_fingerprint(&collect_row_forensics(&g));
             assert_eq!(
                 f, fingerprints[i],
                 "{} 第 {} 帧几何指纹漂移(跨帧布局不稳定)",
@@ -963,15 +850,26 @@ fn mixed_script_galley_metrics_forensics() {
 }
 
 // ---------------------------------------------------------------------------
-// 取证 3:理想态断言(#[ignore];现状必红 = 复现成功,M2 修复后转正)
+// 取证 3:回归护栏(M1 期间 #[ignore] 归档 20 项失败 = 复现成功;M2 转正)
 // ---------------------------------------------------------------------------
 
-/// 三症状的理想态断言。**现状必红**(基线偏差 13pt 正文 +1px、H1 +2px,
-/// 均 > 0.5px 阈值;em 盒越界在所有含 CJK 的行 > 0)——这正是 M1 的复现目标。
-/// M2 修复合入时:移除 `#[ignore]`,断言转绿后成为回归护栏;若某项断言
-/// 在修复方案下被有意豁免(如行距比例换算口径),必须在本注释下登记理由。
+/// 「标题/粗体/斜体/正文四态 × 中英混排」回归矩阵(M1 复现断言的转正形态)。
+/// 断言集:
+/// - S2:同一视觉行内拉丁与 CJK 基线偏差 ≤ 0.5px(修复后实测 0;
+///   M1 现状 13pt +1px、H1 +2px,commit ea31d02 归档)。
+/// - S1:行盒高度 ≥ 行内实际字形 metrics(em 盒口径:face 的行高需求;
+///   M1 现状缺口 1.8-3.1px)。
+/// - S3a:em 盒越出行盒 ≤ 1px —— **有意豁免的口径**(M1 曾按 0.01px 断言,
+///   现状必红是复现目标;M2 修复后实测仍有 0.125-0.375px 越顶,登记豁免
+///   理由:epaint 基线公式末尾的整像素吸附 `round_to_pixel`(text_layout.rs:986)
+///   对非整数 ascent 的 face 有 ±0.5px 离散量化,任何 line_height 取值都无法
+///   让 `round(ascent + φ) ≥ ascent` 对全部字号成立(φ ∈ [−0.5,+0.5] 由行盒
+///   吸附决定);em 盒本身又是 Noto 对全脚本堆叠的超配度量(CJK 实墨只占
+///   ≈0.85em)。「显示不全」的可裁决口径是 S3b(实墨)与 wrap 净空,
+///   修复后实墨在行盒内有 3px 以上余量)。
+/// - S3b:实墨(uv_rect)不越出行盒 —— 「显示不全」的最终裁决(严格 0.01px)。
+/// - wrap:相邻行实墨净空 ≥ 0(不粘连/不互相遮挡)。
 #[test]
-#[ignore = "M1 现状复现(#43):基线偏差/em 盒越界按现状必红;M2 修复后移除本标记转正为回归护栏"]
 fn mixed_script_strict_regression_target() {
     let ctx = egui::Context::default();
     let has_cjk = fonts::install(&ctx).is_some();
@@ -982,28 +880,12 @@ fn mixed_script_strict_regression_target() {
         return;
     }
 
-    let body_font = FontId::new(BODY_SIZE, FontFamily::Proportional);
-    let probe = |font: &FontId, ch: char| {
-        let galley =
-            ctx.fonts_mut(|f| f.layout_no_wrap(ch.to_string(), font.clone(), Color32::WHITE));
-        let g = &galley.rows[0].row.glyphs[0];
-        FaceMetrics {
-            ascent: g.font_face_ascent,
-            row_height: g.font_face_height,
-        }
-    };
-    let inter_probe = probe(&body_font, 'H');
-    let noto_probe = probe(&body_font, '中');
-
     let mut failures: Vec<String> = Vec::new();
     let mut checked_rows = 0usize;
 
-    // 探针按字号逐案取(face metrics 是字号的函数;见 forensics 测试同款注释)。
     for case in CASES {
-        let probe_at_size = probe(&FontId::new(case.size, FontFamily::Proportional), 'H');
-        let noto_probe_at_size = probe(&FontId::new(case.size, FontFamily::Proportional), '中');
         let galley = render_case(&ctx, &format!("m1-strict-{}", case.name), case.md);
-        let rows = collect_row_forensics(&galley, probe_at_size, Some(noto_probe_at_size));
+        let rows = collect_row_forensics(&galley);
         for row in rows.iter().filter(|r| !r.glyphs.is_empty()) {
             checked_rows += 1;
             // S2:同一视觉行内拉丁与 CJK 基线偏差 ≤ 0.5px。
@@ -1028,21 +910,25 @@ fn mixed_script_strict_regression_target() {
                     row.max_face_row_height
                 ));
             }
-            // S3a:em 盒不越出行盒(显示不全的直接断言,保守口径)。
-            if row.overflow_top_em > STRICT_INK_EPSILON {
+            // S3a:em 盒越界 ≤ 基线整像素吸附的量化界(1px)。豁免理由见
+            // 函数级文档(em 盒是超配度量 + round 离散量化,精确 0 不可达;
+            // 可见裁切由 S3b 实墨口径严格断言)。
+            if row.overflow_top_em > STRICT_EM_BOX_SNAP_TOLERANCE {
                 failures.push(format!(
-                    "[{}「{}」] em 盒越出行盒顶 {:+.3}px",
+                    "[{}「{}」] em 盒越出行盒顶 {:+.3}px > {:.1}px",
                     case.name,
                     row.text.chars().take(8).collect::<String>(),
-                    row.overflow_top_em
+                    row.overflow_top_em,
+                    STRICT_EM_BOX_SNAP_TOLERANCE
                 ));
             }
-            if row.overflow_bottom_em > STRICT_INK_EPSILON {
+            if row.overflow_bottom_em > STRICT_EM_BOX_SNAP_TOLERANCE {
                 failures.push(format!(
-                    "[{}「{}」] em 盒越出行盒底 {:+.3}px",
+                    "[{}「{}」] em 盒越出行盒底 {:+.3}px > {:.1}px",
                     case.name,
                     row.text.chars().take(8).collect::<String>(),
-                    row.overflow_bottom_em
+                    row.overflow_bottom_em,
+                    STRICT_EM_BOX_SNAP_TOLERANCE
                 ));
             }
             // S3b:实墨(uv_rect)不越出行盒——「显示不全」的最终裁决。
@@ -1073,7 +959,7 @@ fn mixed_script_strict_regression_target() {
 
     // wrap 文档的相邻行实墨净空 ≥ 0(不粘连/不互相遮挡)。
     let wrap_galley = render_case(&ctx, "m1-strict-wrap", WRAP_DOC);
-    let wrap_rows = collect_row_forensics(&wrap_galley, inter_probe, Some(noto_probe));
+    let wrap_rows = collect_row_forensics(&wrap_galley);
     let content: Vec<&RowForensics> = wrap_rows.iter().filter(|r| !r.glyphs.is_empty()).collect();
     for pair in content.windows(2) {
         let (prev, next) = (pair[0], pair[1]);

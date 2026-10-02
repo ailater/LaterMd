@@ -31,6 +31,8 @@ mod keymap;
 mod layout;
 mod live;
 mod mcp;
+#[cfg(test)]
+mod preview_pixel_acceptance;
 mod search;
 mod settings;
 mod state;

@@ -214,6 +214,19 @@ pub fn default_markdown_style() -> MarkdownStyle {
     style
 }
 
+/// 装机环境修正后的生效样式(#43 M2):把本机 CJK 回退 face 的实际行高
+/// 写进 `min_line_height_em`(行高下限)。该下限是字体链的物理属性而非
+/// 用户偏好,取「用户配置与物理需求较大者」—— 用户显式调高(>CJK 行高,
+/// 如 1.6)完全生效,调低(如 1.2)被物理需求兜底,否则行盒装不下 CJK
+/// 字形的行高需求,越界墨迹被相邻行/后续块背景遮挡(「显示不全」)。
+/// 本机无 CJK 候选(或表值解析失败)时原样返回,行为与修复前一致。
+pub fn effective_markdown_style(ctx: &egui::Context, mut style: MarkdownStyle) -> MarkdownStyle {
+    if let Some(floor) = crate::fonts::line_height_floor_em(ctx) {
+        style.min_line_height_em = style.min_line_height_em.max(floor);
+    }
+    style
+}
+
 impl ThemeSettings {
     /// 启动时装载:平台默认目录;首次运行(无文件)静默用默认,文件在但解析
     /// 失败则终端告警后回落默认 —— 坏配置不该挡住应用启动。
@@ -247,7 +260,7 @@ impl ThemeSettings {
         }
         apply_shell(ctx);
         apply_density(ctx, self.density);
-        let wanted = self.markdown_style();
+        let wanted = effective_markdown_style(ctx, self.markdown_style());
         if *egui_markdown_style::global_style(ctx) != wanted {
             egui_markdown_style::set_style(ctx, wanted);
         }

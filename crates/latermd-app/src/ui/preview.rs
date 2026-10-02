@@ -577,7 +577,15 @@ pub fn ui(
             // [X](<wiki://X>) 链接,点击由下面的 handler 拦截;相对图片
             // 地址在这里再换成 file:// URI(两层都是"只改渲染,源码不动")
             let rendered = resolve_relative_images(&preview.rendered, base_dir);
+            // 字体(#43 M2):字号沿用默认解析(Default → Body,将来 #23 的
+            // 字号设置自然生效),只把族换成预览专用族 —— 链头是行 metrics
+            // 对齐过 CJK 回退的 Inter 副本,中英数字混排基线齐;无 CJK 时
+            // 回落 Proportional,行为与修复前一致。font 参与 vendored 布局
+            // 缓存 hash,族名是常量,不破坏 widget id 稳定性(§6.7)。
+            let mut font = egui::FontSelection::Default.resolve(ui.style());
+            font.family = crate::fonts::preview_body_family(ui.ctx());
             MarkdownLabel::new(label_id, rendered.as_ref())
+                .font(font)
                 .wrap()
                 .heal(heal)
                 .link_handler(&handler)
