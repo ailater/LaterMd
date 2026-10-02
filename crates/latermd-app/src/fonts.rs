@@ -45,6 +45,24 @@
 //! ①类修复承接:`MarkdownStyle::min_line_height_em` 行高下限,app 侧在
 //! `theme` 应用样式时通过 [`line_height_floor_em`] 注入本机 CJK face 的
 //! 实际行高。
+//!
+//! # #50 M1:编辑器专用等宽族(为什么 override 方向与预览相反)
+//!
+//! 源码编辑器的等宽渲染面(源码 TextEdit、行号槽、Live 活动块)走
+//! `TextStyle::Monospace` 档,行 metrics 取 `FontFamily::Monospace` 链头
+//! (egui 内置 Hack)出厂值;行内 fallback 的 CJK 字形基线由中点近似公式
+//! 决定(见上节),Hack(行高 1.164em)与 Noto CJK(1.448em)的表值差
+//! 在源码页放大为 1-3px 的可见基线错位(坤哥 2026-10-02「高低不一致」)。
+//!
+//! 修法与 #43 M2 同一套 override 机制、**方向相反**:预览把链头 Inter 的
+//! 表值改写为 CJK 同款(行高随之变大,那是阅读排版想要的);编辑器则把
+//! CJK 等宽 face **副本**的表值改写为链头 Hack 同款 em 值 —— 链头 metrics
+//! 分毫不动,纯 ASCII 的行盒高与换行位置逐像素不变(否决线),而链头与
+//! fallback 的行 metrics 全等后,基线公式残差同样精确归零。副本只挂
+//! [`FAMILY_EDITOR_MONO`] 专用族且替换掉链尾原生 CJK 等宽条目(链内混入
+//! 原生 face 会先命中、override 白做,与预览族的教训同款);字号仍走
+//! `theme::apply_font_size` 的 `TextStyle::Monospace` 档投影,族由投影写
+//! 入投影档(见 [`editor_mono_family`])。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -72,6 +90,14 @@ pub const FAMILY_PREVIEW_BODY: &str = "Inter-Preview";
 const PREVIEW_REGULAR: &str = "Inter-Regular-Preview";
 /// Inter SemiBold override 副本的 font_data 键(`bold` 别名族的链头)。
 const PREVIEW_SEMIBOLD: &str = "Inter-SemiBold-Preview";
+/// 编辑器专用等宽族(#50 M1):链头与 `FontFamily::Monospace` 同为内置
+/// Hack(出厂行 metrics 不动,纯 ASCII 排版逐像素不变),链尾是 CJK 等宽
+/// face 的「反向 override 副本」(行 metrics 改写为链头同款 em 值)——
+/// 混排行的行内 fallback 基线因此与拉丁字形精确同线(见模块级注释)。
+pub const FAMILY_EDITOR_MONO: &str = "editor-mono";
+/// 编辑器族 CJK 回退的 font_data 键(`FAMILY_EDITOR_MONO` 专属副本;
+/// 原生 `CJK_MONOSPACE` 不得入链,否则 CJK 先命中未修补的原生 face)。
+const CJK_MONOSPACE_EDITOR: &str = "latermd-cjk-monospace-editor";
 
 /// sfnt 垂直排印相关的表值集合(font units,大端)。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -213,11 +239,18 @@ pub(crate) fn parse_vertical_tables(data: &[u8], face_index: u32) -> Option<Vert
 /// 量化残差(≤0.5/upem em)远小于 epaint 布局的 1/32 点量化网格,
 /// 在任何字号下都吸附到与目标 face 相同的取值。
 ///
-/// 只支持普通 sfnt(Inter 单 face);.ttc 不走本函数。表目录里的 checksum
-/// 字段不重算:光栅化器(skrifa)不校验表 checksum,单测以实际 shaping
-/// 裁决 patch 产物可正常解析。
-pub(crate) fn override_vertical_metrics(data: &[u8], target: VerticalMetricsEm) -> Option<Vec<u8>> {
-    let face = parse_vertical_tables(data, 0)?;
+/// 支持普通 sfnt(face_index 0,Inter/Hack 单 face)与 .ttc 集合内指定
+/// face(#50 M1 的 Noto CJK 等宽 face):ttc 各 face 的表目录在其自有
+/// 偏移处,目录内的表偏移按 sfnt 规则从**文件起点**计,与
+/// [`parse_vertical_tables`] 同一口径。表目录里的 checksum 字段不重算:
+/// 光栅化器(skrifa)不校验表 checksum,单测以实际 shaping 裁决 patch
+/// 产物可正常解析。
+pub(crate) fn override_vertical_metrics(
+    data: &[u8],
+    face_index: u32,
+    target: VerticalMetricsEm,
+) -> Option<Vec<u8>> {
+    let face = parse_vertical_tables(data, face_index)?;
     let upem = f32::from(face.units_per_em);
     let to_units = |em: f32| {
         let v = (em * upem)
@@ -229,12 +262,26 @@ pub(crate) fn override_vertical_metrics(data: &[u8], target: VerticalMetricsEm) 
     let desc = to_units(target.descent);
     let gap = to_units(target.line_gap);
 
-    let num_tables = be_u16(data, 4)? as usize;
+    // ttc:目录在 face 自有偏移处;表偏移从文件起点计(补目录偏移会
+    // 越界写坏共享表)。普通 sfnt 的 face_offset 为 0,与原行为一致。
+    let face_offset = if data.get(0..4)? == b"ttcf" {
+        let num_fonts = be_u32(data, 8)? as usize;
+        let idx = face_index as usize;
+        if idx >= num_fonts {
+            return None;
+        }
+        be_u32(data, 12 + idx * 4)? as usize
+    } else if face_index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let num_tables = be_u16(data, face_offset + 4)? as usize;
     let mut head = None;
     let mut hhea = None;
     let mut os2 = None;
     for i in 0..num_tables {
-        let rec = 12 + i * 16;
+        let rec = face_offset + 12 + i * 16;
         let tag = data.get(rec..rec + 4)?;
         let offset = be_u32(data, rec + 8)? as usize;
         match tag {
@@ -312,8 +359,12 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         let cjk_metrics =
             parse_vertical_tables(&bytes, prop_idx).map(|tables| tables.vertical_metrics_em());
         let cjk = cjk_metrics.map(|metrics| (&bytes[..], prop_idx, mono_idx, metrics));
-        ctx.set_fonts(build_definitions(cjk));
-        mark_installed(ctx, cjk_metrics);
+        let defs = build_definitions(cjk);
+        let editor_mono = defs
+            .families
+            .contains_key(&FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO)));
+        ctx.set_fonts(defs);
+        mark_installed(ctx, cjk_metrics, editor_mono);
         return Some(format!(
             "{path} (比例 face {prop_idx} / 等宽 face {mono_idx}){}",
             if cjk_metrics.is_some() {
@@ -324,7 +375,7 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         ));
     }
     ctx.set_fonts(build_definitions(None));
-    mark_installed(ctx, None);
+    mark_installed(ctx, None, false);
     None
 }
 
@@ -374,9 +425,9 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontD
         // #43 M2:Inter Regular/SemiBold 的行 metrics override 副本(ascent/
         // descent/lineGap 改写为 CJK face 同款 em 值;字形 outline 不动)。
         // 副本只挂下面的预览专用族,原生族(UI 消费)不受影响。
-        let preview_regular = override_vertical_metrics(INTER_REGULAR, metrics)
+        let preview_regular = override_vertical_metrics(INTER_REGULAR, 0, metrics)
             .expect("嵌入 Inter-Regular 的垂直排印表结构恒可解析");
-        let preview_semibold = override_vertical_metrics(INTER_SEMIBOLD, metrics)
+        let preview_semibold = override_vertical_metrics(INTER_SEMIBOLD, 0, metrics)
             .expect("嵌入 Inter-SemiBold 的垂直排印表结构恒可解析");
         defs.font_data.insert(
             PREVIEW_REGULAR.to_owned(),
@@ -424,6 +475,42 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontD
                 .or_default()
                 .push(name.to_owned());
         }
+        // #50 M1:编辑器专用等宽族。#43 M2 的 override 手法反向应用 ——
+        // 目标不是「链头对齐 CJK」而是「CJK 副本对齐链头」:链头(Hack)
+        // 的行 metrics 就是纯 ASCII 行盒/换行的现状,否决线要求分毫不动;
+        // 把 CJK 等宽 face 副本的表值改写为链头同款 em 值后,链头与
+        // fallback 的行 metrics 全等,基线公式残差精确归零。目标表值来自
+        // 内置 Hack(嵌入资源,恒可解析),源头是系统字体文件 —— 表值
+        // 不合预期(如 ttc 结构异常)时整体跳过本族,回落 `Monospace`,
+        // 行为与修复前一致,不 panic。
+        let head_target = defs
+            .font_data
+            .get("Hack")
+            .and_then(|head| parse_vertical_tables(head.font.as_ref(), head.index))
+            .map(|tables| tables.vertical_metrics_em());
+        if let Some(target) = head_target {
+            if let Some(patched) = override_vertical_metrics(bytes, mono_idx, target) {
+                defs.font_data.insert(
+                    CJK_MONOSPACE_EDITOR.to_owned(),
+                    Arc::new(FontData {
+                        index: mono_idx,
+                        ..FontData::from_owned(patched)
+                    }),
+                );
+                // 与预览正文族同一纪律:链内不得残留原生 CJK 等宽条目,
+                // 否则 CJK 先命中未修补的原生 face、override 白做;出厂链
+                // 序(Hack → Ubuntu-Light → NotoEmoji → emoji-icon)原样
+                // 保留,副本占原生 CJK 的链尾位置。
+                let mut chain: Vec<String> = defs.families[&FontFamily::Monospace]
+                    .iter()
+                    .filter(|name| name.as_str() != CJK_MONOSPACE)
+                    .cloned()
+                    .collect();
+                chain.push(CJK_MONOSPACE_EDITOR.to_owned());
+                defs.families
+                    .insert(FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO)), chain);
+            }
+        }
     }
     defs
 }
@@ -454,6 +541,23 @@ pub fn preview_body_family(ctx: &egui::Context) -> FontFamily {
     }
 }
 
+/// 编辑器等宽渲染面(源码 TextEdit、行号槽、Live 活动块)的字体族:
+/// 专用族已注册时返回 [`FAMILY_EDITOR_MONO`](链头 = 内置 Hack 出厂
+/// metrics,纯 ASCII 排版与 `FontFamily::Monospace` 逐像素一致;链尾 CJK
+/// 副本行 metrics 对齐链头,混排基线对齐),否则回落 `FontFamily::
+/// Monospace`(无 CJK 候选 / 表值解析失败 / 副本构建失败 —— 行为与修复
+/// 前一致)。注册标志经 `install` 一次性写入 data 槽(每帧渲染读槽续期,
+/// 与 `semibold_family`/`preview_body_family` 同一模式,避免走
+/// `ctx.fonts` —— 首帧前 `theme.apply` 调不到它)。
+pub fn editor_mono_family(ctx: &egui::Context) -> FontFamily {
+    let registered = ctx.data(|data| data.get_temp::<bool>(editor_mono_id()).unwrap_or(false));
+    if registered {
+        FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO))
+    } else {
+        FontFamily::Monospace
+    }
+}
+
 /// 行高下限(em 倍数):本机命中的 CJK 回退 face 的实际行高
 /// (`ascent − descent + lineGap`,如 Noto Sans CJK ≈ 1.448em)。
 /// 预览渲染把它写进 vendored `MarkdownStyle::min_line_height_em`,
@@ -475,13 +579,19 @@ fn floor_id() -> egui::Id {
     egui::Id::new("latermd-cjk-line-height-floor-em")
 }
 
-fn mark_installed(ctx: &egui::Context, cjk_metrics: Option<VerticalMetricsEm>) {
+/// [`FAMILY_EDITOR_MONO`] 注册标志的 data 槽键。
+fn editor_mono_id() -> egui::Id {
+    egui::Id::new("latermd-editor-mono-registered")
+}
+
+fn mark_installed(ctx: &egui::Context, cjk_metrics: Option<VerticalMetricsEm>, editor_mono: bool) {
     ctx.data_mut(|data| {
         data.insert_temp(installed_id(), true);
         data.insert_temp(
             floor_id(),
             cjk_metrics.map(|m| m.row_height()).filter(|em| *em > 0.0),
         );
+        data.insert_temp(editor_mono_id(), editor_mono);
     });
 }
 
@@ -633,6 +743,16 @@ mod tests {
                 .is_some_and(|d| d.index == 0),
             "Inter 副本是单 face ttf,index 应为 0"
         );
+
+        // #50 M1 降级:假 CJK 字节(非 sfnt)让编辑器族副本构建失败,
+        // 整族跳过而非 panic(其余族照常注册 —— 源头是系统文件,结构
+        // 异常时回落 `Monospace` 现状)。
+        assert!(
+            !defs
+                .families
+                .contains_key(&FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO))),
+            "副本构建失败时编辑器族不应注册"
+        );
     }
 
     /// 候选全失配(`None`):Inter 仍注册(嵌入资源),族链上无 CJK 条目;
@@ -675,6 +795,12 @@ mod tests {
             Some(FAMILY_SEMIBOLD),
             "无 CJK 时 bold 族链头保持原生 SemiBold"
         );
+        assert!(
+            !defs
+                .families
+                .contains_key(&FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO))),
+            "无 CJK 时不应注册编辑器专用等宽族"
+        );
     }
 
     /// install 端到端:无论本机有无 CJK 候选,context 里 Proportional 首位
@@ -716,7 +842,7 @@ mod tests {
             ("Inter-SemiBold", INTER_SEMIBOLD),
         ] {
             let original = parse_vertical_tables(bytes, 0).expect("{name} 原始表解析失败");
-            let patched_bytes = override_vertical_metrics(bytes, target)
+            let patched_bytes = override_vertical_metrics(bytes, 0, target)
                 .unwrap_or_else(|| panic!("{name} patch 失败"));
             let patched =
                 parse_vertical_tables(&patched_bytes, 0).expect("{name} patch 后表解析失败");
@@ -952,14 +1078,184 @@ mod tests {
         );
     }
 
+    /// #50 M1:编辑器专用等宽族的链结构与字节级正确性(纯 build 层,用
+    /// 嵌入 Inter 字节充当 CJK 源字节 —— 它们是合法 sfnt,patch 必然成
+    /// 功,不依赖本机字体)。链头 = 内置 Hack(与 `FontFamily::Monospace`
+    /// 同 face 同 metrics,纯 ASCII 排版逐像素一致的前提);链内不得残留
+    /// 原生 CJK 等宽条目(否则先命中未修补 face,override 白做);emoji
+    /// 出厂链序保留;副本的表值 = Hack 采纳表值按副本 upem 量化。
+    #[test]
+    fn editor_mono_family_chain_and_patched_tables() {
+        let fake = VerticalMetricsEm {
+            ascent: 1.16,
+            descent: -0.288,
+            line_gap: 0.0,
+        };
+        let defs = build_definitions(Some((INTER_REGULAR, 0, 0, fake)));
+        let family = FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO));
+        let chain = defs
+            .families
+            .get(&family)
+            .unwrap_or_else(|| panic!("{FAMILY_EDITOR_MONO} 未注册"));
+
+        let factory_mono = &FontDefinitions::default().families[&FontFamily::Monospace];
+        let expected: Vec<String> = factory_mono
+            .iter()
+            .filter(|n| n.as_str() != CJK_MONOSPACE)
+            .cloned()
+            .chain([CJK_MONOSPACE_EDITOR.to_owned()])
+            .collect();
+        assert_eq!(chain, &expected, "链 = 出厂等宽链 - 原生CJK + 副本");
+        assert_eq!(
+            chain.first().map(String::as_str),
+            Some("Hack"),
+            "链头保持内置 Hack"
+        );
+        assert_eq!(chain.last().map(String::as_str), Some(CJK_MONOSPACE_EDITOR));
+        assert!(
+            !chain.iter().any(|n| n == CJK_MONOSPACE),
+            "原生 CJK 等宽条目不得入链"
+        );
+        assert!(
+            pos_in(chain, "NotoEmoji-Regular") < pos_in(chain, "emoji-icon-font"),
+            "emoji 相对顺序保留"
+        );
+
+        // 副本字节:采纳表值 == Hack 采纳表值按副本 upem(Inter 2048)量化。
+        let hack = defs.font_data.get("Hack").expect("内置 Hack 存在");
+        let target = parse_vertical_tables(hack.font.as_ref(), 0)
+            .expect("Hack 表恒可解析")
+            .vertical_metrics_em();
+        let copy = defs
+            .font_data
+            .get(CJK_MONOSPACE_EDITOR)
+            .expect("副本已注册");
+        let patched = parse_vertical_tables(copy.font.as_ref(), copy.index).expect("副本可解析");
+        let to_units = |em: f32| (em * f32::from(patched.units_per_em)).round() as i16;
+        let want = (
+            to_units(target.ascent),
+            to_units(target.descent),
+            to_units(target.line_gap),
+        );
+        assert_eq!(
+            patched.selected(),
+            want,
+            "副本采纳表值应等于链头 em 值的量化(基线归零的前提)"
+        );
+        let original = parse_vertical_tables(INTER_REGULAR, 0).expect("stand-in 原始表解析失败");
+        assert_eq!(
+            patched.use_typo_metrics, original.use_typo_metrics,
+            "采纳策略(fsSelection bit7)不应被翻转"
+        );
+    }
+
+    fn pos_in(chain: &[String], name: &str) -> usize {
+        chain
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} 不在链里: {chain:?}"))
+    }
+
+    /// #50 M1 install 端到端:注册标志落槽、`editor_mono_family` 不再回落、
+    /// 新族在投影字号下 CJK 可见(不豆腐)、**混排基线偏差精确为 0** 且
+    /// 纯 ASCII 行盒高与 `FontFamily::Monospace` 完全一致。本机无 CJK 候选
+    /// 时如实跳过(降级语义由 [`inter_registers_even_without_cjk`] 钉住)。
+    #[test]
+    fn install_registers_editor_mono_family_with_aligned_baseline() {
+        let ctx = egui::Context::default();
+        let cjk = install(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+
+        if cjk.is_none() {
+            eprintln!("本机无 CJK 候选字体,编辑器族端到端断言跳过");
+            assert_eq!(editor_mono_family(&ctx), FontFamily::Monospace);
+            return;
+        }
+        assert_eq!(
+            editor_mono_family(&ctx),
+            FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO))
+        );
+
+        let size = 15.0;
+        let editor = egui::FontId::new(size, editor_mono_family(&ctx));
+        ctx.fonts_mut(|f| assert!(f.has_glyphs(&editor, "中文混排"), "CJK 回退在链上,不出豆腐"));
+
+        // 混排基线:同一行内 CJK 与拉丁字形的布局基线(placed.pos.y +
+        // glyph.pos.y,#43 M1 同一度量)逐项相等 —— 链头与 fallback 行
+        // metrics 全等的直接读数。
+        let baseline_gap = |font: &egui::FontId| {
+            ctx.fonts_mut(|f| {
+                let galley = f.layout_no_wrap(
+                    "甲post中文123".to_owned(),
+                    font.clone(),
+                    egui::Color32::WHITE,
+                );
+                baseline_cjk_minus_latin(&galley)
+            })
+        };
+        assert_eq!(
+            baseline_gap(&editor),
+            Some(0.0),
+            "新族混排基线偏差应精确为 0"
+        );
+        let stock = egui::FontId::new(size, FontFamily::Monospace);
+        let old_gap = baseline_gap(&stock).expect("现状族混排行应同时含 CJK 与拉丁");
+        assert!(
+            old_gap >= 1.0,
+            "对照(现状 Monospace 族)应存在基线偏差,实测 {old_gap}"
+        );
+
+        // 行盒高:新族与现状族完全一致(链头未动的直接读数)。
+        let row_height = |font: &egui::FontId| {
+            ctx.fonts_mut(|f| {
+                f.layout_no_wrap(
+                    "甲post中文123".to_owned(),
+                    font.clone(),
+                    egui::Color32::WHITE,
+                )
+                .rows[0]
+                    .rect()
+                    .height()
+            })
+        };
+        assert_eq!(
+            row_height(&editor),
+            row_height(&stock),
+            "编辑器族行盒高不得偏离现状族"
+        );
+    }
+
+    /// 从 galley 首行读「CJK 基线 − 拉丁基线」(无头布局度量,与
+    /// #43 M1 取证同式);行内缺 CJK 或缺拉丁时返回 `None`。
+    fn baseline_cjk_minus_latin(galley: &egui::Galley) -> Option<f32> {
+        let is_ideograph = |c: char| ('\u{4E00}'..='\u{9FFF}').contains(&c);
+        let is_latin = |c: char| c.is_ascii_alphanumeric();
+        let row = &galley.rows[0].row;
+        let latin = row
+            .glyphs
+            .iter()
+            .filter(|g| is_latin(g.chr))
+            .map(|g| g.pos.y)
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+        let cjk = row
+            .glyphs
+            .iter()
+            .filter(|g| is_ideograph(g.chr))
+            .map(|g| g.pos.y)
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+        Some(cjk? - latin?)
+    }
+
     /// #23 F3 CJK 防回归:F3 起预览正文用**显式 FontId**(size = 用户字号
     /// 偏好读侧,族 = [`preview_body_family`]),编辑器字号经 theme 投影到
     /// Monospace 档。本测试把整条 F3 链路(install 字体链 → `ThemeSettings
     /// ::apply` 投影字号/行距 → 读侧取族与字号)在同一个 context 上串起来
     /// 验证:预览所用的族在用户字号下 CJK 回退仍在链尾、字形可见 —— 字号/
-    /// 行距偏好不得以任何方式(换族、断链、新造 `FontFamily::Name` 族)
-    /// 破坏中文可见性。本机无 CJK 候选时如实跳过(降级语义由
-    /// [`inter_registers_even_without_cjk`] 钉住)。
+    /// 行距偏好不得以任何方式(断链、漏挂 CJK)破坏中文可见性(#50 M1 起
+    /// 编辑器档的族投影到专用等宽族,其链纪律同样在此钉住)。本机无 CJK
+    /// 候选时如实跳过(降级语义由 [`inter_registers_even_without_cjk`]
+    /// 钉住)。
     #[test]
     fn font_size_projection_keeps_cjk_fallback_on_preview_family() {
         let ctx = egui::Context::default();
@@ -977,8 +1273,9 @@ mod tests {
         let size = crate::theme::editor_font_size(&ctx);
         assert_eq!(size, 22.0, "读侧应与投影同源");
 
-        // 编辑器 Monospace 档:size 已投影,族仍是等宽族(不新造 Name 族,
-        // CJK 回退挂等宽族链尾 —— fonts.rs 的字体链纪律在投影后保持)
+        // 编辑器 Monospace 档:size 已投影,#50 M1 起族同步投影为编辑器
+        // 专用等宽族(链头与 Monospace 同为内置 Hack,字号语义不变;
+        // CJK 回退挂专用族链尾 —— fonts.rs 的字体链纪律在投影后保持)
         let mono = ctx
             .style_of(egui::Theme::Dark)
             .text_styles
@@ -986,7 +1283,7 @@ mod tests {
             .expect("出厂 Monospace 档恒存在")
             .clone();
         assert_eq!(mono.size, 22.0);
-        assert_eq!(mono.family, FontFamily::Monospace);
+        assert_eq!(mono.family, editor_mono_family(&ctx));
 
         if cjk.is_none() {
             eprintln!("本机无 CJK 候选字体,CJK 链尾断言跳过");

@@ -638,7 +638,9 @@ fn apply_density(ctx: &egui::Context, density: Density) {
 }
 
 /// 字号偏好(#23 F3)在 egui data 槽的键:`apply_font_size` 写入(经
-/// staleness 检查),预览正文侧的 [`editor_font_size`] 读取。
+/// staleness 检查),预览正文侧的 [`editor_font_size`] 读取。槽值是
+/// `(字号, 投影族)`:族随字体安装状态而变(#50 M1),staleness 按两者
+/// 联合键控,族翻转的下一帧即重投影。
 fn font_size_id() -> egui::Id {
     egui::Id::new("latermd-editor-font-size")
 }
@@ -652,27 +654,34 @@ fn font_size_id() -> egui::Id {
 /// (#43 系列)不受本读侧影响。
 pub fn editor_font_size(ctx: &egui::Context) -> f32 {
     ctx.data(|data| {
-        data.get_temp::<f32>(font_size_id())
+        data.get_temp::<(f32, egui::FontFamily)>(font_size_id())
+            .map(|(size, _)| size)
             .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
     })
 }
 
 /// 字号偏好(#23 F3)→ egui style 的 `TextStyle::Monospace` 档投影:编辑器
 /// 面板(源码模式 TextEdit、行号槽、Live 模式活动块源码)字体恒取
-/// Monospace 档,改档位 size 即改编辑器字号。族(`FontFamily::Monospace`,
-/// CJK 回退挂其链尾)与链内其余字体分毫不动 —— 只改 size,不新造
-/// `FontFamily::Name` 族,字体链纪律由投影保持。
+/// Monospace 档,改档位 size 即改编辑器字号。#50 M1 起族一并投影:
+/// 有 CJK 且编辑器专用等宽族注册成功时用 [`crate::fonts::
+/// editor_mono_family`](`editor-mono`,链头与 `FontFamily::Monospace` 同
+/// 为内置 Hack、纯 ASCII 排版逐像素一致,链尾 CJK 副本行 metrics 对齐链
+/// 头、混排基线对齐),否则保持 `FontFamily::Monospace`(降级 = 修复前
+/// 行为)。字号语义不变:唯一事实源仍是本档位的 size 字段,行号槽与
+/// Live 活动块经 `FontSelection::Style(Monospace)` 自动跟随。
 ///
 /// 与 [`apply_density`] 同款 staleness 检查:`apply` 每帧调用,值没变就
 /// 不写 style(`style_mut_of` 即使值相同也推进 style 版本、作废布局缓存,
-/// 滑杆拖动帧之外不得付这笔开销);字号变了(滑杆/载入新 settings)当帧
-/// 即重投影 —— 不放进 `apply_shell` 那类一次性投影(ui.data 标志只挡
-/// 第一次,后续滑杆变化会哑掉),而是像密度一样按值键控。
+/// 滑杆拖动帧之外不得付这笔开销);字号或族变了(滑杆/载入新 settings/
+/// 字体安装完成)当帧即重投影 —— 不放进 `apply_shell` 那类一次性投影
+/// (ui.data 标志只挡第一次,后续滑杆变化会哑掉),而是像密度一样按值
+/// 键控。
 fn apply_font_size(ctx: &egui::Context, size: f32) {
+    let family = crate::fonts::editor_mono_family(ctx);
     let id = font_size_id();
     let changed = ctx.data_mut(|data| {
-        let changed = data.get_temp::<f32>(id) != Some(size);
-        data.insert_temp(id, size);
+        let changed = data.get_temp::<(f32, egui::FontFamily)>(id) != Some((size, family.clone()));
+        data.insert_temp(id, (size, family.clone()));
         changed
     });
     if !changed {
@@ -682,6 +691,7 @@ fn apply_font_size(ctx: &egui::Context, size: f32) {
         ctx.style_mut_of(theme, |style| {
             if let Some(mono) = style.text_styles.get_mut(&egui::TextStyle::Monospace) {
                 mono.size = size;
+                mono.family = family.clone();
             }
         });
     }

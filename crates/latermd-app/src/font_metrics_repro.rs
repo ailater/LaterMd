@@ -447,6 +447,7 @@ fn mixed_script_galley_metrics_forensics() {
     let inter = parse_vertical_tables(
         &override_vertical_metrics(
             include_bytes!("../../../assets/fonts/Inter-Regular.ttf"),
+            0,
             target,
         )
         .expect("Inter-Regular override patch 失败"),
@@ -456,6 +457,7 @@ fn mixed_script_galley_metrics_forensics() {
     let semibold = parse_vertical_tables(
         &override_vertical_metrics(
             include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") as &[u8],
+            0,
             target,
         )
         .expect("Inter-SemiBold override patch 失败"),
