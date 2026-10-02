@@ -9,17 +9,37 @@ use crate::link::LinkHandler;
 use crate::style::{InlineCodeStyle, MarkdownStyle};
 use crate::types::Token;
 
+/// Absolute slack added when the fallback floor engages, in points.
+///
+/// epaint snaps the row height to whole pixels (`round_to_pixel`), which can
+/// shave up to 0.5px off the requested height. Without slack, a floor set to a
+/// fallback face's exact row-height need (e.g. 1.448em for Noto Sans CJK) can
+/// still end up below it after snapping, and the CJK ink overflows again.
+/// 0.75px covers the worst-case downward snap plus metric quantization on the
+/// 1/32 point grid, at every font size (it is absolute, not relative).
+const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
+
 /// Resolve the row height for a given font size under the user's
-/// [`MarkdownStyle::line_height_ratio`](style::MarkdownStyle::line_height_ratio).
+/// [`MarkdownStyle::line_height_ratio`](style::MarkdownStyle::line_height_ratio)
+/// and the host-declared fallback floor
+/// [`MarkdownStyle::min_line_height_em`](style::MarkdownStyle::min_line_height_em).
 ///
 /// A single fixed pixel height cannot serve both sizes in one document: at the
 /// default 13pt body font, 13pt * 1.30 is about 17px, but H1 renders at 20.8pt and
 /// needs about 24px. Pinning every row to the body's height clipped every heading
 /// row by 1–7px, so wrapped heading lines drew on top of each other. Scaling by the
 /// font size instead keeps one rhythm that headings grow into rather than outgrow.
+///
+/// The floor only ever *raises* the height, and only when the host declared one
+/// above the ratio (the default of `1.0` never engages for sane sizes), so a
+/// Latin-only document keeps its existing rhythm to the pixel. When the floor does
+/// engage, absolute snapping slack is added so a pixel-snapped row still clears the
+/// fallback face's row-height need (see [`LINE_HEIGHT_FLOOR_SLACK_PX`]).
 #[inline]
 fn line_height_for(size: f32, style: &MarkdownStyle) -> Option<f32> {
-  Some(size * style.line_height_ratio)
+  let ratio_height = size * style.line_height_ratio;
+  let floor_height = size * style.min_line_height_em + LINE_HEIGHT_FLOOR_SLACK_PX;
+  Some(ratio_height.max(floor_height))
 }
 
 /// List markers are right-aligned in a slot as wide as this string, measured in the body font,

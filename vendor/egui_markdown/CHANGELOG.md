@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size, replacing the fixed `17px` height. Rows now derive their height from their own font
   size, so headings grow into the rhythm instead of being clipped by a height tuned for
   body-size glyphs.
+- `MarkdownStyle::min_line_height_em` (default `1.0`, no floor): lower bound for the row height
+  in font-size multiples. Hosts that register a CJK fallback chain set this to the fallback
+  face's row-height need (e.g. Noto Sans CJK ≈ `1.448`): a row shorter than that still
+  *advances* by its height, so the overflowing CJK ink collides with the next row or gets
+  occluded by the next block's opaque background. When the floor engages (above the ratio),
+  `0.75px` of absolute slack covers epaint's whole-pixel row snapping so the row still clears
+  the need at every font size; rows also stay uniform across Latin-only and mixed lines. The
+  default of `1.0` never engages for sane sizes, so Latin-only documents keep their rhythm
+  to the pixel.
 - `TableStyle::header_fill` and `TableStyle::zebra_fill` (both default `false`): fill the
   header row with `Visuals::faint_bg_color`, and zebra-stripe the body rows via
   `egui_extras`' built-in striped rows (same color). Both adapt to light and dark visuals.
