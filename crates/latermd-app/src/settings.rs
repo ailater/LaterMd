@@ -18,7 +18,10 @@ use crate::command::Command;
 use crate::keymap::Keymap;
 use crate::mcp::McpState;
 use crate::state::Message;
-use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
+use crate::theme::{
+    Density, SkinCatalog, ThemeMode, ThemeSettings, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
+};
 use crate::ui::icons;
 use eframe::egui;
 use latermd_mcp::{McpConfig, ToolKind};
@@ -341,6 +344,37 @@ fn appearance(
         {
             outbox.push(Message::ThemeDensityChanged(density));
         }
+    }
+
+    // 排版偏好(#23 F2):滑杆从 theme 读**回显副本**,拖动中值变化的每帧
+    // 都发消息,归约落字段并写 settings.json,下一帧滑杆位置即归约后的
+    // 值 —— 与上方主题/密度选择的「即时生效」同款(不是 AI 页的草稿模式:
+    // 字号/行距是拖一下就该看到的偏好,没有「保存」步骤)。渲染投影在
+    // F3,本期滑杆动的是数据与落盘。
+    ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.label("排版(编辑器与预览正文的字号与行距):");
+    let mut font_size = theme.editor_font_size;
+    let font_size_response = ui
+        .add(
+            egui::Slider::new(&mut font_size, EDITOR_FONT_SIZE_MIN..=EDITOR_FONT_SIZE_MAX)
+                .integer()
+                .text("字号"),
+        )
+        .on_hover_text("正文基准字号(标题按比例放大)。下限 12 是中文(CJK)可读性下限,不再往下放。");
+    if font_size_response.changed() {
+        outbox.push(Message::EditorFontSizeChanged(font_size));
+    }
+    let mut line_height = theme.line_height;
+    let line_height_response = ui
+        .add(
+            egui::Slider::new(&mut line_height, LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX)
+                .fixed_decimals(1)
+                .step_by(0.1)
+                .text("行距"),
+        )
+        .on_hover_text("正文行距倍率(如 1.5 = 1.5 倍字号)。中文可读区间通常在 1.5–1.8。");
+    if line_height_response.changed() {
+        outbox.push(Message::EditorLineHeightChanged(line_height));
     }
 
     ui.add_space(crate::ui::tokens::SPACE_MD);
@@ -1105,6 +1139,115 @@ mod tests {
                     "{density:?} 档滑杆 handle 中心 {center:?} 不在任何 rail 上: rails={rails:?}"
                 );
             }
+        }
+    }
+
+    /// #23 F2:外观页两根排版滑杆真实渲出 —— 「字号」「行距」标签与 theme
+    /// 当前回显值进入末帧 shapes 的**精确** Text 形状(galley 文本恰等于
+    /// 标签/值,不与区块标题整句撞车),滑杆轨道(rail)至少两根;无拖动的
+    /// 初始帧渲染不产出消息(改动只经拖动时的 `changed()` 走归约)。两轮
+    /// 回显值(出厂 15/1.5 与自定义 20/1.8)证明滑杆的值绑定在 theme 字段
+    /// 上(回显来自归约侧真值,而不是 UI 本地草稿)。
+    ///
+    /// 直接渲 `appearance()` 而不是整个 `dialog`:设置窗 default_size 440px
+    /// 视口只装到「排版」区块标题,滑杆在 ScrollArea 视口之下(首屏要滚一下
+    /// 才看到,产品上可接受);clip 之外 tessellation 会剔除形状,滑杆就取
+    /// 不到断言了。在整窗里的「渲不 panic」由 `every_tab_renders` 覆盖,本
+    /// 测试只断言滑杆本体。与 #35 同款环境:先跑主题投影(滑杆轨道填充色
+    /// 硬绑 `widgets.inactive.bg_fill`)。
+    #[test]
+    fn appearance_page_renders_font_prefs_sliders() {
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+
+        for (font_size, line_height) in [(15.0_f32, 1.5_f32), (20.0, 1.8)] {
+            state.theme.editor_font_size = font_size;
+            state.theme.line_height = line_height;
+            let mut last_shapes = Vec::new();
+            let mut last_outbox = Vec::new();
+            let system_theme_ok = state.system_theme_ok;
+            let resolved = resolved_theme_for_test(&state);
+            let skins = state.skins.clone();
+            // 3 帧取末帧:appearance() 直接渲没有 Window fade-in,多帧只为
+            // 避开可能的布局 warm-up 首帧(egui Slider 的 DragValue 编辑态)
+            for _ in 0..3 {
+                let State {
+                    settings, theme, ..
+                } = &mut state;
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        // egui 0.36:面板嵌套 Ui 用 `show`(旧 `show_inside`
+                        // 已弃用);这里只借一层全屏 Ui 当画布,不参与布局
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            appearance(
+                                ui,
+                                settings,
+                                theme,
+                                &skins,
+                                system_theme_ok,
+                                resolved,
+                                &mut outbox,
+                            );
+                        });
+                    },
+                );
+                // shapes move 出前清 textures delta(直接 drop 带 delta 会 panic)
+                let mut output = output;
+                output.textures_delta.clear();
+                last_shapes = output.shapes;
+                last_outbox = outbox;
+            }
+
+            // 精确匹配:滑杆标签是独立 Label 形状,值是独立 DragValue 形状,
+            // 二者的 galley 文本恰等于「字号」/「行距」/数值本身;区块标题
+            // (整句「排版(…)」)不会以纯标签形态出现,contains 会撞车,
+            // 这里用 trim 后全等
+            let text_shapes: Vec<&str> = last_shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().trim()),
+                    _ => None,
+                })
+                .collect();
+            for label in ["字号", "行距"] {
+                assert!(
+                    text_shapes.contains(&label),
+                    "{font_size}/{line_height}: 滑杆标签「{label}」未渲出,文本形状:{text_shapes:?}"
+                );
+            }
+            for value in [format!("{font_size}"), format!("{line_height}")] {
+                assert!(
+                    text_shapes.contains(&value.as_str()),
+                    "{font_size}/{line_height}: 回显值「{value}」未渲出,文本形状:{text_shapes:?}"
+                );
+            }
+            // 轨道:横向细长填充矩形(与 #35 同款判据),主题区分隔线等同类
+            // 形状只会多算不会少算,断言 ≥2
+            use egui::epaint::Shape;
+            let rails = last_shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(&clipped.shape, Shape::Rect(r)
+                        if r.rect.height() <= 12.0 && r.rect.width() > 40.0)
+                })
+                .count();
+            assert!(
+                rails >= 2,
+                "{font_size}/{line_height}: 滑杆轨道不足 2 根({rails})"
+            );
+            assert!(
+                last_outbox.is_empty(),
+                "无拖动的渲染帧不产出消息(值只在 changed() 时发)"
+            );
         }
     }
 
