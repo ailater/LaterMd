@@ -36,8 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableStyle::header_fill` and `TableStyle::zebra_fill` (both default `false`): fill the
   header row with `Visuals::faint_bg_color`, and zebra-stripe the body rows via
   `egui_extras`' built-in striped rows (same color). Both adapt to light and dark visuals.
+- `MarkdownStyle::heading_space_above` (default `4.0`): extra vertical space above a
+  heading, on top of `block_spacing`. It is emitted as a transparent spacer row of
+  `block_spacing + heading_space_above` points ahead of the heading's first row, so it
+  reaches both render paths — the whole-document galley and separately flushed segment
+  ranges. A heading that starts the document (or a flushed range) or directly follows a
+  block element keeps the plain `block_spacing`, and setting the field to `0.0` makes the
+  spacer row exactly `block_spacing` tall. The spacer row counts towards a
+  `max_rows` / truncate budget.
 
 ### Changed
+
+- Default heading size scales widened from `1.6/1.35/1.2/1.1/1.05/1.0` to
+  `2.0/1.55/1.30/1.15/1.08/1.0`: at a 13pt body this renders ~26.0/20.2/16.9/15.0/14.0/13.0pt,
+  so the adjacent low levels H4–H6 stay visually distinguishable (they used to pack within
+  ~0.6pt of each other, with H6 identical to body text) and H1 sits at the top of the
+  customary 1.8–2.0× range for Latin body text, which also suits dense CJK glyphs. Hosts
+  that set their own `scales` are unaffected, and body text is untouched.
 
 - **Breaking:** `build_layout` now takes `max_width: f32` and `break_anywhere: bool`, and no
   longer reads `ui.wrap_mode()` itself. A caller that caches the resulting job must write the

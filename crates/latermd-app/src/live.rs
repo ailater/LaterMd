@@ -250,7 +250,14 @@ pub fn ui(
                     // 富渲染。区域用渲染前后的 cursor 差值框出来;「点击进
                     // 编辑」的命中不走 egui widget,理由见 [`clicked_for_edit`]。
                     let top = ui.cursor().top();
+                    // 字体与右栏预览同源(#23 F3):size = 用户字号偏好,
+                    // 族 = 预览专用族(#43 M2 的行 metrics 对齐副本,无 CJK
+                    // 回落 Proportional)。源码/Live 两种模式下排版偏好同观感。
                     MarkdownLabel::new(editor_id.with(("live-render", index)), &block_text)
+                        .font(egui::FontId::new(
+                            crate::theme::editor_font_size(ui.ctx()),
+                            crate::fonts::preview_body_family(ui.ctx()),
+                        ))
                         .wrap()
                         // 代码块复制头(#38)与右栏预览同一份:Live 模式的
                         // 富渲染块也是「code 预览的地方」。

@@ -356,6 +356,22 @@ pub fn build_layout(
           continue;
         }
         if let Some(level) = style.heading {
+          // A heading that follows other content gets a transparent spacer row above it,
+          // so headings breathe more than a paragraph break (see `heading_space_above`).
+          // Heading blocks are preceded by at least one `Newline` token, while further
+          // spans inside the same heading (bold, links, …) follow a non-newline token,
+          // so this fires once per heading block — and never for a heading that starts
+          // the token stream (or a flushed segment), which should hug the top without a
+          // lead-in gap. The trailing newline shares the spacer's line height so the row
+          // is exactly the spacer height under either row-height rule epaint applies.
+          if token_index > 0 && matches!(tokens[token_index - 1], Token::Newline) {
+            let mut spacer_format = transparent_format.clone();
+            spacer_format.line_height = Some(style_ref.block_spacing + style_ref.heading_space_above);
+            job.append(" ", 0.0, spacer_format.clone());
+            section_to_token.push(token_index);
+            job.append("\n", 0.0, spacer_format);
+            section_to_token.push(token_index);
+          }
           format.color = ui.visuals().strong_text_color();
           apply_bold(&mut format, ui, bold_available);
           let idx = (level as usize).saturating_sub(1).min(5);

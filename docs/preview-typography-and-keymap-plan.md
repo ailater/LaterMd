@@ -70,9 +70,11 @@ format.font_id.size *= style_ref.heading.scales[idx];   // 20.8pt
 
 ---
 
-## 2. 待办 A：行距节奏 + 标题区分（UI 协调性）
+## 2. 待办 A：行距节奏 + 标题区分（UI 协调性）—— ✅ 已落地（2026-10-02，auto-plan #23 F4/F5）
 
 §1 解开的是**重叠**（bug）。让预览「好看」是另一件事，层次要靠两条一起调：**字号分级** + **块间距**。
+
+> **落地状态（2026-10-02）**：本节三项已全部随 auto-plan #23 落地——（1）（2）为 vendored **①类（上游可合）** commit `02b33ad`（F4，独立 `vendor:` commit），（3）的用户设置页滑杆为 #23 F2/F3（`e5a7203`/`3e55b39`）；`theme_presets.rs` 同步与无头像素验收为 `f138140`（F5），验收记录见 [preview-typography-acceptance.md](preview-typography-acceptance.md)。逐项对照见 §2.2 各小节旁注；§2.3 的自动侧验收（数值/几何断言）已过，**真机目视 M1–M6 留人工**（验收文档 §5）。与计划原文的两处偏差以现状为准：① spacer 落点在 `build_layout` 层而非下文写的 `render_token_range`（纯正文/代码块文档走整篇 galley 路径不经过该函数，岔路全文见 decisions-pending #74）；② 出厂 `line_height_ratio=1.30` 未动，但 app 侧生效值被用户行距滑杆覆盖（默认 1.5，优先级：滑杆 > 皮肤 > overrides > 出厂）。
 
 ### 2.1 现状问题
 
@@ -88,11 +90,13 @@ format.font_id.size *= style_ref.heading.scales[idx];   // 20.8pt
 
 ### 2.2 计划改法
 
-**（1）拉开低阶标题的字号分级**
+**（1）拉开低阶标题的字号分级 —— ✅ 已落地（2026-10-02，vendored ①类 `02b33ad`）**
 
 ```
 scales: [2.0, 1.55, 1.30, 1.15, 1.08, 1.0]   // 建议值，需真机目视后微调
 ```
+
+落地值与本节建议值**逐项一致**；注释里的「真机目视后微调」仍成立——微调只需改 `HeadingStyle::scales` 出厂值一行（真机目视项 M1/M4，验收文档 §5）。
 
 | | H1 | H2 | H3 | H4 | H5 | H6 |
 |---|---|---|---|---|---|---|
@@ -101,7 +105,7 @@ scales: [2.0, 1.55, 1.30, 1.15, 1.08, 1.0]   // 建议值，需真机目视后�
 
 H1 从 1.6 拉到 2.0 是中文排版常用档（英文正文常用 1.8–2.0，中文因字形密度建议偏上限）。
 
-**（2）块间距分级：标题前后比正文多留**
+**（2）块间距分级：标题前后比正文多留 —— ✅ 已落地（2026-10-02，vendored ①类 `02b33ad` + app `f138140`）**
 
 现在 `before_block` / `after_block` 一律 `ui.add_space(style.block_spacing)`（`label.rs:745-761`）。标题应该比这个更宽。
 
@@ -112,17 +116,22 @@ H1 从 1.6 拉到 2.0 是中文排版常用档（英文正文常用 1.8–2.0，
 pub heading_space_above: f32,
 ```
 
-改 `render_token_range`：判断 token 是 heading 时 `add_space(block_spacing + heading_space_above)`。
-**注意 `skinsPresets` 也要同步**（`crates/latermd-app/src/theme_presets.rs` 的 `base()`），否则九套预设皮肤各自看着不一致。
+> **落地偏差（以现状为准，decisions-pending #74）**：字段与默认值照计划落地，但实现不在 `render_token_range` 里 `add_space`，而是在 `build_layout` 层给标题块首 token 前插**透明 spacer 行**（行高 `block_spacing + heading_space_above`，数值语义同为「叠在空行之上」）——纯正文/普通代码块文档走整篇 galley 路径根本不经过 `render_token_range`，且 `add_space(12px)` 是替换空行而非叠加（12px < 段落间距，反而比段落更紧，违背 §2.3 验收③）；两条渲染路径需一处产出才能一致。`render_token_range` 零改动，正文观感否决线由「纯正文文档 rows 数与高度对新字段完全不变」测试钉死。
 
-**（3）顺手校正的行距：** `line_height_ratio = 1.30` 已在 §1 落地，中文可读区间通常 1.5–1.8。
+`skinsPresets` 同步已做（`f138140`，F5）：`theme_presets.rs` 的 `base()` 显式钉 `heading_space_above=4.0`，与 vendored 默认/出厂默认做**三方交叉断言**（vendored 默认再变时测试红，强制显式同步）；不按皮肤微调——九套预设只差颜色，标题节奏是全局一致属性。
+
+**（3）顺手校正的行距 —— ✅ 已落地（2026-10-02，#23 F2 `e5a7203` / F3 `3e55b39`）：** `line_height_ratio = 1.30` 已在 §1 落地，中文可读区间通常 1.5–1.8。
 **但改正文倍率会让正文跑版**（17.0 → 19.5+，一屏少看两三行），属于偏好不是 bug —— 建议留成用户在设置页自己调，出厂值维持 1.30，等坤哥目视后再定要不要出厂就调松。
 
-### 2.3 验收
+> **落地状态**：本节「留成用户在设置页自己调」的建议已原样兑现——#23 F2 在外观页交付行距滑杆（1.2–2.0、步进 0.1、默认 1.5，即时生效即时落盘 settings.json），F3 把滑杆值覆盖到 markdown style 生效值（vendored 出厂 1.30 未动，见本节开头状态段）。注意默认出厂观感因此变为 15pt×1.5（#23 规格默认值），vendored 基线仍 1.30。源码编辑器侧的行距投影不在 #23 范围（decisions-pending #73，随 #50 转正）。
+
+### 2.3 验收 —— 自动侧已过（2026-10-02），真机目视留人工
 
 - 一篇含 H1–H6 + 列表 + 引用 + 表格 + 代码块的样例文档，明暗两套主题各截一张。
 - 逐条看：① 换行标题不再压字；② H4–H6 能分辨层级；③ 标题上下呼吸明显大于行间距；④ 正文密度不变（这是否决线）。
 - 对比基准＝当前 build 的同文档截图，`compare -metric AE` 只用于确认「确实变了」，真正判好看得靠眼睛。
+
+> **落地状态（2026-10-02，`f138140`）**：①④ 与 ③ 的数值/几何断言已由**无头像素验收**覆盖（[preview-typography-acceptance.md](preview-typography-acceptance.md)：生产生效链路 15pt/用户行距 1.5/CJK 行高下限下，标题上方空隙 35.00px − 段落间 23.00px = **恰 12.00px = spacer**；section 字号 30.00/23.25/19.50/17.25/16.20/15.00pt 精断；**纯正文文档 rows/高度对 `heading_space_above` 全不变**（否决线④）；② 有像素带高度分离新旧分级的下限断言）。全元素样例文档明暗两主题的结构带（22 文本带/6 strong 带/引用竖条/表格横边框 6 条/代码底色 694×45px）全部像素层可检出。「真正判好看得靠眼睛」的部分即验收文档 **§5 M1–M6 真机目视清单**，留坤哥人工——眼睛说了算之前不宣称「好看」只宣称「数值如设计」。
 
 ---
 
@@ -237,8 +246,8 @@ pub heading_space_above: f32,
 | 1 | ✅ **预览行高修复**（已完成） | vendor 两文件 | vendor check.sh + 主仓 597 |
 | 2 | ✅ **键位改排**（已完成 2026-10-01，主题 → Alt+T，Cmd+Shift+T 空出给 TabRestore，commit 780a79c） | `command.rs` / `keymap.rs` | 主仓六项 |
 | 3 | ✅ **TabRestore 完整实现**（已完成 2026-10-01，commit 881edfd） | `command.rs` / `state.rs` / `tabs.rs` / `ui/menubar.rs` | 主仓六项 + 新增单测 |
-| 4 | heading scales 拉开 + 标题块间距 | vendor + `theme_presets.rs` | vendor check.sh + 主仓六项 |
-| 5 | 明暗两套真机截图对比 | 截图 | 目视验收 |
+| 4 | ✅ **heading scales 拉开 + 标题块间距**（已完成 2026-10-02，#23 F4/F5：vendored ①类 `02b33ad` + app `f138140`；无头像素验收落档 [preview-typography-acceptance.md](preview-typography-acceptance.md)，真机目视 M1–M6 留人工） | vendor + `theme_presets.rs` | vendor check.sh + 主仓六项（各自实跑全绿，F4 另含 vendored 10+1 新测试） |
+| 5 | 明暗两套真机截图对比（自动侧明暗两轮像素验收已随第 4 行做过，**真机截图本体留人工**，对应验收文档 M5） | 截图 | 目视验收 |
 
 **分支纪律**（AGENTS §8）：上述分两条 commit 走——vendor 改动用 `vendor:` 前缀标 ①类；app 侧改动注明「非 vendor」。`main` 禁止直推，走 `feature/<主题>` + PR。
 
@@ -253,4 +262,4 @@ pub heading_space_above: f32,
 - [x] 键位改排（2026-10-01，780a79c）：主题 → Alt+T，旧 `keymap.json` 值感知迁移「旧默认→新默认」不覆盖用户绑定，mac 显示 ⌥（取舍见 decisions-pending #69）
 - [x] TabRestore 完整实现（2026-10-01，881edfd）：关闭栈 LIFO / 只记已落盘 / 封顶 20 / 失败丢弃继续（取舍见 decisions-pending #70），「文件」菜单入口 + state 侧四条单测 + command 侧两条键位断言（K1/K2 联动）；对照明细见 §3.3 落地对照
 - [x] 真机项登记（2026-10-01）：Win11 Alt+T 助记键 / macOS ⌥T / 三平台 Cmd/Ctrl+Shift+T 捕获回归，三项留坤哥人工，见 §3.4 真机项清单
-- [ ] 标题字号分级 / 块间距 —— 按 §5 排期
+- [x] 标题字号分级 / 块间距（2026-10-02，#23 F4/F5：vendored ①类 `02b33ad` + app `f138140`）——scales 新默认 [2.0,1.55,1.30,1.15,1.08,1.0]、`MarkdownStyle::heading_space_above=4.0`（落点 `build_layout` 透明 spacer 行而非 `render_token_range`，decisions-pending #74；`render_token_range` 零改动、纯正文否决线测试钉死）、`theme_presets base()` 显式钉 4.0 与 vendored/出厂三方交叉断言、行距滑杆与皮肤标题间距正交单测；无头像素验收落档 [preview-typography-acceptance.md](preview-typography-acceptance.md)（spacer 行精确 12.00px/section 字号精确/呼吸差恰 12.00px/纯正文 rows 与高度全不变），**真机目视 M1–M6 留人工**（§5 表第 5 行同此）

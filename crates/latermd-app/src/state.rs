@@ -37,7 +37,9 @@ use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
 use crate::tabs::{DraftRecovery, TabState, TabsState};
-use crate::theme::{Density, SkinCatalog, ThemeMode, ThemeSettings};
+use crate::theme::{
+    clamp_editor_font_size, clamp_line_height, Density, SkinCatalog, ThemeMode, ThemeSettings,
+};
 use crate::ui::emoji_panel::EmojiPanelState;
 use crate::ui::image_dialog::ImageDialogState;
 use latermd_editor::EditorBuffer;
@@ -687,6 +689,14 @@ pub enum Message {
     },
     /// 切换界面密度(宽松 / 标准)。
     ThemeDensityChanged(Density),
+    /// 编辑器与预览正文的**基准字号**变化(#23 F2):外观页滑杆拖动中值
+    /// 变化的每帧产出,归约里钳进 12..=24(pt,CJK 可读性下限)后落
+    /// `theme.editor_font_size` 并即时写 settings.json(与切密度同款通路;
+    /// 滑杆自带 range,但钳制是**不依赖 UI** 的防线 —— 消息可被测试或其他
+    /// 调用方直塞越界值)。F3 才把字段投影到渲染。
+    EditorFontSizeChanged(f32),
+    /// 正文行距倍率变化(#23 F2):同上,钳进 1.2..=2.0。
+    EditorLineHeightChanged(f32),
 }
 
 /// 字符偏移 → 字节偏移(替换命中落 `String` 前的换算;落在多字节字符
@@ -801,6 +811,14 @@ impl State {
             Message::ThemeSkinExported { name } => self.export_skin(&name),
             Message::ThemeDensityChanged(density) => {
                 self.theme.density = density;
+                self.persist_theme();
+            }
+            Message::EditorFontSizeChanged(size) => {
+                self.theme.editor_font_size = clamp_editor_font_size(size);
+                self.persist_theme();
+            }
+            Message::EditorLineHeightChanged(ratio) => {
+                self.theme.line_height = clamp_line_height(ratio);
                 self.persist_theme();
             }
             Message::ToggleLivePreview => self.toggle_live_preview(),
@@ -3629,6 +3647,80 @@ mod tests {
         // `load_preferences`),这里按同源的 load_from 复现
         let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
         assert_eq!(reloaded_theme.density, Density::Compact);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #23 F2:字号/行距消息归约落 `theme` 对应字段并即时写 settings.json
+    /// (与切密度同款通路);重启(load_from)后值仍在。只动各自字段 ——
+    /// 密度与其余主题偏好不受影响(与密度选择并存、互不影响)。
+    #[test]
+    fn editor_font_prefs_messages_update_fields_and_persist() {
+        let dir = temp_path("font-prefs-persist");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert_eq!(state.theme.editor_font_size, 15.0);
+        assert_eq!(state.theme.line_height, 1.5);
+        let density_before = state.theme.density;
+
+        state.apply(Message::EditorFontSizeChanged(18.0));
+        assert_eq!(state.theme.editor_font_size, 18.0);
+        state.apply(Message::EditorLineHeightChanged(1.8));
+        assert_eq!(state.theme.line_height, 1.8);
+        // 互不影响:改字号不动行距,反之亦然;密度档全程不变
+        assert_eq!(state.theme.editor_font_size, 18.0);
+        assert_eq!(state.theme.density, density_before);
+
+        // 重启路径:主题由 `main` 的 `ThemeSettings::load` 装载(不经过
+        // `load_preferences`),这里按同源的 load_from 复现(与切密度测试同款)
+        let reloaded_theme = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(reloaded_theme.editor_font_size, 18.0);
+        assert_eq!(reloaded_theme.line_height, 1.8);
+        assert_eq!(reloaded_theme.density, density_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #23 F2:消息可被直塞越界值(滑杆 range 只是 UI 侧约束,归约层是
+    /// 独立防线)—— 字号钳进 12..=24、行距钳进 1.2..=2.0;`inf` 钳到端点、
+    /// `NaN` 回落默认(防线在 `theme::clamp_*` 纯函数:NaN 对 f32 clamp 是
+    /// 穿透的)。界内值(含非整数字号,UI 的 integer 步进只是滑杆层约束)
+    /// 原样通过 —— 钳制管边界不管粒度。
+    #[test]
+    fn editor_font_prefs_out_of_range_messages_are_clamped() {
+        let dir = temp_path("font-prefs-clamp");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        for (size, want) in [
+            (99.0_f32, 24.0),
+            (f32::INFINITY, 24.0),
+            (0.0, 12.0),
+            (-5.0, 12.0),
+            (f32::NEG_INFINITY, 12.0),
+            (f32::NAN, 15.0),
+            // 端点本身合法,clamp 不动;界内非整数原样通过(不偷偷 round)
+            (12.0, 12.0),
+            (24.0, 24.0),
+            (18.5, 18.5),
+        ] {
+            state.apply(Message::EditorFontSizeChanged(size));
+            assert_eq!(state.theme.editor_font_size, want, "{size} -> {want}");
+        }
+        for (ratio, want) in [
+            (99.0_f32, 2.0),
+            (f32::INFINITY, 2.0),
+            (0.0, 1.2),
+            (f32::NEG_INFINITY, 1.2),
+            (f32::NAN, 1.5),
+            (1.2, 1.2),
+            (2.0, 2.0),
+            (1.75, 1.75),
+        ] {
+            state.apply(Message::EditorLineHeightChanged(ratio));
+            assert_eq!(state.theme.line_height, want, "{ratio} -> {want}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
