@@ -63,6 +63,16 @@ pub struct MarkdownStyle {
   /// contain, which also keeps row spacing uniform across a mixed document.
   #[cfg_attr(feature = "serde", serde(default = "default_min_line_height_em"))]
   pub min_line_height_em: f32,
+  /// Extra vertical space inserted above a heading, in pixels, added on top of
+  /// `block_spacing`. Default: `4.0`.
+  ///
+  /// This is emitted in the layout job as a transparent spacer row of height
+  /// `block_spacing + heading_space_above` ahead of a heading's first row, so it
+  /// applies both to a whole-document galley and to a segmented range flushed on
+  /// its own. Headings at the very start of a document (or of a flushed range)
+  /// get no spacer. The spacer row counts towards a `max_rows` / truncate budget.
+  #[cfg_attr(feature = "serde", serde(default = "default_heading_space_above"))]
+  pub heading_space_above: f32,
   /// Language used for syntax highlighting when no language is specified.
   pub default_code_language: String,
 }
@@ -80,6 +90,13 @@ fn default_min_line_height_em() -> f32 {
   1.0
 }
 
+/// Serde default for [`MarkdownStyle::heading_space_above`]: a modest 4px of
+/// extra breathing room above headings, on top of `block_spacing`.
+#[cfg(feature = "serde")]
+fn default_heading_space_above() -> f32 {
+  4.0
+}
+
 impl Default for MarkdownStyle {
   fn default() -> Self {
     Self {
@@ -94,6 +111,7 @@ impl Default for MarkdownStyle {
       code_font_size: 10.0,
       line_height_ratio: 1.30,
       min_line_height_em: 1.0,
+      heading_space_above: 4.0,
       default_code_language: String::new(),
     }
   }
@@ -112,6 +130,7 @@ impl Hash for MarkdownStyle {
     self.code_font_size.to_bits().hash(state);
     self.line_height_ratio.to_bits().hash(state);
     self.min_line_height_em.to_bits().hash(state);
+    self.heading_space_above.to_bits().hash(state);
     self.default_code_language.hash(state);
   }
 }
@@ -150,6 +169,11 @@ impl MarkdownStyle {
     ui.horizontal(|ui| {
       ui.label("Min line height (em):");
       ui.add(DragValue::new(&mut self.min_line_height_em).range(1.0..=3.0).speed(0.01));
+    });
+
+    ui.horizontal(|ui| {
+      ui.label("Heading space above:");
+      ui.add(DragValue::new(&mut self.heading_space_above).range(0.0..=40.0).speed(0.5));
     });
 
     ui.separator();
@@ -343,7 +367,12 @@ pub struct HeadingStyle {
 
 impl Default for HeadingStyle {
   fn default() -> Self {
-    Self { scales: [1.6, 1.35, 1.2, 1.1, 1.05, 1.0] }
+    // Spread the six levels far enough apart to stay distinguishable: at a 13pt body
+    // this yields ~26.0 / 20.2 / 16.9 / 15.0 / 14.0 / 13.0pt, so the adjacent lower
+    // levels differ by ~1pt instead of ~0.6pt and H6 alone matches the body size.
+    // H1 at 2.0× sits at the top of the customary range for Latin body text (1.8–2.0×)
+    // and also suits dense CJK glyphs, which read best at the larger end of that range.
+    Self { scales: [2.0, 1.55, 1.30, 1.15, 1.08, 1.0] }
   }
 }
 
@@ -579,5 +608,40 @@ impl ListStyle {
       ui.add(DragValue::new(&mut self.bullet_scale).range(0.5..=4.0).speed(0.05));
       ui.end_row();
     });
+  }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+  use super::*;
+
+  /// Serialize a style, drop the field named `field` from the document, and
+  /// deserialize it back — the shape of a theme file saved before `field` existed.
+  fn style_without_field(field: &str) -> MarkdownStyle {
+    let mut value = serde_json::to_value(MarkdownStyle::default()).expect("serialize default style");
+    value.as_object_mut().expect("style serializes to a map").remove(field);
+    serde_json::from_value(value).expect("deserialize legacy style")
+  }
+
+  #[test]
+  fn heading_space_above_defaults_when_missing_and_keeps_explicit_values() {
+    // Old theme files predate the field; they must deserialize with the default.
+    let legacy = style_without_field("heading_space_above");
+    assert_eq!(legacy.heading_space_above, 4.0);
+    // The same legacy tolerance covers the previously added line-height fields.
+    assert_eq!(style_without_field("line_height_ratio").line_height_ratio, 1.30);
+    assert_eq!(style_without_field("min_line_height_em").min_line_height_em, 1.0);
+
+    // An explicit zero is a real preference ("no extra heading space"), not a
+    // missing value, and must survive a round trip.
+    let mut value = serde_json::to_value(MarkdownStyle::default()).expect("serialize");
+    value["heading_space_above"] = serde_json::Value::from(0.0_f32);
+    let explicit_zero: MarkdownStyle = serde_json::from_value(value).expect("deserialize explicit zero");
+    assert_eq!(explicit_zero.heading_space_above, 0.0);
+
+    let tuned = MarkdownStyle { heading_space_above: 9.5, ..Default::default() };
+    let round: MarkdownStyle =
+      serde_json::from_str(&serde_json::to_string(&tuned).expect("serialize tuned")).expect("round trip");
+    assert_eq!(round.heading_space_above, 9.5);
   }
 }
