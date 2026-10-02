@@ -18,10 +18,13 @@
 //!
 //! ## 渲染口径
 //!
-//! 应用内 emoji 由 NotoEmoji(egui 出厂字体链)黑白渲染 —— 这是上游
-//! 限制不是 bug,面板底部一行小字说明「导出 / 外发仍是彩色」
-//! (emoji-plan §2 F2)。无头测试只断言「点击 → 发出正确消息」与「渲染
-//! 不 panic」,不断言字形(has_glyph 依赖真实字体,会 flaky,§7 #7)。
+//! 面板与「最近使用」条:随包 Twemoji 72px PNG 画 32 逻辑点白 tint Image
+//! —— 彩色(A2,机制与回落见下方「纹理路径」节);**编辑器正文仍是黑白**
+//! (epaint 0.36.2 字形管线恒纯白填充,emoji-color-feasibility §1),导出 /
+//! 外发的显示效果取决于目标环境的字体,面板底部一行小字即此口径。
+//! 无头测试只断言「点击 → 发出正确消息」「渲染不 panic」「实显枚都拿到
+//! 纹理(损坏/缺失回落)」,不断言字形(has_glyph 依赖真实字体,会
+//! flaky,§7 #7)。
 //!
 //! ## E3 的口径:不让用户看到豆腐块
 //!
@@ -37,6 +40,8 @@
 //! 字符一律误报 false,实测全表 0/272 —— 原方案作废,按 decisions-pending
 //! #52 的 cmap 直验口径运行时化(`emoji_data::from_font_cmap12`),同时
 //! 给 #52 的入库清洗加一道常驻回归防线。
+
+use std::collections::HashMap;
 
 use crate::state::Message;
 use crate::ui::emoji_data::{self, EmojiEntry};
@@ -54,6 +59,349 @@ const CELL_FONT: f32 = CELL * 0.6;
 /// `is_rect_visible` 跳过)把渲进字体图集的量限在可视区,防图集膨胀
 /// (emoji-plan §7 #6)。
 const RESULTS_MAX_H: f32 = 200.0;
+
+// ## A2 纹理路径(#47,emoji-color-feasibility §2)
+//
+// 面板与「最近使用」的彩色来自随包 Twemoji 72px PNG(`assets/emoji/twemoji/`,
+// jdecked v17.0.3,CC-BY 4.0,登记 docs/distribution.md §6):`image` 解码 →
+// `ctx.load_texture` → 画 32 逻辑点白 tint Image(72px 资产,≥2.25x 显示
+// 密度)。纹理句柄存 egui temp memory(per-Context、不序列化、Context 销毁
+// 才清,0.36.2 `IdTypeMap` 的 GC 只作用于序列化值),与
+// [`EmojiPanelState::glyphs`] 同节奏:面板首帧懒建、会话内不失效。
+// 资产缺失 / PNG 解码失败 → 该单元回落出厂 NotoEmoji 黑白字形,与 E3
+// 「数据保留、渲染兜底」同哲学,彩色不引入新失败面。
+
+/// 资产表紧凑写法:`(字符, 文件名)` → `(字符, PNG 字节)`,路径相对本文件,
+/// include_bytes 编译期钉住:文件挪走 / 改名即编译红。
+macro_rules! twemoji_png_assets {
+    ($(($char:literal, $file:literal)),* $(,)?) => {
+        &[$(($char, include_bytes!(concat!("../../../../assets/emoji/twemoji/", $file)))),*]
+    };
+}
+
+/// emoji 字符 → 随包 Twemoji PNG,272 枚与 `emoji_data` 全表 1:1(顺序 =
+/// 表序;清单与 `assets/emoji/twemoji/fetch.sh` 的钉死下载清单按同一规则
+/// 派生,两边不许单边增删)。
+static TWEMOJI: &[(&str, &[u8])] = twemoji_png_assets![
+    ("😀", "1f600.png"),
+    ("😃", "1f603.png"),
+    ("😄", "1f604.png"),
+    ("😁", "1f601.png"),
+    ("😆", "1f606.png"),
+    ("😅", "1f605.png"),
+    ("😂", "1f602.png"),
+    ("😉", "1f609.png"),
+    ("😊", "1f60a.png"),
+    ("😍", "1f60d.png"),
+    ("😘", "1f618.png"),
+    ("😋", "1f60b.png"),
+    ("😛", "1f61b.png"),
+    ("😜", "1f61c.png"),
+    ("😏", "1f60f.png"),
+    ("😒", "1f612.png"),
+    ("😬", "1f62c.png"),
+    ("😲", "1f632.png"),
+    ("😳", "1f633.png"),
+    ("😢", "1f622.png"),
+    ("😭", "1f62d.png"),
+    ("😱", "1f631.png"),
+    ("😴", "1f634.png"),
+    ("😷", "1f637.png"),
+    ("😪", "1f62a.png"),
+    ("😫", "1f62b.png"),
+    ("😩", "1f629.png"),
+    ("😑", "1f611.png"),
+    ("😐", "1f610.png"),
+    ("😶", "1f636.png"),
+    ("😔", "1f614.png"),
+    ("😕", "1f615.png"),
+    ("😤", "1f624.png"),
+    ("👍", "1f44d.png"),
+    ("👎", "1f44e.png"),
+    ("👌", "1f44c.png"),
+    ("✌️", "270c.png"),
+    ("👏", "1f44f.png"),
+    ("🙌", "1f64c.png"),
+    ("👐", "1f450.png"),
+    ("🙏", "1f64f.png"),
+    ("💪", "1f4aa.png"),
+    ("👋", "1f44b.png"),
+    ("👈", "1f448.png"),
+    ("👉", "1f449.png"),
+    ("👆", "1f446.png"),
+    ("👇", "1f447.png"),
+    ("☝️", "261d.png"),
+    ("👊", "1f44a.png"),
+    ("✊", "270a.png"),
+    ("✋", "270b.png"),
+    ("👶", "1f476.png"),
+    ("👦", "1f466.png"),
+    ("👧", "1f467.png"),
+    ("👨", "1f468.png"),
+    ("👩", "1f469.png"),
+    ("👴", "1f474.png"),
+    ("👵", "1f475.png"),
+    ("👮", "1f46e.png"),
+    ("🕵️", "1f575.png"),
+    ("💁", "1f481.png"),
+    ("🙋", "1f64b.png"),
+    ("🙆", "1f646.png"),
+    ("🙅", "1f645.png"),
+    ("🙇", "1f647.png"),
+    ("💃", "1f483.png"),
+    ("🚶", "1f6b6.png"),
+    ("🏃", "1f3c3.png"),
+    ("🏊", "1f3ca.png"),
+    ("🚴", "1f6b4.png"),
+    ("👪", "1f46a.png"),
+    ("👫", "1f46b.png"),
+    ("🛀", "1f6c0.png"),
+    ("🐶", "1f436.png"),
+    ("🐱", "1f431.png"),
+    ("🐭", "1f42d.png"),
+    ("🐻", "1f43b.png"),
+    ("🐼", "1f43c.png"),
+    ("🐨", "1f428.png"),
+    ("🐯", "1f42f.png"),
+    ("🐮", "1f42e.png"),
+    ("🐷", "1f437.png"),
+    ("🐸", "1f438.png"),
+    ("🐵", "1f435.png"),
+    ("🐔", "1f414.png"),
+    ("🐧", "1f427.png"),
+    ("🐝", "1f41d.png"),
+    ("🐟", "1f41f.png"),
+    ("🐙", "1f419.png"),
+    ("🐳", "1f433.png"),
+    ("🐬", "1f42c.png"),
+    ("🍎", "1f34e.png"),
+    ("🍌", "1f34c.png"),
+    ("🍇", "1f347.png"),
+    ("🍉", "1f349.png"),
+    ("🍓", "1f353.png"),
+    ("🍑", "1f351.png"),
+    ("🍞", "1f35e.png"),
+    ("🍚", "1f35a.png"),
+    ("🍜", "1f35c.png"),
+    ("🍕", "1f355.png"),
+    ("🍔", "1f354.png"),
+    ("🍟", "1f35f.png"),
+    ("🍰", "1f370.png"),
+    ("☕", "2615.png"),
+    ("🍺", "1f37a.png"),
+    ("🍷", "1f377.png"),
+    ("🐴", "1f434.png"),
+    ("🐹", "1f439.png"),
+    ("🐰", "1f430.png"),
+    ("🌽", "1f33d.png"),
+    ("🍅", "1f345.png"),
+    ("🍪", "1f36a.png"),
+    ("💻", "1f4bb.png"),
+    ("🖥️", "1f5a5.png"),
+    ("⌨️", "2328.png"),
+    ("🖱️", "1f5b1.png"),
+    ("📱", "1f4f1.png"),
+    ("📞", "1f4de.png"),
+    ("📷", "1f4f7.png"),
+    ("🔋", "1f50b.png"),
+    ("💡", "1f4a1.png"),
+    ("🔍", "1f50d.png"),
+    ("🔒", "1f512.png"),
+    ("🔑", "1f511.png"),
+    ("🔧", "1f527.png"),
+    ("🔨", "1f528.png"),
+    ("📌", "1f4cc.png"),
+    ("📎", "1f4ce.png"),
+    ("✂️", "2702.png"),
+    ("📝", "1f4dd.png"),
+    ("📓", "1f4d3.png"),
+    ("📚", "1f4da.png"),
+    ("📖", "1f4d6.png"),
+    ("✏️", "270f.png"),
+    ("💰", "1f4b0.png"),
+    ("💵", "1f4b5.png"),
+    ("💳", "1f4b3.png"),
+    ("⏰", "23f0.png"),
+    ("⌚", "231a.png"),
+    ("🎁", "1f381.png"),
+    ("🎈", "1f388.png"),
+    ("🎉", "1f389.png"),
+    ("🎂", "1f382.png"),
+    ("🏆", "1f3c6.png"),
+    ("🎸", "1f3b8.png"),
+    ("🎮", "1f3ae.png"),
+    ("🎲", "1f3b2.png"),
+    ("🔔", "1f514.png"),
+    ("📢", "1f4e2.png"),
+    ("🎧", "1f3a7.png"),
+    ("🎤", "1f3a4.png"),
+    ("❤️", "2764.png"),
+    ("💛", "1f49b.png"),
+    ("💚", "1f49a.png"),
+    ("💙", "1f499.png"),
+    ("💜", "1f49c.png"),
+    ("💔", "1f494.png"),
+    ("💕", "1f495.png"),
+    ("💯", "1f4af.png"),
+    ("✅", "2705.png"),
+    ("❌", "274c.png"),
+    ("⚠️", "26a0.png"),
+    ("❗", "2757.png"),
+    ("❓", "2753.png"),
+    ("⭐", "2b50.png"),
+    ("🌟", "1f31f.png"),
+    ("✨", "2728.png"),
+    ("🔥", "1f525.png"),
+    ("💥", "1f4a5.png"),
+    ("💫", "1f4ab.png"),
+    ("⚡", "26a1.png"),
+    ("☀️", "2600.png"),
+    ("🌈", "1f308.png"),
+    ("🌙", "1f319.png"),
+    ("❄️", "2744.png"),
+    ("💤", "1f4a4.png"),
+    ("💢", "1f4a2.png"),
+    ("💬", "1f4ac.png"),
+    ("💭", "1f4ad.png"),
+    ("♻️", "267b.png"),
+    ("➕", "2795.png"),
+    ("➖", "2796.png"),
+    ("🚫", "1f6ab.png"),
+    ("⛔", "26d4.png"),
+    ("🆕", "1f195.png"),
+    ("🆗", "1f197.png"),
+    ("🆒", "1f192.png"),
+    ("🔝", "1f51d.png"),
+    ("🔴", "1f534.png"),
+    ("💐", "1f490.png"),
+    ("🌹", "1f339.png"),
+    ("🚀", "1f680.png"),
+    ("✈️", "2708.png"),
+    ("🚉", "1f689.png"),
+    ("🚗", "1f697.png"),
+    ("🚕", "1f695.png"),
+    ("🚌", "1f68c.png"),
+    ("🚑", "1f691.png"),
+    ("🚒", "1f692.png"),
+    ("🚓", "1f693.png"),
+    ("🚲", "1f6b2.png"),
+    ("🚢", "1f6a2.png"),
+    ("⛵", "26f5.png"),
+    ("🚂", "1f682.png"),
+    ("🗺️", "1f5fa.png"),
+    ("🗽", "1f5fd.png"),
+    ("🗼", "1f5fc.png"),
+    ("🏰", "1f3f0.png"),
+    ("🎡", "1f3a1.png"),
+    ("🎢", "1f3a2.png"),
+    ("⛱️", "26f1.png"),
+    ("🌋", "1f30b.png"),
+    ("🗻", "1f5fb.png"),
+    ("🌊", "1f30a.png"),
+    ("🌍", "1f30d.png"),
+    ("🌏", "1f30f.png"),
+    ("🌎", "1f30e.png"),
+    ("🏠", "1f3e0.png"),
+    ("🏢", "1f3e2.png"),
+    ("🏥", "1f3e5.png"),
+    ("🏦", "1f3e6.png"),
+    ("🏫", "1f3eb.png"),
+    ("⛩️", "26e9.png"),
+    ("🏯", "1f3ef.png"),
+    ("🌃", "1f303.png"),
+    ("🌅", "1f305.png"),
+    ("🌄", "1f304.png"),
+    ("🚙", "1f699.png"),
+    ("🚚", "1f69a.png"),
+    ("⛽", "26fd.png"),
+    ("⛪", "26ea.png"),
+    ("🇨🇳", "1f1e8-1f1f3.png"),
+    ("🇺🇸", "1f1fa-1f1f8.png"),
+    ("🇬🇧", "1f1ec-1f1e7.png"),
+    ("🇯🇵", "1f1ef-1f1f5.png"),
+    ("🇰🇷", "1f1f0-1f1f7.png"),
+    ("🇫🇷", "1f1eb-1f1f7.png"),
+    ("🇩🇪", "1f1e9-1f1ea.png"),
+    ("🇮🇹", "1f1ee-1f1f9.png"),
+    ("🇪🇸", "1f1ea-1f1f8.png"),
+    ("🇵🇹", "1f1f5-1f1f9.png"),
+    ("🇷🇺", "1f1f7-1f1fa.png"),
+    ("🇮🇳", "1f1ee-1f1f3.png"),
+    ("🇧🇷", "1f1e7-1f1f7.png"),
+    ("🇨🇦", "1f1e8-1f1e6.png"),
+    ("🇦🇺", "1f1e6-1f1fa.png"),
+    ("🇳🇿", "1f1f3-1f1ff.png"),
+    ("🇸🇬", "1f1f8-1f1ec.png"),
+    ("🇲🇾", "1f1f2-1f1fe.png"),
+    ("🇹🇭", "1f1f9-1f1ed.png"),
+    ("🇻🇳", "1f1fb-1f1f3.png"),
+    ("🇵🇭", "1f1f5-1f1ed.png"),
+    ("🇮🇩", "1f1ee-1f1e9.png"),
+    ("🇳🇱", "1f1f3-1f1f1.png"),
+    ("🇨🇭", "1f1e8-1f1ed.png"),
+    ("🇸🇪", "1f1f8-1f1ea.png"),
+    ("🇳🇴", "1f1f3-1f1f4.png"),
+    ("🇫🇮", "1f1eb-1f1ee.png"),
+    ("🇩🇰", "1f1e9-1f1f0.png"),
+    ("🇵🇱", "1f1f5-1f1f1.png"),
+    ("🇧🇪", "1f1e7-1f1ea.png"),
+    ("🇬🇷", "1f1ec-1f1f7.png"),
+    ("🇹🇷", "1f1f9-1f1f7.png"),
+    ("🇪🇬", "1f1ea-1f1ec.png"),
+    ("🇿🇦", "1f1ff-1f1e6.png"),
+    ("🇦🇷", "1f1e6-1f1f7.png"),
+    ("🇨🇱", "1f1e8-1f1f1.png"),
+    ("🇲🇽", "1f1f2-1f1fd.png"),
+    ("🇸🇦", "1f1f8-1f1e6.png"),
+    ("🇦🇪", "1f1e6-1f1ea.png"),
+    ("🇺🇦", "1f1fa-1f1e6.png"),
+];
+
+/// emoji 字符 → 随包 PNG 字节;表外字符返回 `None`(调用方回落黑白)。
+fn twemoji_png(glyph: &str) -> Option<&'static [u8]> {
+    TWEMOJI
+        .iter()
+        .find(|(ch, _)| *ch == glyph)
+        .map(|(_, png)| *png)
+}
+
+/// 会话级纹理缓存:emoji 字符 → 纹理句柄(节奏见模块顶部 A2 说明)。
+type TextureCache = HashMap<String, egui::TextureHandle>;
+
+/// `TextureCache` 在 temp memory 里的槽位。
+fn texture_cache_id() -> egui::Id {
+    egui::Id::new("latermd_emoji_twemoji_textures")
+}
+
+/// PNG 字节 → 纹理句柄(unmultiplied RGBA + 线性采样,白 tint 下即原色,
+/// emoji-color-feasibility §2.1 探针口径)。解码失败返回 `None`,调用方
+/// 回落黑白,不 panic。
+fn decode_texture(ctx: &egui::Context, glyph: &str, png: &[u8]) -> Option<egui::TextureHandle> {
+    let rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    Some(ctx.load_texture(
+        format!("twemoji:{glyph}"),
+        egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        ),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// 该字符的纹理:缓存命中直接给;未命中解码一次并落缓存;表外字符 /
+/// 解码失败给 `None`(调用方回落黑白)。每枚全会话至多解码一次。
+fn texture_for(
+    ui: &egui::Ui,
+    glyph: &str,
+    cache: &mut TextureCache,
+) -> Option<egui::TextureHandle> {
+    if let Some(handle) = cache.get(glyph) {
+        return Some(handle.clone());
+    }
+    let handle = decode_texture(ui.ctx(), glyph, twemoji_png(glyph)?)?;
+    cache.insert(glyph.to_owned(), handle.clone());
+    Some(handle)
+}
 
 /// Emoji 面板状态(归约置 `open`,UI 改 `query` / `group`)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -124,6 +472,13 @@ pub fn panel(
     if state.glyphs.is_none() {
         state.glyphs = Some(probe_glyphs());
     }
+    // A2:会话级纹理缓存本帧取出来(首帧为空 = 懒建的起点),绘制中未
+    // 命中的解码落进来,帧尾整体写回 temp memory —— 一次取还,不在单元
+    // 粒度反复克隆
+    let mut textures = ui.ctx().data_mut(|data| {
+        data.get_temp::<TextureCache>(texture_cache_id())
+            .unwrap_or_default()
+    });
     let mut cells = Vec::new();
     egui::Window::new("插入 Emoji")
         // 与 image_dialog 同款:首帧锚定屏幕中心,拖动后由 Area 记忆保持
@@ -174,7 +529,7 @@ pub fn panel(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
                         for &entry in row {
-                            cells.push(cell(ui, entry, None, outbox));
+                            cells.push(cell(ui, entry, None, &mut textures, outbox));
                         }
                     });
                 }
@@ -197,7 +552,13 @@ pub fn panel(
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
                                         for &(_, entry) in row {
-                                            cells.push(cell(ui, entry, Some(source), outbox));
+                                            cells.push(cell(
+                                                ui,
+                                                entry,
+                                                Some(source),
+                                                &mut textures,
+                                                outbox,
+                                            ));
                                         }
                                     });
                                 }
@@ -216,14 +577,24 @@ pub fn panel(
                     ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
                     ui.weak("最近");
                     for emoji in recent {
-                        cells.push(glyph_cell(ui, emoji, "最近使用 · 点选再次插入", outbox));
+                        cells.push(glyph_cell(
+                            ui,
+                            emoji,
+                            "最近使用 · 点选再次插入",
+                            &mut textures,
+                            outbox,
+                        ));
                     }
                 });
                 ui.add_space(tokens::SPACE_XS);
                 ui.separator();
             }
-            ui.weak("应用内为黑白显示;导出 HTML 或粘贴到外部仍是彩色");
+            ui.weak("面板内彩色;编辑器正文仍黑白;导出/外发的显示效果取决于目标环境的字体");
         });
+    // A2:纹理缓存写回(temp memory 随 Context 存活,面板关了再开也不
+    // 重复解码)
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(texture_cache_id(), textures));
     // Esc 关闭:面板开着才走到这里,Esc 就是「收起面板」;不消费 ——
     // 编辑器对 Esc 本就无动作,禅定的 Esc 出口在 draw_zen 里先消费,
     // 输入流顺序天然让「退禅定」优先于「关面板」。
@@ -239,6 +610,7 @@ fn cell(
     ui: &mut egui::Ui,
     entry: &EmojiEntry,
     source: Option<&'static str>,
+    textures: &mut TextureCache,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let tooltip = match source {
@@ -251,19 +623,24 @@ fn cell(
             entry.name_zh, entry.name_en, entry.shortcode
         ),
     };
-    glyph_cell(ui, entry.char, &tooltip, outbox)
+    glyph_cell(ui, entry.char, &tooltip, textures, outbox)
 }
 
-/// 字符单元的公共体(网格与「最近使用」共用):32×32 点击区,字符居中,
-/// hover 底色 + tooltip,点选发插入消息。
+/// 字符单元的公共体(网格与「最近使用」共用):32×32 点击区,hover 底色
+/// 与 tooltip,点选发插入消息。绘制是 A2 的单点分支:随包 Twemoji 纹理
+/// 可用 → 32 逻辑点白 tint Image(72px 资产,≥2.25x 显示密度);资产缺失
+/// 或解码失败 → 原样回落出厂 NotoEmoji 黑白字形。点击区、hover、tooltip
+/// 与载荷不因彩色变。
 fn glyph_cell(
     ui: &mut egui::Ui,
     glyph: &str,
     tooltip: &str,
+    textures: &mut TextureCache,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
     if ui.is_rect_visible(rect) {
+        let texture = texture_for(ui, glyph, textures);
         let painter = ui.painter();
         if response.hovered() {
             painter.rect_filled(
@@ -272,13 +649,22 @@ fn glyph_cell(
                 ui.visuals().widgets.hovered.bg_fill,
             );
         }
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            egui::FontId::proportional(CELL_FONT),
-            ui.visuals().text_color(),
-        );
+        if let Some(texture) = texture {
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(CELL_FONT),
+                ui.visuals().text_color(),
+            );
+        }
     }
     let response = response.on_hover_text(tooltip);
     if response.clicked() {
@@ -291,6 +677,7 @@ fn glyph_cell(
 mod tests {
     use super::*;
     use egui::{Event, PointerButton, RawInput, Rect};
+    use std::collections::HashSet;
 
     /// 一帧:画面板(可带走本帧的网格单元矩形)。未探测(`None`)时预置
     /// 全量集 —— 既有断言(全表可见)因此不依赖真实字形(E3 口径:过滤
@@ -301,6 +688,19 @@ mod tests {
         events: Vec<Event>,
         outbox: Option<&mut Vec<Message>>,
     ) -> Vec<egui::Response> {
+        let (cells, output) = frame_output(ctx, state, events, outbox);
+        output.drop_without_applying_deltas();
+        cells
+    }
+
+    /// 同 `frame`,但连本帧的 `FullOutput` 一起带走(A2 的纹理命中计数读
+    /// `textures_delta`,是引擎层证据);调用方自行 drop 纹理增量。
+    fn frame_output(
+        ctx: &egui::Context,
+        state: &mut EmojiPanelState,
+        events: Vec<Event>,
+        outbox: Option<&mut Vec<Message>>,
+    ) -> (Vec<egui::Response>, egui::FullOutput) {
         if state.glyphs.is_none() {
             state.glyphs = Some(emoji_data::GlyphSet::all());
         }
@@ -316,8 +716,7 @@ mod tests {
             },
             |ui| cells = panel(ui, state, outbox),
         );
-        output.drop_without_applying_deltas();
-        cells
+        (cells, output)
     }
 
     fn click(pos: egui::Pos2, pressed: bool) -> Event {
@@ -650,6 +1049,179 @@ mod tests {
                 .sum::<usize>()
                 - 7,
             "出厂链上核验结果 = 全表 − 7 枚文本表现条目"
+        );
+    }
+
+    /// 本帧上传的 emoji 纹理数(textures_delta 里 72×72 的整图增量;出厂
+    /// 字体图集不是 72×72,天然排除)。纹理命中枚计数的引擎层口径。
+    fn emoji_texture_loads(output: &egui::FullOutput) -> usize {
+        output
+            .textures_delta
+            .set
+            .values()
+            .flatten()
+            .filter(|delta| delta.image.size() == [72, 72])
+            .count()
+    }
+
+    /// 本帧上传了 72×72 emoji 纹理的纹理 id(对照画面上的 image mesh)。
+    fn emoji_texture_ids(output: &egui::FullOutput) -> HashSet<egui::TextureId> {
+        output
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(_, deltas)| deltas.iter().any(|d| d.image.size() == [72, 72]))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// A2 资产表契约:272 枚与数据表 1:1(include_bytes 编译期钉住,挪走
+    /// / 改名即编译红),且每枚都真能解码成 72×72 —— fetch.sh --verify 的
+    /// 魔数校验之上的进程内全量复核。
+    #[test]
+    fn bundled_assets_cover_the_whole_table_and_decode() {
+        assert_eq!(TWEMOJI.len(), 272, "资产表与钉死清单同规模");
+        let mut seen = HashSet::new();
+        for entry in emoji_data::GROUPS.iter().flat_map(|g| g.entries.iter()) {
+            let png = twemoji_png(entry.char)
+                .unwrap_or_else(|| panic!("{}(:{}) 无随包资产", entry.name_zh, entry.shortcode));
+            assert!(seen.insert(entry.char), "{} 重复入库", entry.shortcode);
+            let img = image::load_from_memory(png).unwrap_or_else(|e| {
+                panic!("{}(:{}) 资产解码失败:{e}", entry.name_zh, entry.shortcode)
+            });
+            assert_eq!(
+                (img.width(), img.height()),
+                (72, 72),
+                "{} 非 72×72",
+                entry.shortcode
+            );
+        }
+    }
+
+    /// A2 彩色路径(无头):首帧每个实显枚恰好上传一张 72×72 纹理
+    /// (命中枚计数 ≥ 实显枚数;全屏可见时取等,缓存保证不重复上传),
+    /// 画面上发出绑定这些纹理的 image mesh;第二帧零新增 —— 会话缓存
+    /// 命中,不重复解码。明暗两套 visuals 各跑一遍。
+    #[test]
+    fn panel_loads_one_texture_per_displayed_glyph_and_reuses_it() {
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            if !dark {
+                ctx.set_theme(egui::Theme::Light);
+            }
+            let mut state = EmojiPanelState {
+                open: true,
+                recent: vec!["🚀".to_owned(), "🎉".to_owned()],
+                ..EmojiPanelState::default()
+            };
+            // 实显 distinct 口径:表情分类全表 + 最近两枚(分属旅行/物品,
+            // 不与网格重);总数恰为 distinct(无重复上传)
+            let displayed: HashSet<&str> = emoji_data::GROUPS[0]
+                .entries
+                .iter()
+                .map(|e| e.char)
+                .chain(["🚀", "🎉"])
+                .collect();
+
+            // 浮窗首几帧是 sizing pass(不真正绘制,与点击测试的「多帧后
+            // 取矩形」同一口径),连跑 3 帧取累计命中 —— 缓存保证每枚
+            // distinct 只上传一次,跨帧累计恰等于 distinct
+            let mut loaded = 0;
+            let mut meshes = 0;
+            for _ in 0..3 {
+                let (cells, out) = frame_output(&ctx, &mut state, Vec::new(), None);
+                assert_eq!(
+                    cells.len(),
+                    displayed.len(),
+                    "实显单元数与 distinct 口径一致"
+                );
+                loaded += emoji_texture_loads(&out);
+                let textured = emoji_texture_ids(&out);
+                meshes += out
+                    .shapes
+                    .iter()
+                    .filter(|clipped| match &clipped.shape {
+                        egui::Shape::Mesh(mesh) => textured.contains(&mesh.texture_id),
+                        _ => false,
+                    })
+                    .count();
+                out.drop_without_applying_deltas();
+            }
+            assert!(
+                loaded >= displayed.len(),
+                "纹理命中 {loaded} < 实显 {}:彩色应覆盖全部实显枚",
+                displayed.len()
+            );
+            assert_eq!(loaded, displayed.len(), "每枚 distinct 会话内恰上传一次");
+            assert!(
+                meshes >= displayed.len(),
+                "image mesh {meshes} < 实显 {}:实显单元都应画纹理",
+                displayed.len()
+            );
+
+            // 第 4 帧:缓存全命中,零重复上传
+            let (_, fourth) = frame_output(&ctx, &mut state, Vec::new(), None);
+            assert_eq!(emoji_texture_loads(&fourth), 0, "会话缓存命中,不再解码上传");
+            fourth.drop_without_applying_deltas();
+        }
+    }
+
+    /// A2 失败面:坏 PNG 字节(损坏资产口径)解码得 `None` 不 panic;
+    /// 表外字符(资产缺失口径)照常渲染且不产生纹理 —— 该单元回落黑白,
+    /// 点选载荷仍是原始 Unicode。与 E3「数据保留、渲染兜底」同哲学。
+    #[test]
+    fn corrupt_or_missing_assets_fall_back_without_panic() {
+        let ctx = egui::Context::default();
+        assert!(decode_texture(&ctx, "😀", b"not a png").is_none());
+        assert!(decode_texture(&ctx, "😀", &[]).is_none());
+        let full = twemoji_png("😀").expect("😀 有随包资产");
+        assert!(
+            decode_texture(&ctx, "😀", &full[..40]).is_none(),
+            "截断的真 PNG 同样回落"
+        );
+
+        // 资产缺失:🫠(Emoji 14)不在 272 枚清单 → 走回落绘制路径。
+        // E3 白名单管「字符可写文档」,与资产有无正交,故注入放行 🫠 的
+        // 集合(表内全量 + 🫠)——「白名单放行、资产缺失」正是回落路径的
+        // 真实形态。面板照常渲、单元照常可点、不产生纹理(浮窗前几帧
+        // sizing 与点击测试同款,多帧累计口径)
+        assert!(twemoji_png("🫠").is_none());
+        let ctx = egui::Context::default();
+        let mut glyphs = emoji_data::GlyphSet::all();
+        glyphs.insert("🫠");
+        let mut state = EmojiPanelState {
+            open: true,
+            glyphs: Some(glyphs),
+            recent: vec!["🫠".to_owned()],
+            ..EmojiPanelState::default()
+        };
+        let mut last = Rect::NOTHING;
+        let mut loaded = 0;
+        for step in 0..6 {
+            let (cells, out) = frame_output(&ctx, &mut state, Vec::new(), None);
+            assert_eq!(
+                cells.len(),
+                emoji_data::GROUPS[0].entries.len() + 1,
+                "第 {step} 帧:回落单元仍在(网格 + 最近行)"
+            );
+            loaded += emoji_texture_loads(&out);
+            if step == 5 {
+                last = cells.last().expect("回落单元存在").rect;
+            }
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            loaded,
+            emoji_data::GROUPS[0].entries.len(),
+            "有资产的网格枚各自上传一次,🫠 不产生任何纹理"
+        );
+
+        let mut outbox = Vec::new();
+        click_at(&ctx, &mut state, last.center(), &mut outbox);
+        assert_eq!(
+            outbox,
+            vec![Message::EmojiInserted("🫠".to_owned())],
+            "回落单元载荷仍是原始 Unicode"
         );
     }
 }

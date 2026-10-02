@@ -24,16 +24,16 @@
 | # | 事实 | 实测出处 | 对方案的影响 |
 |---|---|---|---|
 | **F1** | egui 0.36.2 `FontDefinitions::default()` **已注册 `NotoEmoji-Regular` 与 `emoji-icon-font`**，且注释写明 emoji "Use as first priority"，排在 Proportional / Monospace 回退链里 | `epaint-0.36.2/src/text/fonts.rs:508-545` | **零新增依赖即可渲染 emoji**。我们的 `fonts.rs::install()` 是在 `FontDefinitions::default()` 之后 push CJK，emoji 已在链上，无需改动 |
-| **F2** | **彩色 emoji 不支持**。epaint 把所有字形以白色写入字体图集（`FontColorTransferFunction::Off` 的注释只说"这是彩色 emoji 需要的模式"，但紧邻段落明说未实现、仍是白色图集 + shader 乘色） | `epaint-0.36.2/src/image.rs:350-373` | 应用内 emoji 是**黑白轮廓**。这不是 bug，是上游限制，必须写进用户可见说明 |
+| **F2** | **彩色 emoji 不支持**。epaint 把所有字形以白色写入字体图集（`FontColorTransferFunction::Off` 的注释只说"这是彩色 emoji 需要的模式"，但紧邻段落明说未实现、仍是白色图集 + shader 乘色） | `epaint-0.36.2/src/image.rs:350-373` | 应用内 emoji 是**黑白轮廓**。这不是 bug，是上游限制，必须写进用户可见说明。**#47 A2 更新**：面板/最近使用条改走随包 Twemoji PNG 纹理（见下「F2 的连带结论」），**编辑器正文仍黑白**（字形管线结论不变） |
 | **F3** | 网上老教程让开 `monochrome_emoji_fonts` feature —— **该 feature 在 0.36.2 已不存在**（已被并入 `default_fonts`），照抄会编不过 | `epaint-0.36.2/Cargo.toml` features 段（只有 `default_fonts`，无 monochrome 项） | 排除一条错误路径；数据虽然还在 `epaint_default_fonts` crate 里，但**不需要**直接依赖它 |
 | **F4** | `Fonts::has_glyph(&FontId, char)` / `has_glyphs(&FontId, &str)` 可用 | `epaint-0.36.2/src/text/fonts.rs:779-857` | 可以**主动探测字形缺失**，把渲染不出的 emoji 从面板里剔掉，而不是让用户看到豆腐块 |
 
 ### F2 的连带结论（必须让用户知道）
 
-- **本应用内**：黑白线条 emoji（Noto Emoji 风格）。
-- **导出的 HTML / 粘到微信、飞书、GitHub**：**彩色**，由对方系统的彩色 emoji 字体渲染。
+- **本应用内**：编辑器正文黑白线条 emoji（Noto Emoji 风格）。**#47 A2 起**：插入面板与「最近使用」条用随包 Twemoji 72px PNG 纹理显示**彩色**（`assets/emoji/twemoji/`，CC-BY 4.0，登记 distribution.md §6；损坏/缺失回落黑白，实现见 `ui/emoji_panel.rs`「纹理路径」节）。
+- **导出的 HTML / 粘到微信、飞书、GitHub**：显示效果**取决于目标环境的字体**，不承诺必然彩色。
 - Markdown 文件里存的永远是标准 Unicode 字符，**不存在兼容性问题**。
-- 这条要在面板底部或首次打开时用一行小字说明，否则用户会以为程序坏了。
+- 这条要在面板底部用一行小字说明（现行口径：「面板内彩色；编辑器正文仍黑白；导出/外发的显示效果取决于目标环境的字体」），否则用户会以为程序坏了。
 
 ---
 
@@ -119,7 +119,7 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 
 | # | 坑 | 处理 |
 |---|---|---|
-| 1 | **黑白不是彩色**（F2） | 面板底部一行小字说明；导出/外发仍是彩色。别当 bug 修 |
+| 1 | **黑白不是彩色**（F2） | 面板底部一行小字说明；导出/外发的显示效果取决于目标环境的字体。别当 bug 修。#47 A2 起面板本身已走 Twemoji 纹理彩色，但编辑器正文仍是黑白 —— 字形管线上游限制未变 |
 | 2 | **Noto Emoji 覆盖落后于 Unicode 17**：2024 后新增的 emoji（如 🫩）在 `NotoEmoji-Regular` 里可能无字形 → 豆腐块 | E3 用 `has_glyph` 在建表时过滤；面板只在探测通过后才显示该枚 |
 | 3 | **ZWJ 序列**（👨‍👩‍👧、🏳️‍🌈）是**多个码位**：插入后按一次 Backspace 只删最后一个组件 | 已知接受（主流编辑器同行为）。数据表中序列与单组件**二选一收**，避免重复占位 |
 | 4 | **肤色 / 性别变体**会让条目数翻倍 | 只收默认肤色。不做长按展开变体 |
@@ -138,7 +138,7 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 
 ## 9. 不做
 
-- **彩色 emoji 渲染**（egui 上游未支持，等上游）。
+- **编辑器正文彩色 emoji 维持黑白**（上游限制，见可行性调查 §4）。面板/预览走纹理路径（见 E-C1/E-C2 与可行性调查；#48 预览内联彩色走 `emoji://` 改写 + inline_widget，不经字形管线），不在本条禁区。
 - 自定义表情包 / 图片 emoji（那是 image-plan 的地盘）。
 - 肤色选择器、性别变体、长按展开。
 - `:shortcode:` 自动补全 → 放进可选的 E4。
@@ -147,3 +147,17 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 
 - 与 **#26 image-bed** 无依赖关系，可并行；E1 只有 0.5d，**想先看效果可以先放行 E1**。
 - 若 UI 现代化 #27 的 U1（Inter + CJK fallback）先做，注意字体链顺序：emoji 在默认链里已是第一优先级，Inter 注入时要把 emoji 保持在链上（别被覆盖掉）。
+
+---
+
+## 11. E-C1 落地（#47，2026-10-02）
+
+> 本节是落地登记，不再是规划。完整取舍与实测依据见可行性调查
+> `.zcode/workflow-drafts/emoji-color-feasibility.md`（未入 git 库，路径以工作区为准）。
+
+- **背景**：§2 F2 的「彩色不支持」是 epaint 字形管线上游限制（所有字形恒以纯白填充写入图集）；可行性调查实测换任何彩色字体（CBDT/COLR/sbix）都不可行（CBDT/COLR 字形无矢量轮廓，装上后连黑白都得不到），**随包 PNG 纹理是唯一低侵入路径**（`image` 解码 → `load_texture` → 白 tint Image，零新增依赖，`latermd-app` 已依赖 `image` 的 png feature）。
+- **范围**：**面板 + 最近使用条**两处展示层（`ui/emoji_panel.rs` 单文件纹理分支 + `assets/emoji/twemoji/` 资产目录）。资产 = Twemoji（jdecked **v17.0.3**）72×72 PNG × 272 枚，CC-BY 4.0（全文随库，登记 [distribution.md](distribution.md) §6），钉版本下载脚本与 SOURCES.txt 随库可复现。缓存 = 会话级懒解码 `TextureHandle`（首帧懒建，不合并图集）。
+- **明确不含**：预览内联彩色（**#48** E-C2，字符串层 `emoji://` 改写 + LinkHandler inline_widget，另案）、**编辑器正文**彩色（feasibility §4 否决：需 fork epaint，光标/选择/IME/undo 全锚在 galley，收益配不上代价）。
+- **失败面**：PNG 解码失败 / 资产缺失 → 该单元回落出厂 NotoEmoji 黑白（`painter.text` 原路径）；与 E3「数据保留、渲染兜底」同哲学，彩色不引入新失败面。点击区、hover、tooltip、`Message::EmojiInserted`、E3 cmap 过滤、settings.json recent 持久化零改动。
+- **对外口径**（用户可见文案的唯一口径）：「**面板内彩色；编辑器正文仍黑白；导出/外发的显示效果取决于目标环境的字体**」——面板底部说明行（`ui/emoji_panel.rs`）、本文 §2、验收文档 §3 三处同源；**不许出现「全面支持彩色」**。
+- **验收**：自动证据与人工清单分栏落档于 [emoji-color-acceptance.md](emoji-color-acceptance.md)（渲染不 panic、纹理命中计数、损坏回落、272/272 资产校验、体积/显存数字；Linux X11 / HiDPI / Win/mac 目视与 272 枚抽查待坤哥）。
