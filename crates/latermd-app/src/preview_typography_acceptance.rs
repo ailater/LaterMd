@@ -127,6 +127,14 @@ struct DocColors {
 /// 预览族)+ wrap,样式吃 context 全局槽)。probe 拿到面板与验收区矩形,
 /// 自行创建 child;返回 probe 的捕获值、实际 visuals 断言用色、生效样式、
 /// 网格与 CJK 行高下限。
+/// #43 口径的无 CJK 环境检测:像素/几何验收没有混排对象,失败不代表
+/// 回归 —— 无头 CI 的 ubuntu runner 不预装 fonts-noto-cjk,测试入口检测
+/// 到缺失时打印原因并 `return` 跳过(不硬 panic 红门禁),同
+/// `preview_pixel_acceptance` 的既有口径。
+fn cjk_fonts_missing() -> bool {
+    fonts::install(&egui::Context::default()).is_none()
+}
+
 fn render_headless<T>(
     dark: bool,
     id: &'static str,
@@ -142,7 +150,7 @@ fn render_headless<T>(
     let ctx = egui::Context::default();
     assert!(
         fonts::install(&ctx).is_some(),
-        "本机无 CJK 候选字体,像素验收无混排对象 —— 无 CJK 环境请按 #43 口径如实跳过"
+        "render_headless 的调用方须先经 cjk_fonts_missing() 做无 CJK 跳过(#43 口径)"
     );
     let mode = if dark {
         ThemeMode::Dark
@@ -298,6 +306,10 @@ fn bands_from_rows(hits: &[bool]) -> Vec<(usize, usize)> {
 
 #[test]
 fn typography_doc_geometry_matches_shipped_style_in_both_visuals() {
+    if cjk_fonts_missing() {
+        eprintln!("本机无 CJK 候选字体,排版验收无混排对象,跳过");
+        return;
+    }
     for dark in [true, false] {
         let theme_name = if dark { "暗色" } else { "亮色" };
         // 同帧两个同 id 同 wrap 宽的 child:前者取 galley(几何),后者
@@ -597,6 +609,10 @@ fn typography_doc_geometry_matches_shipped_style_in_both_visuals() {
 
 #[test]
 fn full_sample_doc_elements_visible_and_spaced_in_both_visuals() {
+    if cjk_fonts_missing() {
+        eprintln!("本机无 CJK 候选字体,排版验收无混排对象,跳过");
+        return;
+    }
     for dark in [true, false] {
         let theme_name = if dark { "暗色" } else { "亮色" };
         let (_, colors, style, primitives, _) = render_headless(
@@ -840,11 +856,17 @@ fn full_sample_doc_elements_visible_and_spaced_in_both_visuals() {
 /// 上再钉一次。
 #[test]
 fn body_only_document_is_invariant_to_heading_space_on_app_style() {
+    if cjk_fonts_missing() {
+        eprintln!("本机无 CJK 候选字体,排版验收无混排对象,跳过");
+        return;
+    }
     let doc = "纯正文文档,中文与 English 数字 123 混排,不含任何标题。\n\n第二段正文,观测段落空隙与行推进。\n\n收尾正文段落。";
     let mut results = Vec::new();
     for heading_space in [0.0, 4.0, 40.0] {
         let ctx = egui::Context::default();
-        assert!(fonts::install(&ctx).is_some(), "本机无 CJK 候选字体");
+        // 入口已过无 CJK 跳过检测;循环内每个新 ctx 都要重装字体,
+        // preview_body_family/行高下限读的是本 ctx 的注入状态。
+        let _ = fonts::install(&ctx);
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
         let mut style = (*egui_markdown_style::global_style(&ctx)).clone();
         style.heading_space_above = heading_space;
