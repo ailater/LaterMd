@@ -3,7 +3,7 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #76 为当前最新条目。
+> 编号 #77 为当前最新条目。
 
 ## #68 标签「缩短标题/完整标题」(#37)的三个口径:作用范围=整条标签条、默认=完整(既有观感)、收窄分配=保底+max-min 公平(2026-10-01,#37 tab-management 标题宽度显示模式·自动拍板;原编号 #67,因重命名条目重编号顺延为 #68,撞号事由见 #67 条头注)
 
@@ -653,3 +653,11 @@
 - **自动选择**:③。
 - **理由**:①违反本棒「不触碰 vendor」的显式约束;②把编辑器修复外溢到预览(预览行距/行盒是 #23/#50 M2 的领地,代码块拉丁行从 17px 涨 21.7px 是可见回归);③的代价可控——代码块拉丁字形与新族链头同为内置 Hack face,纯拉丁代码渲染逐像素一致,唯一保留的现状缺陷是「代码块内 CJK 注释与拉丁的基线差」(同根因,#72 已登记),不影响坤哥反馈的源码 TextEdit 主症状。
 - **如何改**:若拍板代码块也要基线对齐,走①类 vendored 最小补丁(`MarkdownStyle` 增 `code_font_family: Option<String>` 之类字段,layout 的 `FontId::monospace` 处改读字段、None 回落现行为,独立 `vendor:` commit + vendor/README 登记),app 侧把编辑器语境的 `MarkdownStyle` 填 `editor-mono`、预览填 `Inter-Preview` 或 None;或拍板全局换 `FontFamily::Monospace` 链头(一行改动,预览代码块与全部 UI 等宽文本随之变化,需真机目视行盒 +24% 的观感)。
+
+## #77 流式 O(n) 的主导修复(布局缓存失效粒度块级化)确需 vendor ①类改动,#46 R2 红线内不可修,移交人工拍板(2026-10-02,#46 streaming-perf R2·待人工拍板)
+
+- **岔路**:R1 复测判定流式追加仍 O(n)(10000 行档 1001.7 ms,较 M0 +26.9%,[perf-recheck-2026-10.md](perf-recheck-2026-10.md) §2/§5),R2 修复路径激活;但 R1 交接的修复对象(疑点 A:布局缓存失效粒度从「整篇 text_hash」降到「块/段」)机制位置**全部在 vendored 层**——顶层 `CachedMarkdownLayout` 以整篇文本哈希为门控(`vendor/egui_markdown/src/label.rs:57-65` `hash_text`、`:636` 命中判定),miss 即 `parser::parse` 全文解析 + `tokens_to_owned` 全量深拷贝(`label.rs:663-665`),纯代码块等 `needs_segmentation=false` 文档更是整篇 `build_layout` 单 galley(`label.rs:669-691`、`layout.rs:262-275`),块级剔除缓存的 key 同样是整篇哈希(`label.rs:137-151` `try_cull_block`、`:772/:808/:837` 调用点)——改任何一处都动 `vendor/egui_markdown/src/label.rs`。#46 R2 模块约束「不触碰 vendor/,修复确需 vendor 时把需求记 decisions-pending 交人工拍板,本模块按 app 侧可达近似或如实报未修」。
+- **备选**:①**vendor ①类补丁(两步)**:第一步放宽 `needs_segmentation` 准入(按 token 数/字节数或代码块行数阈值,阈值挂 `MarkdownStyle` 可配、默认保守)让长文档进分段路径;第二步把块级缓存 key(`try_cull_block`/`cache_block_height` 的 `text_hash`)换成「块内容 hash」(token 在手逐块可算,追加尾行只失效尾块);flush 段缓存已是 per-range(`label.rs:975-976` `hash_flush_context` 按 token 切片)可直接受益;整篇 galley 路径的全文 parse+深拷贝占比 ~0.13%(R1 实测外推)可接受不动。②**app 侧近似**:逐一核对后**不存在**——heal 已条件化(#39,`ui/layout.rs:301-310` 三栏与 `:671-674` Live 两处仅 AI 流式写入本标签帧开)、`LinkHandler::id()` 用默认 0 稳定(`app ui/preview.rs` 未 override,`vendor link.rs:92-94`)、widget id 只含 tab id(`ui/preview.rs:539-541`)、修订号纪律在位(`ui/editor.rs:295-299` 仅 rev 前进重建快照);开 `scroll_code_blocks(true)` 强制分段**不构成修复**——块级 cull key 仍是整篇 text_hash(追加仍全块失效),且代码块渲染形态改滚动窗格是观感回归。③**产品侧降级(app 可达,属行为变化)**:AI 流式写入时预览降级纯文本排版,或对流式文档设规模上限,`m0-report` §4.2 曾列的备选方向。
+- **自动选择**:本模块不动任何代码(红线);修复需求按①+③登记移交人工拍板;#46 R3 复测按「未修」口径落档(水位即 R1 水位),M0 验证 4 挂账不销。
+- **理由**:主导成本(10000 行档 ~99%,全文解析仅 ~0.13%)在 vendored 整篇 galley `build_layout` 与整篇哈希门控;app 侧四候选方向(流式帧免全文重解析/heal 路径/布局缓存命中/无关帧重建)逐项实读核对均「已在位」或「不可达」,任何 app 侧修补都不改变 O(n) 判定曲线;擅动 `scroll_code_blocks` 有观感回归且被 cull key 机制证明无效,属投机优化不做。
+- **如何改**:拍板①时——按「先分段准入、再块级 key」两步走 vendor ①类最小补丁(独立 `vendor:` commit + vendor/README.md 变更表 ①类登记 + `vendor/egui_markdown/check.sh` 六项;①类按上游 CONTRIBUTING 标准保持可 cherry-pick),注意两处连带语义:`debug_assert!(layout.segment_breaks.is_empty())`(`label.rs:692`)的两侧一致性约束、以及块序号作 id 成分时编辑中部不得挪移后续块序号(AGENTS §6.7 widget id 纪律);完成后按 perf-recheck §2 同一条命令复测,验收口径 = 每行成本随规模趋稳(亚线性),M0 挂账凭新数字销账。拍板③时——改动局限 crates/(流式路径按文档规模切渲染配置或关流式预览),一个 PR 可完成,但流式写作的产品体验降级需坤哥先认。
