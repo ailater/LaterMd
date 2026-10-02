@@ -1,0 +1,22 @@
+# Twemoji 72x72 彩色资产来源登记(#47 A1)
+#
+# 本目录的 *.png 共 272 枚由 fetch.sh 钉版本下载,重跑脚本可逐字节复现
+# (2026-10-02 已实测:重下目录与在库目录聚合 sha256 一致)。
+
+项目:      Twemoji(jdecked/twemoji —— twitter/twemoji 停更后的社区延续 fork)
+版本:      v17.0.3(tag,2026-06-01 release;覆盖 Unicode 17 / Emoji 17)
+URL:       https://github.com/jdecked/twemoji/tree/v17.0.3
+资产路径:  assets/72x72/*.png(72x72,palette PNG)
+下载 URL:  https://raw.githubusercontent.com/jdecked/twemoji/v17.0.3/assets/72x72/<文件名>
+文件名:    272 枚钉死清单见 fetch.sh,派生自 crates/latermd-app/src/ui/emoji_data.rs
+           同一提交(规则:字符逐码位小写 hex 以 "-" 相连;序列中的 FE0F 不进
+           文件名,如 ✌️ -> 270c.png;旗帜为双区域指示码位,如 🇨🇳 -> 1f1e8-1f1f3.png)
+图形许可:  CC-BY 4.0(全文随库:本目录 LICENSE-GRAPHICS,与上游
+           LICENSE-GRAPHICS 逐字节一致;义务 = 署名 + 附许可文本,
+           登记 docs/distribution.md §6 第三方声明表)
+下载日期:  2026-10-02
+实测体积:  272 枚合计 208,646 B(约 0.20 MiB),单枚均值 767 B
+           (最小 182 B,最大 3,309 B;可行性调查口径 ~806 B/枚、全量
+           0.3 MB 级,实测略优)
+核对结果:  272/272 在位,非空,均为合法 72x72 PNG(fetch.sh --verify 断言),
+           无缺枚,无回落黑白单元
