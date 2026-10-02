@@ -22,6 +22,8 @@ mod compose;
 mod export;
 mod file;
 mod filetree;
+#[cfg(test)]
+mod font_metrics_repro;
 mod fonts;
 mod git_diff;
 mod git_panel;
@@ -29,6 +31,8 @@ mod keymap;
 mod layout;
 mod live;
 mod mcp;
+#[cfg(test)]
+mod preview_pixel_acceptance;
 mod search;
 mod settings;
 mod state;

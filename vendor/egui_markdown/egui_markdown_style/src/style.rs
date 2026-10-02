@@ -49,6 +49,20 @@ pub struct MarkdownStyle {
   /// instead of being clipped by a height tuned for body-size glyphs.
   #[cfg_attr(feature = "serde", serde(default = "default_line_height_ratio"))]
   pub line_height_ratio: f32,
+  /// Lower bound for the row height, in font-size multiples (em). Default: `1.0`
+  /// (no floor; the ratio alone decides).
+  ///
+  /// Fallback faces used for non-Latin scripts (CJK in particular) carry much
+  /// taller row metrics than the Latin chain head — Noto Sans CJK needs ≈1.448em
+  /// where the default ratio of 1.30 leaves only 1.30em. A row shorter than the
+  /// fallback face's own row height still *advances* by that row height, so the
+  /// overflowing CJK ink visually collides with the next row or gets occluded by
+  /// the next block's opaque background ("clipped" rows). A host that registers a
+  /// CJK fallback chain sets this to the fallback face's row height in em, and
+  /// every row — Latin-only or mixed — then clears the tallest face it may
+  /// contain, which also keeps row spacing uniform across a mixed document.
+  #[cfg_attr(feature = "serde", serde(default = "default_min_line_height_em"))]
+  pub min_line_height_em: f32,
   /// Language used for syntax highlighting when no language is specified.
   pub default_code_language: String,
 }
@@ -58,6 +72,12 @@ pub struct MarkdownStyle {
 #[cfg(feature = "serde")]
 fn default_line_height_ratio() -> f32 {
   1.30
+}
+
+/// Serde default for [`MarkdownStyle::min_line_height_em`]: no floor.
+#[cfg(feature = "serde")]
+fn default_min_line_height_em() -> f32 {
+  1.0
 }
 
 impl Default for MarkdownStyle {
@@ -73,6 +93,7 @@ impl Default for MarkdownStyle {
       block_spacing: 8.0,
       code_font_size: 10.0,
       line_height_ratio: 1.30,
+      min_line_height_em: 1.0,
       default_code_language: String::new(),
     }
   }
@@ -90,6 +111,7 @@ impl Hash for MarkdownStyle {
     self.block_spacing.to_bits().hash(state);
     self.code_font_size.to_bits().hash(state);
     self.line_height_ratio.to_bits().hash(state);
+    self.min_line_height_em.to_bits().hash(state);
     self.default_code_language.hash(state);
   }
 }
@@ -123,6 +145,11 @@ impl MarkdownStyle {
     ui.horizontal(|ui| {
       ui.label("Line height:");
       ui.add(DragValue::new(&mut self.line_height_ratio).range(1.0..=3.0).speed(0.01));
+    });
+
+    ui.horizontal(|ui| {
+      ui.label("Min line height (em):");
+      ui.add(DragValue::new(&mut self.min_line_height_em).range(1.0..=3.0).speed(0.01));
     });
 
     ui.separator();

@@ -1,4 +1,5 @@
-//! 字体接入:M0 CJK 系统回退 + U1 Inter 三字重(docs/ui-modernization.md §3 U1)。
+//! 字体接入:M0 CJK 系统回退 + U1 Inter 三字重(docs/ui-modernization.md §3 U1)
+//! + #43 M2 混排基线/行高修复(Inter 行 metrics override 副本 + 行高下限)。
 //!
 //! egui 内置字体只有拉丁字符,中文默认渲染为方块(tofu)。此处叠加两层:
 //!
@@ -15,6 +16,35 @@
 //! egui 出厂链(Ubuntu-Light → NotoEmoji → emoji-icon-font)的**相对顺序
 //! 不动**:Inter 没有 emoji 字形,NotoEmoji 仍是 emoji 的第一个命中;把
 //! CJK 或 Inter 插到它前面会让 emoji 落到 CJK 字体或变豆腐块。
+//!
+//! # #43 M2:混排基线/行高修复(为什么有「override 副本」)
+//!
+//! epaint 的行 metrics 取**链头** face,行内 fallback 字形(汉字走链尾
+//! CJK face)的基线由近似公式
+//! `face_ascent + valign·(行高−line_height) + 0.5·(链头行高−face行高)`
+//! 决定(`epaint text_layout.rs` 的字形垂直定位)。Inter(行高 1.21em)与
+//! Noto Sans CJK(1.448em)的 ascent 占比与行高都不同,公式残差
+//! ≈ 0.072em,再经整像素吸附放大为正文 1px、H1 2px 的可见基线错位 ——
+//! 这就是「中文英文数字高低不一」的根因,且**与 line_height 覆盖值无关**
+//! (残差只由两个 face 的表值决定)。
+//!
+//! 修复 = 把预览链头的 Inter Regular/SemiBold 注册为「行 metrics override
+//! 副本」:运行时读本机命中的 CJK face 的 (ascent, descent, lineGap)
+//! 表值,以 em 为单位改写到 Inter 副本的 hhea 与 OS/2 typo 表(等价 CSS
+//! `@font-face { ascent-override / descent-override }` 的标准手法 ——
+//! 布局 metrics 对齐,字形 outline 与光栅化不动)。链头与 fallback 的
+//! 行 metrics 因此全等,基线公式残差精确归零;字形 atlas 不重复
+//! (`GlyphCacheKey` 不含 ascent/descent,副本与原生 face 共享缓存)。
+//!
+//! 副本只挂**预览专用族**(`Inter-Preview` 正文族 + `bold` 别名族链头),
+//! Proportional / SemiBold / Medium 原生族不动 —— UI 外壳的行高与现状
+//! 完全一致,预览排版的修复不外溢到界面密度。无 CJK 候选时不注册副本,
+//! 预览正文族回落 Proportional,行为与修复前一致。
+//!
+//! 行高(「显示不全」:行盒不足以容纳 CJK face 的行高需求)由 vendored
+//! ①类修复承接:`MarkdownStyle::min_line_height_em` 行高下限,app 侧在
+//! `theme` 应用样式时通过 [`line_height_floor_em`] 注入本机 CJK face 的
+//! 实际行高。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +65,206 @@ pub const FAMILY_SEMIBOLD: &str = "Inter-SemiBold";
 pub const FAMILY_BOLD: &str = "bold";
 /// Inter Medium 的族名:介于正文与强调之间,U1 注册备用、暂无消费者。
 pub const FAMILY_MEDIUM: &str = "Inter-Medium";
+/// 预览正文的专用族名:#43 M2 起链头是行 metrics override 过的 Inter
+/// Regular 副本(与 CJK 回退 face 行 metrics 全等,混排基线对齐)。
+pub const FAMILY_PREVIEW_BODY: &str = "Inter-Preview";
+/// Inter Regular override 副本的 font_data 键。
+const PREVIEW_REGULAR: &str = "Inter-Regular-Preview";
+/// Inter SemiBold override 副本的 font_data 键(`bold` 别名族的链头)。
+const PREVIEW_SEMIBOLD: &str = "Inter-SemiBold-Preview";
+
+/// sfnt 垂直排印相关的表值集合(font units,大端)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VerticalTables {
+    pub(crate) units_per_em: u16,
+    /// hhea (ascender, descender, lineGap)。
+    pub(crate) hhea: (i16, i16, i16),
+    /// OS/2 typo (sTypoAscender, sTypoDescender, sTypoLineGap)。
+    pub(crate) typo: (i16, i16, i16),
+    /// OS/2 win (usWinAscent, usWinDescent)。
+    pub(crate) win: (u16, u16),
+    /// OS/2 fsSelection bit7(USE_TYPO_METRICS)。
+    pub(crate) use_typo_metrics: bool,
+}
+
+impl VerticalTables {
+    /// skrifa(epaint 的字体解析后端)最终采纳的行 metrics:
+    /// fsSelection bit7 置位 → OS/2 typo;否则 hhea;hhea 双零才回落 typo/win。
+    pub(crate) fn selected(&self) -> (i16, i16, i16) {
+        if self.use_typo_metrics {
+            self.typo
+        } else {
+            self.hhea
+        }
+    }
+
+    /// 采纳表值换算为 em 单位(#43 M2 的 override 目标/下限口径)。
+    pub(crate) fn vertical_metrics_em(&self) -> VerticalMetricsEm {
+        let scale = 1.0 / f32::from(self.units_per_em);
+        let (asc, desc, gap) = self.selected();
+        VerticalMetricsEm {
+            ascent: f32::from(asc) * scale,
+            descent: f32::from(desc) * scale,
+            line_gap: f32::from(gap) * scale,
+        }
+    }
+}
+
+/// 垂直排印 metrics(em 单位)——跨 upem 可比的目标值口径。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VerticalMetricsEm {
+    pub(crate) ascent: f32,
+    /// 负值(位于基线下方的深度)。
+    pub(crate) descent: f32,
+    pub(crate) line_gap: f32,
+}
+
+impl VerticalMetricsEm {
+    /// `ascent − descent + line_gap`(epaint StyledMetrics.row_height 同式)。
+    pub(crate) fn row_height(self) -> f32 {
+        self.ascent - self.descent + self.line_gap
+    }
+}
+
+fn be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let r = data.get(offset..offset + 2)?;
+    Some(u16::from_be_bytes([r[0], r[1]]))
+}
+
+fn be_i16(data: &[u8], offset: usize) -> Option<i16> {
+    be_u16(data, offset).map(|v| v as i16)
+}
+
+fn be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let r = data.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([r[0], r[1], r[2], r[3]]))
+}
+
+/// 解析一个 sfnt face(支持 .ttc 的 face index)的垂直排印表值。
+/// 只读表头与固定字段,不解构 outline;失败返回 `None`(文件残缺/非 sfnt)。
+pub(crate) fn parse_vertical_tables(data: &[u8], face_index: u32) -> Option<VerticalTables> {
+    // ttcf: tag(u32) + version(u32) + numFonts(u32) + offsets[numFonts](u32);
+    // 普通 sfnt: face 偏移 0。
+    let face_offset = if data.get(0..4)? == b"ttcf" {
+        let num_fonts = be_u32(data, 8)? as usize;
+        let idx = face_index as usize;
+        if idx >= num_fonts {
+            return None;
+        }
+        be_u32(data, 12 + idx * 4)? as usize
+    } else {
+        0
+    };
+    let num_tables = be_u16(data, face_offset + 4)? as usize;
+    let mut head = None;
+    let mut hhea = None;
+    let mut os2 = None;
+    for i in 0..num_tables {
+        let rec = face_offset + 12 + i * 16;
+        let tag = data.get(rec..rec + 4)?;
+        let offset = be_u32(data, rec + 8)? as usize;
+        match tag {
+            b"head" => head = Some(offset),
+            b"hhea" => hhea = Some(offset),
+            b"OS/2" => os2 = Some(offset),
+            _ => {}
+        }
+    }
+    let head = head?;
+    let units_per_em = be_u16(data, head + 18)?;
+    // hhea: version(u32) + ascender(i16)+4 + descender(i16)+6 + lineGap(i16)+8。
+    let hhea_off = hhea?;
+    let hhea_metrics = (
+        be_i16(data, hhea_off + 4)?,
+        be_i16(data, hhea_off + 6)?,
+        be_i16(data, hhea_off + 8)?,
+    );
+    // OS/2: fsSelection(u16)+62、typo 三元组(i16)+68/70/72、win 二元组(u16)+74/76。
+    let (typo, win, use_typo_metrics) = match os2 {
+        Some(os2) => (
+            (
+                be_i16(data, os2 + 68)?,
+                be_i16(data, os2 + 70)?,
+                be_i16(data, os2 + 72)?,
+            ),
+            (be_u16(data, os2 + 74)?, be_u16(data, os2 + 76)?),
+            be_u16(data, os2 + 62)? & (1 << 7) != 0,
+        ),
+        // 无 OS/2: skrifa 直接用 hhea。
+        None => (hhea_metrics, (0, 0), false),
+    };
+    Some(VerticalTables {
+        units_per_em,
+        hhea: hhea_metrics,
+        typo,
+        win,
+        use_typo_metrics,
+    })
+}
+
+/// 把 face 的垂直排印布局 metrics(ascent/descent/lineGap)改写为目标值,
+/// 返回字节副本。hhea 与 OS/2 typo 两表同步改写(Inter 置位 USE_TYPO_METRICS,
+/// skrifa 采纳 typo;hhea 同步是为了两表口径一致,防采纳策略差异);
+/// OS/2 win 表是实际渲染的剪裁参考而非布局 metrics,保持不动
+/// (与 CSS `@font-face { ascent-override / descent-override }` 的语义一致:
+/// 只对齐布局,字形 outline 与光栅化完全不变)。
+///
+/// 目标值以 em 为单位、按目标文件的 upem 量化到 i16 font units ——
+/// 量化残差(≤0.5/upem em)远小于 epaint 布局的 1/32 点量化网格,
+/// 在任何字号下都吸附到与目标 face 相同的取值。
+///
+/// 只支持普通 sfnt(Inter 单 face);.ttc 不走本函数。表目录里的 checksum
+/// 字段不重算:光栅化器(skrifa)不校验表 checksum,单测以实际 shaping
+/// 裁决 patch 产物可正常解析。
+pub(crate) fn override_vertical_metrics(data: &[u8], target: VerticalMetricsEm) -> Option<Vec<u8>> {
+    let face = parse_vertical_tables(data, 0)?;
+    let upem = f32::from(face.units_per_em);
+    let to_units = |em: f32| {
+        let v = (em * upem)
+            .round()
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX));
+        v as i16
+    };
+    let asc = to_units(target.ascent);
+    let desc = to_units(target.descent);
+    let gap = to_units(target.line_gap);
+
+    let num_tables = be_u16(data, 4)? as usize;
+    let mut head = None;
+    let mut hhea = None;
+    let mut os2 = None;
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        let tag = data.get(rec..rec + 4)?;
+        let offset = be_u32(data, rec + 8)? as usize;
+        match tag {
+            b"head" => head = Some(offset),
+            b"hhea" => hhea = Some(offset),
+            b"OS/2" => os2 = Some(offset),
+            _ => {}
+        }
+    }
+    // head 表存在性 = 合法 sfnt 的前置条件(units_per_em 的来源表);
+    // 其数值字段(upem)在 parse 阶段已消费,patch 阶段无需再用。
+    let _ = head?;
+    let hhea = hhea?;
+    let os2 = os2?;
+    // 表长不校验(Inter 的 hhea/OS/2 均为定长标准表;越界写字节会 panic,
+    // 而非静默产出残缺字体 —— 单 face ttf 实测字段位置恒在表内)。
+    let mut out = data.to_vec();
+    let put_i16 = |out: &mut Vec<u8>, off: usize, v: i16| {
+        out[off..off + 2].copy_from_slice(&v.to_be_bytes());
+    };
+    // hhea: ascender +4 / descender +6 / lineGap +8。
+    put_i16(&mut out, hhea + 4, asc);
+    put_i16(&mut out, hhea + 6, desc);
+    put_i16(&mut out, hhea + 8, gap);
+    // OS/2 typo: sTypoAscender +68 / sTypoDescender +70 / sTypoLineGap +72。
+    put_i16(&mut out, os2 + 68, asc);
+    put_i16(&mut out, os2 + 70, desc);
+    put_i16(&mut out, os2 + 72, gap);
+    Some(out)
+}
 
 /// CJK 回退在 font_data 里的两个键(比例 / 等宽 face)。
 const CJK_PROPORTIONAL: &str = "latermd-cjk-proportional";
@@ -66,6 +296,10 @@ const CANDIDATES: &[(&str, u32, u32)] = &[
 
 /// 注入字体,返回 CJK 回退的加载来源(用户可见);`None` = 候选全失配,
 /// 中文将显示为方块 —— 但 Inter 三字重照常生效(嵌入资源,与系统无关)。
+///
+/// 命中 CJK 时同时解析其比例 face 的垂直排印表值(可能失败:文件结构
+/// 非预期/表残缺 —— 此时 CJK 照挂、预览副本与行高下限均不生效,回退到
+/// 修复前行为,基线偏差与行盒缺口保留,但不影响中文可显示)。
 pub fn install(ctx: &egui::Context) -> Option<String> {
     for &(path, prop_idx, mono_idx) in CANDIDATES {
         if !Path::new(path).is_file() {
@@ -75,21 +309,30 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        ctx.set_fonts(build_definitions(Some((&bytes, prop_idx, mono_idx))));
-        mark_installed(ctx);
+        let cjk_metrics =
+            parse_vertical_tables(&bytes, prop_idx).map(|tables| tables.vertical_metrics_em());
+        let cjk = cjk_metrics.map(|metrics| (&bytes[..], prop_idx, mono_idx, metrics));
+        ctx.set_fonts(build_definitions(cjk));
+        mark_installed(ctx, cjk_metrics);
         return Some(format!(
-            "{path} (比例 face {prop_idx} / 等宽 face {mono_idx})"
+            "{path} (比例 face {prop_idx} / 等宽 face {mono_idx}){}",
+            if cjk_metrics.is_some() {
+                String::new()
+            } else {
+                ";垂直表值解析失败,预览混排基线/行高修复未生效".to_owned()
+            }
         ));
     }
     ctx.set_fonts(build_definitions(None));
-    mark_installed(ctx);
+    mark_installed(ctx, None);
     None
 }
 
 /// 构建字体定义:Inter 三字重 + 可选 CJK 回退。纯函数、不触 context ——
 /// 链顺序单测由此注入假字节(字体解析发生在 set_fonts 之后的首帧,此处
-/// 只排链)。
-fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
+/// 只排链)。`cjk_metrics` 存在且可解析时,额外注册两个「行 metrics override
+/// 副本」并挂预览专用族(#43 M2,见模块级注释)。
+fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
     for (name, bytes) in [
         (NAME_REGULAR, INTER_REGULAR),
@@ -119,7 +362,7 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
     bold_chain.extend(fallback_tail.iter().cloned());
     defs.families
         .insert(FontFamily::Name(Arc::from(FAMILY_BOLD)), bold_chain);
-    if let Some((bytes, prop_idx, mono_idx)) = cjk {
+    if let Some((bytes, prop_idx, mono_idx, metrics)) = cjk {
         let face = |index: u32| FontData {
             index,
             ..FontData::from_owned(bytes.to_vec())
@@ -128,6 +371,36 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
             .insert(CJK_PROPORTIONAL.to_owned(), Arc::new(face(prop_idx)));
         defs.font_data
             .insert(CJK_MONOSPACE.to_owned(), Arc::new(face(mono_idx)));
+        // #43 M2:Inter Regular/SemiBold 的行 metrics override 副本(ascent/
+        // descent/lineGap 改写为 CJK face 同款 em 值;字形 outline 不动)。
+        // 副本只挂下面的预览专用族,原生族(UI 消费)不受影响。
+        let preview_regular = override_vertical_metrics(INTER_REGULAR, metrics)
+            .expect("嵌入 Inter-Regular 的垂直排印表结构恒可解析");
+        let preview_semibold = override_vertical_metrics(INTER_SEMIBOLD, metrics)
+            .expect("嵌入 Inter-SemiBold 的垂直排印表结构恒可解析");
+        defs.font_data.insert(
+            PREVIEW_REGULAR.to_owned(),
+            Arc::new(FontData::from_owned(preview_regular)),
+        );
+        defs.font_data.insert(
+            PREVIEW_SEMIBOLD.to_owned(),
+            Arc::new(FontData::from_owned(preview_semibold)),
+        );
+        // 预览正文族:与 Proportional 完全同构,唯一差别是链头 —— 副本
+        // Inter(行 metrics = CJK face 同款)替下原生 Inter。链内没有原生
+        // Inter,拉丁字形才真正落到副本上(否则先命中原生、override 白做)。
+        let mut preview_chain = vec![PREVIEW_REGULAR.to_owned()];
+        preview_chain.extend(fallback_tail.iter().cloned());
+        defs.families.insert(
+            FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY)),
+            preview_chain,
+        );
+        // `bold` 别名族链头换成 SemiBold 副本:预览标题/加粗的混排基线
+        // 同样对齐;该族无 UI 消费者(格式条/标题栏走 semibold_family)。
+        let mut bold_chain = vec![PREVIEW_SEMIBOLD.to_owned()];
+        bold_chain.extend(fallback_tail.iter().cloned());
+        defs.families
+            .insert(FontFamily::Name(Arc::from(FAMILY_BOLD)), bold_chain);
         for (family, name) in [
             (FontFamily::Proportional, CJK_PROPORTIONAL),
             (FontFamily::Monospace, CJK_MONOSPACE),
@@ -139,6 +412,11 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32)>) -> FontDefinitions {
             // `bold` 别名族:预览标题(heading)与加粗文本经 vendored
             // apply_bold 切到它,链尾无 CJK 会整行变方块
             (FontFamily::Name(Arc::from(FAMILY_BOLD)), CJK_PROPORTIONAL),
+            // 预览正文族的链尾同样挂 CJK 回退
+            (
+                FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY)),
+                CJK_PROPORTIONAL,
+            ),
         ] {
             // push 到末尾 = 回退:拉丁字符命中 Inter 后不再往下走
             defs.families
@@ -162,17 +440,66 @@ pub fn semibold_family(ctx: &egui::Context) -> FontFamily {
     }
 }
 
+/// 预览正文的字体族:行 metrics override 副本已注册(`Inter-Preview` 族,
+/// 链头与 CJK 回退的行 metrics 全等,混排基线对齐);否则回落
+/// Proportional(本机无 CJK 候选/表值解析失败 —— 预览行为与修复前一致,
+/// 代价是基线偏差与行盒缺口保留,如实可见而非静默换字体)。
+pub fn preview_body_family(ctx: &egui::Context) -> FontFamily {
+    let installed = ctx.data(|data| data.get_temp::<bool>(installed_id()).unwrap_or(false));
+    let has_metrics = ctx.data(|data| data.get_temp::<Option<f32>>(floor_id()).flatten().is_some());
+    if installed && has_metrics {
+        FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY))
+    } else {
+        FontFamily::Proportional
+    }
+}
+
+/// 行高下限(em 倍数):本机命中的 CJK 回退 face 的实际行高
+/// (`ascent − descent + lineGap`,如 Noto Sans CJK ≈ 1.448em)。
+/// 预览渲染把它写进 vendored `MarkdownStyle::min_line_height_em`,
+/// 行盒不足导致的越界墨迹遮挡(「显示不全」)由此兜底。
+/// `None` = 无 CJK 候选或表值解析失败,调用方应保持 vendored 默认(无下限)。
+pub fn line_height_floor_em(ctx: &egui::Context) -> Option<f32> {
+    ctx.data(|data| {
+        data.get_temp::<Option<f32>>(floor_id())
+            .flatten()
+            .filter(|em| em.is_finite() && *em > 0.0)
+    })
+}
+
 fn installed_id() -> egui::Id {
     egui::Id::new("latermd-fonts-installed")
 }
 
-fn mark_installed(ctx: &egui::Context) {
-    ctx.data_mut(|data| data.insert_temp(installed_id(), true));
+fn floor_id() -> egui::Id {
+    egui::Id::new("latermd-cjk-line-height-floor-em")
+}
+
+fn mark_installed(ctx: &egui::Context, cjk_metrics: Option<VerticalMetricsEm>) {
+    ctx.data_mut(|data| {
+        data.insert_temp(installed_id(), true);
+        data.insert_temp(
+            floor_id(),
+            cjk_metrics.map(|m| m.row_height()).filter(|em| *em > 0.0),
+        );
+    });
+}
+
+/// 测试取证用:#43 M1 混排复现需要直接解析命中的 CJK 回退字体文件
+/// (路径 + 两个 face index),与 `install` 同一条候选探测路径。
+/// 未命中任何候选时返回 `None`(本机无 CJK 字体,如实跳过)。
+#[cfg(test)]
+pub(crate) fn cjk_source_for_test() -> Option<(&'static str, u32, u32)> {
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|(path, _, _)| Path::new(path).is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui::FontId;
     use std::collections::HashSet;
 
     /// `Path::is_absolute` 按宿主平台判定(Linux 上 `C:\...` 是相对路径),
@@ -223,11 +550,19 @@ mod tests {
     /// U1 验收:字体链顺序。Inter 恒在 Proportional 首位;出厂链
     /// (Ubuntu-Light → NotoEmoji → emoji-icon-font)相对顺序不变 ——
     /// NotoEmoji 仍是 emoji 的第一命中,不得被 Inter 或 CJK 挤后;CJK 回退
-    /// 挂在四个族的链尾。假字节不进 set_fonts,不触发解析。
+    /// 挂在各族的链尾。假字节不进 set_fonts,不触发解析。
+    /// #43 M2 补充:预览专用族(`Inter-Preview` / `bold`)链头是 override
+    /// 副本,且链内不得混入原生 Inter(否则拉丁先命中原生、override 白做)。
     #[test]
     fn inter_leads_and_emoji_order_survives() {
+        // metrics 数值任意(排链阶段不消费字体字节,只取键名)。
         let fake = [0u8; 16];
-        let defs = build_definitions(Some((&fake, 2, 7)));
+        let metrics = VerticalMetricsEm {
+            ascent: 1.16,
+            descent: -0.288,
+            line_gap: 0.0,
+        };
+        let defs = build_definitions(Some((&fake, 2, 7, metrics)));
         let chain = |family: &FontFamily| -> &[String] {
             defs.families
                 .get(family)
@@ -246,6 +581,8 @@ mod tests {
         assert!(pos(prop, "Ubuntu-Light") < pos(prop, "NotoEmoji-Regular"));
         assert!(pos(prop, "NotoEmoji-Regular") < pos(prop, "emoji-icon-font"));
         assert_eq!(prop.last().map(String::as_str), Some(CJK_PROPORTIONAL));
+        // UI 共用的 Proportional 族不得被 override 副本污染(接口密度不变)。
+        assert!(!prop.contains(&PREVIEW_REGULAR.to_owned()));
 
         // Inter 非等宽,不进 Monospace;CJK 照挂尾
         let mono = chain(&FontFamily::Monospace);
@@ -253,7 +590,13 @@ mod tests {
         assert_eq!(mono.last().map(String::as_str), Some(CJK_MONOSPACE));
 
         // 三字重数据齐全;权重族链头是对应字重,emoji 链与 CJK 回退同构
-        for name in [NAME_REGULAR, FAMILY_MEDIUM, FAMILY_SEMIBOLD] {
+        for name in [
+            NAME_REGULAR,
+            FAMILY_MEDIUM,
+            FAMILY_SEMIBOLD,
+            PREVIEW_REGULAR,
+            PREVIEW_SEMIBOLD,
+        ] {
             assert!(defs.font_data.contains_key(name), "{name} 缺字体数据");
         }
         for (family, head) in [
@@ -262,8 +605,6 @@ mod tests {
                 FontFamily::Name(Arc::from(FAMILY_SEMIBOLD)),
                 FAMILY_SEMIBOLD,
             ),
-            // bold 别名族链头也是 SemiBold,且必须吃到 CJK 回退(预览标题中文)
-            (FontFamily::Name(Arc::from(FAMILY_BOLD)), FAMILY_SEMIBOLD),
         ] {
             let weight = chain(&family);
             assert_eq!(weight.first().map(String::as_str), Some(head));
@@ -271,9 +612,32 @@ mod tests {
             assert!(pos(weight, "NotoEmoji-Regular") < pos(weight, "emoji-icon-font"));
             assert_eq!(weight.last().map(String::as_str), Some(CJK_PROPORTIONAL));
         }
+
+        // 预览正文族:链头 = override Regular 副本,链内无原生 Inter,
+        // emoji 相对顺序与出厂一致,CJK 挂尾(与 Proportional 完全同构)。
+        let preview = chain(&FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY)));
+        assert_eq!(preview.first().map(String::as_str), Some(PREVIEW_REGULAR));
+        assert!(!preview.iter().any(|n| n == NAME_REGULAR));
+        assert!(pos(preview, "NotoEmoji-Regular") < pos(preview, "emoji-icon-font"));
+        assert_eq!(preview.last().map(String::as_str), Some(CJK_PROPORTIONAL));
+
+        // `bold` 别名族(#43 M2 起链头 = override SemiBold 副本):预览标题与
+        // 加粗文本经 vendored apply_bold 切到它,链内同样不得有原生 SemiBold。
+        let bold = chain(&FontFamily::Name(Arc::from(FAMILY_BOLD)));
+        assert_eq!(bold.first().map(String::as_str), Some(PREVIEW_SEMIBOLD));
+        assert!(!bold.iter().any(|n| n == FAMILY_SEMIBOLD));
+        assert_eq!(bold.last().map(String::as_str), Some(CJK_PROPORTIONAL));
+        assert!(
+            defs.font_data
+                .get(PREVIEW_SEMIBOLD)
+                .is_some_and(|d| d.index == 0),
+            "Inter 副本是单 face ttf,index 应为 0"
+        );
     }
 
-    /// 候选全失配(`None`):Inter 仍注册(嵌入资源),四族链上无 CJK 条目。
+    /// 候选全失配(`None`):Inter 仍注册(嵌入资源),族链上无 CJK 条目;
+    /// #43 M2:预览 override 副本与预览正文族**都不注册**(无 metrics 来源),
+    /// `bold` 族链头保持原生 SemiBold —— 行为与修复前的降级完全一致。
     #[test]
     fn inter_registers_even_without_cjk() {
         let defs = build_definitions(None);
@@ -295,6 +659,22 @@ mod tests {
                 "{family:?} 不应残留 CJK 条目"
             );
         }
+        assert!(
+            !defs
+                .families
+                .contains_key(&FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY))),
+            "无 CJK 时不应注册预览正文族"
+        );
+        for key in [PREVIEW_REGULAR, PREVIEW_SEMIBOLD] {
+            assert!(!defs.font_data.contains_key(key), "{key} 不应注册");
+        }
+        assert_eq!(
+            defs.families[&FontFamily::Name(Arc::from(FAMILY_BOLD))]
+                .first()
+                .map(String::as_str),
+            Some(FAMILY_SEMIBOLD),
+            "无 CJK 时 bold 族链头保持原生 SemiBold"
+        );
     }
 
     /// install 端到端:无论本机有无 CJK 候选,context 里 Proportional 首位
@@ -316,6 +696,197 @@ mod tests {
         assert_eq!(
             semibold_family(&ctx),
             FontFamily::Name(Arc::from(FAMILY_SEMIBOLD))
+        );
+    }
+
+    /// #43 M2:override 副本的表值改写正确性(纯字节级,不依赖系统字体)。
+    /// 目标 = Noto Sans CJK 的 (ascent 1.16 / descent −0.288 / gap 0) em,
+    /// 在 Inter 的 2048 upem 下量化;patch 后 hhea 与 OS/2 typo 同步等于量化值,
+    /// win 表与 fsSelection(bit7)保持不动 —— 光栅化不受影响,采纳表仍是 typo。
+    #[test]
+    fn override_vertical_metrics_rewrites_layout_tables_only() {
+        let target = VerticalMetricsEm {
+            ascent: 1.16,
+            descent: -0.288,
+            line_gap: 0.0,
+        };
+        let to_units = |em: f32| (em * 2048.0).round() as i16;
+        for (name, bytes) in [
+            ("Inter-Regular", INTER_REGULAR),
+            ("Inter-SemiBold", INTER_SEMIBOLD),
+        ] {
+            let original = parse_vertical_tables(bytes, 0).expect("{name} 原始表解析失败");
+            let patched_bytes = override_vertical_metrics(bytes, target)
+                .unwrap_or_else(|| panic!("{name} patch 失败"));
+            let patched =
+                parse_vertical_tables(&patched_bytes, 0).expect("{name} patch 后表解析失败");
+            assert_eq!(
+                patched.units_per_em, original.units_per_em,
+                "{name} upem 不应被改"
+            );
+            assert_eq!(
+                patched.use_typo_metrics, original.use_typo_metrics,
+                "{name} fsSelection 不应被改"
+            );
+            assert_eq!(
+                patched.win, original.win,
+                "{name} win 表(渲染剪裁参考)不应被改"
+            );
+            let want = (
+                to_units(target.ascent),
+                to_units(target.descent),
+                to_units(target.line_gap),
+            );
+            assert_eq!(patched.hhea, want, "{name} hhea 未改写为目标值");
+            assert_eq!(patched.typo, want, "{name} OS/2 typo 未改写为目标值");
+            assert_eq!(patched.selected(), want, "{name} skrifa 采纳表未对齐");
+            let diff_positions: Vec<usize> = bytes
+                .iter()
+                .zip(patched_bytes.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .collect();
+            // diff 只允许出现在两张表的 6 个 i16 字段(hhea +4/+6/+8 与
+            // OS/2 typo +68/+70/+72)—— 按位置对照,而非仅数量:除此之外
+            // 全文件逐字节相同 = 字形 outline/字宽/cmap 完全未动的硬证据。
+            let table_offset = |tag: &[u8; 4]| -> usize {
+                let num = be_u16(bytes, 4).expect("numTables") as usize;
+                (0..num)
+                    .map(|i| 12 + i * 16)
+                    .find(|rec| bytes.get(*rec..rec + 4) == Some(tag.as_slice()))
+                    .map(|rec| be_u32(bytes, rec + 8).expect("表偏移") as usize)
+                    .unwrap_or_else(|| panic!("{name} 缺 {tag:?} 表"))
+            };
+            let hhea = table_offset(b"hhea");
+            let os2 = table_offset(b"OS/2");
+            let mut expected: Vec<usize> =
+                [hhea + 4, hhea + 6, hhea + 8, os2 + 68, os2 + 70, os2 + 72]
+                    .into_iter()
+                    .flat_map(|off| [off, off + 1])
+                    .collect();
+            expected.sort_unstable();
+            // 子集断言(非相等):字段值与原值碰巧共享高位/低位字节时,
+            // 该字节的 diff 为空(如 lineGap 0→0 全等)——只要改动不出
+            // 6 个字段之外,字形 outline/字宽/cmap 就是完全未动的。
+            assert!(
+                diff_positions.iter().all(|p| expected.contains(p)),
+                "{name} 改动越出了 hhea/typo 的 6 个 i16 字段:diff={diff_positions:?} 字段位={expected:?}"
+            );
+            assert!(
+                !diff_positions.is_empty(),
+                "{name} 目标值与原值全等,patch 未生效"
+            );
+        }
+    }
+
+    /// #43 M2 install 端到端:本机有 CJK 候选时,预览正文族与 `bold` 族的
+    /// 链头 face 在 context 里的实测行 metrics(ascent/行高)== CJK 回退
+    /// face 同款 —— 这既是「patch 产物可正常解析、shaping 正常」的裁决,
+    /// 也是「链头与 fallback 行 metrics 全等 → 基线公式残差归零」的直接前提。
+    /// 同时核对行高下限值(CJK face 实际行高的 em 值)。无 CJK 候选的机器上
+    /// 如实跳过(CI runner 可能没有;三平台真机核验在 #43 人工清单)。
+    #[test]
+    fn install_aligns_preview_family_metrics_with_cjk_fallback() {
+        let ctx = egui::Context::default();
+        let cjk = install(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+
+        let Some((path, prop_idx, _)) = cjk_source_for_test() else {
+            eprintln!("本机无 CJK 候选字体,预览族 metrics 对齐断言跳过");
+            assert!(cjk.is_none(), "候选字体存在但 install 返回 None?");
+            assert_eq!(preview_body_family(&ctx), FontFamily::Proportional);
+            assert_eq!(
+                line_height_floor_em(&ctx),
+                None,
+                "无 CJK 时行高下限应为 None"
+            );
+            return;
+        };
+        let cjk_bytes = std::fs::read(path).expect("候选字体文件读取失败");
+        let cjk_metrics = parse_vertical_tables(&cjk_bytes, prop_idx)
+            .expect("已确认本机有 CJK")
+            .vertical_metrics_em();
+
+        let size = 13.0;
+        let probe = |family: FontFamily| {
+            let font = FontId::new(size, family);
+            let galley =
+                ctx.fonts_mut(|f| f.layout_no_wrap("中H".to_owned(), font, egui::Color32::WHITE));
+            let glyphs = &galley.rows[0].row.glyphs;
+            let face = |ch: char| {
+                glyphs
+                    .iter()
+                    .find(|g| g.chr == ch)
+                    .unwrap_or_else(|| panic!("{ch} 未被 shaping"))
+            };
+            (
+                face('H').font_face_ascent,
+                face('H').font_face_height,
+                face('中').font_face_ascent,
+                face('中').font_face_height,
+            )
+        };
+
+        // 预览正文族:链头(override Inter)与 CJK 回退的 ascent/行高逐项相等。
+        let (head_asc, head_h, cjk_asc, cjk_h) =
+            probe(FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY)));
+        assert_eq!(
+            head_asc, cjk_asc,
+            "预览族链头 ascent 应与 CJK face 全等(基线对齐前提)"
+        );
+        assert_eq!(
+            head_h, cjk_h,
+            "预览族链头行高应与 CJK face 全等(基线对齐前提)"
+        );
+        // 与表值推算对账:styled_metrics 对 ascent/descent/lineGap 各自做
+        // 1/32 网格量化后再合成行高(不二次量化),推算须同式,否则会拿
+        // 「量化合成值」错比「合成再量化值」(18.84375 vs 18.8125 的差源)。
+        let round_ui = |v: f32| (v * 32.0).round() / 32.0;
+        let expect_ascent = round_ui(cjk_metrics.ascent * size);
+        let expect_h = round_ui(cjk_metrics.ascent * size) - round_ui(cjk_metrics.descent * size)
+            + round_ui(cjk_metrics.line_gap * size);
+        assert!(
+            (head_asc - expect_ascent).abs() < 0.02,
+            "链头 ascent {head_asc} 与表值 {expect_ascent} 不符"
+        );
+        assert!(
+            (head_h - expect_h).abs() < 0.02,
+            "链头行高 {head_h} 与表值 {expect_h} 不符"
+        );
+
+        // `bold` 别名族(预览标题/加粗)同样对齐。
+        let (b_head_asc, b_head_h, b_cjk_asc, b_cjk_h) =
+            probe(FontFamily::Name(Arc::from(FAMILY_BOLD)));
+        assert_eq!(
+            b_head_asc, b_cjk_asc,
+            "bold 族链头 ascent 应与 CJK face 全等"
+        );
+        assert_eq!(b_head_h, b_cjk_h, "bold 族链头行高应与 CJK face 全等");
+
+        // UI 原生族不受影响:Proportional 链头仍是原生 Inter 的行 metrics
+        // (Inter 出厂表值 0.96875 / 1.20996em)。
+        let (p_head_asc, p_head_h, _, _) = probe(FontFamily::Proportional);
+        assert!(
+            (p_head_asc - 0.96875 * size).abs() < 0.03,
+            "Proportional 链头 ascent 不应被修复改动"
+        );
+        assert!(
+            (p_head_h - 2478.0 / 2048.0 * size).abs() < 0.03,
+            "Proportional 链头行高不应被修复改动"
+        );
+
+        // 行高下限 = CJK face 实际行高;预览正文族可用。
+        let floor = line_height_floor_em(&ctx).expect("有 CJK 时行高下限应存在");
+        assert!(
+            (floor - cjk_metrics.row_height()).abs() < 1e-4,
+            "下限 {floor} 与 CJK face 行高 {} 不符",
+            cjk_metrics.row_height()
+        );
+        assert_eq!(
+            preview_body_family(&ctx),
+            FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY))
         );
     }
 
