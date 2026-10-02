@@ -42,13 +42,13 @@ const DOC: &str = concat!(
     "中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文",
 );
 
-/// 两色通道距离和(#41 口径,0 = 同色)。
-fn color_dist(a: Color32, b: Color32) -> i32 {
+/// 两色通道距离和(#41 口径,0 = 同色)。#43/#23 验收模块共用。
+pub(crate) fn color_dist(a: Color32, b: Color32) -> i32 {
     let ch = |x: u8, y: u8| (i32::from(x) - i32::from(y)).abs();
     ch(a.r(), b.r()) + ch(a.g(), b.g()) + ch(a.b(), b.b())
 }
 
-fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+pub(crate) fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
     let det = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
     if det(b - a, c - a).abs() < 1e-9 {
         return false;
@@ -60,7 +60,7 @@ fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
 
 /// 采样点的**最终覆盖色**(画家算法:遍历全部 mesh,记录最后覆盖该点的
 /// 顶点色)。返回 `None` = 没有任何三角形覆盖(露画布背景)。
-fn final_covered_color(meshes: &[&Mesh], p: Pos2) -> Option<Color32> {
+pub(crate) fn final_covered_color(meshes: &[&Mesh], p: Pos2) -> Option<Color32> {
     let mut top = None;
     for mesh in meshes {
         for tri in mesh.indices.as_chunks::<3>().0 {
@@ -75,7 +75,7 @@ fn final_covered_color(meshes: &[&Mesh], p: Pos2) -> Option<Color32> {
 }
 
 /// 单个字形的墨迹矩形(galley 坐标):基线 + uv_rect 偏移,尺寸即 quad。
-fn glyph_ink_rect(row_pos: Pos2, glyph: &Glyph) -> Option<(Pos2, Vec2)> {
+pub(crate) fn glyph_ink_rect(row_pos: Pos2, glyph: &Glyph) -> Option<(Pos2, Vec2)> {
     if glyph.uv_rect.offset == Vec2::ZERO && glyph.uv_rect.size == Vec2::ZERO {
         return None;
     }

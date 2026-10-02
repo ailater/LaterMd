@@ -1176,6 +1176,77 @@ mod tests {
         );
     }
 
+    /// #23 F5:行距滑杆与标题呼吸间距**正交** —— `apply` 的行距覆盖只写
+    /// `line_height_ratio` 一个字段,`heading_space_above`(F4 vendored
+    /// 新字段,标题上方 spacer 行)属于「节奏/间距」维,不随行距覆盖被
+    /// 吞掉或顶掉。两字段语义正交:行距管**行内**(行盒高随字号重算,
+    /// `line_height_for` 按各自 span 字号求),标题间距管**块间**
+    /// (spacer 行高 = `block_spacing + heading_space_above` 定值,不吃行距
+    /// 倍率)。双向钉:动滑杆不动标题间距;换皮肤改标题间距不动行距。
+    /// 出厂默认(无皮肤无 overrides)时两者经同一条链路带 vendored 新
+    /// 默认落进 context(4.0 + 用户行距默认)。
+    #[test]
+    fn line_height_slider_and_heading_space_above_are_orthogonal() {
+        let ctx = egui::Context::default();
+        // 出厂链路:F4 的 vendored 新默认(4.0)应穿透到生效样式
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        let factory = egui_markdown_style::global_style(&ctx);
+        assert_eq!(
+            factory.heading_space_above, 4.0,
+            "vendored 新默认穿透出厂链路"
+        );
+        assert_eq!(
+            factory.line_height_ratio, LINE_HEIGHT_DEFAULT,
+            "出厂行距仍由用户偏好的默认值决定"
+        );
+
+        // 皮肤带自定义标题间距:行距滑杆覆盖行距字段,标题间距原样生效
+        let breathing_skin = MarkdownStyle {
+            heading_space_above: 11.0,
+            block_spacing: 12.0,
+            line_height_ratio: 1.30, // 皮肤显式写的行距,必须让位给滑杆
+            ..MarkdownStyle::default()
+        };
+        let skin_settings = |slider: f32| ThemeSettings {
+            line_height: slider,
+            skin: Some("呼吸皮肤".to_owned()),
+            skin_style: Some(breathing_skin.clone()),
+            ..ThemeSettings::default()
+        };
+        for slider in [1.2, 1.5, 1.8, 2.0] {
+            skin_settings(slider).apply(&ctx, ThemeMode::Dark);
+            let installed = egui_markdown_style::global_style(&ctx);
+            assert_eq!(
+                installed.line_height_ratio,
+                clamp_line_height(slider),
+                "行距随滑杆变化"
+            );
+            assert_eq!(
+                installed.heading_space_above, 11.0,
+                "滑杆怎么动都不吞标题呼吸间距"
+            );
+        }
+
+        // 反向:标题间距随皮肤变(9.0→25.0),行距保持滑杆值不动
+        for heading_space in [0.0, 4.0, 9.0, 25.0, 40.0] {
+            let mut style = breathing_skin.clone();
+            style.heading_space_above = heading_space;
+            ThemeSettings {
+                line_height: 1.7,
+                skin: Some("呼吸皮肤".to_owned()),
+                skin_style: Some(style),
+                ..ThemeSettings::default()
+            }
+            .apply(&ctx, ThemeMode::Dark);
+            let installed = egui_markdown_style::global_style(&ctx);
+            assert_eq!(
+                installed.heading_space_above, heading_space,
+                "标题间距随皮肤生效"
+            );
+            assert_eq!(installed.line_height_ratio, 1.7, "标题间距怎么变都不动行距");
+        }
+    }
+
     /// #23 F3:排版偏好与密度互不覆盖 —— 密度切换(重投影 spacing token)
     /// 不得重置字号档与正文样式;反之改字号/行距不得重置密度投影;来回切
     /// 各自恢复,互不累积。`apply_density` 与 `apply_font_size` 是两个独立

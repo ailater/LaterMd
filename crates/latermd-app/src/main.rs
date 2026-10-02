@@ -33,6 +33,8 @@ mod live;
 mod mcp;
 #[cfg(test)]
 mod preview_pixel_acceptance;
+#[cfg(test)]
+mod preview_typography_acceptance;
 mod search;
 mod settings;
 mod state;

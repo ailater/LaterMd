@@ -77,8 +77,8 @@ const LINE_HEIGHT_RATIO: f32 = 1.30;
 /// vendored `line_height_for` floor 生效时的吸附安全余量(egui_markdown
 /// layout.rs `LINE_HEIGHT_FLOOR_SLACK_PX`,推算与 vendored 同源)。
 const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
-/// vendored 标题字号缩放(egui_markdown_style style.rs:319,H1-H6)。
-const HEADING_SCALES: [f32; 6] = [1.6, 1.35, 1.2, 1.1, 1.05, 1.0];
+/// vendored 标题字号缩放(egui_markdown_style style.rs,H1-H6;镜像复制,默认变更需同步)。
+const HEADING_SCALES: [f32; 6] = [2.0, 1.55, 1.30, 1.15, 1.08, 1.0];
 /// epaint 的 UI 量化网格(emath gui_rounding.rs:17;styled_metrics 按 1/32 吸附)。
 const GUI_ROUNDING: f32 = 1.0 / 32.0;
 /// 严格断言的基线偏差阈值:0.5px。半像素以内人眼不可辨;egui 对基线做
