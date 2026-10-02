@@ -16,7 +16,7 @@
 
 ```
 [x] Vendor 适配   2026-09-24 完成(check.sh 六项全绿,spans 已加入)
-[~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项。验证 1 IME Linux 已首测:输入可用,候选框不跟随光标,排查挂账(m0-report.md 验证 1)。出口仍卡两条真机项(Win/mac IME、Win/mac wgpu),见 m0-report.md
+[~] M0 技术验证   验证 2 已实测:10 万字真窗口滚动 p50 60.3 fps(llvmpipe 软件渲染下限)、bench 单帧 430 µs;验证 4 实测出流式追加是 O(n)(~77 µs/行),已列为 P1 开工前必解项;2026-10 同口径复测确认仍未解(期间未做修复,水位即原水位:10,000 行档 993.94 ms、较 M0 +25.9%,每行成本随规模上升;修复需 vendored ①类改动,需求挂 decisions-pending #77 待拍板,前后对比见 perf-recheck-2026-10.md §8),挂账维持。验证 1 IME Linux 已首测:输入可用,候选框不跟随光标,排查挂账(m0-report.md 验证 1)。出口仍卡两条真机项(Win/mac IME、Win/mac wgpu),见 m0-report.md
 [~] P0 骨架       ← 当前(2026-09-30 按 V1 核对表 R3/R8 纠偏):功能 11/11 已落地(打包分发链路三版跑通);收尾修补(跨平台字体候选/ADR 登记/后端显示)已于 2026-09-25 完成;Release 链路已跑通——v0.0.1 2026-09-26、v0.0.2 09-29、v0.0.3 09-30 三版均自动发版(auto-tag → release → dmg/deb 全链路,runbook 见 [distribution.md](distribution.md),证据 E1–E4/E7);P0 剩余 = 三平台真机验收(安装/IME/wgpu)与连续写作长跑人工段
 [~] P1 差异化     全文搜索已落地(2026-09-25),latermd-ai 基础(Mock 流式)已落地(2026-09-25),ai:// 链接与 AI 指令块已落地(2026-09-25),AI commit message 与摘要大纲已落地(2026-09-25);阶段内模块全部落地,P1 剩余仅真实 key 的凭据存取,按 auto-plan 队列归 #7(P2) 实施
 [x] P2 版本层     Git 只读集成已落地(2026-09-25);凭据管理已落地(2026-09-25);P2 全部完成(latermd-creds + AI key 闸门/设置区经 PR #20 携带合入)

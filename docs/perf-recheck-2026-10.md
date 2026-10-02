@@ -285,3 +285,199 @@ scrollbench: 没有采到帧
 - 修复对象 = 疑点 A:把失效粒度从「整篇 text_hash」降到「块/段」(追加只失效尾块),复用 `segment_breaks` 与分段 galley(m0-report §4.2 既定方向);产品 preview 的 `heal(true)` O(n) 扫描一并评估。
 - 修复后用 §2 同一条命令对照本表,验收口径 = 每行成本随规模趋稳/下降(亚线性),而不是绝对值。
 - 疑点 B 在修复时顺带核对四个 vendor 排版 commit 的单档影响;疑点 C 走环境复测(真机或会话修复后跑 §3b 命令),不占 R2。
+
+---
+
+## 7. R2 修复评估(2026-10-02,#46 R2 模块)—— **主导修复确需 vendor ①类,app 侧无可达近似,如实报未修**
+
+> R2 输入 = §5 判定(流式 O(n) 未解 → 修复路径激活)。R2 模块红线:`paths=["crates"]`、零新增依赖、**不触碰 vendor/**;约束原文「修复确需 vendor 时停下,把需求记 decisions-pending 交人工拍板,本模块按 app 侧可达近似或如实报未修」。本节 = 机制复核 + app 侧可达性逐项核对 + 结论。**crates/ 零改动,本模块未修任何产品代码。**
+
+### 7.1 疑点 A 机制复核(实读 vendored 层,两个 R1 未展开的 nuance)
+
+R1 疑点 A 的机制描述(整篇 `hash_text` 门控,miss 即全文解析)复核**属实**,行号与现状一致;补两个对 vendor 修复设计有直接影响的细节:
+
+1. **bench 场景走整篇 galley 路径,分段路径的 per-range 缓存帮不了它。** §2 bench 的 `code_fence` 文档是纯代码块,`MarkdownLabel` 未开 `scroll_code_blocks` 且无 `link_handler`(`benches/longdoc.rs:80-82`),`needs_segmentation` 返回 false(`vendor/egui_markdown/src/layout.rs:262-275`:纯 `CodeBlock` token 且两条件皆 false)→ 走 `label.rs:679-691` 的**整篇 `build_layout` 单 galley**,10000 行档的 ~1 秒主导在这里。分段路径(`render_segmented`)里 `flush_text_range` 的段缓存本来就是 per-range 的(`label.rs:975-976` `hash_flush_context` 按 **token 切片**哈希,`:991-1008` 命中即复用 galley)——「失效粒度过粗」对**文本段**不成立,成立的是顶层门控(`label.rs:636`)与块级剔除 key。
+2. **即使强制分段,块级剔除缓存的 key 仍是整篇 text_hash。** `try_cull_block`/`cache_block_height`(`label.rs:137-156`)以 `text_hash`(整篇,`:629` 传入)为 key,`:772`(Table)/`:808`(滚动代码块)/`:837`(Image)三个块型都是——追加一行让整篇 hash 变,**视口外所有块剔除失效、全部重测**。这解释了 M0 上游 bench(`scroll_code_blocks(true)`,m0-report §验证 4 基准语义)同样呈线性的现象。**含义:app 侧开 `scroll_code_blocks` 不是修复,块级 key 必须换。**
+
+### 7.2 app 侧可达性核对表(任务候选方向 + 自查,逐项行号证据)
+
+| 候选方向(R1 §6 / 任务书) | 核对结果 | 证据(本轮实读) |
+|---|---|---|
+| 流式帧避免全文重解析(修订号增量) | 快照侧**已在位**;全文重解析主导在 vendor `render()` miss 分支,app 不可达 | `ui/editor.rs:295-299`「快照只在修订号前进时重建…第一层,vendored 层 text hash 缓存是第二层」、`live.rs:287-290` 同款;vendor `label.rs:663-665` |
+| heal 只对流式预览帧生效(路径核对) | **已在位(#39 落地)**,两处调用点均按「AI 流式写入本标签」条件传参,稳态帧 `heal=false` | `ui/layout.rs:301-310`(三栏)、`ui/layout.rs:671-674`(Live,注释「heal 条件同三栏路径」)、`ui/preview.rs:594-597` 消费;流式帧 heal 是语义必需(AGENTS §6.5),成本 ~0.1 µs/行量级(§4-A 实测 2 万行 ~2ms),占 10000 行档 <0.1%,不动 |
+| 布局缓存命中 | app 侧贡献项全稳定,无泄漏:handler `id()` 用 trait 默认 0、widget id 只含 tab id、font/style 稳定 | `ui/preview.rs:231-258`(AiLinkHandler 无 `fn id` override)、`vendor link.rs:92-94`(默认 0)、`ui/preview.rs:539-541`(`tab_preview_id` 只含 tab id,§6.7) |
+| 避免无关帧重建 | **已在位**:修订号纪律 + egui request_repaint 纪律,空闲帧不渲染 | `ui/editor.rs:295-299`、`live.rs:288` |
+| (R2 自查)`scroll_code_blocks(true)` 强制分段 | **不构成修复**:§7.1-2(cull key 整篇哈希,追加仍全块失效)+ 代码块渲染形态改滚动窗格(#38 复制头/既有观感回归) | vendor `label.rs:137-151/772/808`;#39 已记「预览既有配置不开 scroll_code_blocks」 |
+
+### 7.3 结论与去向
+
+- **未修(如实)**:O(n) 主导修复(失效粒度块级化)确需 vendor ①类改动,越出本模块红线;app 侧四候选方向 + 自查开关逐项核对,无一个可达且能改变 O(n) 判定曲线的修复点。按约束「如实报未修」执行,本模块 `crates/` **零改动**。
+- 修复需求(两步 vendor ①类方案 + 产品侧降级备选)已按五要素登记 **decisions-pending #77**,交人工拍板。
+- R3 复测口径:水位即 §2 当前水位(未修),挂账不销;拍板后修复的验收命令与口径见 §6 第二条。
+- 单测:无修复行为,无新增断言(不造假凑数);已在位机制的既有护栏 = heal 开关切换不改渲染(`ui/preview.rs` `preview_reflects_edits_immediately_despite_per_tab_cache`)、widget id 稳定(#39 `tab_switch_perf` 回归)、rev 纪律(state.rs 既有断言),本轮未动。
+- 门禁:本模块零代码改动,实跑 fmt/clippy 三轮/test 确认工作区健康(结果见 §7.4);六项全量门禁由编排在本棒最终 head 复验。
+
+### 7.4 门禁实跑记录(2026-10-02,本模块收尾时,全部实跑)
+
+```
+$ cargo fmt --all --check                                            # 通过(exit 0,无输出)
+$ cargo check --workspace --all-features --quiet                     # 通过(exit 0)
+$ cargo clippy --workspace --all-targets -- -D warnings              # 通过(exit 0)
+$ cargo clippy --workspace --all-targets --no-default-features -- -D warnings   # 通过(exit 0)
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings          # 通过(exit 0)
+$ cargo test --workspace --all-features                              # 通过(exit 0)
+```
+
+test 汇总:**830 passed / 0 failed / 1 ignored**(唯一 ignored = #39 既有 `tab_switch` 取证测试,与 #47 A2 轮基线一致);本模块零代码改动,数字为工作区健康确认,非修复后对比。`cargo doc` 未在本模块单跑(零代码改动无文档面变化),由编排在本棒最终 head 六项全量门禁复验。
+
+---
+
+## 8. R3 同口径复测与前后对比(2026-10-02,#46 R3 模块)—— **未做修复,水位即当前水位;六项 headless 数字与 R1 无统计差异**
+
+> 前置事实:#46 R2 未触发代码修复(§7:主导修复确需 vendor ①类,app 侧无可达近似,`crates/` 零改动,修复需求挂 [decisions-pending.md](decisions-pending.md) #77 待人工拍板)→ 按任务口径,**本轮复测结论 = R1 结论,「未做修复,水位即当前水位」**,挂账不销。本节 = 同命令同参数复跑 + R1→R3 前后对比落档。
+
+### 8.1 同口径前提核对(先证明确实在同一条基线上比)
+
+- **命令与参数**:与 §2 / §3a / §3b 逐字相同的三条命令,一个参数未动(见各小节引用)。
+- **载体源码**:`benches/longdoc.rs` 与 `examples/scrollbench.rs` 自 R1 零改动——`git diff --name-only 618b3ab..HEAD` 仅 `docs/perf-recheck-2026-10.md`(R1 文档提交 `31828b8`);R2 模块 `crates/` 零改动(§7)。R1→R3 之间**没有任何产品代码变更**,这是「水位可比」的前提。
+- **运行环境**:同机同会话(X11,DISPLAY=:0);Mesa 25.0.7-2 / LLVM 19.1.4 与 R1 相同;`target/release/deps/longdoc-9a3abfe4edeb0714` 与 `target/release/examples/scrollbench` 为 R1 同一二进制(增量构建 `Finished in 0.15s` 未重编)。
+- **criterion change 基线**:criterion 的 `change:` 行是与**上一轮存档估算**的自动对比;R1(2026-10-02)之后再无人跑过这两条 bench(target/criterion 存档未刷新),故本轮 `change:` 即 **R3 vs R1** 的统计学检验。
+
+### 8.2 流式追加复跑(命令 = §2 同款)
+
+```bash
+cargo bench -p latermd-app --bench longdoc -- streaming_append
+```
+
+逐字输出(2026-10-02 R3,全量,含 criterion change 行):
+
+```
+    Finished `bench` profile [optimized] target(s) in 0.15s
+     Running benches/longdoc.rs (target/release/deps/longdoc-9a3abfe4edeb0714)
+Gnuplot not found, using plotters backend
+long doc: 100251 chars, 3704 lines
+Benchmarking streaming_append_by_lines/append_1_line_at_500
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Collecting 10 samples in estimated 5.6132 s (165 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Analyzing
+streaming_append_by_lines/append_1_line_at_500
+                        time:   [33.575 ms 33.853 ms 34.163 ms]
+                        change: [-1.0122% +0.1254% +1.2037%] (p = 0.84 > 0.05)
+                        No change in performance detected.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 8.0s or enable flat sampling.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Collecting 10 samples in estimated 8.0238 s (55 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Analyzing
+streaming_append_by_lines/append_1_line_at_2000
+                        time:   [144.61 ms 146.00 ms 147.94 ms]
+                        change: [-0.6276% +0.8818% +2.4399%] (p = 0.29 > 0.05)
+                        No change in performance detected.
+Benchmarking streaming_append_by_lines/append_1_line_at_10000
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 9.9s.
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Collecting 10 samples in estimated 9.8525 s (10 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Analyzing
+streaming_append_by_lines/append_1_line_at_10000
+                        time:   [980.55 ms 993.94 ms 1.0079 s]
+                        change: [-2.7368% -0.7791% +1.1116%] (p = 0.48 > 0.05)
+                        No change in performance detected.
+```
+
+前后对比表(R1 = §2,换算口径同 §0:µs/行 = 中值 ÷ 行数):
+
+| 档位 | R1 中值 | R3 中值 | R3 µs/行 | R3 vs R1 | criterion 检验 |
+|---|---|---|---|---|---|
+| 500 行 | 33.800 ms | 33.853 ms | 67.71 µs | +0.16% | No change(p=0.84) |
+| 2,000 行 | 146.46 ms | 146.00 ms | 73.00 µs | −0.31% | No change(p=0.29) |
+| 10,000 行 | 1,001.7 ms | 993.94 ms | 99.39 µs | −0.78% | No change(p=0.48) |
+
+R3 增长曲线(口径 = §0):规模 ×4 成本 ×**4.31**(33.853→146.00 ms),规模 ×5 成本 ×**6.81**(146.00→993.94 ms),每行成本 67.71 → 73.00 → 99.39 µs 仍随规模上升。**判定与 R1 相同:线性偏超线性,O(n) 未解**——R2 未修,曲线自然原样。
+
+### 8.3 headless 滚动复跑(命令 = §3a 同款)
+
+```bash
+cargo bench -p latermd-app --bench longdoc -- long_doc_100k
+```
+
+逐字输出(2026-10-02 R3,全量):
+
+```
+    Finished `bench` profile [optimized] target(s) in 0.27s
+     Running benches/longdoc.rs (target/release/deps/longdoc-9a3abfe4edeb0714)
+Gnuplot not found, using plotters backend
+long doc: 100251 chars, 3704 lines
+Benchmarking long_doc_100k/cold_first_frame
+Benchmarking long_doc_100k/cold_first_frame: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 6.8s or enable flat sampling.
+Benchmarking long_doc_100k/cold_first_frame: Collecting 10 samples in estimated 6.8117 s (55 iterations)
+Benchmarking long_doc_100k/cold_first_frame: Analyzing
+long_doc_100k/cold_first_frame
+                        time:   [120.25 ms 121.84 ms 124.86 ms]
+                        change: [-1.8532% +0.6817% +3.1808%] (p = 0.62 > 0.05)
+                        No change in performance detected.
+Benchmarking long_doc_100k/steady_state_top
+Benchmarking long_doc_100k/steady_state_top: Warming up for 3.0000 s
+Benchmarking long_doc_100k/steady_state_top: Collecting 10 samples in estimated 5.0167 s (14k iterations)
+Benchmarking long_doc_100k/steady_state_top: Analyzing
+long_doc_100k/steady_state_top
+                        time:   [357.76 µs 360.55 µs 364.09 µs]
+                        change: [-1.1553% -0.0752% +1.0505%] (p = 0.90 > 0.05)
+                        No change in performance detected.
+Benchmarking long_doc_100k/steady_state_scroll_middle
+Benchmarking long_doc_100k/steady_state_scroll_middle: Warming up for 3.0000 s
+Benchmarking long_doc_100k/steady_state_scroll_middle: Collecting 10 samples in estimated 5.0159 s (13k iterations)
+Benchmarking long_doc_100k/steady_state_scroll_middle: Analyzing
+long_doc_100k/steady_state_scroll_middle
+                        time:   [368.16 µs 373.51 µs 380.19 µs]
+                        change: [-1.3971% +0.7185% +3.0133%] (p = 0.56 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 10 measurements (30.00%)
+  2 (20.00%) low mild
+  1 (10.00%) high mild
+```
+
+前后对比表(M0 与 R1 数字取自 §5):
+
+| 场景 | M0 中值 | R1 中值 | R3 中值 | R3 vs M0 | R3 vs R1 | criterion 检验 |
+|---|---|---|---|---|---|---|
+| `cold_first_frame` | 136.3 ms | 123.49 ms | 121.84 ms | **变好(−10.6%)** | −1.3% | No change(p=0.62) |
+| `steady_state_top` | 415.3 µs | 358.83 µs | 360.55 µs | **变好(−13.2%)** | +0.5% | No change(p=0.90) |
+| `steady_state_scroll_middle` | 430.2 µs | 371.36 µs | 373.51 µs | **变好(−13.2%)** | +0.6% | No change(p=0.56) |
+
+顶部与中部差 12.96 µs(≈3.5%),视口剔除维持;距 18.18 ms(55 fps)预算余量 **48.7×**。**三项维持「优于 M0」判定,水位与 R1 持平。**
+
+### 8.4 真窗口 scrollbench 复跑(命令 = §3b 同款)—— **blocked_external 状态未变**
+
+```bash
+target/release/examples/scrollbench     # 20 秒自动退出并打印统计
+```
+
+逐字输出(2026-10-02 R3,单次复跑):
+
+```
+scrollbench: 文档 100030 字符 / 4384 行
+scrollbench: 没有采到帧
+```
+
+与 §3b 六次运行结果逐字相同(20 秒内 ui 帧数仍 <121)。环境旁证复查:kwin 合成仍 active(`dbus-send --dest=org.kde.KWin /Compositor org.freedesktop.DBus.Properties.Get string:org.kde.kwin.Compositing string:active` → `boolean true`;注:R1 用的方法调用形式本轮报 `No such method`,KWin 现仅暴露同值 property,读取结论一致)。§3b 的诊断链与结论(会话级 Vulkan WSI Fifo present 阻塞,非应用代码)原样沿用,**该项维持 blocked_external,不因本轮复跑解除**。
+
+### 8.5 R3 结论汇总
+
+| 项 | M0 | R1 | R3(本轮) | 判定 |
+|---|---|---|---|---|
+| 流式 500 行 | 38.7 ms(77.4 µs/行) | 33.800 ms | 33.853 ms(67.71 µs/行) | 与 R1 持平(No change) |
+| 流式 2000 行 | 154.7 ms(77.35 µs/行) | 146.46 ms | 146.00 ms(73.00 µs/行) | 与 R1 持平(No change) |
+| 流式 10000 行 | 789.3 ms(78.93 µs/行) | 1001.7 ms | 993.94 ms(99.39 µs/行) | 与 R1 持平(No change);对 M0 仍 +25.9% 变差 |
+| 流式增长曲线 | 线性 O(n) | 线性偏超线性 | 线性偏超线性(×4.31 / ×6.81) | **O(n) 未解(与 R1 同判)** |
+| 滚动·冷首帧 | 136.3 ms | 123.49 ms | 121.84 ms | 优于 M0,与 R1 持平 |
+| 滚动·稳态顶部 | 415.3 µs | 358.83 µs | 360.55 µs | 优于 M0,与 R1 持平 |
+| 滚动·稳态中部 | 430.2 µs | 371.36 µs | 373.51 µs | 优于 M0,与 R1 持平 |
+| 滚动·真窗口 p50 | 60.3 fps(16.58 ms) | 不可测(blocked_external) | 不可测(**复跑同果,仍 blocked_external**) | 环境未恢复 |
+
+10000 行档 R3 对 M0 换算:993.94 / 789.3 = +25.9%,与 R1 的 +26.9% 同量级(R1 用中值 1001.7;两轮各自中值对同一 M0 基准,差异在轮间噪声内)。
+
+**一句话结论:R2 未做修复,复测即原水位——流式 O(n) 未解(曲线与绝对值均与 R1 无统计差异),滚动渲染路径维持优于 M0,真窗口 vsync 口径维持 blocked_external。** 修复验收命令与口径见 §6 第二条(拍板后复跑 §2 命令,判据 = 每行成本随规模趋稳);环境恢复后跑 §3b 命令与 m0-report §2.2 同表对照。
