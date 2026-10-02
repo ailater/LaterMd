@@ -951,4 +951,77 @@ mod tests {
             "bold 别名族的 CJK 回退链生效"
         );
     }
+
+    /// #23 F3 CJK 防回归:F3 起预览正文用**显式 FontId**(size = 用户字号
+    /// 偏好读侧,族 = [`preview_body_family`]),编辑器字号经 theme 投影到
+    /// Monospace 档。本测试把整条 F3 链路(install 字体链 → `ThemeSettings
+    /// ::apply` 投影字号/行距 → 读侧取族与字号)在同一个 context 上串起来
+    /// 验证:预览所用的族在用户字号下 CJK 回退仍在链尾、字形可见 —— 字号/
+    /// 行距偏好不得以任何方式(换族、断链、新造 `FontFamily::Name` 族)
+    /// 破坏中文可见性。本机无 CJK 候选时如实跳过(降级语义由
+    /// [`inter_registers_even_without_cjk`] 钉住)。
+    #[test]
+    fn font_size_projection_keeps_cjk_fallback_on_preview_family() {
+        let ctx = egui::Context::default();
+        let cjk = install(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+        // 用户字号 22(接近上界,排版偏好的显式自定义值)
+        crate::theme::ThemeSettings {
+            editor_font_size: 22.0,
+            ..Default::default()
+        }
+        .apply(&ctx, crate::theme::ThemeMode::Dark);
+
+        // 读侧拿到的就是投影值:预览 FontId 与编辑器档位的共同 size 来源
+        let size = crate::theme::editor_font_size(&ctx);
+        assert_eq!(size, 22.0, "读侧应与投影同源");
+
+        // 编辑器 Monospace 档:size 已投影,族仍是等宽族(不新造 Name 族,
+        // CJK 回退挂等宽族链尾 —— fonts.rs 的字体链纪律在投影后保持)
+        let mono = ctx
+            .style_of(egui::Theme::Dark)
+            .text_styles
+            .get(&egui::TextStyle::Monospace)
+            .expect("出厂 Monospace 档恒存在")
+            .clone();
+        assert_eq!(mono.size, 22.0);
+        assert_eq!(mono.family, FontFamily::Monospace);
+
+        if cjk.is_none() {
+            eprintln!("本机无 CJK 候选字体,CJK 链尾断言跳过");
+            return;
+        }
+        // 预览正文族(Inter-Preview)与回落族(Proportional)的链尾都还是
+        // CJK 回退:F3 只动 FontId 的 size,族选择沿用 #43 M2 的预览族,
+        // 其 CJK 回退链没被字号偏好殃及。
+        let preview_family = preview_body_family(&ctx);
+        assert_eq!(
+            preview_family,
+            FontFamily::Name(Arc::from(FAMILY_PREVIEW_BODY)),
+            "有 CJK 时预览正文族应为 override 副本族(不是 Proportional)"
+        );
+        ctx.fonts(|f| {
+            for family in [preview_family.clone(), FontFamily::Proportional] {
+                let chain = &f.definitions().families[&family];
+                assert_eq!(
+                    chain.last().map(String::as_str),
+                    Some(CJK_PROPORTIONAL),
+                    "{family:?}: CJK 回退仍在链尾"
+                );
+            }
+        });
+        ctx.fonts_mut(|f| {
+            let preview = FontId::new(size, preview_family.clone());
+            assert!(
+                f.has_glyphs(&preview, "中文字体测试"),
+                "预览正文族在用户字号下 CJK 可见"
+            );
+            let fallback = FontId::new(size, FontFamily::Proportional);
+            assert!(
+                f.has_glyphs(&fallback, "中文字体测试"),
+                "回落族 Proportional 的 CJK 回退可见"
+            );
+        });
+    }
 }

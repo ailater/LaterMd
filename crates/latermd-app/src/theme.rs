@@ -223,13 +223,17 @@ pub struct ThemeSettings {
     pub tab_title_width: TitleWidthMode,
     /// 编辑器与预览正文的**基准字号**(pt,#23):标题按比例放大,本字段
     /// 只定正文基准。有效范围 12..=24(闭区间,CJK 可读性下限),默认 15。
-    /// 本期只交持久化底座,F2 滑杆读写、F3 才投影到渲染 —— 当前渲染路径
-    /// 不消费本字段。
+    /// 生效链路(F3):编辑器经 `apply` 的 `apply_font_size` 投影到
+    /// `TextStyle::Monospace` 档;预览经 [`crate::ui::preview`] 的显式
+    /// `FontId`(size 取自 [`editor_font_size`],标题按 `heading.scales`
+    /// 比例放大,行高随字号重算)。
     pub editor_font_size: f32,
     /// 正文行距倍率(#23),有效范围 1.2..=2.0(闭区间),默认 1.5。
-    /// 是**用户偏好**:`vendored` 的 `MarkdownStyle::line_height_ratio`
-    /// (出厂 1.30,preview-typography §1.2 已定「正文观感不变」)才是
-    /// 当前生效值,用户显式调整在 F3 覆盖之。
+    /// 是**用户偏好**:`apply` 在皮肤/overrides 之上再覆盖 vendored
+    /// `MarkdownStyle::line_height_ratio`(出厂 1.30,preview-typography
+    /// §1.2 的「正文观感不变」口径,见 F3 的行距覆盖决策)。用户调低
+    /// (如 1.2)时 `effective_markdown_style` 的 CJK 行高下限(本机
+    /// CJK face 行高,约 1.448em)在更下层兜底。
     pub line_height: f32,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
@@ -313,9 +317,10 @@ impl ThemeSettings {
         }
     }
 
-    /// 把主题投影到 context:切 egui 主题(外壳)+ 密度 token + 安装正文样式。
-    /// 幂等且带 staleness 检查,每帧调用时空闲帧近零开销。egui 0.36 中 theme
-    /// 属于 options 数据,`logic` 阶段写入合法(不是绘制)。
+    /// 把主题投影到 context:切 egui 主题(外壳)+ 密度 token + 字号档
+    /// (编辑器)+ 安装正文样式(预览,含行距覆盖)。幂等且带 staleness
+    /// 检查,每帧调用时空闲帧近零开销。egui 0.36 中 theme 属于 options
+    /// 数据,`logic` 阶段写入合法(不是绘制)。
     ///
     /// `resolved` 是 [`ThemeMode::resolve`] 的结果(已把 `System` 落到确定的
     /// 明暗):本模块不做系统检测 —— 那要查 dbus/注册表,不该每帧发生。
@@ -329,7 +334,15 @@ impl ThemeSettings {
         }
         apply_shell(ctx);
         apply_density(ctx, self.density);
-        let wanted = effective_markdown_style(ctx, self.markdown_style());
+        apply_font_size(ctx, clamp_editor_font_size(self.editor_font_size));
+        // #23 F3:行距倍率在皮肤/overrides 选出的生效样式**之上**再覆盖
+        // —— 滑杆是显式用户意图,优先级高于「皮肤是一整套显式选择」。
+        // 由此生效的 ratio 恒等于 `theme.line_height`(默认 1.5,vendored
+        // 出厂 1.30 只是未接线时代的基线);`effective_markdown_style` 的
+        // CJK 行高下限照旧兜在更下层,用户调低(如 1.2)时物理需求胜出。
+        let mut wanted = self.markdown_style();
+        wanted.line_height_ratio = clamp_line_height(self.line_height);
+        let wanted = effective_markdown_style(ctx, wanted);
         if *egui_markdown_style::global_style(ctx) != wanted {
             egui_markdown_style::set_style(ctx, wanted);
         }
@@ -622,6 +635,56 @@ fn apply_density(ctx: &egui::Context, density: Density) {
             widget.corner_radius = radius;
         }
     });
+}
+
+/// 字号偏好(#23 F3)在 egui data 槽的键:`apply_font_size` 写入(经
+/// staleness 检查),预览正文侧的 [`editor_font_size`] 读取。
+fn font_size_id() -> egui::Id {
+    egui::Id::new("latermd-editor-font-size")
+}
+
+/// 当前生效的正文基准字号(#23 F3):预览正文(vendored `MarkdownLabel`
+/// 的显式 `FontId`)与编辑器 Monospace 档投影同源。
+///
+/// 生产路径恒有 `ThemeSettings::apply` 先行(启动 main 一次 + 每帧 logic);
+/// 未投影过的 context(无头测试直渲预览)回落出厂默认 15pt —— 比回落
+/// egui Body 档出厂值更接近真机口径。自建显式 `FontId` 的取证测试
+/// (#43 系列)不受本读侧影响。
+pub fn editor_font_size(ctx: &egui::Context) -> f32 {
+    ctx.data(|data| {
+        data.get_temp::<f32>(font_size_id())
+            .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
+    })
+}
+
+/// 字号偏好(#23 F3)→ egui style 的 `TextStyle::Monospace` 档投影:编辑器
+/// 面板(源码模式 TextEdit、行号槽、Live 模式活动块源码)字体恒取
+/// Monospace 档,改档位 size 即改编辑器字号。族(`FontFamily::Monospace`,
+/// CJK 回退挂其链尾)与链内其余字体分毫不动 —— 只改 size,不新造
+/// `FontFamily::Name` 族,字体链纪律由投影保持。
+///
+/// 与 [`apply_density`] 同款 staleness 检查:`apply` 每帧调用,值没变就
+/// 不写 style(`style_mut_of` 即使值相同也推进 style 版本、作废布局缓存,
+/// 滑杆拖动帧之外不得付这笔开销);字号变了(滑杆/载入新 settings)当帧
+/// 即重投影 —— 不放进 `apply_shell` 那类一次性投影(ui.data 标志只挡
+/// 第一次,后续滑杆变化会哑掉),而是像密度一样按值键控。
+fn apply_font_size(ctx: &egui::Context, size: f32) {
+    let id = font_size_id();
+    let changed = ctx.data_mut(|data| {
+        let changed = data.get_temp::<f32>(id) != Some(size);
+        data.insert_temp(id, size);
+        changed
+    });
+    if !changed {
+        return;
+    }
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.style_mut_of(theme, |style| {
+            if let Some(mono) = style.text_styles.get_mut(&egui::TextStyle::Monospace) {
+                mono.size = size;
+            }
+        });
+    }
 }
 
 /// 一份皮肤:显示名(文件名去扩展名)+ 正文样式。
@@ -985,6 +1048,212 @@ mod tests {
         assert_eq!(clamp_line_height(f32::NEG_INFINITY), 1.2, "负无穷钳到下界");
     }
 
+    /// #23 F3:字号投影到 `TextStyle::Monospace` 档(编辑器面板/行号槽/
+    /// Live 活动块源码的字体档),Light/Dark 两套 style 都生效;族保持
+    /// 等宽族(CJK 回退挂其链尾,只改 size 不换族);**值变了即重投影**
+    /// —— staleness 检查按值键控而非一次性标志(apply_shell 式),滑杆
+    /// 每拖一步都当帧生效。读侧 [`editor_font_size`] 与投影同源。
+    #[test]
+    fn apply_projects_font_size_to_monospace_style_and_reprojects_on_change() {
+        let ctx = egui::Context::default();
+        let mono_of = |ctx: &egui::Context| {
+            ctx.style_of(egui::Theme::Dark)
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .expect("出厂 Monospace 档恒存在")
+                .clone()
+        };
+        let factory = mono_of(&ctx);
+        assert_ne!(
+            factory.size, 18.0,
+            "防御:出厂 Monospace 档恰为 18 时本测试失去鉴别力(egui 0.36 实为 13.0)"
+        );
+        assert_eq!(
+            factory.family,
+            egui::FontFamily::Monospace,
+            "防御:出厂档即等宽族"
+        );
+
+        // 投影 18:两套 style 的档位 size 换成用户值,族不动
+        ThemeSettings {
+            editor_font_size: 18.0,
+            ..ThemeSettings::default()
+        }
+        .apply(&ctx, ThemeMode::Dark);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            let mono = style
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .expect("出厂 Monospace 档恒存在");
+            assert_eq!(mono.size, 18.0, "{theme:?}: Monospace 档投影用户字号");
+            assert_eq!(
+                mono.family,
+                egui::FontFamily::Monospace,
+                "{theme:?}: 投影只动 size,族保持等宽族(CJK 回退链挂其链尾)"
+            );
+        }
+        assert_eq!(
+            editor_font_size(&ctx),
+            18.0,
+            "读侧与投影同源(预览 FontId 的 size 来源)"
+        );
+
+        // 同一 context 上换字号(滑杆第二步/载入新 settings):当帧重投影
+        for (size, expected) in [(13.0, 13.0), (24.0, 24.0), (12.0, 12.0)] {
+            ThemeSettings {
+                editor_font_size: size,
+                ..ThemeSettings::default()
+            }
+            .apply(&ctx, ThemeMode::Dark);
+            assert_eq!(
+                mono_of(&ctx).size,
+                expected,
+                "字号变更必须即时重投影,不是只投影一次的一次性标志"
+            );
+        }
+        assert_eq!(editor_font_size(&ctx), 12.0);
+    }
+
+    /// #23 F3:行距覆盖优先级 —— 滑杆(显式用户意图)、皮肤、overrides、
+    /// 出厂默认,从左到右依次让位。overrides 里显式写的 `line_height_ratio`
+    /// 同样被用户值盖过,但 overrides 的**其他**字段(block_spacing)原样生效。
+    #[test]
+    fn apply_overrides_line_height_ratio_over_skins_and_overrides() {
+        let ctx = egui::Context::default();
+        // 出厂默认(用户没动过滑杆,1.5):生效 ratio 即默认偏好,不是 vendored 的 1.30
+        ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
+        assert_eq!(
+            egui_markdown_style::global_style(&ctx).line_height_ratio,
+            LINE_HEIGHT_DEFAULT,
+            "默认安装的生效行距 = 用户偏好的默认 1.5"
+        );
+
+        // overrides 显式写 1.30(vendored 出厂值):用户 1.7 仍覆盖之
+        let overrides = MarkdownStyle {
+            block_spacing: 11.0,
+            line_height_ratio: 1.30,
+            ..MarkdownStyle::default()
+        };
+        ThemeSettings {
+            line_height: 1.7,
+            overrides: Some(overrides),
+            ..ThemeSettings::default()
+        }
+        .apply(&ctx, ThemeMode::Dark);
+        let installed = egui_markdown_style::global_style(&ctx);
+        assert_eq!(
+            installed.line_height_ratio, 1.7,
+            "用户行距在 overrides 之上再覆盖"
+        );
+        assert_eq!(
+            installed.block_spacing, 11.0,
+            "overrides 的其他字段不被行距覆盖殃及"
+        );
+
+        // 皮肤(优先级最高的样式源)同样只输给行距覆盖:皮肤里调的
+        // line_height_ratio 在皮肤被选中期间不生效,滑杆是唯一行距真源。
+        let skin = MarkdownStyle {
+            block_spacing: 19.0,
+            line_height_ratio: 1.30,
+            ..MarkdownStyle::default()
+        };
+        let settings = ThemeSettings {
+            line_height: 1.5,
+            skin: Some("我的皮肤".to_owned()),
+            skin_style: Some(skin),
+            ..ThemeSettings::default()
+        };
+        settings.apply(&ctx, ThemeMode::Dark);
+        let installed = egui_markdown_style::global_style(&ctx);
+        assert_eq!(
+            installed.block_spacing, 19.0,
+            "皮肤的其他字段仍生效(优先级链未被整体推翻)"
+        );
+        assert_eq!(
+            installed.line_height_ratio, 1.5,
+            "行距唯一真源是用户滑杆,皮肤值不生效"
+        );
+    }
+
+    /// #23 F3:排版偏好与密度互不覆盖 —— 密度切换(重投影 spacing token)
+    /// 不得重置字号档与正文样式;反之改字号/行距不得重置密度投影;来回切
+    /// 各自恢复,互不累积。`apply_density` 与 `apply_font_size` 是两个独立
+    /// 的 staleness 槽,style 写入面不相交(spacing / text_styles+正文样式)。
+    #[test]
+    fn font_prefs_and_density_do_not_clobber_each_other() {
+        let ctx = egui::Context::default();
+        let factory_item_spacing = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
+        let mono_of = |ctx: &egui::Context| {
+            ctx.style_of(egui::Theme::Dark)
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .expect("出厂 Monospace 档恒存在")
+                .size
+        };
+        let ratio_of =
+            |ctx: &egui::Context| egui_markdown_style::global_style(ctx).line_height_ratio;
+        let prefs = |size: f32, ratio: f32, density: Density| ThemeSettings {
+            editor_font_size: size,
+            line_height: ratio,
+            density,
+            ..ThemeSettings::default()
+        };
+
+        // 起点:紧凑密度 + 自定义排版偏好,三者同时生效
+        prefs(18.0, 1.7, Density::Compact).apply(&ctx, ThemeMode::Dark);
+        let compacted_item_spacing = ctx.style_of(egui::Theme::Dark).spacing.item_spacing;
+        assert!(
+            compacted_item_spacing.y < factory_item_spacing.y,
+            "防御:紧凑档间距确比出厂小"
+        );
+        assert_eq!(mono_of(&ctx), 18.0);
+        assert_eq!(ratio_of(&ctx), 1.7);
+
+        // 切密度(字号/行距保持):密度重投影,不得重置字号档与正文样式
+        prefs(18.0, 1.7, Density::Standard).apply(&ctx, ThemeMode::Dark);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).spacing.item_spacing,
+            factory_item_spacing,
+            "宽松档恢复出厂间距"
+        );
+        assert_eq!(mono_of(&ctx), 18.0, "切密度不得重置字号投影");
+        assert_eq!(ratio_of(&ctx), 1.7, "切密度不得重置行距覆盖");
+
+        // 反向:改字号/行距(密度不动),不得重置密度投影
+        prefs(12.0, 1.2, Density::Standard).apply(&ctx, ThemeMode::Dark);
+        assert_eq!(mono_of(&ctx), 12.0);
+        assert_eq!(ratio_of(&ctx), 1.2);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).spacing.item_spacing,
+            factory_item_spacing,
+            "改字号/行距不得重置密度投影"
+        );
+
+        // 再切回紧凑:两侧各自恢复,互不累积
+        prefs(18.0, 1.7, Density::Compact).apply(&ctx, ThemeMode::Dark);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).spacing.item_spacing,
+            compacted_item_spacing
+        );
+        assert_eq!(mono_of(&ctx), 18.0);
+        assert_eq!(ratio_of(&ctx), 1.7);
+    }
+
+    /// #23 F3 读侧兜底:未投影过的 context(无头测试直渲预览、未跑
+    /// `ThemeSettings::apply`)回落出厂默认字号,而不是 egui Body 档的
+    /// 出厂值 —— 预览 FontId 的 size 在两条路径(投影过/未投影)下都来自
+    /// 本读侧,兜底值即用户偏好的出厂值。
+    #[test]
+    fn editor_font_size_reader_falls_back_to_default_before_projection() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            editor_font_size(&ctx),
+            EDITOR_FONT_SIZE_DEFAULT,
+            "未投影过的 context 回落出厂默认 15pt"
+        );
+    }
+
     /// 首次运行:目录/文件不存在 → Missing;`load` 语义是回落默认,这里只测
     /// 判别本身(不调 `load`,它走真实平台目录)。
     #[test]
@@ -1027,7 +1296,9 @@ mod tests {
     }
 
     /// 投影:切 egui 主题(context 随即按 light/dark 选 visuals),并把
-    /// overrides 装进 context 默认槽;默认深色;幂等。
+    /// overrides 装进 context 默认槽;默认深色;幂等。#23 F3 起生效样式
+    /// 的 `line_height_ratio` 一律被用户偏好覆盖(overrides 的 1.30 也
+    /// 盖成默认 1.5),其余字段逐项保留。
     #[test]
     fn apply_switches_theme_and_installs_markdown_style() {
         let ctx = egui::Context::default();
@@ -1047,12 +1318,15 @@ mod tests {
         assert!(!ctx.global_style().visuals.dark_mode);
         assert_eq!(egui_markdown_style::global_style(&ctx).block_spacing, 11.0);
 
-        // 无 overrides 时装的就是出厂默认;重复 apply 幂等
+        // 无 overrides 时装的就是出厂默认 + 用户行距覆盖;重复 apply 幂等
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let mut expected = default_markdown_style();
+        expected.line_height_ratio = LINE_HEIGHT_DEFAULT;
         assert_eq!(
             *egui_markdown_style::global_style(&ctx),
-            default_markdown_style()
+            expected,
+            "生效样式 = 出厂默认,唯 line_height_ratio 被用户偏好覆盖"
         );
         ThemeSettings::default().apply(&ctx, ThemeMode::Dark);
     }

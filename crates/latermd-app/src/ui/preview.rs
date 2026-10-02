@@ -577,13 +577,20 @@ pub fn ui(
             // [X](<wiki://X>) 链接,点击由下面的 handler 拦截;相对图片
             // 地址在这里再换成 file:// URI(两层都是"只改渲染,源码不动")
             let rendered = resolve_relative_images(&preview.rendered, base_dir);
-            // 字体(#43 M2):字号沿用默认解析(Default → Body,将来 #23 的
-            // 字号设置自然生效),只把族换成预览专用族 —— 链头是行 metrics
-            // 对齐过 CJK 回退的 Inter 副本,中英数字混排基线齐;无 CJK 时
-            // 回落 Proportional,行为与修复前一致。font 参与 vendored 布局
-            // 缓存 hash,族名是常量,不破坏 widget id 稳定性(§6.7)。
-            let mut font = egui::FontSelection::Default.resolve(ui.style());
-            font.family = crate::fonts::preview_body_family(ui.ctx());
+            // 字体(#43 M2 + #23 F3):size 取用户字号偏好(投影槽的读侧,
+            // 未投影的 context 回落出厂 15pt),族用预览专用族 —— 链头是行
+            // metrics 对齐过 CJK 回退的 Inter 副本,中英数字混排基线齐;无
+            // CJK 时回落 Proportional,行为与修复前一致。显式 FontId 经
+            // vendored 布局自然传导:标题按 `heading.scales` 比例放大(base
+            // font size × scales,layout.rs 标题分支),行高随各自字号重算,
+            // 行距倍率来自 markdown style 的 `line_height_ratio`(用户滑杆,
+            // ThemeSettings::apply 已在皮肤/overrides 之上覆盖)。font 参与
+            // vendored 布局缓存 hash,族名与字号均随偏好稳定,不破坏 widget
+            // id 稳定性(§6.7)。
+            let font = egui::FontId::new(
+                crate::theme::editor_font_size(ui.ctx()),
+                crate::fonts::preview_body_family(ui.ctx()),
+            );
             MarkdownLabel::new(label_id, rendered.as_ref())
                 .font(font)
                 .wrap()
