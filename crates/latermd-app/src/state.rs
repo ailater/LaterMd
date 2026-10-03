@@ -164,13 +164,19 @@ pub struct PreviewState {
     /// 文档大纲,与 `text` 同一次重建产出,`span` 直接索引该文本。
     pub outline: Vec<OutlineItem>,
     /// 喂给预览的**渲染文本**:`[[wikilink]]` 已展开成 `wiki://` 链接
-    /// (P3 双向链接)。源码 `text` 一字不改 —— 展开只影响渲染。
+    /// (P3 双向链接),覆盖集内的 emoji 已改写成 `emoji://` 链接(#48 B1)。
+    /// 源码 `text` 一字不改 —— 两层改写都只影响渲染。
     pub rendered: String,
-    /// 「源码偏移 ↔ 渲染偏移」映射表(LP2-4):与 `rendered` 同一次重建产出
-    /// (`latermd_md::expand_wikilinks_with_map`),两者单一事实来源。预览侧
-    /// 消费(大纲跳转/section anchor 的偏移换算,见 `ui::preview`),只读
-    /// 派生物,不回写编辑缓冲。
+    /// 「源码偏移 ↔ wikilink 展开后偏移」映射表(LP2-4 第一层):与
+    /// `rendered` 同一次重建产出(`latermd_md::expand_wikilinks_with_map`)。
+    /// 预览侧消费(大纲跳转/section anchor 的偏移换算,见 `ui::preview`),
+    /// 只读派生物,不回写编辑缓冲。
     pub offset_map: latermd_md::OffsetMap,
+    /// 「wikilink 展开后偏移 ↔ `rendered` 偏移」映射表(#48 B1 第二层:
+    /// emoji 链接改写),与 `rendered` 同次产出。消费点把它与 `offset_map`
+    /// **按改写顺序串行穿过**(可组合口径见 `latermd_md::OffsetMap`),
+    /// 不与第一层预合并。
+    pub emoji_map: latermd_md::OffsetMap,
     /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
     /// 面板收起期间悬置(消费只发生在预览绘制帧);快照 rebuild(文档
     /// 变更)即丢弃 —— 旧偏移对重建后的文本没有意义。
@@ -182,13 +188,21 @@ impl PreviewState {
     /// 以编辑器当前内容建立快照(文本 + 大纲)。
     pub fn new(editor: &EditorBuffer) -> Self {
         let text = editor.text().to_owned();
-        // 展开放在重建里而不是每帧:wikilink 展开要遍历全文,空闲帧
-        // 不该付这个代价(与「修订号前进才重建」同一条规则)。渲染串与
-        // 偏移映射同一次产出,消费侧换算与渲染文本永不漂移。
-        let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
+        // 两层改写都放在重建里而不是每帧:wikilink 展开要遍历全文、emoji
+        // 改写要解析全文,空闲帧不该付这个代价(与「修订号前进才重建」同
+        // 一条规则)。顺序固定 **wikilink 展开 → emoji 链接改写**(再往预览
+        // 绘制帧叠相对图片 URI):wikilink 展开把 `[[X]]` 变成链接后,emoji
+        // 层才能把它的文本/目标整体豁免,反过来会拆坏 wikilink。每层一张
+        // 映射表,与渲染串同次产出,消费点按同一顺序串行穿过。
+        let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
+        let (rendered, emoji_map) = latermd_md::expand_emoji_links(
+            &after_wikilinks,
+            crate::ui::emoji_data::covered_glyphs(),
+        );
         Self {
             rendered,
             offset_map,
+            emoji_map,
             outline: latermd_md::outline(&text),
             text,
             synced_rev: editor.revision(),
@@ -3013,6 +3027,76 @@ mod tests {
         );
         // 换算后取到的确实是渲染串里的标题文本(落点正确,不是恰好数字相等)
         assert!(preview.rendered[mapped..].starts_with("## 标题"));
+    }
+
+    /// #48 B1:emoji 链接改写只进 `rendered` 渲染副本 —— 源码、快照真源
+    /// 一字不动;两层映射(wikilink → emoji)串行穿过,标题偏移落在渲染串
+    /// 同一文本处;代码区(围栏 + 行内)与既有链接内部豁免。
+    #[test]
+    fn preview_emoji_rewrite_touches_only_rendered_copy() {
+        let source =
+            "开场 😀 与 [[架构决策]]\n\n## 标题\n\n```rust\nlet e = \"😀\";\n```\n\n行内 `😀` 免\n";
+        let mut editor = EditorBuffer::new(source);
+        editor.clear_dirty();
+        let (rev, dirty) = (editor.revision(), editor.is_dirty());
+        let preview = PreviewState::new(&editor);
+
+        // 源码零外泄:缓冲、快照真源、修订号与 dirty 分毫不动
+        assert_eq!(editor.text(), source);
+        assert_eq!(preview.text, source);
+        assert_eq!(editor.revision(), rev);
+        assert_eq!(editor.is_dirty(), dirty);
+
+        // 渲染副本:裸 😀 成 emoji:// 链接;wikilink 照旧展开且不被拆坏;
+        // 围栏与行内代码豁免
+        assert!(preview
+            .rendered
+            .starts_with("开场 [😀](<emoji://😀>) 与 [架构决策](<wiki://架构决策>)\n"));
+        assert!(preview.rendered.contains("let e = \"😀\";"));
+        assert!(preview.rendered.contains("行内 `😀` 免"));
+
+        // 两层串行穿过:标题(在两类改写之后)落在渲染串同一文本处
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let after1 = preview.offset_map.source_to_rendered(heading_src);
+        let after2 = preview.emoji_map.source_to_rendered(after1);
+        assert_eq!(
+            after2,
+            preview.rendered.find("## 标题").expect("in rendered")
+        );
+        assert_eq!(
+            preview
+                .offset_map
+                .rendered_to_source(preview.emoji_map.rendered_to_source(after2)),
+            heading_src,
+            "两层逆穿回源码原处"
+        );
+    }
+
+    /// #48 B1:改写零外泄到落盘 —— emoji 文档建预览快照后保存,盘上字节与
+    /// 源码逐字节相同(改写只活在渲染副本,保存走编辑缓冲)。
+    #[test]
+    fn emoji_rewrite_never_leaks_into_saved_bytes() {
+        let path = temp_path("emoji-b1.md");
+        let source = "# 标题 😀\n\n正文 🚀 与 [[链接]]\n\n```rust\nlet e = \"😀\";\n```\n";
+        let mut state = State::default();
+        {
+            let tab = state.tabs.current_mut();
+            tab.editor.replace_all(source);
+            tab.preview.rebuild(&tab.editor);
+        }
+        assert_ne!(
+            state.tabs.current().preview.rendered,
+            source,
+            "前置:渲染副本确实被改写(断言非恒真)"
+        );
+
+        state.save_to(path.clone());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            source.as_bytes(),
+            "盘上字节 == 源码,emoji 改写零外泄"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 大纲点击归约:跳过 span 吸收的前置换行落到标题行首,并按当前缓冲

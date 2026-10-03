@@ -30,7 +30,7 @@
 
 ### F2 的连带结论（必须让用户知道）
 
-- **本应用内**：编辑器正文黑白线条 emoji（Noto Emoji 风格）。**#47 A2 起**：插入面板与「最近使用」条用随包 Twemoji 72px PNG 纹理显示**彩色**（`assets/emoji/twemoji/`，CC-BY 4.0，登记 distribution.md §6；损坏/缺失回落黑白，实现见 `ui/emoji_panel.rs`「纹理路径」节）。
+- **本应用内**：编辑器正文黑白线条 emoji（Noto Emoji 风格）。**#47 A2 起**：插入面板与「最近使用」条用随包 Twemoji 72px PNG 纹理显示**彩色**（`assets/emoji/twemoji/`，CC-BY 4.0，登记 distribution.md §6；损坏/缺失回落黑白，实现见 `ui/emoji_panel.rs`「纹理路径」节）。**#48 B1/B2 起**：右栏**预览内联** emoji 同走纹理彩色（`emoji://` 渲染副本改写 + LinkHandler inline_widget 两件套，见 §12；只预览，编辑器正文与 Live 模式仍黑白）。
 - **导出的 HTML / 粘到微信、飞书、GitHub**：显示效果**取决于目标环境的字体**，不承诺必然彩色。
 - Markdown 文件里存的永远是标准 Unicode 字符，**不存在兼容性问题**。
 - 这条要在面板底部用一行小字说明（现行口径：「面板内彩色；编辑器正文仍黑白；导出/外发的显示效果取决于目标环境的字体」），否则用户会以为程序坏了。
@@ -157,7 +157,26 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 
 - **背景**：§2 F2 的「彩色不支持」是 epaint 字形管线上游限制（所有字形恒以纯白填充写入图集）；可行性调查实测换任何彩色字体（CBDT/COLR/sbix）都不可行（CBDT/COLR 字形无矢量轮廓，装上后连黑白都得不到），**随包 PNG 纹理是唯一低侵入路径**（`image` 解码 → `load_texture` → 白 tint Image，零新增依赖，`latermd-app` 已依赖 `image` 的 png feature）。
 - **范围**：**面板 + 最近使用条**两处展示层（`ui/emoji_panel.rs` 单文件纹理分支 + `assets/emoji/twemoji/` 资产目录）。资产 = Twemoji（jdecked **v17.0.3**）72×72 PNG × 272 枚，CC-BY 4.0（全文随库，登记 [distribution.md](distribution.md) §6），钉版本下载脚本与 SOURCES.txt 随库可复现。缓存 = 会话级懒解码 `TextureHandle`（首帧懒建，不合并图集）。
-- **明确不含**：预览内联彩色（**#48** E-C2，字符串层 `emoji://` 改写 + LinkHandler inline_widget，另案）、**编辑器正文**彩色（feasibility §4 否决：需 fork epaint，光标/选择/IME/undo 全锚在 galley，收益配不上代价）。
+- **明确不含**：预览内联彩色（**#48** E-C2，字符串层 `emoji://` 改写 + LinkHandler inline_widget——已于 #48 落地，见 §12 与 [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章）、**编辑器正文**彩色（feasibility §4 否决：需 fork epaint，光标/选择/IME/undo 全锚在 galley，收益配不上代价）。
 - **失败面**：PNG 解码失败 / 资产缺失 → 该单元回落出厂 NotoEmoji 黑白（`painter.text` 原路径）；与 E3「数据保留、渲染兜底」同哲学，彩色不引入新失败面。点击区、hover、tooltip、`Message::EmojiInserted`、E3 cmap 过滤、settings.json recent 持久化零改动。
 - **对外口径**（用户可见文案的唯一口径）：「**面板内彩色；编辑器正文仍黑白；导出/外发的显示效果取决于目标环境的字体**」——面板底部说明行（`ui/emoji_panel.rs`）、本文 §2、验收文档 §3 三处同源；**不许出现「全面支持彩色」**。
 - **验收**：自动证据与人工清单分栏落档于 [emoji-color-acceptance.md](emoji-color-acceptance.md)（渲染不 panic、纹理命中计数、损坏回落、272/272 资产校验、体积/显存数字；Linux X11 / HiDPI / Win/mac 目视与 272 枚抽查待坤哥）。
+
+---
+
+## 12. E-C2 落地（#48，2026-10-04）
+
+> 本节是落地登记，不再是规划。完整取舍与实测依据见可行性调查
+> `.zcode/workflow-drafts/emoji-color-feasibility.md` §3/§7；验收证据见
+> [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章；实现岔路登记
+> decisions-pending #90（B1）/ #91（B2）。commits：B1 `b50a292`、B2 `a6ea1bc`、B3 `bf1bdbc`（验收与口径落档，纯 docs）。
+
+- **机制（两件套，缺一不可，feasibility §3.2 的结论）**：
+  - **B1 渲染副本改写器**：`latermd_md::expand_emoji_links` 纯函数（`latermd-md/src/lib.rs:740`，与 wikilinks/inline_marks 同层，不依赖 egui）把裸 emoji 改写成 `[😀](<emoji://😀>)`，产物**只进 `preview.rendered` 渲染副本**——源码、rope、字节偏移、撤销栈、落盘字节分毫不动（与图片改写同一承诺）。豁免走**与渲染同一套 pulldown-cmark**（同 vendored options）的事件区间：围栏/缩进代码块、行内代码、既有链接的文本与目标、HTML、脚注。覆盖集 = `emoji_data` 全表 272 枚参数注入（app 侧 `covered_glyphs()` OnceLock，`emoji_data.rs:279`），与面板/纹理共用单一数据源。同次产出第二层 `OffsetMap`（`state.rs:179`），wikilink → emoji 两层**串行穿过可组合**（#14 LP2-4 口径，`preview.rs:129` `map_source_offset` 三层穿透）。
+  - **B2 inline widget 接线**：`AiLinkHandler`（`preview.rs:254`）接 vendored `LinkHandler` 五级扩展点，**app 侧实现、vendor 零改动**：`inline_widget_size` = font.size 正方形（行高恒不超正文自然行高，含 emoji 的行与相邻行同高）；`layout_link` = 透明占位用链接文字本体 + 同款字体（推进宽度与「emoji 以普通文本出现」逐像素一致，改写前后文本流零漂移）；`paint_inline_widget` = 查 #47 同源会话缓存 `emoji_panel::inline_texture`（`emoji_panel.rs:415`）→ 白 tint 画正方形（纹理原色），查不到什么都不画（透明占位原样保持）；`link_style` = 正文色 + 无下划线（不吃超链接样式）；`click` = 吞掉（`emoji://😀` 不是合法 URL，交浏览器只会弹错）；手型抑制在 app 侧 label 渲染后按本帧 emoji 区块压回 Default（vendored 对 inline widget 悬停无条件置手型，`link_style` 管不到光标，#91）。
+- **范围：只预览（右栏 `preview.rendered` 渲染链）**。**编辑器正文不做**——重申 feasibility §4：egui 0.36.2 `LayoutJob` 无图片内嵌通道、字形管线恒白填充，「编辑器彩色」只有 fork epaint（与不 fork 边界冲突）或字符换 widget（破坏 `CCursor`↔字节换算与 IME/undo）两条路，收益配不上代价，§9 禁区维持。**Live 模式富渲染块同口径维持黑白**（`live.rs:457` 直渲染源码 block_text，不进改写链不挂 handler——Live 是编辑器形态）。代码块/行内代码内的 emoji 豁免不改写（保持黑白字形）。
+- **三段覆盖断言销账（feasibility §3.2 点名的缺口）**：段落/标题/表格全部吃到 inline widget（`emoji_inline_widget_paints_textured_squares_in_paragraph` / `…_inside_heading_at_link_font_scale` / `…_in_table_cell`，2026-10-04 实跑 3 passed）——无需「该段暂为黑白」的降级登记；唯一缩水口径是**标题内 emoji 不随 H1–H6 字号放大**（vendored 对 `Token::Link` 一律传正文基础字体，与 wiki:///ai:// 在标题里的既有行为同源，#91 已知如实行为，附 vendor ①类改法）。
+- **已知边界（如实）**：覆盖集外字符（如 🫠）不改写（只有 272 枚有资产，改写而无纹理 = 从预览消失）；手写表外 `emoji://` 链接只留透明占位不画图；链接引用定义标签与脚注定义正文内的 emoji 暂不改写（黑白，#90）。
+- **导出口径（重申 feasibility §5）**：`latermd-export` 零改动，emoji 以 Unicode 原样透传，CSS 只声明系统字体栈——导出/外发的显示效果**取决于目标环境的字体**，不承诺任何平台必然彩色；不做「导出保证彩色」的能力宣称。
+- **对外口径（E-C1 口径按交付面扩展，用户可见文案的唯一口径）**：「**面板与预览内联彩色；编辑器正文（含 Live 模式）仍黑白；导出/外发的显示效果取决于目标环境的字体**」——**不许出现「全面支持彩色」**（2026-10-04 grep 核对：docs/crates/README 无一处能力宣称）。遗留：面板底部说明行（`emoji_panel.rs:619`）仍写「面板内彩色…」，句子真但未提预览，待后续 crates/ commit 顺手更新。
+- **验收**：自动证据（三段断言、豁免测试、落盘字节不变、副作用/回落/全量回归）与人工清单（真机预览正文/标题/表格观感、HiDPI、明暗主题、代码区黑白对照、缓存同源、Win11/macOS 14、导出抽查共八项）分栏落档于 [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章（B3 `bf1bdbc`）。自动证据 2026-10-04 本机实跑：三段覆盖断言 3 passed（`cargo test -p latermd-app --all-features emoji_inline_widget`）、豁免 9 passed（`cargo test -p latermd-md --all-features expand_emoji_links`）、落盘字节不变 2 passed（`emoji_rewrite`）、emoji 全过滤 50 passed、两 crate 全量 622 passed + 1 ignored（既有 #39 取证）/ 49 passed、`cargo fmt --all --check` 干净、禁语 grep 六处命中全为禁令/核对自身零能力宣称；三轮 clippy 与 cargo doc 本轮未复跑（B3 零代码改动仅 .md，结果与 B2 head 全等，编排最终 head 复验兜底）。真机人工项 blocked_external（本机 Linux 无头、缺 Win11/macOS 14 真机），不以单测冒充目视。

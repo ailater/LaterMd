@@ -2,8 +2,24 @@
 
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
-> #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #89 为当前最新条目。
+> #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
+> 编号 #91 为当前最新条目。
+
+## #91 #48 B2 emoji inline widget 的两处口径:标题里的 emoji 不随标题字号缩放(沿用 vendored 链接基础字体)、手型抑制在 app 侧渲染后压回(不改 vendor)(2026-10-04,#48 emoji-color B2·自动拍板)
+
+- **岔路**:①可行性调查 §3.2 点名要验的「heading 段是否吃到 inline widget」实测落地:吃到了(图片落在标题行内),但 vendored 层对 `Token::Link` 一律传**正文基础字体**(layout.rs `Token::Link` 分支不走 `Token::Text` 的 heading 字号放大),`inline_widget_size`/`layout_link` 拿到的 font 恒为正文档 —— 标题里的 emoji 彩图因此不随 H1-H6 缩放;②vendored 对悬停中的 inline widget **无条件**置 PointingHand(label.rs `handle_hover` 的 inline-widget 分支、layout.rs `render_link_in_ui`),`link_style` 管不到光标,任务书却要求「不吃手型」。
+- **备选**:①a 接受(emoji 在标题里按正文字号画,与 wiki:///ai:// 链接文本在标题里的既有行为同源);①b vendor ①类补丁:`Token::Link` 分支继承当前 heading 的放大字体(或引入 current font 上下文),登记 vendor/README 变更表;②a app 侧在 `MarkdownLabel::show` 之后按本帧 emoji widget 区块把悬停光标压回 `CursorIcon::Default`(同面板内后写者胜);②b vendor 补丁给 `LinkStyle` 加 cursor 字段或 inline widget 关手型开关。
+- **自动选择**:①a + ②a。标题覆盖断言(preview.rs `emoji_inline_widget_paints_inside_heading_at_link_font_scale`)把两个事实钉成已知如实行为:图片纵向落在标题行带内(生效)、边长与段落档一致(不缩放)。
+- **理由**:B2 任务红线「app 侧实现,不改 vendor」直接排除 ①b/②b;①b 还会牵动**所有**链接(含 http/ai://wiki://)在标题里的字形 metrics,影响面远超 emoji;现状并非 LaterMD 缺陷而是上游简化(标题里的任何链接文本都按正文渲染,emoji 只是首次把这个差异**画**出来);②a 的副作用面已收敛:压回只发生在指针落在本帧 emoji 区块内、且写点在 label 渲染之后、同帧后续面板(编辑器/侧栏)之前 —— 后续面板按各自悬停自设光标,不受影响(无头双向断言:emoji 上 Default、普通链接上 PointingHand 均钉住)。
+- **如何改**:①要 emoji 随标题缩放 —— vendor/egui_markdown/src/layout.rs `Token::Link` 分支把 `font_id` 换成继承当前 heading 放大后的 format(照 `Token::Text` 的 heading 分支同款推导),按 §6 ①类登记 vendor/README 变更表并跑 check.sh,app 侧零改动(`inline_widget_size`/占位宽度都按传入 font 派生,自动跟随);②要更根治的手型口径 —— vendored `LinkStyle` 加 `cursor: Option<CursorIcon>` 字段(①类),app 侧删掉 preview::ui 里 label 渲染后的压回段与 `emoji_rects` 探针的抑制用途(探针保留供无头断言)。
+
+## #90 #48 B1 emoji→emoji:// 链接改写器的三处口径:覆盖集取 emoji_data 全表 272 枚(参数注入 md 层)、豁免扫描走 pulldown 事件区间(而非手写围栏开关机)、载荷原文直书尖括号目标(而非百分号编码)(2026-10-04,#48 emoji-color B1·自动拍板)
+
+- **岔路**:任务书把三处自由度交给实现者:①**覆盖口径**——只改写 `emoji_data` 覆盖的枚,还是全量 emoji 码位段(任务书明示二选一记本表);②**豁免扫描机制**——任务书说「照 inline_image_dests/wikilinks 先例」(两者都是手写 ```/~~~ 围栏开关机),但同段又要求行内代码与链接文本/目标内豁免,先例机制并不覆盖后两样;③**载荷编码**——emoji 原文 URL 编码或等价可逆编码,口径自定。
+- **备选**:①全量 Unicode emoji 码位段(RangeTable 式判定,面板外枚也改写);②app 侧手写扫描器(围栏开关机 + 自造反引号配对 + 括号配对);③百分号编码 `emoji://%F0%9F%98%80`。
+- **自动选择**:①**latermd-md 新纯函数 `expand_emoji_links(text, covered)`,覆盖集 = `emoji_data::covered_glyphs()`(面板数据表全量 272 枚,含旗帜/带 FE0F 的两字符形态,前缀长优先匹配),app 侧 OnceLock 注入**;②**豁免区间走与渲染同一套 pulldown-cmark(同 vendored options)的事件区间**——CodeBlock(围栏+缩进+info string)/Code(行内)/Link/Image(构造区间含文本与目标)/Html 块与行内标签/脚注引用与定义,首字符快路径无命中不解析;③**载荷原文直书 `[😀](<emoji://😀>)`**,可逆 = 剥 `emoji://` 前缀。
+- **理由**:①覆盖集外的字符改写后无纹理可画——B2 的回落是「透明占位不动」,等于该 emoji 从预览**消失**;只有 272 枚有 #47 的 Twemoji 资产(272/272 在位),覆盖集与面板/纹理共用单一数据源,改表自动跟随;参数化注入让 md 层不反向依赖 app 的数据表,归属与 wikilinks/inline_marks 同层。②手写开关机对「行内代码/链接内」豁免要自造 CommonMark 括号/反引号配对,且与渲染器判定漂移——缩进代码块、跨行链接文本、引用式链接都会判错(实测 pulldown 对这些全部给对区间);pulldown 是铁律 1 的唯一解析器,LP2-1 `inline_marks` 已是同款先例;代价是含 emoji 文档每次快照重建多一次全文解析(无 emoji 文档走快路径零成本)。③尖括号目标允许除换行与 `>` 外的一切字符,覆盖集单测钉住不含这些字符(`covered_glyphs_round_trip_through_emoji_links`);与 `wiki://中文目标` 同口径,渲染串人可读;百分号编码要多一对 encode/decode 面且没有要解的冲突。**已知边界(如实)**:链接引用定义 `[😀]: url` 的标签 pulldown 不产事件、不豁免(极罕见,出现时该行变可见文本);流式未闭合 `[` 后紧跟 emoji 的帧会照改、预览多显示一个 `[`(下一帧闭合即自愈);脚注定义整个区间(含正文)保守豁免,定义正文里的 emoji 暂为黑白。
+- **如何改**:①要全量码位段——`latermd_md::expand_emoji_links` 的 `covered` 参数改传按码位段展开的集合(或把参数改成谓词),`state.rs` 注入点同步换;②要手写扫描——替换 `latermd-md` `emoji_rewrites` 实现,并补缩进代码块/跨行链接/引用式链接的豁免测试;③要百分号编码——改 `emoji_rewrites` 内 `replacement` 的 `format!` 一处,并与 B2 的 `emoji://` 解码侧同步。
 
 ## #89 #24 C3 快速打开浮层的两处落地口径:选中 QuickOpen 自身只发一条翻转(不补第二条)、浮层高度自适应内容但封顶 430(宽度才定死)(2026-10-03,#24 quick-open C3·自动拍板)
 

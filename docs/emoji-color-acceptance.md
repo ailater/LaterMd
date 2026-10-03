@@ -79,3 +79,127 @@
 - **自动侧全部通过**:14/14 测试全绿(`cargo test -p latermd-app --all-features emoji_panel`)、272/272 资产校验过(`fetch.sh --verify`)、口径逐字核对过(§3)、体积/显存数字齐(§2),全部可复现。
 - **人工侧 §4 六项全部待坤哥真机目视**,销账前本功能按口径只宣称「面板内彩色已落地」,不宣称全面完成;Win/mac 两项在真机到位前保持 blocked_external。
 - 无头测试不冒充目视:命中计数与 image mesh 断言是引擎层证据(feasibility §8 同口径:「上述是数据与管线事实,不是『看到了彩色』」)。
+
+---
+
+# E-C2 收口:预览内联 emoji 彩色自动/人工验收(#48,2026-10-04)
+
+> 验收对象:#48 E-C2「预览内联彩色 emoji」——B1 渲染副本改写器(`b50a292`)+ B2 inline widget 接线(`a6ea1bc`)已落,本文档为 B3 验收落档(纯 docs 模块,零代码改动)。
+> 方案依据:[emoji-color-feasibility.md](../.zcode/workflow-drafts/emoji-color-feasibility.md) §3(改写 + inline_widget 两件套、§3.2 点名的 heading/table 断言缺口、§3.3 豁免与偏移纪律)与 §7(E-C2 定义);实现岔路已登记 decisions-pending #90(B1 三口径)/ #91(B2 两口径)。
+> 证据分两类:**自动验证** = 本机实跑(§1–§3,命令与输出均为 2026-10-04 实测);**人工目视** = §4 清单,本机 Linux 无头环境无法自验,全部标「待坤哥」,不以单测冒充目视。
+> 口径红线(E-C1 口径按交付面扩展):**面板与预览内联彩色;编辑器正文(含 Live 模式富渲染块)仍黑白;导出/外发的显示效果取决于目标环境的字体。** 不写「全面支持彩色」。
+
+## 0. 范围与口径(先读这个)
+
+- **做了**:右栏预览的段落 / 标题 / 列表 / 引用 / 表格单元格里的**覆盖集内** emoji(与面板同一份 `emoji_data` 全表 272 枚,`covered_glyphs()` 注入,`emoji_data.rs:279`)显示为 Twemoji 彩色。机制是两件套,缺一不可(feasibility §3.2 的结论):
+  - **B1 改写器**:`latermd_md::expand_emoji_links` 纯函数(`latermd-md/src/lib.rs:740`)把渲染副本里的裸 emoji 改写为 `[😀](<emoji://😀>)`;豁免区间走**与渲染同一套 pulldown-cmark**(同 vendored options)的事件区间——围栏/缩进代码块、行内代码、既有链接的文本与目标、HTML 块与行内标签、脚注;同次产出第二层 `OffsetMap`(`state.rs:179` `emoji_map`,wikilink → emoji 两层串行可组合,#14 LP2-4 口径)。
+  - **B2 inline widget**:`AiLinkHandler` 接 vendored `LinkHandler` 五级扩展点(app 侧实现,vendor 零改动):`inline_widget_size`(`preview.rs:409`,font.size 正方形,行高恒不超正文自然行高)/ `layout_link`(`preview.rs:382`,透明占位 = 链接文字本体 + 同款字体,推进宽度与普通文本逐像素一致)/ `paint_inline_widget`(`preview.rs:420`,查 `emoji_panel::inline_texture` #47 同源会话缓存 → 白 tint 画方块;查不到什么都不画)/ `link_style`(`preview.rs:329`,正文色 + 无下划线)/ `click`(`preview.rs:351`,吞掉,不交系统浏览器)。
+- **明确不含**:编辑器正文彩色(feasibility §4 否决:需 fork epaint)、**Live 模式富渲染块**(`live.rs:457` 直接 `MarkdownLabel` 渲染源码 block_text,不进改写链、不挂 handler——Live 是编辑器形态,同「正文黑白」口径)、代码块/行内代码内的 emoji(B1 豁免,保持黑白字形)、导出 HTML 的任何「保证彩色」承诺(feasibility §5)。
+- **已知边界(如实,不硬撑全覆盖)**:
+  - 标题里的 emoji **不随 H1–H6 字号放大**:vendored 层对 `Token::Link` 一律传正文基础字体,与 wiki:// / ai:// 链接文本在标题里的既有行为同源,非 B2 引入的回归——断言把它钉成已知如实行为(decisions-pending #91,含 vendor ①类改法)。
+  - 覆盖集外字符(如 🫠)不改写(#90:只有 272 枚有 #47 资产,改写而无纹理 = 该 emoji 从预览消失);手写表外 `emoji://` 链接 → 透明占位不动,该处不显示字形。
+  - 链接引用定义 `[😀]: url` 的标签、脚注定义正文内的 emoji 暂不改写(黑白)——#90 登记的已知边界(极罕见形态)。
+- **失败面**:纹理缺失 / 解码失败 → 什么都不画,透明占位原样保持(不画黑块不 panic,连续两帧复测);改写零外泄——源码、rope、修订号、dirty、撤销栈、落盘字节分毫不动(§1 ③)。
+
+## 1. 自动验证证据(本机实跑,2026-10-04)
+
+### ① 三段覆盖断言(可行性调查 §3.2 点名的缺口)—— PASS
+
+命令:`cargo test -p latermd-app --all-features emoji_inline_widget`
+
+输出:`test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 620 filtered out`
+
+| 段 | 测试(`ui::preview::tests`) | 钉住的事实 |
+|---|---|---|
+| 段落 | `emoji_inline_widget_paints_textured_squares_in_paragraph` | 两枚 emoji 各留一个 widget 区块、各画一张纹理图;mesh 绑定的就是本帧上传的 72×72 Twemoji 纹理(`textures_delta` 引擎层证据);正方形边长与正文字号同源(0.8–3 倍区间)、纵向落在正文行带 ±1px 内、按文档序左右排开;正文文字照常在文本层 |
+| 标题 | `emoji_inline_widget_paints_inside_heading_at_link_font_scale` | 图片纵向落在「标题」文本同一行带内(**heading 吃到 inline widget**);边长与段落档一致(链接字体不吃 heading 缩放,#91 已知如实行为,非漏网) |
+| 表格 | `emoji_inline_widget_paints_in_table_cell` | 表格 cell 走 vendored 另一条 `render_link_in_ui` 每链接 widget 路径,同样画成纹理正方形;表头与正文文字照常渲染 |
+
+> §3.2 缺口的销账结论:**三段全部吃到 inline widget,无需「该段暂为黑白」的降级登记**;唯一降级口径是「标题内不随字号缩放」(上表 #91 行)。
+
+### ② 豁免测试(B1 保证、B2 渲染层复测)—— PASS
+
+改写层命令:`cargo test -p latermd-md --all-features expand_emoji_links`
+
+输出:`test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out`
+
+| 断言 | 测试(`latermd_md::tests`) |
+|---|---|
+| 围栏/缩进代码块 + 行内代码豁免 | `expand_emoji_links_skips_code_blocks_and_inline_code` |
+| 既有链接的文本与目标豁免(防嵌套破坏) | `expand_emoji_links_skips_existing_link_text_and_destinations` |
+| HTML 块/行内标签 + 脚注豁免 | `expand_emoji_links_skips_html_and_footnotes` |
+| 改写发生面(正文/标题/列表/引用) | `expand_emoji_links_rewrites_body_heading_list_quote` |
+| 与 wikilink 层叠加互不破坏 | `expand_emoji_links_stacks_after_wikilink_expansion` |
+| 无命中恒等 / 幂等 / CJK 与多字符边界 / 映射换算 | `…_identity_without_covered_hits` / `…_is_idempotent_on_own_output` / `…_cjk_boundaries_and_multichar_glyphs` / `…_map_translates_offsets` |
+
+渲染层复测(任务书「豁免由 B1 保证,B2 复测一条」):`emoji_dense_document_renders_both_themes_without_panicking`——明暗两主题 × 连续两帧 × 密集文档,断言**恰 29 枚**进 widget / 画图(正文 6 行 ×4 + 标题 1 + 列表 2 + 引用 1 + 表格 1),代码块 `let e = "😀";` 与行内 `` `🚀` `` 保持字面文本、不进 widget 不多画图。
+
+### ③ 落盘字节不变(改写零外泄)—— PASS
+
+命令:`cargo test -p latermd-app --all-features emoji_rewrite`
+
+输出:`test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 621 filtered out`
+
+| 断言 | 测试(`state::tests`) | 证据口径 |
+|---|---|---|
+| 盘上字节 == 源码 | `emoji_rewrite_never_leaks_into_saved_bytes` | emoji 文档建预览快照(前置断言 `rendered != source`,断言非恒真)后 `save_to`,读回逐字节相等——改写只活在渲染副本,保存走编辑缓冲 |
+| 源码零外泄 + 两层映射 | `preview_emoji_rewrite_touches_only_rendered_copy` | 缓冲/快照真源/修订号/dirty 分毫不动;wikilink→emoji 两层串行穿过,标题偏移落渲染串同一文本处且逆穿回源码原处 |
+
+配套:`covered_glyphs_round_trip_through_emoji_links`(272 枚全表经改写器往返可逆,含在 ④ 的 emoji 过滤轮里)、`map_source_offset_through_both_rewrites`(三层串行穿透,`preview.rs:129` `map_source_offset`;测试名不含 "emoji",单独跑:`cargo test -p latermd-app --all-features map_source_offset_through_both_rewrites` → `1 passed`)均过。
+
+### ④ 副作用压住 + 回落 + 回归 —— PASS
+
+命令:`cargo test -p latermd-app --all-features emoji`
+
+输出:`test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 573 filtered out`
+
+| 断言 | 测试 |
+|---|---|
+| link_style = 正文色 + 无下划线;click 吞掉且零消息;普通链接样式/放行分毫不动 | `emoji_link_style_and_click_are_contained` |
+| 手型抑制双向:悬停 emoji = Default,悬停普通链接仍 PointingHand | `emoji_hover_keeps_default_cursor_while_links_keep_pointing_hand` |
+| 纹理缺失(表外手写 `emoji://`)两帧占位不动、不画黑块不 panic、周边文本照常 | `emoji_texture_miss_keeps_placeholder_without_panicking` |
+| 改写后整档明暗双主题无头渲染不 panic(代码块字面保留) | `preview_ui_renders_emoji_rewritten_doc_without_panic` |
+
+### ⑤ 全量回归 —— PASS
+
+命令:`cargo test -p latermd-app -p latermd-md --all-features`
+
+输出:latermd-app `test result: ok. 622 passed; 0 failed; 1 ignored`(ignored 为 #39 既有取证)、latermd-md `test result: ok. 49 passed; 0 failed`。
+
+## 2. 纹理缓存与显存(引用 E-C1 §2,增量口径)
+
+- 预览与面板**同一份会话缓存**:`emoji_panel.rs:415` `inline_texture`,同一 temp memory 键——面板先开则预览直接命中,反之亦然,同一 Context 内每枚至多解码一次(E-C1 §1 ① 的命中计数承诺不变,消费方 +1)。显存上限口径不变:272 枚全量常驻 ≈ 5.6 MB(E-C1 §2),预览不新开缓存、不合并图集。
+- 每帧成本:命中走只读 `data` + 句柄克隆(emoji 密集文档的常态);未命中的解码与 `load_texture` 在 data 锁外做(egui 0.36 `load_texture` 经 `Context::input` 再入写锁,包在 `data_mut` 闭包里会自锁死——#48 B2 开发期实测,注释在案 `emoji_panel.rs:411-414`)。
+
+## 3. 对外口径核对 —— PASS(2026-10-04 逐项核对)
+
+| 落点 | 现状(B3 逐字/逐项核对) |
+|---|---|
+| 禁用语「全面支持(彩色)」 | B3 编辑后重跑 `grep -rn "全面支持" docs/ crates/ README.md`:命中 6 处,**全部是禁令/核对记录自身**(E-C1 红线与 §3 核对、E-C2(本文)红线与本行、emoji-plan §11/§12 禁令),无一处能力宣称;`crates/`、README.md 零命中 |
+| [emoji-plan.md](emoji-plan.md) | §2 F2 连带结论已随 E-C2 补记「预览内联彩色」;新增 §12 E-C2 落地登记(机制/范围/已知边界/口径);§11 的「另案」处补指向 §12 |
+| 导出链路 | `latermd-export` 零改动(B1/B2 提交 `git show --stat` 均未触碰 `crates/latermd-export`),emoji 以 Unicode 原样透传;口径 = 显示效果取决于目标环境的字体(feasibility §5),不承诺任何平台必然彩色 |
+| 面板底部说明行 | `emoji_panel.rs:619` 仍为「面板内彩色;编辑器正文仍黑白;导出/外发的显示效果取决于目标环境的字体」——句子仍真(面板确实彩色)但**未提预览**,属欠完整而非错误;文案在 `crates/`,B3 模块 paths=docs 不动,登记 §5 遗留跟进 |
+| 偏移锚点 | 大纲跳转/section anchor 的偏移换算升级为三层串行穿透(`preview.rs:126-139`),#14 LP2-4 既有口径不破坏(`map_source_offset_through_both_rewrites` 钉住) |
+
+## 4. 人工验收清单(blocked_external)
+
+**缺什么**:本机为 Linux 无头环境,无法开窗口目视;无 Windows 11 / macOS 14 真机。自动测试证明「数据与管线对」(纹理上传、mesh 发出、占位几何、豁免边界),不能证明「眼睛看到了彩色且观感可接受」。
+
+| # | 项 | 判据 | 状态 |
+|---|---|---|---|
+| M1 | Linux 真机预览正文彩色观感 | 正文/列表/引用里的 emoji 为彩色 Twemoji,与文字基线、行距、行高无漂移错位,无「顶高行」 | 待坤哥 |
+| M2 | 标题与表格中的彩色 emoji | H1–H6 与表格 cell 内 emoji 彩色;已知「标题内不随字号放大」的观感可接受与否由坤哥裁决(#91 附 vendor ①类改法) | 待坤哥 |
+| M3 | HiDPI 缩放 | 1x 与 2x 缩放下预览 emoji 无模糊/拉伸/错位(72px 资产对 font.size 格子 ≥1:1 采样) | 待坤哥 |
+| M4 | 明暗主题 | 两主题下彩色 emoji 清晰可读,暗色下不发灰、亮色下不刺眼 | 待坤哥 |
+| M5 | 代码区黑白对照 | 同文档代码块/行内代码里的 emoji 仍为黑白字形(豁免),与正文彩色形成预期对照,无「以为坏了」的落差 | 待坤哥 |
+| M6 | 面板 ↔ 预览缓存同源 | 先开面板再滚预览(或反之)无重复解码卡顿;emoji 密集文档滚动流畅 | 待坤哥 |
+| M7 | Win11 / macOS 14 预览目视 | 打包版预览彩色正常(资产 `include_bytes` 随二进制走,机制上无平台差异,以目视为准) | 待坤哥 |
+| M8 | 导出/外发抽查 | 同文档导出 HTML:现代浏览器预期彩色、纯文本查看器黑白——「取决于目标环境的字体」话术与事实相符 | 待坤哥 |
+
+## 5. 结论与遗留
+
+- **自动侧全部通过**:三段覆盖断言 3/3、改写层豁免与行为 9/9、落盘字节不变 2/2、副作用/回落/回归全绿(§1 命令与输出均可复现)。
+- **heading/表格断言都过了**——无需把任何一段降级为「暂为黑白」;唯一缩水口径是「标题内 emoji 不随字号放大」(#91 已知如实行为)。
+- **人工侧 §4 八项全部待坤哥真机目视**,销账前本功能按口径只宣称「预览内联彩色已落地(无头证据)」,不宣称全面完成;Win/mac 两项在真机到位前保持 blocked_external。
+- 无头测试不冒充目视:三段断言与 mesh 取证是引擎层证据(feasibility §8 同口径)。
+- **遗留跟进**(均不阻断销账):① 面板底部说明行 `emoji_panel.rs:619` 可更新为「面板与预览内联彩色…」(crates/ 文案,后续 commit 顺手带上);② 标题内 emoji 随字号放大需 vendor ①类补丁(#91「如何改」);③ 链接引用定义标签/脚注定义正文的豁免补齐(#90 已知边界)。

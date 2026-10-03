@@ -121,19 +121,22 @@ fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<latermd_md::Rewrit
 }
 
 /// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
-/// 偏移。两层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
-/// `latermd_md::OffsetMap`):wikilink 展开(源文本 → `rendered`,表由
-/// `PreviewState` 与渲染串同次产出持有)与相对图片 `file://` 改写
+/// 偏移。三层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
+/// `latermd_md::OffsetMap`):wikilink 展开(源文本 → 展开后,表由
+/// `PreviewState::offset_map` 持有)、emoji 链接改写(展开后 → `rendered`,
+/// `PreviewState::emoji_map`,#48 B1)与相对图片 `file://` 改写
 /// (`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
 fn map_source_offset(
     offset_map: &latermd_md::OffsetMap,
+    emoji_map: &latermd_md::OffsetMap,
     rendered: &str,
     base_dir: Option<&Path>,
     offset: usize,
 ) -> usize {
     let after_wikilinks = offset_map.source_to_rendered(offset);
+    let after_emoji = emoji_map.source_to_rendered(after_wikilinks);
     let image_map = latermd_md::OffsetMap::from_rewrites(image_rewrites(rendered, base_dir));
-    image_map.source_to_rendered(after_wikilinks)
+    image_map.source_to_rendered(after_emoji)
 }
 
 /// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
@@ -253,6 +256,9 @@ struct AiLinkHandler {
     color: egui::Color32,
     /// 当前明暗(wikilink 取色用,与 ai:// 走两套色)。
     dark_mode: bool,
+    /// 正文文本色(`link_style` 对 `emoji://` 的回落色,取构造时真实
+    /// visuals,不用 `Visuals::dark()/light()` 推 —— 皮肤可自定义文本色)。
+    text_color: egui::Color32,
     /// AI 是否在流(卡片「进行中」判据,取自 [`AiState::is_streaming`])。
     streaming: bool,
     /// 最近一次真实发起的 prompt(卡片状态匹配键,取自 [`AiState::last_prompt`])。
@@ -262,18 +268,23 @@ struct AiLinkHandler {
     card_count: Cell<usize>,
     /// 本帧各卡片的 widget id(渲染序);测试借它断言 id 稳定性。
     card_ids: RefCell<Vec<egui::Id>>,
+    /// 本帧画过的 `emoji://` inline widget 区块(屏幕坐标,含纹理缺失只留
+    /// 占位的):手型抑制的命中判定 + 无头探针(见 [`emoji_probe_id`])。
+    emoji_rects: RefCell<Vec<egui::Rect>>,
 }
 
 impl AiLinkHandler {
-    fn new(color: egui::Color32, dark_mode: bool, ai: &AiState) -> Self {
+    fn new(color: egui::Color32, dark_mode: bool, text_color: egui::Color32, ai: &AiState) -> Self {
         Self {
             clicked: RefCell::new(Vec::new()),
             color,
             dark_mode,
+            text_color,
             streaming: ai.is_streaming(),
             last_prompt: ai.last_prompt.clone(),
             card_count: Cell::new(0),
             card_ids: RefCell::new(Vec::new()),
+            emoji_rects: RefCell::new(Vec::new()),
         }
     }
 
@@ -310,7 +321,19 @@ impl AiLinkHandler {
 impl LinkHandler for AiLinkHandler {
     /// ai:// 链接换色;`underline: true` 只是声明意图 —— vendored 层当前
     /// 未消费该字段(hover 下划线对全部链接无条件绘制),见 decisions-pending #11。
+    ///
+    /// `emoji://`(#48 B2)是 inline widget:文字本就是透明占位,这里返回
+    /// 正文色 + 无下划线只是把「不吃超链接样式」的意图钉进协议 —— vendored
+    /// 对 inline widget 的 hover 本就不画下划线(label.rs `handle_hover`),
+    /// 该返回同时兜住「inline_widget_size 未来返回 None」的退化路径。
     fn link_style(&self, href: &str) -> Option<LinkStyle> {
+        // emoji:// 不吃默认超链接色/下划线:它不是可点的链接,是彩字形
+        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(self.text_color),
+                underline: false,
+            });
+        }
         // [[wikilink]] 用青绿,与 ai:// 的紫罗兰区分:两种链接的点击后果不同
         // (一个开文档、一个发起 AI 流),颜色不该撞
         if href.starts_with(latermd_md::WIKI_SCHEME) {
@@ -326,6 +349,11 @@ impl LinkHandler for AiLinkHandler {
     }
 
     fn click(&self, _text: &str, href: &str, _ui: &mut egui::Ui) -> bool {
+        // emoji:// 没有点击语义:吞掉(返回 true),绝不交系统浏览器 ——
+        // `emoji://😀` 不是合法 URL,交给浏览器只会弹错误提示
+        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return true;
+        }
         if let Some(target) = href.strip_prefix(latermd_md::WIKI_SCHEME) {
             let target = target.trim();
             if !target.is_empty() {
@@ -343,6 +371,76 @@ impl LinkHandler for AiLinkHandler {
                 true
             }
             None => false,
+        }
+    }
+
+    /// `emoji://` 的透明占位(#48 B2):用**链接文字本体 + 周围同款字体**
+    /// 追加透明文本 —— 占位的推进宽度与「emoji 以普通文本出现」逐像素
+    /// 一致(同一 shaping 同一回退链),B1 改写前后的文本流零漂移。
+    /// 行高不在这里设:vendored 会把 `inline_widget_size` 的高度强制盖到
+    /// 这些 section 上(append_link_to_job)。
+    fn layout_link(
+        &self,
+        _ui: &egui::Ui,
+        text: &str,
+        href: &str,
+        job: &mut egui::text::LayoutJob,
+        font: &egui::FontId,
+        color: egui::Color32,
+    ) -> bool {
+        if !href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return false;
+        }
+        // 到这里的调用只来自 inline widget 分支,color 恒为 TRANSPARENT
+        // (append_link_to_job);按参数透传,分支语义变化时随动。
+        let format = egui::TextFormat {
+            font_id: font.clone(),
+            color,
+            ..egui::TextFormat::default()
+        };
+        job.append(text, 0.0, format);
+        true
+    }
+
+    /// `emoji://` 判定(#48 B2):返回与正文字号匹配的尺寸。宽度分量仅是
+    /// 声明(vendored 只消费 `.y` 作占位行高);高度取 `font.size`,恒不
+    /// 超过正文自然行高(epaint 行高取行内 max,不缩行),含 emoji 的行
+    /// 与相邻行同高,文档布局不被改写扰动。
+    fn inline_widget_size(&self, href: &str, font: &egui::FontId) -> Option<egui::Vec2> {
+        href.starts_with(latermd_md::EMOJI_SCHEME)
+            .then(|| egui::vec2(font.size, font.size))
+    }
+
+    /// 在透明占位上画 Twemoji 纹理(#48 B2):查面板同源纹理缓存(#47 A2,
+    /// [`crate::ui::emoji_panel::inline_texture`]),查到 → 白 tint 画正方形
+    /// (原色,探针口径 emoji-color-feasibility §2.1);查不到 → 什么都不画,
+    /// 透明占位原样保持(不画黑块不 panic)。方块边长取占位区宽高的较小者:
+    /// 单枚 emoji 的宽 ≈ 字体自然推进(与字号成正比),多字形跨度(旗帜等)
+    /// 会被行高封顶,不横向溢出到邻字。
+    fn paint_inline_widget(&self, ui: &mut egui::Ui, _text: &str, href: &str, rect: egui::Rect) {
+        let Some(glyph) = href.strip_prefix(latermd_md::EMOJI_SCHEME) else {
+            return;
+        };
+        let side = rect.width().min(rect.height());
+        if side <= 0.0 {
+            return;
+        }
+        self.emoji_rects.borrow_mut().push(rect);
+        // 视口剔除与面板单元同款(AGENTS.md §6.2:每帧工作量按可见区)
+        let paint_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - side / 2.0),
+            egui::vec2(side, side),
+        );
+        if !ui.is_rect_visible(paint_rect) {
+            return;
+        }
+        if let Some(texture) = crate::ui::emoji_panel::inline_texture(ui, glyph) {
+            ui.painter().image(
+                texture.id(),
+                paint_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         }
     }
 
@@ -591,6 +689,7 @@ pub fn ui(
             let handler = AiLinkHandler::new(
                 ai_link_color(ui.visuals().dark_mode),
                 ui.visuals().dark_mode,
+                ui.visuals().text_color(),
                 ai,
             );
             // 渲染的是**展开过 wikilink 的**文本:源码里的 [[X]] 在这里已是
@@ -623,6 +722,23 @@ pub fn ui(
                 .show(ui);
             handler.drain_into(outbox);
 
+            // emoji:// inline widget 的收尾(#48 B2):①把本帧的 widget 区块
+            // 写进探针(每帧整帧覆盖,零 emoji 帧不留上一帧的旧区块 —— 与
+            // copy_button_rects 同一语义);②手型抑制 —— vendored 对悬停中的
+            // inline widget 无条件置 PointingHand(label.rs `handle_hover` /
+            // layout.rs `render_link_in_ui`),`link_style` 管不到光标,只能在
+            // label 渲染完之后把指针悬停 emoji 时的光标按回 Default(本面板
+            // 内后写者胜;同帧后续面板仍按各自悬停自设,不受影响)。
+            let emoji_rects = handler.emoji_rects.borrow().clone();
+            let hovering_emoji = ui
+                .input(|input| input.pointer.latest_pos())
+                .is_some_and(|pos| emoji_rects.iter().any(|rect| rect.contains(pos)));
+            if hovering_emoji {
+                ui.output_mut(|out| out.cursor_icon = egui::CursorIcon::Default);
+            }
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(emoji_probe_id(tab_id), emoji_rects));
+
             // 大纲跳转的预览侧(#42):源码偏移(大纲 span 口径)先穿过两层
             // 渲染改写(wikilink 展开 + 相对图片 URI)映射到喂给 label 的文本
             // 偏移,再查 vendored 块表拿目标块 rect。两件事都必须发生在
@@ -632,8 +748,13 @@ pub fn ui(
             // 也只在渲染当帧有效,同帧先写后读。块缺失(空文档/未渲染)就
             // 不滚,下一帧有表了也不会再滚 —— 滚动目标消费即清空,一次语义。
             if let Some(target) = preview.scroll_target.take() {
-                let offset =
-                    map_source_offset(&preview.offset_map, &preview.rendered, base_dir, target);
+                let offset = map_source_offset(
+                    &preview.offset_map,
+                    &preview.emoji_map,
+                    &preview.rendered,
+                    base_dir,
+                    target,
+                );
                 if let Some(block) = egui_markdown::block_rect_at_offset(ui, label_id, offset) {
                     ui.scroll_to_rect_animation(
                         block.rect,
@@ -664,6 +785,13 @@ fn scroll_probe_id(tab_id: u64) -> egui::Id {
     egui::Id::new("latermd-preview-scroll-offset").with(tab_id)
 }
 
+/// 预览 emoji inline widget 区块探针的 data 键(#48 B2,每 tab 一份):
+/// 本帧全部 `emoji://` 占位区块(含纹理缺失的),生产只写不读 —— 手型
+/// 抑制走 handler 字段,无头测试读它断言「widget 在该段生效」。
+fn emoji_probe_id(tab_id: u64) -> egui::Id {
+    egui::Id::new("latermd-preview-emoji-rects").with(tab_id)
+}
+
 /// 探针载荷(仅测试读):帧末滚动偏移 + 视口矩形 + 内容高度 —— 无头测试
 /// 用这三样把 `Align::Center` 的换算(块中心 − 视口中心,再钳到
 /// `[0, 内容高 − 视口高]`)复算一遍,做「跳转落点方位」的精确断言。
@@ -679,6 +807,7 @@ struct ScrollProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::emoji_data;
     use eframe::egui::RawInput;
 
     /// 造一个指定流式/最近 prompt 的 AI 状态(卡片状态的三个输入)。
@@ -702,6 +831,7 @@ mod tests {
             let handler = AiLinkHandler::new(
                 ai_link_color(ui.visuals().dark_mode),
                 ui.visuals().dark_mode,
+                ui.visuals().text_color(),
                 &AiState::default(),
             );
             assert!(handler.click("续写", "ai://write?prompt=%E7%BB%AD%E5%86%99", ui));
@@ -768,19 +898,30 @@ mod tests {
     #[test]
     fn card_status_follows_last_prompt_and_streaming() {
         let color = ai_link_color(true);
-        let idle = AiLinkHandler::new(color, true, &ai_state(false, None));
+        let idle = AiLinkHandler::new(color, true, egui::Color32::WHITE, &ai_state(false, None));
         assert_eq!(idle.card_status("续写"), AiCardStatus::Idle);
 
-        let running = AiLinkHandler::new(color, true, &ai_state(true, Some("续写")));
+        let running = AiLinkHandler::new(
+            color,
+            true,
+            egui::Color32::WHITE,
+            &ai_state(true, Some("续写")),
+        );
         assert_eq!(running.card_status("续写"), AiCardStatus::Running);
 
-        let done = AiLinkHandler::new(color, true, &ai_state(false, Some("续写")));
+        let done = AiLinkHandler::new(
+            color,
+            true,
+            egui::Color32::WHITE,
+            &ai_state(false, Some("续写")),
+        );
         assert_eq!(done.card_status("续写"), AiCardStatus::Done);
 
         // 其它卡片不受牵连:菜单发起的 prompt 是拼装文本,不等任何指令
         let unrelated = AiLinkHandler::new(
             color,
             true,
+            egui::Color32::WHITE,
             &ai_state(true, Some("请续写以下文档内容:\n……")),
         );
         assert_eq!(unrelated.card_status("续写"), AiCardStatus::Idle);
@@ -816,6 +957,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text,
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -853,7 +995,12 @@ mod tests {
     /// 不受展示截断影响),经 drain_into 进 outbox,与 ai:// 链接同一归约入口。
     #[test]
     fn execute_routes_ai_link_clicked_with_full_instruction() {
-        let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
+        let handler = AiLinkHandler::new(
+            ai_link_color(true),
+            true,
+            egui::Color32::WHITE,
+            &AiState::default(),
+        );
         handler.request_execute("总结,本文要点!(含标点)");
         let mut outbox = Vec::new();
         handler.drain_into(&mut outbox);
@@ -870,7 +1017,12 @@ mod tests {
     #[test]
     fn wiki_link_click_is_intercepted_as_wikilink_message() {
         let ctx = egui::Context::default();
-        let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
+        let handler = AiLinkHandler::new(
+            ai_link_color(true),
+            true,
+            egui::Color32::WHITE,
+            &AiState::default(),
+        );
         let intercepted = std::cell::Cell::new(true);
         let output = ctx.run_ui(RawInput::default(), |ui| {
             handler.click("架构决策", "wiki://架构决策", ui);
@@ -899,6 +1051,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.to_owned(),
             offset_map: latermd_md::OffsetMap::empty(),
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -922,14 +1075,15 @@ mod tests {
     }
 
     /// 偏移映射三层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
-    /// 相对图片改写叠加在同一映射里;偏移落在改写区间内归段首。
-    /// (展开层的「映射与展开输出逐字节一致」由 latermd-md 的
-    /// `expand_wikilinks_with_map` 测试直接锁死 —— 本侧只验两层串行穿过。)
+    /// emoji 链接与相对图片改写按同一顺序叠加;偏移落在改写区间内归段首。
+    /// (各层的「映射与输出逐字节一致」由 latermd-md 的
+    /// `expand_wikilinks_with_map` / `expand_emoji_links` 测试直接锁死 ——
+    /// 本侧只验三层串行穿过。)
     #[test]
     fn map_source_offset_through_both_rewrites() {
         // 无改写:恒等
         let identity = latermd_md::OffsetMap::empty();
-        assert_eq!(map_source_offset(&identity, "# h\n", None, 3), 3);
+        assert_eq!(map_source_offset(&identity, &identity, "# h\n", None, 3), 3);
 
         // wikilink 改写:[[架构决策]](12 字节)→ [架构决策](<wiki://架构决策>)
         // (2+12+2+4+8+12+2=…);标题在 wikilink 之后,映射后偏移必须落在
@@ -938,29 +1092,521 @@ mod tests {
         let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(source);
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
-        let mapped = map_source_offset(&offset_map, &rendered, None, heading_src);
+        let mapped = map_source_offset(&offset_map, &identity, &rendered, None, heading_src);
         assert_eq!(mapped, heading_out, "wikilink 之后的偏移按平移映射");
 
         // 偏移落在 wikilink 区间内(点击目标是标题,标题不会落在链接里,
         // 但边界语义仍要确定):归改写段首。
         let link_start = source.find("[[").expect("wikilink");
         let in_link = link_start + 3;
-        let mapped_in = map_source_offset(&offset_map, &rendered, None, in_link);
+        let mapped_in = map_source_offset(&offset_map, &identity, &rendered, None, in_link);
         assert_eq!(
             &rendered[mapped_in..].chars().take(3).collect::<String>(),
             "[架构",
             "区间内偏移归改写段首: {mapped_in}"
         );
 
+        // emoji 层叠加(#48 B1):展开文本里的覆盖枚改写成链接后,标题偏移
+        // 在 wikilink 平移之上再平移一次。
+        let source = "见 [[架构决策]] 与 😀 再谈。\n\n## 后续标题\n\n正文。\n";
+        let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(source);
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        let mapped = map_source_offset(&offset_map, &emoji_map, &rendered, None, heading_src);
+        assert_eq!(mapped, heading_out, "emoji 改写叠加平移");
+
         // 图片层叠加:渲染文本里相对图片地址换成 file:// URI 后,标题偏移
-        // 再平移一次。
-        let doc = "![图](./x.png)\n\n## 标题\n";
+        // 再平移一次(与 emoji 层共存,三层全穿)。`rendered` 是 emoji 层的
+        // 真实输出 —— 图片层扫描的正是这份字符串(生产同款口径)。
+        let doc = "![图](./x.png) 😀\n\n## 标题\n";
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(doc, emoji_data::covered_glyphs());
         let base = Some(Path::new("/doc"));
-        let with_uri = resolve_relative_images(doc, base);
+        let with_uri = resolve_relative_images(&rendered, base);
         let heading = doc.find("## 标题").expect("heading");
         let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
-        let mapped_img = map_source_offset(&identity, doc, base, heading);
+        let mapped_img = map_source_offset(&identity, &emoji_map, &rendered, base, heading);
         assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
+    }
+
+    /// #48 B1 覆盖集的数据卫生:全表 272 枚改写后能被解析成链接,href 剥
+    /// scheme 前缀还原原文(可逆口径),且载荷不含尖括号目标的非法字符
+    /// (`>`、换行、空白 —— 含则改写产物不是合法 CommonMark)。
+    #[test]
+    fn covered_glyphs_round_trip_through_emoji_links() {
+        let covered = emoji_data::covered_glyphs();
+        assert_eq!(covered.len(), 272, "面板数据表全量");
+        for glyph in covered {
+            for c in glyph.chars() {
+                assert!(
+                    !matches!(c, '>' | '<' | '\n' | '\r' | ' ' | '\t'),
+                    "{glyph:?} 含尖括号目标非法字符"
+                );
+            }
+            let (rendered, _) = latermd_md::expand_emoji_links(glyph, covered);
+            assert_eq!(
+                rendered,
+                format!("[{g}](<{}{g}>)", latermd_md::EMOJI_SCHEME, g = glyph),
+                "{glyph:?} 单枚文档改写形状"
+            );
+            // 可逆:href 剥前缀还原原文,且真能被解析成链接 token
+            let href = format!("{}{}", latermd_md::EMOJI_SCHEME, glyph);
+            assert_eq!(href.strip_prefix(latermd_md::EMOJI_SCHEME), Some(*glyph));
+            let doc = latermd_md::parse(&rendered);
+            assert!(
+                doc.tokens.iter().any(|token| match token {
+                    egui_markdown::types::Token::Link {
+                        href: found, text, ..
+                    } => found.as_ref() == href && text.as_ref() == *glyph,
+                    _ => false,
+                }),
+                "{glyph:?} 未解析成 emoji:// 链接"
+            );
+        }
+    }
+
+    /// #48 B1 接线回归:emoji 改写后的渲染串过生产入口 `ui()` 明暗两主题
+    /// 各渲染一帧不 panic,emoji 密集文档的正文/标题/列表文字仍在;围栏
+    /// 代码块的 emoji 保持原字符(未被改写,代码路径零牵连)。
+    /// (链接的样式与点击行为归 #48 B2 的 handler 接线,本测只钉 B1 的
+    /// 改写不破坏渲染。)
+    #[test]
+    fn preview_ui_renders_emoji_rewritten_doc_without_panic() {
+        let doc = "# 标题 😀 一\n\n正文 😀🚀 密集 💡 段。\n\n- 项 🚀\n\n> 引 😀\n\n```rust\nlet e = \"😀\";\n```\n";
+        let (after_wikilinks, _) = latermd_md::expand_wikilinks_with_map(doc);
+        let (rendered, _) =
+            latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+        assert!(
+            rendered.contains("正文 [😀](<emoji://😀>)[🚀](<emoji://🚀>)"),
+            "前置:改写确实发生(断言非恒真):{rendered}"
+        );
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            // OffsetMap 不 Clone,两帧各建一份(纯函数,同输入同产出)
+            let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(doc);
+            let (frame_rendered, emoji_map) =
+                latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+            assert_eq!(frame_rendered, rendered, "纯函数:两帧改写产出一致");
+            let mut preview = PreviewState {
+                rendered: frame_rendered,
+                offset_map,
+                emoji_map,
+                text: doc.to_owned(),
+                synced_rev: 0,
+                outline: Vec::new(),
+                scroll_target: None,
+            };
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(RawInput::default(), |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    7,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            });
+            let painted = painted_text(&output);
+            output.drop_without_applying_deltas();
+            for expected in ["标题", "密集", "项", "let e = \"😀\";"] {
+                assert!(
+                    painted.iter().any(|t| t.contains(expected)),
+                    "dark={dark} 缺 {expected}:{painted:?}"
+                );
+            }
+        }
+    }
+
+    // —— #48 B2:emoji:// inline widget 接线(可行性调查 §3.2 点名的
+    // 段落/标题/表格覆盖断言 + 副作用压住 + 回落面)——
+
+    /// 一帧生产入口渲染的汇集(测试断言素材)。文档先走 B1 同款两层改写
+    /// (wikilink → emoji),与 `PreviewState::new` 生产链一致。
+    struct EmojiFrame {
+        /// 全部 Text shape 的文本(painted_text 同款汇集)。
+        texts: Vec<String>,
+        /// 画出的图片((纹理 id, mesh 包围盒) —— `Painter::image` 落成
+        /// Mesh shape,纹理走 TextureManager 分配的 Managed id(egui 0.36
+        /// 的 `load_texture` 即如此,不是 User)。这些测试文档里没有其它
+        /// 图片来源,首帧可再与 `delta72` 交叉核对纹理身份。
+        images: Vec<(egui::TextureId, egui::Rect)>,
+        /// emoji widget 探针区块(含纹理缺失只留占位的)。
+        probe: Vec<egui::Rect>,
+        /// 本帧悬停光标(手型抑制断言)。
+        cursor: egui::CursorIcon,
+        /// 本帧上传的整幅 72×72 纹理的 id 集合(textures_delta,Twemoji 资产
+        /// 尺寸;首帧解码上传,次帧走缓存不再出现)—— 图片 mesh 的纹理
+        /// 身份交叉核对用。
+        delta72: std::collections::HashSet<egui::TextureId>,
+        /// 全部 Text shape 的(原点, galley)—— 按 glyph 位置精确定位文本用。
+        galleys: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
+    }
+
+    /// 生产入口渲染一帧并汇集断言素材(见 [`EmojiFrame`])。
+    fn render_emoji_frame(
+        ctx: &egui::Context,
+        doc: &str,
+        events: Vec<egui::Event>,
+        tab_id: u64,
+    ) -> EmojiFrame {
+        let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(doc);
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(&rendered, emoji_data::covered_glyphs());
+        let mut preview = PreviewState {
+            rendered,
+            offset_map,
+            emoji_map,
+            text: doc.to_owned(),
+            synced_rev: 0,
+            outline: Vec::new(),
+            scroll_target: None,
+        };
+        let mut outbox = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let output = ctx.run_ui(
+            RawInput {
+                events,
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    tab_id,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            },
+        );
+        let mut images = Vec::new();
+        let mut galleys = Vec::new();
+        fn collect(
+            shape: &egui::epaint::Shape,
+            images: &mut Vec<(egui::TextureId, egui::Rect)>,
+            galleys: &mut Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Mesh(mesh) => {
+                    if let Some(first) = mesh.vertices.first() {
+                        let mut min = first.pos;
+                        let mut max = first.pos;
+                        for vertex in &mesh.vertices {
+                            min = min.min(vertex.pos);
+                            max = max.max(vertex.pos);
+                        }
+                        images.push((mesh.texture_id, egui::Rect::from_min_max(min, max)));
+                    }
+                }
+                egui::epaint::Shape::Text(t) => galleys.push((t.pos, t.galley.clone())),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| collect(s, images, galleys)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut images, &mut galleys);
+        }
+        let delta72 = output
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(_, deltas)| {
+                deltas.iter().any(|delta| {
+                    delta.pos.is_none() && delta.image.width() == 72 && delta.image.height() == 72
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let frame = EmojiFrame {
+            texts: painted_text(&output),
+            images,
+            probe: ctx
+                .data(|d| d.get_temp::<Vec<egui::Rect>>(emoji_probe_id(tab_id)))
+                .unwrap_or_default(),
+            cursor: output.platform_output.cursor_icon,
+            delta72,
+            galleys,
+        };
+        output.drop_without_applying_deltas();
+        frame
+    }
+
+    /// 在汇集的 galley 里找 `needle` 首字的字形行带(屏幕坐标):返回该行
+    /// 的 y 区间 —— pos_from_cursor 是 0 宽 Rect,y 即所在行的 min_y..max_y。
+    fn row_band_of(frame: &EmojiFrame, needle: &str) -> egui::Rect {
+        for (origin, galley) in &frame.galleys {
+            if let Some(byte) = galley.text().find(needle) {
+                let chars = galley.text()[..byte].chars().count();
+                let band = galley.pos_from_cursor(egui::text::CCursor::new(chars));
+                return egui::Rect::from_min_max(
+                    egui::pos2(origin.x + band.left(), origin.y + band.top()),
+                    egui::pos2(origin.x + band.right(), origin.y + band.bottom()),
+                );
+            }
+        }
+        panic!("{needle:?} 不在任何文本 shape 内:{:?}", frame.texts)
+    }
+
+    /// 段落覆盖断言(§3.2 第一段):正文里的 emoji 经 inline widget 画成
+    /// **带纹理的正方形图片**,尺寸与正文字号同源(边长落在字号 0.8-3 倍
+    /// 区间),两枚按文档序左右排开,且纵向落在正文行带内;正文文字照常
+    /// 在文本层。
+    #[test]
+    fn emoji_inline_widget_paints_textured_squares_in_paragraph() {
+        let ctx = egui::Context::default();
+        let doc = "正文 😀 与 🚀 密集段落。";
+        let frame = render_emoji_frame(&ctx, doc, Vec::new(), 11);
+        assert_eq!(frame.probe.len(), 2, "两枚 emoji 各留一个 widget 区块");
+        assert_eq!(frame.images.len(), 2, "两枚 emoji 各画一张纹理图");
+        let size = crate::theme::editor_font_size(&ctx);
+        let band = row_band_of(&frame, "正文");
+        assert_eq!(frame.delta72.len(), 2, "首帧解码上传两枚 Twemoji 纹理");
+        for (texture, image) in &frame.images {
+            assert!(
+                frame.delta72.contains(texture),
+                "图片 mesh 绑定的就是本帧上传的 72×72 Twemoji 纹理:{texture:?}"
+            );
+            assert!(
+                (image.width() - image.height()).abs() <= 0.51,
+                "画的是正方形:{image:?}"
+            );
+            let side = image.width();
+            assert!(
+                (0.8 * size..=3.0 * size).contains(&side),
+                "边长 {side} 应与正文字号 {size} 同源(0.8-3 倍区间)"
+            );
+            assert!(
+                band.top() - 1.0 <= image.center().y && image.center().y <= band.bottom() + 1.0,
+                "图片纵向落在正文行带 {band:?} 内:{image:?}"
+            );
+        }
+        // 文档序:😀 在 🚀 左边
+        assert!(
+            frame.images[0].1.left() < frame.images[1].1.left(),
+            "图片按文档序排开:{:?}",
+            frame.images
+        );
+        for expected in ["正文", "与", "密集段落"] {
+            assert!(
+                frame.texts.iter().any(|t| t.contains(expected)),
+                "正文缺 {expected}:{:?}",
+                frame.texts
+            );
+        }
+    }
+
+    /// 标题覆盖断言(§3.2 第二段):heading 里的 emoji **确实吃到** inline
+    /// widget —— 图片纵向落在「标题」文本的同一行带内。边长与段落档一致:
+    /// vendored 层对链接一律传正文基础字体(`Token::Link` 分支不吃 heading
+    /// 的字号放大,layout.rs),emoji 因此不随标题缩放,与 wiki:// 等既有
+    /// 链接在标题里的行为同源 —— 非 B2 引入的回归,岔路登记 decisions-pending
+    /// #91。断言把这两个事实都钉成**已知的如实行为**,不是缺陷漏网。
+    #[test]
+    fn emoji_inline_widget_paints_inside_heading_at_link_font_scale() {
+        let ctx = egui::Context::default();
+        let heading = render_emoji_frame(&ctx, "# 标题 😀 落位", Vec::new(), 12);
+        assert_eq!(heading.images.len(), 1, "标题里恰一枚 emoji 图");
+        let band = row_band_of(&heading, "标");
+        let image = heading.images[0].1;
+        assert!(
+            band.top() - 1.0 <= image.center().y && image.center().y <= band.bottom() + 1.0,
+            "图片纵向落在标题行带 {band:?} 内:{image:?}"
+        );
+
+        let para = render_emoji_frame(&ctx, "对照段落 😀", Vec::new(), 13);
+        assert_eq!(para.images.len(), 1);
+        assert!(
+            (image.width() - para.images[0].1.width()).abs() <= 0.51,
+            "标题档与段落档边长一致(链接字体不吃 heading 缩放):{} vs {}",
+            image.width(),
+            para.images[0].1.width()
+        );
+    }
+
+    /// 表格单元格覆盖断言(§3.2 第三段):表格 cell 走 vendored 的另一条
+    /// `render_link_in_ui` 路径(每链接一个 widget),emoji 同样画成纹理图,
+    /// 表头与正文文字照常渲染。
+    #[test]
+    fn emoji_inline_widget_paints_in_table_cell() {
+        let ctx = egui::Context::default();
+        let doc = "| 名称 | 图标 |\n| --- | --- |\n| 文字行 | 😀 |\n";
+        let frame = render_emoji_frame(&ctx, doc, Vec::new(), 14);
+        assert_eq!(frame.probe.len(), 1, "表内 emoji 留一个 widget 区块");
+        assert_eq!(frame.images.len(), 1, "表内 emoji 画一张纹理图");
+        let (_, image) = frame.images[0];
+        assert!(
+            (image.width() - image.height()).abs() <= 0.51,
+            "表内同样画正方形:{image:?}"
+        );
+        for expected in ["名称", "图标", "文字行"] {
+            assert!(
+                frame.texts.iter().any(|t| t.contains(expected)),
+                "表格缺 {expected}:{:?}",
+                frame.texts
+            );
+        }
+    }
+
+    /// 副作用压住(handler 层):`emoji://` 的 link_style = 正文色 + 无下划线
+    /// (不吃默认超链接样式);click 吞掉(返回 true)且**不产任何消息**,
+    /// 不交系统浏览器;非 emoji:// 的行为分毫不动(默认样式/放行浏览器)。
+    #[test]
+    fn emoji_link_style_and_click_are_contained() {
+        let body = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+        let ctx = egui::Context::default();
+        let handler = AiLinkHandler::new(ai_link_color(true), true, body, &AiState::default());
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            let style = handler.link_style("emoji://😀").expect("emoji:// 有样式");
+            assert_eq!(style.color, Some(body), "正文色,不吃超链接色");
+            assert!(!style.underline, "无下划线");
+            assert!(handler.click("😀", "emoji://😀", ui), "emoji:// 点击被吞掉");
+            assert!(
+                !handler.click("x", "https://example.com", ui),
+                "普通链接照常放行"
+            );
+            // 尺寸判定:与传入字号匹配的正方形;非 emoji:// 不进 widget 路径
+            assert_eq!(
+                handler.inline_widget_size("emoji://😀", &egui::FontId::proportional(15.0)),
+                Some(egui::vec2(15.0, 15.0))
+            );
+            assert_eq!(
+                handler
+                    .inline_widget_size("https://example.com", &egui::FontId::proportional(15.0)),
+                None,
+                "非 emoji:// 不认 inline widget"
+            );
+        });
+        output.drop_without_applying_deltas();
+        let mut outbox = Vec::new();
+        handler.drain_into(&mut outbox);
+        assert!(outbox.is_empty(), "吞掉的 emoji 点击不产消息:{outbox:?}");
+    }
+
+    /// 失败面:纹理查不到(资产表外的手写 `emoji://` 链接,模拟资产缺失/
+    /// 解码失败面)→ 什么都不画,透明占位原样保持 —— 不画黑块、不 panic、
+    /// 周边文本照常渲染。连续两帧钉住「未命中不落负缓存、次帧同样安全」。
+    #[test]
+    fn emoji_texture_miss_keeps_placeholder_without_panicking() {
+        let uncovered = "🫠";
+        assert!(
+            !emoji_data::covered_glyphs().contains(uncovered),
+            "前置:选的字符必须在资产表外"
+        );
+        let doc = format!(
+            "前文 [{uncovered}](<{}{uncovered}>) 后文",
+            latermd_md::EMOJI_SCHEME
+        );
+        let ctx = egui::Context::default();
+        for frame in 0..2 {
+            let frame_data = render_emoji_frame(&ctx, &doc, Vec::new(), 15);
+            assert_eq!(
+                frame_data.probe.len(),
+                1,
+                "第 {frame} 帧:widget 区块仍在(占位不动)"
+            );
+            assert!(
+                frame_data.images.is_empty(),
+                "第 {frame} 帧:查不到纹理就不画图:{:?}",
+                frame_data.images
+            );
+            for expected in ["前文", "后文"] {
+                assert!(
+                    frame_data.texts.iter().any(|t| t.contains(expected)),
+                    "第 {frame} 帧缺 {expected}:{:?}",
+                    frame_data.texts
+                );
+            }
+        }
+    }
+
+    /// 手型抑制(副作用压住的第三项):悬停 emoji → 光标保持 Default;同
+    /// 文档悬停普通链接 → PointingHand(vendored 默认行为不受牵连)。vendored
+    /// 对 inline widget 悬停无条件置手型(label.rs `handle_hover`),app 侧在
+    /// label 渲染后按探针区块把光标压回 —— 两个方向都要钉住。
+    #[test]
+    fn emoji_hover_keeps_default_cursor_while_links_keep_pointing_hand() {
+        let ctx = egui::Context::default();
+        let doc = "开头 😀 结尾 [跳转链接](https://example.com/target) 完。";
+        let frame = render_emoji_frame(&ctx, doc, Vec::new(), 16);
+        assert_eq!(
+            frame.images.len(),
+            1,
+            "文档只有一枚 emoji:{:?}",
+            frame.images
+        );
+        let emoji_center = frame.probe[0].center();
+        // 行带是 0 宽 caret rect(见 row_band_of),停在边界上会把命中让给
+        // 前一个字符(空格,非链接段);往右挪半个字形,落进「跳」 glyph 内部
+        let band = row_band_of(&frame, "跳转链接");
+        let link_center = egui::pos2(band.left() + 8.0, band.center().y);
+
+        let hover = |pos| vec![egui::Event::PointerMoved(pos)];
+        let on_emoji = render_emoji_frame(&ctx, doc, hover(emoji_center), 16);
+        assert_eq!(on_emoji.cursor, egui::CursorIcon::Default, "emoji 不吃手型");
+        let on_link = render_emoji_frame(&ctx, doc, hover(link_center), 16);
+        assert_eq!(
+            on_link.cursor,
+            egui::CursorIcon::PointingHand,
+            "普通链接的手型不受牵连"
+        );
+    }
+
+    /// 明暗两主题 × emoji 密集文档 × 连续两帧:渲染不 panic,每帧每枚覆盖
+    /// emoji 都出图(首帧解码上传,次帧走会话缓存),围栏代码块与行内代码
+    /// 里的 emoji 保持字面文本(B1 豁免在渲染层的复测:不进 widget 路径,
+    /// 不多画一张图)。
+    #[test]
+    fn emoji_dense_document_renders_both_themes_without_panicking() {
+        let mut doc = String::from("# 密集 😀 标题\n\n");
+        // 6 行正文保持全文落进 800×600 视口(视口剔除是按设计工作的,底部
+        // 出画的块本来就不该画 —— 断言的是「可见的全画」,不是「全可见」)
+        for i in 0..6 {
+            doc.push_str(&format!("第 {i} 行 😀🚀💡👍 正文收尾。\n\n"));
+        }
+        doc.push_str("- 项 ✅\n- 项 💡\n\n> 引用 💡\n\n");
+        doc.push_str("| 键 | 值 |\n| --- | --- |\n| 图 | 🚀 |\n\n");
+        doc.push_str("```rust\nlet e = \"😀\";\n```\n\n行内代码 `🚀` 结束。\n");
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            for frame in 0..2 {
+                let data = render_emoji_frame(&ctx, &doc, Vec::new(), 17);
+                // 正文 6 行 ×4 枚 + 标题 1 + 列表 2 + 引用 1 + 表格 1 = 29 枚
+                // (代码块/行内代码里的 😀/🚀 被 B1 豁免,不进 widget)
+                assert_eq!(
+                    data.probe.len(),
+                    29,
+                    "dark={dark} 第 {frame} 帧:覆盖 emoji 全数进 widget"
+                );
+                assert_eq!(
+                    data.images.len(),
+                    29,
+                    "dark={dark} 第 {frame} 帧:可见全数画图(代码内外不混)"
+                );
+                for expected in ["密集", "正文收尾", "let e = \"😀\";", "行内代码"] {
+                    assert!(
+                        data.texts.iter().any(|t| t.contains(expected)),
+                        "dark={dark} 第 {frame} 帧缺 {expected}:{:?}",
+                        data.texts
+                    );
+                }
+            }
+        }
     }
 
     /// 端到端:scroll_target 指向文档尾部标题,一帧 `ui()` 后预览 ScrollArea
@@ -978,6 +1624,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.clone(),
             offset_map: latermd_md::OffsetMap::empty(),
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.clone(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1103,6 +1750,7 @@ mod tests {
                             let tab = state.tabs.current();
                             let mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.emoji_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1258,6 +1906,7 @@ mod tests {
                             let tab = state.tabs.current();
                             mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.emoji_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1437,6 +2086,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: doc.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1491,7 +2141,12 @@ mod tests {
         // 取回 handler 记录的卡片 id。省掉 ScrollArea 外壳不影响结论:
         // push_id 是相对父 ui 的,稳定性断言看的是相对成分。
         let render = |doc: &str| {
-            let handler = AiLinkHandler::new(ai_link_color(true), true, &AiState::default());
+            let handler = AiLinkHandler::new(
+                ai_link_color(true),
+                true,
+                egui::Color32::WHITE,
+                &AiState::default(),
+            );
             ctx.run_ui(RawInput::default(), |ui| {
                 MarkdownLabel::new(egui::Id::new("preview-md"), doc)
                     .wrap()
@@ -1534,6 +2189,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: rendered.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: rendered.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1618,6 +2274,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered,
             offset_map,
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1748,6 +2405,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: doc.clone(),
                 synced_rev: 0,
                 outline: Vec::new(),

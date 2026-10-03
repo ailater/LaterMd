@@ -271,6 +271,22 @@ pub fn visible_hits(
         .collect()
 }
 
+/// 全表覆盖集(#48 B1):数据表 272 枚的字符集合,预览的 emoji 链接改写
+/// 按它判定哪些字符值得改写 —— 只有改写后的 `emoji://` 载荷在 #47 的
+/// 纹理表里有图可画(资产 272/272 在位),覆盖集外的字符直显原形(黑白),
+/// 不进「改写成链接却无纹理」的不可见坑。进程内一份。E3 的字形过滤是
+/// **面板展示**口径,与这里无关:改写后的字符由纹理顶替,不吃字体字形。
+pub fn covered_glyphs() -> &'static HashSet<&'static str> {
+    static COVERED: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
+    COVERED.get_or_init(|| {
+        GROUPS
+            .iter()
+            .flat_map(|group| group.entries.iter())
+            .map(|entry| entry.char)
+            .collect()
+    })
+}
+
 /// 八个分类,顺序即面板标签页顺序。
 pub const GROUPS: [EmojiGroup; 8] = [
     EmojiGroup {
