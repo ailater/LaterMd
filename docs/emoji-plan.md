@@ -169,7 +169,7 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 > 本节是落地登记，不再是规划。完整取舍与实测依据见可行性调查
 > `.zcode/workflow-drafts/emoji-color-feasibility.md` §3/§7；验收证据见
 > [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章；实现岔路登记
-> decisions-pending #90（B1）/ #91（B2）。commits：B1 `b50a292`、B2 `a6ea1bc`。
+> decisions-pending #90（B1）/ #91（B2）。commits：B1 `b50a292`、B2 `a6ea1bc`、B3 `bf1bdbc`（验收与口径落档，纯 docs）。
 
 - **机制（两件套，缺一不可，feasibility §3.2 的结论）**：
   - **B1 渲染副本改写器**：`latermd_md::expand_emoji_links` 纯函数（`latermd-md/src/lib.rs:740`，与 wikilinks/inline_marks 同层，不依赖 egui）把裸 emoji 改写成 `[😀](<emoji://😀>)`，产物**只进 `preview.rendered` 渲染副本**——源码、rope、字节偏移、撤销栈、落盘字节分毫不动（与图片改写同一承诺）。豁免走**与渲染同一套 pulldown-cmark**（同 vendored options）的事件区间：围栏/缩进代码块、行内代码、既有链接的文本与目标、HTML、脚注。覆盖集 = `emoji_data` 全表 272 枚参数注入（app 侧 `covered_glyphs()` OnceLock，`emoji_data.rs:279`），与面板/纹理共用单一数据源。同次产出第二层 `OffsetMap`（`state.rs:179`），wikilink → emoji 两层**串行穿过可组合**（#14 LP2-4 口径，`preview.rs:129` `map_source_offset` 三层穿透）。
@@ -179,4 +179,4 @@ pub fn insert_emoji(text: &str, sel: Range<usize>, emoji: &str) -> (String, Rang
 - **已知边界（如实）**：覆盖集外字符（如 🫠）不改写（只有 272 枚有资产，改写而无纹理 = 从预览消失）；手写表外 `emoji://` 链接只留透明占位不画图；链接引用定义标签与脚注定义正文内的 emoji 暂不改写（黑白，#90）。
 - **导出口径（重申 feasibility §5）**：`latermd-export` 零改动，emoji 以 Unicode 原样透传，CSS 只声明系统字体栈——导出/外发的显示效果**取决于目标环境的字体**，不承诺任何平台必然彩色；不做「导出保证彩色」的能力宣称。
 - **对外口径（E-C1 口径按交付面扩展，用户可见文案的唯一口径）**：「**面板与预览内联彩色；编辑器正文（含 Live 模式）仍黑白；导出/外发的显示效果取决于目标环境的字体**」——**不许出现「全面支持彩色」**（2026-10-04 grep 核对：docs/crates/README 无一处能力宣称）。遗留：面板底部说明行（`emoji_panel.rs:619`）仍写「面板内彩色…」，句子真但未提预览，待后续 crates/ commit 顺手更新。
-- **验收**：自动证据（三段断言、豁免测试、落盘字节不变、副作用/回落/全量回归）与人工清单（真机预览 heading/表格/正文观感、HiDPI、明暗主题等八项）分栏落档于 [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章。
+- **验收**：自动证据（三段断言、豁免测试、落盘字节不变、副作用/回落/全量回归）与人工清单（真机预览正文/标题/表格观感、HiDPI、明暗主题、代码区黑白对照、缓存同源、Win11/macOS 14、导出抽查共八项）分栏落档于 [emoji-color-acceptance.md](emoji-color-acceptance.md) E-C2 章（B3 `bf1bdbc`）。自动证据 2026-10-04 本机实跑：三段覆盖断言 3 passed（`cargo test -p latermd-app --all-features emoji_inline_widget`）、豁免 9 passed（`cargo test -p latermd-md --all-features expand_emoji_links`）、落盘字节不变 2 passed（`emoji_rewrite`）、emoji 全过滤 50 passed、两 crate 全量 622 passed + 1 ignored（既有 #39 取证）/ 49 passed、`cargo fmt --all --check` 干净、禁语 grep 六处命中全为禁令/核对自身零能力宣称；三轮 clippy 与 cargo doc 本轮未复跑（B3 零代码改动仅 .md，结果与 B2 head 全等，编排最终 head 复验兜底）。真机人工项 blocked_external（本机 Linux 无头、缺 Win11/macOS 14 真机），不以单测冒充目视。
