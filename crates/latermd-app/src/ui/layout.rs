@@ -2747,6 +2747,67 @@ mod tests {
         );
     }
 
+    /// #42 M2:预览面板不可见(右栏收起)时点大纲 —— 源码侧照跳、预览请求
+    /// 悬置不炸;重开面板消费一次(补跳,不因「没看见」就吞掉)。悬置期间
+    /// 文档一旦变更,帧内同步 rebuild 把残留请求丢弃,重开不再跳旧目标。
+    /// 整条走完整 `draw`(面板开合、编辑器消费 jump_to、快照同步都是真实
+    /// 路径),断言之外任何一步 panic 都会直接红在本测试。
+    #[test]
+    fn outline_click_with_preview_collapsed_pending_then_dropped_after_edit() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut app = LaterMdApp::default();
+
+        // —— 第一段:收起 → 点击 → 悬置;重开 → 消费 ——
+        app.state.apply(Message::RightPanelToggled);
+        assert!(!app.state.layout.right, "前置:右栏已收起");
+        let span = app.state.tabs.current().preview.outline[1].span.clone();
+        app.state.apply(Message::OutlineItemClicked(span.clone()));
+        draw_frames(&mut app, &ctx, screen, 3);
+        assert!(
+            app.state.tabs.current().cursor.jump_to.is_none(),
+            "面板不可见,源码侧照常消费跳转"
+        );
+        assert_eq!(
+            app.state.tabs.current().preview.scroll_target,
+            Some(span.start),
+            "预览未绘制,请求悬置不消费、不 panic"
+        );
+
+        app.state.apply(Message::RightPanelToggled);
+        draw_frames(&mut app, &ctx, screen, 3);
+        assert_eq!(
+            app.state.tabs.current().preview.scroll_target,
+            None,
+            "重开面板消费悬置请求(补跳),一次即清"
+        );
+
+        // —— 第二段:收起 → 点击 → 文档变更 → 残留丢弃;重开不复活 ——
+        app.state.apply(Message::RightPanelToggled);
+        let span = app.state.tabs.current().preview.outline[1].span.clone();
+        app.state.apply(Message::OutlineItemClicked(span));
+        // 修订号前进:编辑器 draw 帧内按生产同步规则(editor.rs)rebuild 快照
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "改动\n\n");
+        draw_frames(&mut app, &ctx, screen, 3);
+        assert_eq!(
+            app.state.tabs.current().preview.scroll_target,
+            None,
+            "文档变更后残留请求随快照重建丢弃"
+        );
+
+        app.state.apply(Message::RightPanelToggled);
+        draw_frames(&mut app, &ctx, screen, 3);
+        assert_eq!(
+            app.state.tabs.current().preview.scroll_target,
+            None,
+            "旧请求不复燃:重开不带着旧偏移跳新文本"
+        );
+    }
+
     /// M5 收口:标题栏齿轮(2026-09-27 迁自左栏底段设置行)在**完整
     /// frameless draw** 路径下点得动,且走完归约后设置对话框真的打开
     /// (decisions-pending #31;左栏版本的能力迁移验收点)。

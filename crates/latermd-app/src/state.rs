@@ -142,9 +142,8 @@ pub struct PreviewState {
     /// 当前快照的**源文本**(大纲 `span` 索引它,与编辑器缓冲同源)。
     ///
     /// 渲染走 [`Self::rendered`] —— wikilink 展开会改变偏移,渲染文本不能
-    /// 与源码偏移混用。生产路径当前只读 `rendered`,`text` 是快照真源与
-    /// 「空闲帧不重建」这类不变量的锚点。
-    #[allow(dead_code)]
+    /// 与源码偏移混用。`text` 是快照真源:大纲 `span` 索引它,预览跳转把
+    /// 它的偏移映射到 `rendered`(见 `ui::preview::map_source_offset`)。
     pub text: String,
     /// 快照对应的 [`EditorBuffer::revision`]。
     pub synced_rev: u64,
@@ -154,6 +153,8 @@ pub struct PreviewState {
     /// (P3 双向链接)。源码 `text` 一字不改 —— 展开只影响渲染。
     pub rendered: String,
     /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
+    /// 面板收起期间悬置(消费只发生在预览绘制帧);快照 rebuild(文档
+    /// 变更)即丢弃 —— 旧偏移对重建后的文本没有意义。
     /// 属 UI 关注点(同侧边栏把手与键位捕获),不进归约:滚动位置不是文档状态。
     pub scroll_target: Option<usize>,
 }
@@ -3733,6 +3734,73 @@ mod tests {
         assert!(
             state.tabs.current().cursor.jump_to.is_some(),
             "编辑器侧照旧跳光标"
+        );
+    }
+
+    /// 连续点击大纲:预览请求按**最新**一条覆盖(不排队、不残留旧值);
+    /// 重复点击当前条目照样重登请求(幂等重跳,不是「已在原地就吞掉」),
+    /// 源码侧 `jump_to` 同步重置。
+    #[test]
+    fn outline_click_overwrites_request_and_reclick_rearms() {
+        let mut state = State::default();
+        let (first, second) = {
+            let outline = &state.tabs.current().preview.outline;
+            (outline[0].span.clone(), outline[1].span.clone())
+        };
+        assert_ne!(first.start, second.start, "前置:两个条目偏移不同");
+
+        state.apply(Message::OutlineItemClicked(first.clone()));
+        assert_eq!(
+            state.tabs.current().preview.scroll_target,
+            Some(first.start)
+        );
+
+        state.apply(Message::OutlineItemClicked(second.clone()));
+        assert_eq!(
+            state.tabs.current().preview.scroll_target,
+            Some(second.start),
+            "请求被最新点击覆盖"
+        );
+
+        state.apply(Message::OutlineItemClicked(second.clone()));
+        assert_eq!(
+            state.tabs.current().preview.scroll_target,
+            Some(second.start),
+            "重复点击当前条目仍重登请求(幂等重跳)"
+        );
+        assert!(
+            state.tabs.current().cursor.jump_to.is_some(),
+            "源码侧跳转同步重置"
+        );
+    }
+
+    /// 文档变更后残留的预览请求被丢弃:请求偏移属于旧快照,快照 rebuild
+    /// (生产同步规则:修订号前进即重建,editor.rs)一发生就清,重开预览
+    /// 面板绝不带着旧偏移去跳新文本。
+    #[test]
+    fn outline_click_residual_request_dropped_after_rebuild() {
+        let mut state = State::default();
+        let span = state.tabs.current().preview.outline[1].span.clone();
+        state.apply(Message::OutlineItemClicked(span.clone()));
+        assert_eq!(
+            state.tabs.current().preview.scroll_target,
+            Some(span.start),
+            "前置:请求在册"
+        );
+
+        {
+            let tab = state.tabs.current_mut();
+            tab.editor.replace_all("# 新文档\n\n内容\n");
+            assert!(
+                tab.preview.synced_rev != tab.editor.revision(),
+                "前置:修订号已前进"
+            );
+            tab.preview.rebuild(&tab.editor);
+        }
+        assert_eq!(
+            state.tabs.current().preview.scroll_target,
+            None,
+            "残留请求随快照重建丢弃"
         );
     }
 

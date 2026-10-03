@@ -56,7 +56,8 @@ pub mod types;
 pub use egui_markdown_style::{global_style, set_style};
 pub use label::MarkdownLabel;
 pub use label::{
-  cursor_from_pos, glyph_at_index, last_non_whitespace_glyph, section_anchors, OverflowWrap, SectionAnchor,
+  block_rect_at_offset, block_span_rects, cursor_from_pos, glyph_at_index, last_non_whitespace_glyph, section_anchors,
+  BlockSpanRect, OverflowWrap, SectionAnchor,
 };
 pub use layout::CodeThemeArg;
 pub use link::{LinkHandler, LinkStyle};
