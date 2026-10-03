@@ -2610,6 +2610,7 @@ version = "0.0.3"
 dependencies = [
  "grep-searcher",
  "ignore",
+ "latermd-md",
  "regex",
 ]
 

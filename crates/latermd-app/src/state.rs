@@ -106,11 +106,19 @@ pub enum SidebarTab {
     Outline,
     /// Git(P2:改动列表 + diff + 确认式回滚 + 历史)。
     Git,
+    /// 反向链接(P3 #15:谁链接了当前文档,点击跳来源)。
+    Backlinks,
 }
 
 impl SidebarTab {
     /// 页签栏顺序。
-    pub const ALL: [SidebarTab; 4] = [Self::Files, Self::Search, Self::Outline, Self::Git];
+    pub const ALL: [SidebarTab; 5] = [
+        Self::Files,
+        Self::Search,
+        Self::Outline,
+        Self::Git,
+        Self::Backlinks,
+    ];
 
     /// 页签栏显示名。
     pub fn label(self) -> &'static str {
@@ -119,6 +127,7 @@ impl SidebarTab {
             Self::Search => "搜索",
             Self::Outline => "大纲",
             Self::Git => "Git",
+            Self::Backlinks => "链接",
         }
     }
 
@@ -130,6 +139,8 @@ impl SidebarTab {
             Self::Search => Icon::Search,
             Self::Outline => Icon::Outline,
             Self::Git => Icon::Git,
+            // 复用工具条的链环:反向链接的语义就是「链接」,零新增图标
+            Self::Backlinks => Icon::Link,
         }
     }
 }
@@ -253,6 +264,8 @@ pub struct State {
     pub git: GitPanelState,
     /// 全文搜索(Search 页签):输入去抖、后台服务与结果缓存。
     pub search: SearchState,
+    /// 反向链接(Backlinks 页签,#15):目标快照比对 + 防抖 + 后台直扫。
+    pub backlinks: crate::backlink_panel::BacklinkState,
     /// AI 流式(MockProvider,P1 联调):provider + 接收端 + 防重入标志。
     pub ai: AiState,
     /// AI Provider 凭据设置区(P2「凭据管理」):草稿、三态与凭据操作集,
@@ -388,6 +401,7 @@ impl Default for State {
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
             search: SearchState::default(),
+            backlinks: crate::backlink_panel::BacklinkState::default(),
             ai: AiState::default(),
             ai_key: AiKeyState::default(),
             mcp: McpState::default(),
@@ -552,13 +566,18 @@ pub enum Message {
     SearchQueryChanged,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
+    /// 反向链接防抖到点(#15):按当前(根, 文档)发起后台扫描。归约侧
+    /// 产出(`layout.rs` 的 reduce,与 `SearchRequested` 同款),UI 不直接发。
+    BacklinksRequested,
     /// 点击搜索结果,载荷为(文件路径, 1 起行号):归约里打开该文件并把
     /// 光标跳到行首。
     SearchResultClicked(PathBuf, usize),
     /// 点击大纲条目,载荷为标题的源码字节区间。
     OutlineItemClicked(Range<usize>),
     /// 点击预览里的 `[[wikilink]]`,载荷为目标文档名:归约里在文档库内找同名
-    /// 文档并打开(找不着落提示行,不静默无反应)。
+    /// 文档并打开(找不着落提示行,不静默无反应)。反向链接面板的来源跳转
+    /// (#15)同走此消息 —— 载荷是来源相对路径剥 md 后缀
+    /// (`crate::backlink_panel::jump_target`),与 `[[..]]` 目标写法对称。
     WikilinkClicked {
         target: String,
     },
@@ -767,6 +786,12 @@ impl State {
             }
             Message::SearchQueryChanged => self.search.input_changed(DEBOUNCE),
             Message::SearchRequested => self.start_search(),
+            Message::BacklinksRequested => {
+                self.backlinks.start(
+                    self.file_tree.root.as_deref(),
+                    self.tabs.current().document.path.as_deref(),
+                );
+            }
             Message::SearchResultClicked(path, line_no) => {
                 self.open_search_hit(&path, line_no);
             }
@@ -2117,6 +2142,9 @@ impl State {
         self.file_tree.ensure_loaded();
         // 搜索结果收流:非阻塞收空 channel(重绘驱动见 `ui::layout::reduce`)。
         self.search.poll_hits();
+        // 反向链接(#15):目标快照比对(变化才防抖重扫)+ 结果收流。
+        self.sync_backlink_target();
+        self.backlinks.poll();
         // MCP:收绑定结果与调用计数(两者都是非阻塞的轻量检查)
         self.mcp.poll();
         // 外壳布局落盘的唯一写入点:与上次写下的一份比对,变了才写。
@@ -2554,6 +2582,27 @@ impl State {
             self.search.start(&root);
         } else {
             self.search.reset();
+        }
+    }
+
+    /// 反向链接的触发判定(#15):「(文件树根, 当前文档路径)」与面板的
+    /// [`crate::backlink_panel::BacklinkState::requested_for`] 比对,变了才
+    /// invalidate 顺延防抖 —— 快照比对而非逐入口插桩,打开/切换/保存/
+    /// 另存/换根一处全覆盖(decisions-pending #88)。根或文档缺失时复位:
+    /// 无目标可扫,面板给引导提示。文档**内容**变化不在此键上,不重扫
+    /// (反向链接匹配路径,不匹配正文)。
+    fn sync_backlink_target(&mut self) {
+        let target = match (&self.file_tree.root, &self.tabs.current().document.path) {
+            (Some(root), Some(doc)) => Some((root.clone(), doc.clone())),
+            _ => None,
+        };
+        if self.backlinks.requested_for == target {
+            return;
+        }
+        self.backlinks.requested_for = target.clone();
+        match target {
+            Some(_) => self.backlinks.invalidate(DEBOUNCE),
+            None => self.backlinks.reset(),
         }
     }
 
@@ -3906,6 +3955,172 @@ mod tests {
             .notice
             .as_deref()
             .is_some_and(|notice| notice.contains("未设置文件树根目录")));
+    }
+
+    /// 反向链接的触发状态机(#15):帧末快照比对 —— 目标(根, 文档)变化才
+    /// 防抖排程,同目标重复跑帧不重排(防抖合并且不满帧空转);到点归约
+    /// 发起后台扫描,收流后结果整表刷新;切换文档触发重扫并清旧结果。
+    #[test]
+    fn backlinks_rescan_follows_document_and_root_changes() {
+        let dir = temp_path("backlinks-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "目标文档\n").unwrap();
+        std::fs::write(dir.join("src.md"), "见 [[note]]\n").unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        state.apply(Message::FileSelected(dir.join("note.md")));
+
+        // 帧 1:目标从 None → (根, note.md),防抖排程
+        state.end_of_logic();
+        assert_eq!(
+            state.backlinks.requested_for,
+            Some((dir.clone(), dir.join("note.md"))),
+            "目标快照记录(根, 当前文档)"
+        );
+        assert!(state.backlinks.debounce_due.is_some());
+        let first_due = state.backlinks.debounce_due.unwrap();
+
+        // 帧 2:目标未变,不重排(否则每次 end_of_logic 都顺延,永远到不了点)
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.end_of_logic();
+        assert_eq!(
+            state.backlinks.debounce_due,
+            Some(first_due),
+            "同目标重复跑帧不得顺延防抖计时"
+        );
+
+        // 到点归约(生产在 `ui::layout::reduce`,测试直发):后台扫描
+        state.apply(Message::BacklinksRequested);
+        assert_eq!(
+            state.backlinks.status,
+            crate::backlink_panel::BacklinkStatus::Scanning
+        );
+        assert_eq!(state.backlinks.debounce_due, None, "发起即清计时");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.backlinks.status == crate::backlink_panel::BacklinkStatus::Scanning
+            && std::time::Instant::now() < deadline
+        {
+            state.end_of_logic(); // 收流在帧末
+            if state.backlinks.status == crate::backlink_panel::BacklinkStatus::Scanning {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            state.backlinks.status,
+            crate::backlink_panel::BacklinkStatus::Finished
+        );
+        assert_eq!(state.backlinks.links.len(), 1);
+        assert_eq!(
+            state.backlinks.links[0].path,
+            PathBuf::from("src.md"),
+            "src.md 链接了 note.md"
+        );
+
+        // 切换文档:帧末快照变化 → 旧结果清空、重新排程(防抖合并)
+        state.apply(Message::FileSelected(dir.join("src.md")));
+        state.end_of_logic();
+        assert!(state.backlinks.links.is_empty(), "目标变更即清旧结果");
+        assert!(state.backlinks.debounce_due.is_some());
+        state.apply(Message::BacklinksRequested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.backlinks.status == crate::backlink_panel::BacklinkStatus::Scanning
+            && std::time::Instant::now() < deadline
+        {
+            state.end_of_logic();
+            if state.backlinks.status == crate::backlink_panel::BacklinkStatus::Scanning {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            state.backlinks.status,
+            crate::backlink_panel::BacklinkStatus::Finished
+        );
+        assert!(
+            state.backlinks.links.is_empty(),
+            "src.md 无人链接,零命中如实刷新"
+        );
+
+        // 换根:目标快照变化 → 重新排程(旧根的结果不再可信)
+        state.apply(Message::FileTreeRootSelected(dir.join("不存在子目录")));
+        std::fs::create_dir_all(dir.join("不存在子目录")).unwrap();
+        state.end_of_logic();
+        assert_ne!(
+            state.backlinks.requested_for,
+            Some((dir.clone(), dir.join("src.md"))),
+            "换根后目标快照已更新"
+        );
+        assert!(state.backlinks.debounce_due.is_some(), "换根触发重扫");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 反向链接面板的点击跳转(#15):消息路由走 WikilinkClicked →
+    /// `open_wikilink` 同一条链路 —— 命中即打开来源(含子目录与 `.md`
+    /// 后缀容错);来源已打开时切标签而非双开;来源文件已删除落弱提示,
+    /// 不崩溃。
+    #[test]
+    fn backlink_jump_opens_source_switches_tab_and_notices_when_missing() {
+        let dir = temp_path("backlinks-jump");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("note.md"), "目标文档\n").unwrap();
+        std::fs::write(dir.join("sub/b.md"), "子目录来源 [[note]]\n").unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+        state.apply(Message::FileSelected(dir.join("note.md")));
+
+        // 面板行点击:载荷是 jump_target("sub/b.md") = "sub/b"
+        state.apply(Message::WikilinkClicked {
+            target: "sub/b".into(),
+        });
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("sub/b.md").as_path()),
+            "子目录来源按相对路径命中"
+        );
+        // 基数 = 初始未命名标签 + note.md + 来源 sub/b.md
+        assert_eq!(state.tabs.tabs.len(), 3, "来源未开,开新标签");
+
+        // 回到目标文档后再点同一来源:切标签,不开第二个
+        state.apply(Message::TabActivate(1));
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("note.md").as_path()),
+            "前置:当前停在目标文档"
+        );
+        state.apply(Message::WikilinkClicked {
+            target: "sub/b".into(),
+        });
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("sub/b.md").as_path()),
+            "已开来源被激活"
+        );
+        assert_eq!(state.tabs.tabs.len(), 3, "不双开同一文档");
+
+        // 来源文件已被删除:落弱提示,不崩溃
+        std::fs::remove_file(dir.join("sub/b.md")).unwrap();
+        state.apply(Message::TabActivate(1));
+        state.apply(Message::WikilinkClicked {
+            target: "sub/b".into(),
+        });
+        assert!(
+            state
+                .tabs
+                .current()
+                .document
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("sub/b")),
+            "来源缺失给弱提示:{:?}",
+            state.tabs.current().document.notice
+        );
+        assert_eq!(state.tabs.tabs.len(), 3, "缺失分支不开标签");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 切 Live Preview 只翻标志:文本、修订号、dirty 都不动(共用同一 rope
