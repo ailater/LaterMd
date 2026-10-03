@@ -661,3 +661,27 @@
 - **自动选择**:本模块不动任何代码(红线);修复需求按①+③登记移交人工拍板;#46 R3 复测按「未修」口径落档(水位即 R1 水位),M0 验证 4 挂账不销。
 - **理由**:主导成本(10000 行档 ~99%,全文解析仅 ~0.13%)在 vendored 整篇 galley `build_layout` 与整篇哈希门控;app 侧四候选方向(流式帧免全文重解析/heal 路径/布局缓存命中/无关帧重建)逐项实读核对均「已在位」或「不可达」,任何 app 侧修补都不改变 O(n) 判定曲线;擅动 `scroll_code_blocks` 有观感回归且被 cull key 机制证明无效,属投机优化不做。
 - **如何改**:拍板①时——按「先分段准入、再块级 key」两步走 vendor ①类最小补丁(独立 `vendor:` commit + vendor/README.md 变更表 ①类登记 + `vendor/egui_markdown/check.sh` 六项;①类按上游 CONTRIBUTING 标准保持可 cherry-pick),注意两处连带语义:`debug_assert!(layout.segment_breaks.is_empty())`(`label.rs:692`)的两侧一致性约束、以及块序号作 id 成分时编辑中部不得挪移后续块序号(AGENTS §6.7 widget id 纪律);完成后按 perf-recheck §2 同一条命令复测,验收口径 = 每行成本随规模趋稳(亚线性),M0 挂账凭新数字销账。拍板③时——改动局限 crates/(流式路径按文档规模切渲染配置或关流式预览),一个 PR 可完成,但流式写作的产品体验降级需坤哥先认。
+
+## #78 #42 M1 偏移→预览块位置通道选 vendor ①类而非 app-only(2026-10-03,#42 outline-preview-jump M1·自动拍板)
+
+- **岔路**:任务书给「vendor ①类(渲染时记录块 span→rect 表 + pub 查询)」与「app-only 替代方案」两条路,要求自选并记录理由。探测结论:vendored `render_token_range` 的块 widget 分支(表格/代码块/图片/引用/AI 指令卡)全部在 vendor 内部渲染,app 侧无任何挂载点能拿到它们的 rect(`code_block_buttons` 回调只有按钮行的 Ui,表格完全无回调);`section_anchors`(2026-09-26 已有)只在单 galley 路径有效,分段文档每 flush 覆盖写同一 data key 且 byte_start 是段内偏移——含表格/代码块的文档查表必错。app-only 不可达,通道必须开在 vendor。
+- **备选**:①vendor ①类块表(`BlockSpanRect` + `block_span_rects`/`block_rect_at_offset`,记录点覆盖 render_galley 细块/块 widget 粗块/flush culling 粗块);②app-only 探针(照 `copy_button_rects` 手法在可挂载的回调里记 rect)——只能覆盖代码块按钮行,表格/图片/引用全盲,否决;③修旧 `section_anchors`(分段聚合 + 块 widget 补锚)——行级锚点模型(单 y、无 span)承载不了「块内偏移归属/间隙归后续块」的查询语义,改造量等于重写。
+- **自动选择**:①。
+- **理由**:块 widget 几何只有渲染它的那一层知道,①是唯一完整覆盖;帧号键控的表(首写重置 + 跨帧读 None)天然满足「查询结果随缓存失效」——屏幕坐标过期即不可用,文档变更随重渲染同帧重建;①类按上游 CONTRIBUTING 标准(纯新增 API + 独立测试 + 不动既有渲染路径),`vendor/egui_markdown/check.sh` 六项全绿,可 cherry-pick。实现中推翻了一个直觉方案:`section_to_token` 不能反查行 y——epaint `LayoutJob::append` 会合并同格式相邻 section(text_layout_types.rs:205-213),两序列索引不平行;改用块首文本在 job.text 单调正向查找 + `Galley::pos_from_cursor(prefer_next_row)` 定位(O(doc) 单遍,测试钉死单调性)。
+- **如何改**:想换回行级锚点模型(③),删 label.rs 的 `BlockSpanRect`/`block_span_rects`/`block_rect_at_offset`/`is_block_start`/`block_needle`/`record_text_blocks` 与三处记录点,把 `section_anchors` 改成跨 flush 聚合(offset 换算 + 块 widget 手工补锚),app 侧查询退回「锚点 y 二分」;测试 tests/block_span_rects.rs 同步删。
+
+## #79 #42 M1 大纲跳预览的滚动语义取「一次到位 + 目标居中」(Align::Center + ScrollAnimation::none)(2026-10-03,#42 outline-preview-jump M1·自动拍板)
+
+- **岔路**:任务书跳转语义原文「预览 scroll_to_rect 一次到位居中」——「居中」可读作目标块滚到视口中央(Align::Center),也可读作「跳转到位」的笼统说法、实际按编辑器侧惯例对齐视口顶(Align::TOP,2026-09-26 旧实现即 TOP);「一次到位」可读作禁用滚动动画(ScrollAnimation::none)或仅「不要分步多次滚动」(默认动画也算一步请求)。
+- **备选**:①`scroll_to_rect_animation(rect, Align::Center, ScrollAnimation::none())`——点击即达、目标块居中;②`Align::TOP` + 默认动画——沿用旧行为与 egui 默认平滑滚动;③Center + 默认动画——居中但走动画。
+- **自动选择**:①。
+- **理由**:按任务书字面直译;「一次到位」排除动画(平滑滚动在长文档里目标是屏外千行级距离,动画观感是「飞过半个文档」,编辑器内跳转同类场景也是瞬达);跳转目标是大纲点击的标题,居中让标题上下文(前后文)同时可见,长文档跳到底部标题时 TOP 会让目标贴顶失去「到了哪」的参照。端到端测试 `outline_jump_actually_scrolls_preview` 断言滚动真实发生(这是用户反馈「目前就源码跳转了」的回归锁:旧实现的 scroll_to_rect 写在 ScrollArea 闭包外,pass_state 滚动目标在下一帧 begin_pass 被清空,永不消费——egui 0.36 `PassState::begin_pass` 实读 + 双向对照实验实锤)。
+- **如何改**:想改回顶部对齐或平滑滚动,只动 `crates/latermd-app/src/ui/preview.rs` 消费段的 `Align::Center`/`ScrollAnimation::none()` 两个实参;真机目视若觉居中跳动大,改 `Align::TOP` 一处即可。
+
+## #80 #42 M2 预览面板收起期间的大纲跳转请求取「悬置,重开补跳」而非「即弃」(2026-10-03,#42 outline-preview-jump M2·自动拍板)
+
+- **岔路**:右栏收起时点大纲(左栏大纲仍可见,这是真实路径),预览侧请求(`PreviewState::scroll_target`)怎么处置:①悬置——重开面板的第一帧消费并补跳到目标;②即弃——面板不可见就当请求作废,重开停在原地。任务书只写了「预览面板不可见时消费请求无 panic」,没有给可见性语义,两条都不与之冲突。
+- **备选**:①悬置补跳(零代码 delta:消费只发生在 `preview::ui` 渲染帧,收起时本就不跑);②归约侧判 `layout.right`,不可见直接把 `scroll_target` 清掉(要给归约加 UI 可见性判断,与「滚动位置不是文档状态、不进归约」的既有口径相悖);③收起时挂起、重开时若期间有编辑才丢弃(现行为已是这个并集:悬置 + rebuild 即弃,见 `outline_click_residual_request_dropped_after_rebuild` 与 layout 测试第二段)。
+- **自动选择**:①(即现状 ③的并集)。
+- **理由**:用户点大纲的意图是「带我去那」,面板当时看不见不等于意图消失,重开补跳最贴近意图;文档变更后旧偏移对新文本无意义,rebuild 丢弃兜住「补跳跳错文本」的风险;①不新增任何生产代码,也不把可见性判断漏进归约。落档测试 `outline_click_with_preview_collapsed_pending_then_dropped_after_edit`(完整 draw 路径:悬置→重开补跳→收起→变更→丢弃→重开不复燃)。
+- **如何改**:想改成「即弃」,在 `Message::RightPanelToggled(false)` 的归约里加一行清 `scroll_target`(归约本来就知道面板开关),并把 layout 测试第一段「重开消费」的断言翻转为「重开仍在原地」;悬置语义的文档口径在 `state.rs` 的 `scroll_target` 字段注释,同步改。
