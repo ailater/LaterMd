@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身、返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #88 为当前最新条目。
+> 编号 #89 为当前最新条目。
+
+## #89 #24 C3 快速打开浮层的两处落地口径:选中 QuickOpen 自身只发一条翻转(不补第二条)、浮层高度自适应内容但封顶 430(宽度才定死)(2026-10-03,#24 quick-open C3·自动拍板)
+
+- **岔路**:任务书规定「选中命令 → outbox.push(cmd.message()) 并关面板」与尺寸铁律「窗口宽度定死(如 560px,resizable(false) 或 exact-size 手法)」,落地各有一处自由度:①**命令集里含 `Command::QuickOpen` 自己**——照字面「push 消息 + 补一条关面板」会发两条 `ToggleQuickOpen`(它的 message() 就是这条翻转),同帧先后归约 = 关了又开,浮层关不上;②**「宽度定死」之外高度取什么**——严格定高(浮层恒 430px,短列表空撑一大截)还是自适应内容高度(需自证有界,不违反「禁无界组合」铁律的字面——铁律只钉宽度与列表限高)。
+- **备选**:①QuickOpen 自身改为「关面板一条在前 + cmd.message() 一条在后」(顺序避开双翻)、或引入专用 `QuickOpenClose` 消息、或浮层候选里干脆排除 QuickOpen 命令;②严格定高 430(内容尾部 allocate 剩余高度)、或高度完全交给内容(不设上限,靠组上限 8 自证有界)。
+- **自动选择**:①**选中 QuickOpen 自身只发 `cmd.message()` 一条,不补关面板那条**(其余命令照旧补一条 `ToggleQuickOpen`);②**`fixed_size([560, 430])`:宽度由此定死(输入框 `desired_width(f32::INFINITY)` 撑满,实测恒 560);高度端 egui 对不可调尺寸窗口本就按内容自适应(`Resize::end` 的「Probably a window」分支),`WINDOW_H=430` 作为内容布局区上限封顶,短列表自然收缩**。
+- **理由**:①两条同帧先后归约无顺序能避开「关→开」(翻转幂等路径只有「只发一条」);专用消息要动 C2 已合入的 Message 表与归约(扩表面积);排除 QuickOpen 让「浮层能执行命令全集」的任务字面失真——「快速打开」本身也是可执行命令,且它恰好是「再开/已开就关」的自然语义(与 VS Code 同款 toggle)。回归锁:`command_rows_execute_via_message_and_close` 断言 Enter 后 outbox 恰为一条 `ToggleQuickOpen` 且浮层净效果为关。②严格定高在两三条结果的常见场景里留一大块空白,观感差;而「有界」由三层保证——每组条数上限 8(可见行 ≤ 18)、列表 `ScrollArea::max_height(320)`、布局区封顶 430——高度不随文件总数增长,`window_stays_fixed_and_inside_viewport_with_long_list` 钉死「文件 40 → 80 浮层 rect 逐项不变、宽恒 560、高 ≤ 430、rect 含于视口」。
+- **如何改**:①要「关面板」语义更显式——给 Message 加 `QuickOpenCloseRequested` 变体(归约只关不开),浮层对全部命令统一 push 它;②要严格定高——浮窗内容尾部 `ui.allocate_space(ui.available_size())` 把 min_size 顶满,或把测试断言改为恒等高度后调整 `WINDOW_H`;要改宽度/限高数值,只动 `ui/quick_open.rs` 的 `WINDOW_W`/`WINDOW_H`/`LIST_MAX_H`/`MAX_PER_GROUP` 四个常量。
 
 ## #88 BK2 反向链接面板(#15)的四层口径:触发=帧末快照比对、点击=WikilinkClicked 同链路(载荷=来源剥后缀)、摘要在扫描层产出、内容变更不重扫(2026-10-03,#15 backlinks BK2·自动拍板)
 
