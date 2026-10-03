@@ -89,20 +89,15 @@ pub(crate) fn resolve_relative_images<'a>(
     if rewrites.is_empty() {
         return Cow::Borrowed(text);
     }
-    let mut out = String::with_capacity(text.len() + 64);
-    let mut cursor = 0;
-    for (span, uri) in rewrites {
-        out.push_str(&text[cursor..span.start]);
-        out.push_str(&uri);
-        cursor = span.end;
-    }
-    out.push_str(&text[cursor..]);
-    Cow::Owned(out)
+    // 拼串交给 `OffsetMap::apply`:改写清单只有一份,「渲染串长什么样」与
+    // 「偏移怎么换算」(map_source_offset 的第二层)不漂移。
+    Cow::Owned(latermd_md::OffsetMap::from_rewrites(rewrites).apply(text))
 }
 
-/// 相对图片地址的 `(区间, 改写串)` 清单(改写逻辑见 [`resolve_relative_images`]);
-/// 偏移映射(`map_offset_through`)与字符串改写共用同一份,两处不漂移。
-fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<(Range<usize>, String)> {
+/// 相对图片地址的改写清单(改写逻辑见 [`resolve_relative_images`]):每处
+/// 是一个 `latermd_md::Rewrite`(与 wikilink 展开层**同一结构**),字符串
+/// 改写与偏移映射(`map_source_offset`)共用同一份,两处不漂移。
+fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<latermd_md::Rewrite> {
     let Some(base_dir) = base_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
         return Vec::new();
     };
@@ -117,61 +112,28 @@ fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<(Range<usize>, Str
             if wrapped || uri.chars().any(char::is_whitespace) {
                 uri = format!("<{uri}>");
             }
-            (span, uri)
+            latermd_md::Rewrite {
+                span,
+                replacement: uri,
+            }
         })
         .collect()
-}
-
-/// `[[wikilink]]` 展开对字节偏移的影响:`(区间, 展开后长度)` 清单,供
-/// [`map_offset_through`] 把源码偏移映射到展开文本。
-///
-/// 展开式 `[显示名](<wiki://目标>)` 的长度按字节算(与偏移口径一致),
-/// 与 `latermd_md::expand_wikilinks` 的输出逐字节对应(单测
-/// `wikilink_rewrite_lengths_match_expand` 锁死两者)。
-fn wikilink_rewrites(source: &str) -> Vec<(Range<usize>, usize)> {
-    latermd_md::wikilinks(source)
-        .into_iter()
-        .map(|link| {
-            let expanded_len =
-                link.label.len() + link.target.len() + latermd_md::WIKI_SCHEME.len() + 6;
-            (link.span, expanded_len)
-        })
-        .collect()
-}
-
-/// 把一处字节偏移穿过一条「区间替换」链:偏移在被替换区间内 → 映到该区间
-/// 起点之后的对应位置(改写段内部没有更细的锚点,落点即段首);其余偏移
-/// 平移前方位移的累积长度差。`rewrites` 按区间升序(两个生产者都满足)。
-fn map_offset_through(offset: usize, rewrites: &[(Range<usize>, usize)]) -> usize {
-    let mut delta: i64 = 0;
-    for (span, new_len) in rewrites {
-        if span.end <= offset {
-            delta += *new_len as i64 - (span.end - span.start) as i64;
-        } else if span.start > offset {
-            break;
-        } else {
-            return span.start + delta as usize;
-        }
-    }
-    (offset as i64 + delta) as usize
 }
 
 /// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
-/// 偏移。两层改写:wikilink 展开(源文本 → `PreviewState::rendered`)与
-/// 相对图片 `file://` 改写(`rendered` → 最终渲染文本)。两层都是「区间
-/// 替换」,串行映射即可。
+/// 偏移。两层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
+/// `latermd_md::OffsetMap`):wikilink 展开(源文本 → `rendered`,表由
+/// `PreviewState` 与渲染串同次产出持有)与相对图片 `file://` 改写
+/// (`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
 fn map_source_offset(
-    source: &str,
+    offset_map: &latermd_md::OffsetMap,
     rendered: &str,
     base_dir: Option<&Path>,
     offset: usize,
 ) -> usize {
-    let after_wikilinks = map_offset_through(offset, &wikilink_rewrites(source));
-    let image_deltas: Vec<(Range<usize>, usize)> = image_rewrites(rendered, base_dir)
-        .into_iter()
-        .map(|(span, uri)| (span, uri.len()))
-        .collect();
-    map_offset_through(after_wikilinks, &image_deltas)
+    let after_wikilinks = offset_map.source_to_rendered(offset);
+    let image_map = latermd_md::OffsetMap::from_rewrites(image_rewrites(rendered, base_dir));
+    image_map.source_to_rendered(after_wikilinks)
 }
 
 /// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
@@ -670,7 +632,8 @@ pub fn ui(
             // 也只在渲染当帧有效,同帧先写后读。块缺失(空文档/未渲染)就
             // 不滚,下一帧有表了也不会再滚 —— 滚动目标消费即清空,一次语义。
             if let Some(target) = preview.scroll_target.take() {
-                let offset = map_source_offset(&preview.text, &preview.rendered, base_dir, target);
+                let offset =
+                    map_source_offset(&preview.offset_map, &preview.rendered, base_dir, target);
                 if let Some(block) = egui_markdown::block_rect_at_offset(ui, label_id, offset) {
                     ui.scroll_to_rect_animation(
                         block.rect,
@@ -849,8 +812,10 @@ mod tests {
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |panel| {
             let text = doc.to_owned();
+            let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
             let mut preview = PreviewState {
-                rendered: latermd_md::expand_wikilinks(&text),
+                rendered,
+                offset_map,
                 text,
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -933,6 +898,7 @@ mod tests {
         let doc = "# 一\n\n正文\n\n## 二\n\n正文二\n";
         let mut preview = PreviewState {
             rendered: doc.to_owned(),
+            offset_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -955,50 +921,31 @@ mod tests {
         assert!(outbox.is_empty(), "滚动不产消息");
     }
 
-    /// 展开长度公式与 `expand_wikilinks` 的实际输出逐字节一致 —— 公式错了
-    /// 偏移映射就会漂,这条把两者锁死。样本覆盖中文/带空格目标/显示名与
-    /// 目标不同名(展开式字节长度各不相同)。
-    #[test]
-    fn wikilink_rewrite_lengths_match_expand() {
-        let source = "见 [[架构决策]] 与 [[Note One|笔记一]]、[[中文 文档]]。\n";
-        let expanded = latermd_md::expand_wikilinks(source);
-        let rewrites = wikilink_rewrites(source);
-        // 逐段重建展开文本,长度必须与真实展开一字不差
-        let mut rebuilt = String::new();
-        let mut cursor = 0;
-        for (span, new_len) in &rewrites {
-            rebuilt.push_str(&source[cursor..span.start]);
-            let target = &latermd_md::expand_wikilinks(&source[span.clone()]);
-            assert_eq!(target.len(), *new_len, "span {span:?} 展开长度公式漂移");
-            rebuilt.push_str(target.as_str());
-            cursor = span.end;
-        }
-        rebuilt.push_str(&source[cursor..]);
-        assert_eq!(rebuilt, expanded, "公式重建与 expand 输出不一致");
-    }
-
     /// 偏移映射三层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
     /// 相对图片改写叠加在同一映射里;偏移落在改写区间内归段首。
+    /// (展开层的「映射与展开输出逐字节一致」由 latermd-md 的
+    /// `expand_wikilinks_with_map` 测试直接锁死 —— 本侧只验两层串行穿过。)
     #[test]
     fn map_source_offset_through_both_rewrites() {
         // 无改写:恒等
-        assert_eq!(map_source_offset("# h\n", "# h\n", None, 3), 3);
+        let identity = latermd_md::OffsetMap::empty();
+        assert_eq!(map_source_offset(&identity, "# h\n", None, 3), 3);
 
         // wikilink 改写:[[架构决策]](12 字节)→ [架构决策](<wiki://架构决策>)
         // (2+12+2+4+8+12+2=…);标题在 wikilink 之后,映射后偏移必须落在
         // 展开文本里同一个标题的字节上。
         let source = "见 [[架构决策]] 再谈。\n\n## 后续标题\n\n正文。\n";
-        let rendered = latermd_md::expand_wikilinks(source);
+        let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(source);
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
-        let mapped = map_source_offset(source, &rendered, None, heading_src);
+        let mapped = map_source_offset(&offset_map, &rendered, None, heading_src);
         assert_eq!(mapped, heading_out, "wikilink 之后的偏移按平移映射");
 
         // 偏移落在 wikilink 区间内(点击目标是标题,标题不会落在链接里,
         // 但边界语义仍要确定):归改写段首。
         let link_start = source.find("[[").expect("wikilink");
         let in_link = link_start + 3;
-        let mapped_in = map_source_offset(source, &rendered, None, in_link);
+        let mapped_in = map_source_offset(&offset_map, &rendered, None, in_link);
         assert_eq!(
             &rendered[mapped_in..].chars().take(3).collect::<String>(),
             "[架构",
@@ -1012,7 +959,7 @@ mod tests {
         let with_uri = resolve_relative_images(doc, base);
         let heading = doc.find("## 标题").expect("heading");
         let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
-        let mapped_img = map_source_offset(doc, doc, base, heading);
+        let mapped_img = map_source_offset(&identity, doc, base, heading);
         assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
     }
 
@@ -1030,6 +977,7 @@ mod tests {
         let heading = doc.find("# 底部标题").expect("tail heading");
         let mut preview = PreviewState {
             rendered: doc.clone(),
+            offset_map: latermd_md::OffsetMap::empty(),
             text: doc.clone(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1154,7 +1102,7 @@ mod tests {
                             // 的那个块。首帧滚动起点是 0,记录 rect 即内容坐标。
                             let tab = state.tabs.current();
                             let mapped = map_source_offset(
-                                &tab.preview.text,
+                                &tab.preview.offset_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1206,6 +1154,167 @@ mod tests {
         assert!(
             top < mid && mid < tail,
             "落点按目标块方位有序: top={top} mid={mid} tail={tail}"
+        );
+    }
+
+    /// LP2-4 端到端:文档前部有多条 `[[wikilink]]`(展开让渲染文本比源码
+    /// 长,大纲 span 的源码偏移**直接**喂块表必然错位),大纲点击 → 归约
+    /// → 预览消费帧经映射表换算 → 块表查询 → 滚动。断言三层:
+    /// ①换算保真 —— 渲染文本从落点起逐字节重现「span.start → 标题行」的
+    /// 源码片段(平移不改相对上下文,块表因此查到标题块,而不是被位移差
+    /// 顶到前面的块);②复算 `Align::Center` 落点误差 ≤1px;③中部/尾部
+    /// 两个目标落点有序可区分 —— 换算跟着目标走,不是「碰巧都滚到某处」。
+    #[test]
+    fn outline_click_through_wikilink_offsets_lands_on_target_block() {
+        let mut doc = String::from("# 顶部\n\n");
+        for i in 0..20 {
+            doc.push_str(&format!(
+                "第 {i} 段,见 [[架构决策{i}]] 与 [[Note {i}|笔记{i}]]。\n\n"
+            ));
+        }
+        doc.push_str("## 中部标题\n\n");
+        for i in 0..15 {
+            doc.push_str(&format!("续 {i} 段正文。\n\n"));
+        }
+        doc.push_str("# 尾部标题\n\n收尾。\n");
+
+        // 完整链:换文档(rebuild,生产同步规则)→ 换算/渲染两帧消费。
+        // 返回 (换算落点, 渲染文本里目标标题的实际偏移, 滚动 offset,
+        // Center 期望值, 钳制上限)。
+        let jump = |heading: &str, rendered_needle: &str| -> (usize, usize, f32, f32, f32) {
+            let mut state = crate::state::State::default();
+            {
+                let tab = state.tabs.current_mut();
+                tab.editor.replace_all(&doc);
+                tab.preview.rebuild(&tab.editor);
+            }
+            // 前置:wikilink 展开确实让文本漂移(否则换算对落点退化恒真)
+            let tab = state.tabs.current();
+            assert_ne!(tab.preview.rendered.len(), tab.preview.text.len());
+            let rendered_at = tab
+                .preview
+                .rendered
+                .find(rendered_needle)
+                .unwrap_or_else(|| panic!("渲染文本缺 {rendered_needle}"));
+
+            let span = tab
+                .preview
+                .outline
+                .iter()
+                .find(|item| item.text == heading)
+                .unwrap_or_else(|| panic!("大纲缺 {heading}"))
+                .span
+                .clone();
+            // span.start 吸收标题前的空行(outline 平铺口径),落在标题字符
+            // 之前;换算保真的判据因此不是「== 标题字符位置」,而是「源码
+            // 从 span.start 起的片段,在渲染文本的换算落点处逐字节重现」
+            // (平移不改相对上下文;span.start 到标题行之间没有 wikilink,
+            // 片段内部不可能再被改写)。
+            let heading_char_src = tab
+                .preview
+                .text
+                .find(rendered_needle)
+                .unwrap_or_else(|| panic!("源文本缺 {rendered_needle}"));
+            assert!(
+                span.start <= heading_char_src,
+                "{heading}: 前置 —— span.start 不先于标题字符"
+            );
+            let snippet =
+                tab.preview.text[span.start..heading_char_src + rendered_needle.len()].to_owned();
+            assert_ne!(
+                span.start, rendered_at,
+                "{heading}: 前置 —— 源码偏移与渲染偏移确实不同"
+            );
+            state.apply(Message::OutlineItemClicked(span.clone()));
+
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+            let mut outbox = Vec::new();
+            let mut mapped = 0;
+            let mut block_rect = None;
+            let mut probe = None;
+            for frame in 0..2 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |panel| {
+                        {
+                            let tab = state.tabs.current_mut();
+                            ui(
+                                panel,
+                                &mut tab.preview,
+                                &AiState::default(),
+                                1,
+                                false,
+                                None,
+                                &mut outbox,
+                            );
+                        }
+                        if frame == 0 {
+                            // 与生产消费同帧读块表(帧号键控,跨帧即 None)
+                            let tab = state.tabs.current();
+                            mapped = map_source_offset(
+                                &tab.preview.offset_map,
+                                &tab.preview.rendered,
+                                None,
+                                span.start,
+                            );
+                            block_rect = egui_markdown::block_rect_at_offset(
+                                panel,
+                                tab_preview_id(1),
+                                mapped,
+                            )
+                            .map(|block| block.rect);
+                        }
+                        probe = panel
+                            .ctx()
+                            .data(|d| d.get_temp::<ScrollProbe>(scroll_probe_id(1)));
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            let block = block_rect.unwrap_or_else(|| panic!("{heading}: 换算后的偏移不在块表内"));
+            let probe = probe.expect("探针已写入");
+            // 换算保真:渲染文本从落点开始逐字节重现「span.start → 标题行」
+            // 的源码片段(平移不改相对上下文)—— 落点正确性的直接证据
+            let rendered = state.tabs.current().preview.rendered.clone();
+            assert!(
+                rendered[mapped..].starts_with(&snippet),
+                "{heading}: 换算落点 {mapped} 处的上下文与源码不一致(应重现 {snippet:?})"
+            );
+            (
+                mapped,
+                rendered_at,
+                probe.offset,
+                block.center().y - probe.viewport.center().y,
+                (probe.content_height - probe.viewport.height()).max(0.0),
+            )
+        };
+
+        for (heading, needle) in [("中部标题", "## 中部标题"), ("尾部标题", "# 尾部标题")]
+        {
+            let (_mapped, _rendered_at, offset, expected, max) = jump(heading, needle);
+            let want = expected.clamp(0.0, max);
+            assert!(
+                (offset - want).abs() <= 1.0,
+                "{heading}: 偏移 {offset} 应等于 Center 换算+钳制 {want}(expected={expected}, max={max})"
+            );
+        }
+
+        // 两个目标的换算落点与滚动落点都随目标前进(换算真实起效,不是
+        // 所有点击都滚到同一处)
+        let (mid_mapped, _, mid_offset, _, _) = jump("中部标题", "## 中部标题");
+        let (tail_mapped, _, tail_offset, _, _) = jump("尾部标题", "# 尾部标题");
+        assert!(
+            mid_mapped < tail_mapped,
+            "换算后的偏移随目标前进: mid={mid_mapped} tail={tail_mapped}"
+        );
+        assert!(
+            mid_offset < tail_offset,
+            "滚动落点随目标前进: mid={mid_offset} tail={tail_offset}"
         );
     }
 
@@ -1327,6 +1436,7 @@ mod tests {
         let render = |doc: &str| {
             let mut preview = PreviewState {
                 rendered: doc.to_owned(),
+                offset_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1423,6 +1533,7 @@ mod tests {
         let render = |rendered: &str, heal: bool| -> Vec<String> {
             let mut preview = PreviewState {
                 rendered: rendered.to_owned(),
+                offset_map: latermd_md::OffsetMap::empty(),
                 text: rendered.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1503,8 +1614,10 @@ mod tests {
         doc: &str,
         events: Vec<egui::Event>,
     ) -> (Vec<egui::Rect>, Vec<String>, Vec<String>) {
+        let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(doc);
         let mut preview = PreviewState {
-            rendered: latermd_md::expand_wikilinks(doc),
+            rendered,
+            offset_map,
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1631,8 +1744,10 @@ mod tests {
 
         // 点击后的第一帧:按钮 rect 内出现一正一负两条非零斜率线段(Check)。
         let output = ctx.run_ui(egui::RawInput::default(), |panel| {
+            let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(&doc);
             let mut preview = PreviewState {
-                rendered: latermd_md::expand_wikilinks(&doc),
+                rendered,
+                offset_map,
                 text: doc.clone(),
                 synced_rev: 0,
                 outline: Vec::new(),

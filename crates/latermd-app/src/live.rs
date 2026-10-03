@@ -9,8 +9,22 @@
 //! 块表来自 `latermd_md::blocks`(字节区间**连续覆盖全文**):这是安全底线
 //! —— 若有字节落在任何块之外,在那儿敲一个字符就会静默丢失。
 //!
-//! v1 的范围(roadmap「内联标记半隐藏 v1 可简化」):块是**整块**切换,不做
-//! 行内标记的半隐藏(如只对 `**` 隐藏一半)。改块的代价是整块源码裸出来。
+//! v1 的范围(roadmap「内联标记半隐藏 v1 可简化」):块是**整块**切换。LP2-1
+//! (v2)在活动块内做**内联标记半隐藏**:正文正常显示,`**` 等标记字符以半
+//! 透明遮罩弱化,光标/选区贴上的段显形 —— 区间提取是纯函数
+//! `latermd_md::inline_marks`,绘制是纯叠加,不碰 TextEdit 的状态与命中测试。
+//! LP2-2 加**选区扩展与配对显形**:选区/光标触碰某标记时其配对另一侧同
+//! 时显形;从标记内侧发起的双击/拖选把选区一次性扩到完整标记对(内容+
+//! 两侧标记),让编辑标记本身有可及入口 —— 决策是纯函数
+//! `latermd_md::mark_interaction`,选区仍在块内闭合(v1 既定,块是独立
+//! TextEdit,不引入跨块选区行为变更)。
+//!
+//! LP2-3 补**活动块跟随与跳转时序**(#29 源码栏修复在 Live 侧的同款缺
+//! 口):Live 自有 ScrollArea,在键盘导航帧与光标写回帧把光标行滚入视口
+//! —— 照 #29 的「帧内一次性标志」手法(标志当帧即焚,滚轮/空闲帧不抢
+//! 滚动);跨块路由与大纲跳转(`cursor.jump_to`)的光标落地与视口跟随
+//! **同帧**发生,不出现「光标写了但视图没跟」的帧。滚动偏移与跟随标志
+//! 都在 UI 侧,不进 State 归约。
 
 use std::ops::Range;
 
@@ -55,6 +69,21 @@ pub struct LiveState {
     pub pending_caret: Option<(usize, usize)>,
     /// 块表对应的修订号;只在修订号前进时重算块。
     synced_rev: Option<u64>,
+    /// 活动块的内联标记缓存(LP2-1 半隐藏 + LP2-2 选区扩展):(修订号,
+    /// 块序号) → 标记段与成对表(同一次解析的产出,不会互相错位)。与块
+    /// 表同一条纪律:修订号不动就不重解析(打一个字的代价 = 重解析活动
+    /// 块,与 v1 每次编辑重算整篇块表同一量级)。
+    marks: Option<(u64, usize, latermd_md::InlineMarks)>,
+    /// 拖选锚点(LP2-2):活动块 TextEdit 上**按下帧**的塌缩光标(块内
+    /// 字符偏移),拖选松手帧用于「从标记发起的拖选扩展到完整标记对」。
+    /// 生命周期 = 一次按压:松手帧消费,按在别处的按下帧清除。
+    drag_anchor: Option<usize>,
+    /// pending_caret 落地帧是否同时把光标行滚入视口(LP2-3)。跨块路由
+    /// 与大纲跳转置真 —— 光标去了别的块,视图必须同帧跟上;点击进编辑
+    /// 置假 —— 指针刚把视口定位到点击处,再跟随等于把视图拽离用户点的
+    /// 地方(#29「滚轮/空闲帧不抢滚动」的同族红线)。与 pending_caret
+    /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。
+    caret_follow: bool,
 }
 
 impl LiveState {
@@ -101,6 +130,9 @@ impl LiveState {
         self.active = None;
         self.pending_caret = None;
         self.synced_rev = None;
+        self.marks = None;
+        self.drag_anchor = None;
+        self.caret_follow = false;
     }
 }
 
@@ -167,6 +199,23 @@ pub fn ui(
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
 
+    // 大纲/搜索跳转(LP2-3):与源码模式同一入口(`cursor.jump_to`)、同一
+    // 时序口径 —— 当帧把目标块切成活动块并交 pending_caret,本帧闭包内
+    // 即落地光标 + 请求滚动,不晚一帧。字符偏移是全文口径,先落块再换算
+    // 块内偏移(块区间是字节;`char_to_byte`/`block_containing` 均对过期
+    // 目标钳制)。空文档没有可落点,jump_to 已 take 即算消费,不悬置到
+    // 将来的文档上。
+    if let Some(char_idx) = cursor.jump_to.take() {
+        let byte = editor.char_to_byte(char_idx);
+        if let Some(block) = live.block_containing(byte) {
+            let local = editor.byte_to_char(byte) - editor.byte_to_char(live.blocks[block].start);
+            live.active = Some(block);
+            live.pending_caret = Some((block, local));
+            live.caret_follow = true;
+            live.drag_anchor = None;
+        }
+    }
+
     let mut active_response: Option<egui::Response> = None;
     let mut activate: Option<usize> = None;
     let mut route: Option<(usize, usize)> = None;
@@ -191,21 +240,23 @@ pub fn ui(
                         buffer: editor,
                         range: range.clone(),
                     };
+                    // 稳定 id:按块序号(不带长度/hash),AGENTS §6.7 的红线
+                    let response_id = editor_id.with(("live-block", index));
                     let output = egui::TextEdit::multiline(&mut buffer)
-                        // 稳定 id:按块序号(不带长度/hash),AGENTS §6.7 的红线
-                        .id(editor_id.with(("live-block", index)))
+                        .id(response_id)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                         .desired_rows(lines.clamp(1, 40))
                         .show(ui);
 
+                    // 光标(块内字符偏移):跨块路由判定、键盘跟随与回填共用
+                    let caret = output
+                        .state
+                        .cursor
+                        .char_range()
+                        .map(|range| range.primary.index.0);
                     // 跨块 caret 路由:块首按 ↑ 去上一块末尾;块尾按 ↓ 去下一块开头
                     if output.response.response.has_focus() {
-                        let caret = output
-                            .state
-                            .cursor
-                            .char_range()
-                            .map(|range| range.primary.index.0);
                         let at_start = caret == Some(0);
                         let at_end = caret == Some(char_len);
                         if ui.input(|input| input.key_pressed(egui::Key::ArrowUp))
@@ -228,9 +279,142 @@ pub fn ui(
                             editor.byte_to_char(live.blocks[index].start) + range.primary.index.0,
                         )
                     });
+                    // LP2-1 内联标记半隐藏 + LP2-2 选区扩展。显形集合与扩
+                    // 展选区都是纯函数(`latermd_md::mark_interaction`),绘
+                    // 制仍是纯叠加 —— 不挂 widget(不参与命中测试)。交互
+                    // 边界:双击帧把 egui 选出的词扩到最内层标记对;拖选松
+                    // 手帧只有「锚点压着标记发起」的拖选才扩(从内容中部
+                    // 发起的普通拖选保持原样);键盘选区/三击选行不扩展。
+                    // 光标取 `output.state`(帧内真值)而非 `output.cursor_
+                    // range`:后者在焦点门控的键盘事件段产出,指针交互(选
+                    // 词/拖选/按压塌缩)发生在其后、只改 state —— 用陈旧值
+                    // 会把按压点读成旧光标。
+                    if let Some(cursor_range) = output.state.cursor.char_range() {
+                        let rev = editor.revision();
+                        if !matches!(&live.marks, Some((r, i, _)) if *r == rev && *i == index) {
+                            // 与 galley 同一份文本:本帧的编辑发生在 show()
+                            // 内部,这里取的也是编辑后的同一切片,缓存键即
+                            // 编辑后的修订号 —— 区间与字形永远对得上
+                            live.marks = Some((
+                                rev,
+                                index,
+                                latermd_md::inline_marks_with_pairs(BlockBuffer::slice(
+                                    editor.text(),
+                                    &range,
+                                )),
+                            ));
+                        }
+                        let bundle: &latermd_md::InlineMarks = match &live.marks {
+                            Some((_, _, bundle)) => bundle,
+                            None => unreachable!("缓存已在上一行建立"),
+                        };
+                        let caret = cursor_range.primary.index.0;
+                        let other = cursor_range.secondary.index.0;
+
+                        // 手势判定。egui 在 show() 内部已处理双击选词(词选
+                        // 区就在本帧的 cursor_range 里)与按下塌缩光标;这里
+                        // 只读信号:双击 → 扩词;松手 + 非空选区 + 锚点 → 扩
+                        // 拖选;按下帧记/清锚点(按在别处清,防跨按压串帧)。
+                        let double_clicked = output.response.response.double_clicked();
+                        let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
+                        let primary_released = ui.input(|input| input.pointer.primary_released());
+                        if primary_pressed {
+                            live.drag_anchor = if output.response.response.contains_pointer() {
+                                Some(caret)
+                            } else {
+                                None
+                            };
+                        }
+                        let gesture = if double_clicked {
+                            live.drag_anchor = None;
+                            Some(latermd_md::MarkGesture::DoubleClick)
+                        } else if primary_released {
+                            match (live.drag_anchor.take(), caret != other) {
+                                (Some(anchor), true) => {
+                                    Some(latermd_md::MarkGesture::DragRelease { anchor })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        let interaction = latermd_md::mark_interaction(
+                            BlockBuffer::slice(editor.text(), &range),
+                            bundle,
+                            caret,
+                            other,
+                            gesture,
+                        );
+                        paint_mark_fades(
+                            ui,
+                            &output.galley,
+                            output.galley_pos,
+                            BlockBuffer::slice(editor.text(), &range),
+                            &bundle.segments,
+                            &interaction.revealed,
+                        );
+                        // 扩展写回:与 pending_caret 同一条通道(改 TextEdit
+                        // 光标状态,下一帧生效);primary 方向保留手势原方向。
+                        if let Some(expanded) = interaction.expanded {
+                            let (low, high) = (expanded.start, expanded.end);
+                            if low != caret.min(other) || high != caret.max(other) {
+                                let mut state = output.state.clone();
+                                let (primary, secondary) = if caret <= other {
+                                    (low, high)
+                                } else {
+                                    (high, low)
+                                };
+                                state
+                                    .cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(primary),
+                                        egui::text::CCursor::new(secondary),
+                                    )));
+                                state.store(ui.ctx(), response_id);
+                            }
+                        }
+                    }
                     let response = output.response.response;
+                    // 活动块跟随(LP2-3,#29「帧内一次性标志」同款):只认
+                    // 两类帧 —— 键盘行/页导航键且活动块持焦、pending_caret
+                    // 落地帧(跨块路由/大纲跳转)。标志是帧内局部变量,当帧
+                    // 即焚;滚轮、拖滚动条、空闲帧一概不跟随,徒手滚动不被
+                    // 拽回光标处。egui 内建跟随只覆盖「事件处理改了选区」的
+                    // 帧(它按帧内前后选区比较),程序化写回改 state 再
+                    // store,内建永远比不出变化 —— 路由/跳转的落地帧必须在
+                    // 这里补,这是本层存在的硬理由;键盘导航帧内建本会跟
+                    // 随,这里再补一层是显式化并与源码模式(#29)对齐口
+                    // 径,不依赖内建的比较时机。跨块路由帧本身不跟随:光标
+                    // 这一帧还在旧块,下一帧 pending 落地时随写回同帧跟随,
+                    // 先滚旧位置只会与目标抢动画。
+                    let mut follow: Option<usize> = None;
+                    if route.is_none() {
+                        let nav_key = ui.input(|input| {
+                            input.events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    egui::Event::Key {
+                                        key: egui::Key::ArrowUp
+                                            | egui::Key::ArrowDown
+                                            | egui::Key::Home
+                                            | egui::Key::End
+                                            | egui::Key::PageUp
+                                            | egui::Key::PageDown,
+                                        pressed: true,
+                                        ..
+                                    }
+                                )
+                            })
+                        });
+                        if nav_key && ui.ctx().memory(|mem| mem.has_focus(response_id)) {
+                            follow = caret;
+                        }
+                    }
                     // 上一帧交过来的光标:落到本块的指定字符偏移并要焦点
-                    // (放在回填之后 —— `output.state` 在这里被移走)
+                    // (放在回填之后 —— `output.state` 在这里被移走)。写回
+                    // 与视口跟随同帧落地:跟随目标取写回偏移(本帧 state 是
+                    // 写回前的旧快照,但 galley 文本未变,行位置即目标行)。
                     if let Some((block, char_idx)) = live.pending_caret {
                         if block == index {
                             let id = response.id;
@@ -243,7 +427,24 @@ pub fn ui(
                             state.store(ui.ctx(), id);
                             ui.ctx().memory_mut(|mem| mem.request_focus(id));
                             live.pending_caret = None;
+                            if live.caret_follow {
+                                follow = Some(char_idx);
+                            }
+                            live.caret_follow = false;
                         }
+                    }
+                    if let Some(index) = follow {
+                        let rect = output
+                            .galley
+                            .pos_from_cursor(egui::text::CCursor::new(index));
+                        ui.scroll_to_rect(
+                            egui::Rect::from_min_max(
+                                output.galley_pos + rect.min.to_vec2(),
+                                output.galley_pos + rect.max.to_vec2(),
+                            )
+                            .expand(1.5),
+                            None,
+                        );
                     }
                     active_response = Some(response);
                 } else {
@@ -278,10 +479,16 @@ pub fn ui(
     if let Some(index) = activate {
         live.active = Some(index);
         live.pending_caret = Some((index, live.block_char_len(editor, index)));
+        // 点击进编辑不跟随:指针刚把视口定位到点击处(decisions-pending #83)
+        live.caret_follow = false;
+        live.drag_anchor = None;
     }
     if let Some(route) = route {
         live.active = Some(route.0);
         live.pending_caret = Some(route);
+        // 跨块路由:光标去了别的块,落地帧视口必须同帧跟上
+        live.caret_follow = true;
+        live.drag_anchor = None;
     }
 
     // 快照同步(与源码模式同一条规则:仅修订号前进时重建)
@@ -329,6 +536,80 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect) -> bool {
             .iter()
             .any(|cmd| matches!(cmd, egui::OutputCommand::OpenUrl(_)))
     })
+}
+
+/// 标记半隐藏的遮罩不透明度(遮罩色 = 编辑框背景色)。「弱化但可辨识」,
+/// 不做用户可调的透明度配置面(规格口径)。
+const MARK_FADE_ALPHA: u8 = 166;
+
+/// 把活动块里的内联标记以半透明遮罩弱化(LP2-1)。
+///
+/// 遮罩 = 编辑框背景色 × α 叠在标记字形上,视觉即「标记变淡」,不改
+/// TextEdit 的任何状态。显形与否由调用方经 [`latermd_md::mark_interaction`]
+/// 算好(`revealed` 与 `marks` 平行):光标/选区贴上的段显形,被触碰标
+/// 记的**配对另一侧**所在段也显形(LP2-2)。
+fn paint_mark_fades(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    block_text: &str,
+    marks: &[Range<usize>],
+    revealed: &[bool],
+) {
+    if marks.is_empty() {
+        return;
+    }
+    let bg = ui.visuals().text_edit_bg_color();
+    let fade = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), MARK_FADE_ALPHA);
+    let painter = ui.painter();
+    // 标记是字节区间,TextEdit 的光标是字符偏移(相对同一份块文本);一次
+    // 遍历换算全部区间(标记已升序,逐段各扫一遍前文是 O(len×段数))
+    let mut chars = 0usize;
+    let mut walk = block_text.char_indices().peekable();
+    for (index, mark) in marks.iter().enumerate() {
+        while walk.next_if(|(byte, _)| *byte < mark.start).is_some() {
+            chars += 1;
+        }
+        let start = chars;
+        while walk.next_if(|(byte, _)| *byte < mark.end).is_some() {
+            chars += 1;
+        }
+        if revealed.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        for rect in galley_mark_rects(galley, start..chars) {
+            painter.rect_filled(
+                rect.translate(galley_pos.to_vec2()),
+                egui::CornerRadius::ZERO,
+                fade,
+            );
+        }
+    }
+}
+
+/// 标记字符区间(字符偏移)在 galley 里占的矩形(相对 galley 原点),按行
+/// 切分 —— 折行/换行会把一段标记拆成多行多矩形。
+fn galley_mark_rects(galley: &egui::Galley, char_range: Range<usize>) -> Vec<egui::Rect> {
+    let mut rects = Vec::new();
+    let mut row_start = 0;
+    for row in &galley.rows {
+        let row_chars = row.char_count_excluding_newline().0;
+        let start = char_range.start.max(row_start);
+        let end = char_range.end.min(row_start + row_chars);
+        if end > start {
+            let x0 = row.pos.x + row.x_offset(egui::text::CharIndex(start - row_start));
+            let x1 = row.pos.x + row.x_offset(egui::text::CharIndex(end - row_start));
+            rects.push(egui::Rect::from_min_max(
+                egui::pos2(x0.min(x1), row.min_y()),
+                egui::pos2(x0.max(x1), row.max_y()),
+            ));
+        }
+        row_start += row.char_count_including_newline().0;
+        if row_start >= char_range.end {
+            break;
+        }
+    }
+    rects
 }
 
 #[cfg(test)]
@@ -722,5 +1003,1224 @@ mod tests {
             "链接点击打开 URL"
         );
         assert_eq!(live.active, Some(1), "链接点击不切进编辑:{live:?}");
+    }
+
+    // —— LP2-1 活动块内联标记半隐藏 ——
+
+    /// 半隐藏态的测试文档:六段标记(开/闭 `**`、`[`、`](…)`、开/闭 `` ` ``),
+    /// 光标目标「粗体」两字之间 = 字符 3,不贴任何标记。
+    const FADE_DOC: &str = "**粗体** 与 [链接](https://e.com) 和 `代码`\n";
+    const FADE_BLOCK: usize = 0;
+    const FADE_CARET_CONTENT: usize = 3;
+
+    fn fade_state(text: &str) -> (EditorBuffer, PreviewState, OutlineCursor, LiveState) {
+        let editor = EditorBuffer::new(text);
+        let preview = PreviewState::new(&editor);
+        (
+            editor,
+            preview,
+            OutlineCursor::default(),
+            LiveState {
+                active: Some(FADE_BLOCK),
+                ..LiveState::default()
+            },
+        )
+    }
+
+    /// 遮罩取证帧驱动共用的编辑器 id(各测试独立 `Context`,不互扰)。
+    const FADE_EDITOR_ID: &str = "live-fade";
+
+    /// 跑一帧 Live 面板(生产入口 `super::ui`),取证半透明遮罩矩形
+    /// (以遮罩色从帧 shapes 里挑 Rect,与 #38/#41 的 shapes 取证同款)。
+    fn live_fade_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
+        live_timed_frame(ctx, 0.0, events, editor, preview, cursor, live)
+    }
+
+    /// 带 `RawInput.time` 的帧驱动(LP2-2 手势测试专用):双击判定依赖
+    /// 相邻两次 click 的时间差(input_state 的 max_double_click_delay),
+    /// 必须显式给每帧一个递增时钟。
+    fn live_timed_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
+        let mut fade = egui::Color32::TRANSPARENT;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    live,
+                    egui::Id::new(FADE_EDITOR_ID),
+                );
+                let bg = ui.visuals().text_edit_bg_color();
+                fade = egui::Color32::from_rgba_unmultiplied(
+                    bg.r(),
+                    bg.g(),
+                    bg.b(),
+                    super::MARK_FADE_ALPHA,
+                );
+            },
+        );
+        let rects = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Rect(shape) if shape.fill == fade => Some(shape.rect),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        rects
+    }
+
+    /// 光标在正文里:全部标记半隐藏,渲染一帧不 panic、不改动缓冲、不置脏。
+    #[test]
+    fn live_fades_marks_when_caret_in_content() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+
+        // 经 v1 的 pending_caret 把光标交到正文中间(第一帧只落光标)
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        let before = editor.text().to_owned();
+        let rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(editor.text(), before, "渲染不改动缓冲");
+        assert!(!editor.is_dirty(), "渲染不置脏");
+        assert_eq!(
+            live.marks
+                .as_ref()
+                .map(|(_, _, bundle)| bundle.segments.len()),
+            Some(6),
+            "六段标记:{:?}",
+            live.marks
+        );
+        assert!(
+            rects.len() >= 6,
+            "每段标记至少一枚遮罩(折行只会更多):{:?}",
+            rects
+        );
+        // 标记缓存命中:再跑一帧仍是六段(修订号未动不重解析)
+        live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            live.marks
+                .as_ref()
+                .map(|(_, _, bundle)| bundle.segments.len()),
+            Some(6)
+        );
+
+        // 暗色主题:遮罩色随 visuals 取,同样逐段落位(存在性,非目视裁决)
+        ctx.set_visuals(egui::Visuals::dark());
+        let dark = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(dark.len() >= 6, "暗色下遮罩仍在:{dark:?}");
+    }
+
+    /// 光标贴上标记 → 该段显形;选区压住标记 → 相交段显形。
+    #[test]
+    fn live_reveals_mark_under_caret_or_selection() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(base >= 6);
+
+        // 光标挪进开头的 `**`(两星之间 = 字符 1)→ 该段显形
+        live.pending_caret = Some((FADE_BLOCK, 1));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let on_mark = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            on_mark < base,
+            "光标贴上后应有标记段显形:{on_mark} vs 基准 {base}"
+        );
+
+        // 选区盖住链接前后(字符 9..14:`[`、链接文本、`)` → 链接两段显形
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(9),
+                egui::text::CCursor::new(14),
+            )));
+        state.store(&ctx, id);
+        let selected = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            selected + 2 <= base,
+            "链接两段(`[` 与 `](…)`)应显形:{selected} vs 基准 {base}"
+        );
+    }
+
+    /// 点击半隐藏的标记:遮罩不参与命中测试 —— TextEdit 照常获得焦点,光标
+    /// 落到标记上,下一帧该段显形。
+    #[test]
+    fn live_click_on_faded_mark_focuses_editor_and_reveals() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base_rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(base_rects.len() >= 6);
+
+        // 点最靠左的遮罩矩形(即开头的 `**`)中心
+        let target = base_rects
+            .iter()
+            .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+            .expect("至少一枚遮罩")
+            .center();
+        for events in click_events(target) {
+            let _ = live_fade_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        assert!(
+            ctx.memory(|mem| mem.has_focus(id)),
+            "点击应命中活动块 TextEdit 本体(遮罩不参与 hit-test)"
+        );
+        let clicked = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            clicked < base_rects.len(),
+            "点击落点在标记上,该段应显形:{clicked} vs 基准 {}",
+            base_rects.len()
+        );
+    }
+
+    /// 编辑语义不回退:活动块里打一个字仍直落同一份全文缓冲(undo 栈共用),
+    /// 标记缓存随修订号前进失效重算。
+    #[test]
+    fn live_typing_in_active_block_updates_marks_cache() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (rev_before, _, _) = live.marks.clone().expect("缓存已建立");
+
+        // 在「粗体」内容里插一个字(走 BlockBuffer 同一条路,= TextEdit 打字)
+        editor.insert_chars(FADE_CARET_CONTENT, "字");
+        assert!(editor.text().contains("粗字体**"), "落在同一份缓冲");
+        assert!(editor.is_dirty());
+
+        live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (rev_after, _, marks) = live.marks.clone().expect("缓存已重算");
+        assert!(rev_after > rev_before, "修订号前进,缓存键换新");
+        assert_eq!(marks.segments.len(), 6, "标记段数不变:{:?}", marks.segments);
+        // 插入点在开 `**` 之后:闭 `**` 及其后所有区间右移一个 CJK 字(3 字节)
+        let text_now = editor.text();
+        assert_eq!(
+            &text_now[marks.segments[1].clone()],
+            "**",
+            "闭 ** 仍标对位置"
+        );
+        assert_eq!(
+            marks.segments[1],
+            11..13,
+            "原 8..10 平移一个 CJK 字(3 字节):{marks:?}"
+        );
+    }
+
+    // —— LP2-2 选区扩展与配对显形 ——
+
+    /// 手势测试文档:一对 `**` 包着四个等宽字母(内容中部/四分位的点击
+    /// 坐标可从两枚遮罩矩形折算),后跟普通文本。
+    const GESTURE_DOC: &str = "**abcd** 常规文本\n";
+    const GESTURE_BLOCK: usize = 0;
+    /// `**abcd**` 的完整字符区间(选区扩展的目标)。
+    const GESTURE_PAIR: Range<usize> = 0..8;
+
+    fn gesture_state(text: &str) -> (EditorBuffer, PreviewState, OutlineCursor, LiveState) {
+        let editor = EditorBuffer::new(text);
+        let preview = PreviewState::new(&editor);
+        (
+            editor,
+            preview,
+            OutlineCursor::default(),
+            LiveState {
+                active: Some(GESTURE_BLOCK),
+                ..LiveState::default()
+            },
+        )
+    }
+
+    /// 跑一帧带时钟的 Live 面板,返回遮罩矩形(双击判定依赖帧时间)。
+    fn gesture_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
+        live_timed_frame(ctx, time, events, editor, preview, cursor, live)
+    }
+
+    /// 活动块 TextEdit 的当前选区 (min, max)(字符偏移)。
+    fn block_selection(ctx: &egui::Context) -> Option<(usize, usize)> {
+        let id = egui::Id::new(FADE_EDITOR_ID).with(("live-block", GESTURE_BLOCK));
+        egui::widgets::text_edit::TextEditState::load(ctx, id).and_then(|state| {
+            state.cursor.char_range().map(|range| {
+                let (a, b) = (range.primary.index.0, range.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+        })
+    }
+
+    /// 主键按下/抬起事件。
+    fn button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// 两枚 `**` 遮罩矩形按 x 排序成 (开侧, 闭侧)。
+    fn pair_rects(rects: &[egui::Rect]) -> (egui::Rect, egui::Rect) {
+        let mut sorted = rects.to_vec();
+        sorted.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+        assert_eq!(sorted.len(), 2, "恰两枚 `**` 遮罩:{rects:?}");
+        (sorted[0], sorted[1])
+    }
+
+    /// 渲染不 panic 且无副作用:标记块 + 非空选区状态连跑三帧(含选
+    /// 区触碰标记的形态),缓冲不动、不置脏。
+    #[test]
+    fn live_renders_marks_and_selection_frames_without_panic() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        // 直接把一个非空选区写进 TextEdit 状态(盖住链接开 `[` 与部分内容,
+        // 触碰标记的形态)
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(9),
+                egui::text::CCursor::new(14),
+            )));
+        state.store(&ctx, id);
+
+        let before = editor.text().to_owned();
+        for _ in 0..3 {
+            let _ = live_fade_frame(
+                &ctx,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(editor.text(), before, "渲染不改动缓冲");
+        assert!(!editor.is_dirty(), "渲染不置脏");
+    }
+
+    /// 双击标记对内的词:选区一次性扩到完整标记对(内容+两侧标记),
+    /// 扩展后两段标记随选区显形;再跑一帧不二次改写(扩展不持续吸附)。
+    #[test]
+    fn live_double_click_inside_pair_expands_selection_once() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = gesture_state(GESTURE_DOC);
+        live.pending_caret = Some((GESTURE_BLOCK, 12)); // 光标放普通文本里
+        let _ = gesture_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let rects = gesture_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (opening, closing) = pair_rects(&rects);
+        // 内容中部 = 四个等宽字母的正中(b/c 边界)
+        let content_mid = egui::pos2((opening.right() + closing.left()) / 2.0, opening.center().y);
+
+        // 双击 = 两次完整点击,第二次抬起帧 egui 判定 double_click 并选词
+        for (time, pressed) in [(0.10, true), (0.15, false), (0.25, true), (0.30, false)] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                vec![button_event(content_mid, pressed)],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "双击词 abcd → 扩到 **abcd**"
+        );
+
+        // 稳定帧:选区保持原样,盖住整对 → 两段标记显形(遮罩清零)
+        let rects = gesture_frame(
+            &ctx,
+            0.40,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(rects.is_empty(), "扩展选区盖住整对,两段都显形:{rects:?}");
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "扩展是一次性的,静止帧不再改写选区"
+        );
+        assert_eq!(editor.text(), GESTURE_DOC, "手势不改文本");
+    }
+
+    /// 拖选松手:从标记上发起(锚点压着开 `**`)→ 扩到整对;从内容中部
+    /// 发起的普通拖选 → 保持原选区不吸附(最小惊讶)。
+    #[test]
+    fn live_drag_release_expands_only_from_mark_anchor() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = gesture_state(GESTURE_DOC);
+        live.pending_caret = Some((GESTURE_BLOCK, 12));
+        let _ = gesture_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let rects = gesture_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (opening, closing) = pair_rects(&rects);
+        let on_mark = egui::pos2(opening.left() + opening.width() * 0.25, opening.center().y);
+        let content_mid = egui::pos2((opening.right() + closing.left()) / 2.0, opening.center().y);
+        let content_quarter = egui::pos2(
+            opening.right() + (closing.left() - opening.right()) * 0.25,
+            opening.center().y,
+        );
+
+        // ① 按在开 `**` 上、拖到内容中部松手 → 扩到整对
+        for (time, events) in [
+            (0.10, vec![egui::Event::PointerMoved(on_mark)]),
+            (0.15, vec![button_event(on_mark, true)]),
+            (0.30, vec![egui::Event::PointerMoved(content_mid)]),
+            (0.40, vec![button_event(content_mid, false)]),
+        ] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "从标记发起的拖选松手 → 扩到 **abcd**"
+        );
+
+        // ② 从内容中部(四分位)发起、拖到闭 `**` 边界松手 → 保持原选区
+        for (time, events) in [
+            (0.60, vec![egui::Event::PointerMoved(content_quarter)]),
+            (0.65, vec![button_event(content_quarter, true)]),
+            (
+                0.80,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    closing.left(),
+                    opening.center().y,
+                ))],
+            ),
+            (
+                0.90,
+                vec![button_event(
+                    egui::pos2(closing.left(), opening.center().y),
+                    false,
+                )],
+            ),
+        ] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        // 锚点在 b/c 之间的内容里:普通拖选,选区保持 bcd(3..6)不吸附
+        assert_eq!(
+            block_selection(&ctx),
+            Some((3, 6)),
+            "内容中部发起的拖选不扩展:{:?}",
+            block_selection(&ctx)
+        );
+        assert_eq!(editor.text(), GESTURE_DOC, "手势不改文本");
+    }
+
+    /// 配对显形:选区只盖住一侧标记,配对**另一侧**所在段同时显形 ——
+    /// 这是 LP2-1「只显形被压住的段」之上的增量(该实现会留 3 枚遮罩)。
+    #[test]
+    fn live_selection_on_mark_reveals_partner_segment() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state("**粗** x *i*\n");
+        // 光标放到两组标记之间的 `x` 上(字符 6):不贴任何标记
+        live.pending_caret = Some((0, 6));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(base.len(), 4, "两对标记四枚遮罩:{base:?}");
+
+        // 非空选区只盖住开 `**`(字符 0..2):开闭两段显形,`*i*` 仍半隐藏
+        let id = egui::Id::new("live-fade").with(("live-block", 0));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(2),
+            )));
+        state.store(&ctx, id);
+        let rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            rects.len(),
+            2,
+            "配对闭侧显形 + 无关的 *i* 两段保持半隐藏:{rects:?}"
+        );
+    }
+
+    // —— LP2-3 活动块跟随与跨块 caret/大纲跳转时序 ——
+
+    /// 滚动路径帧驱动的编辑器 id(与生产同一派生规则推导块 TextEdit id)。
+    const SCROLL_EDITOR_ID: &str = "live-scroll";
+
+    /// 滚动测试文档:`count` 行软换行段落(CommonMark 里软换行不成段,整
+    /// 段一块;100 行 ≈ 2000px,远超 600px 视口)+ 一行尾块。
+    fn scroll_doc_lines(count: usize) -> String {
+        let mut text = String::new();
+        for i in 0..count {
+            text.push_str(&format!("行 {i:03}\n"));
+        }
+        text.push_str("\n尾块\n");
+        text
+    }
+
+    /// 活动块 TextEdit 的持久 id(生产同一派生:`editor_id.with(...)`)。
+    fn scroll_block_id(index: usize) -> egui::Id {
+        egui::Id::new(SCROLL_EDITOR_ID).with(("live-block", index))
+    }
+
+    /// 活动块 TextEdit 当前主光标(块内字符偏移)。
+    fn scroll_block_caret(ctx: &egui::Context, index: usize) -> Option<usize> {
+        egui::widgets::text_edit::TextEditState::load(ctx, scroll_block_id(index))
+            .and_then(|state| state.cursor.char_range().map(|range| range.primary.index.0))
+    }
+
+    /// 跑一帧 Live 面板(生产入口 `super::ui`),视口 800×600(#29 测试基建
+    /// 口径:默认测试视口永远装得下整篇,滚动路径测不到),返回本帧活动块
+    /// TextEdit 的屏幕矩形 —— 滚动直接平移屏幕坐标,量 rect 比量内部滚动
+    /// state 更黑盒(editor.rs #29 同款)。
+    fn live_scroll_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Option<egui::Rect> {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut id = egui::Id::NULL;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                events,
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                id = super::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    live,
+                    egui::Id::new(SCROLL_EDITOR_ID),
+                )
+                .id;
+            },
+        );
+        output.drop_without_applying_deltas();
+        ctx.read_response(id).map(|response| response.rect)
+    }
+
+    /// 光标行的屏幕 y:块内字符偏移 → 行号 × 行高。行高用「矩形高 / 行
+    /// 数」从同一响应矩形反推(TextEdit 随内容长高;行数 = 换行数 + 1,
+    /// 与无折行 galley 的行划分同构)。内边距引入的常量误差由断言容差吸收。
+    fn caret_screen_y(rect: egui::Rect, block_text: &str, caret: usize) -> f32 {
+        let rows = block_text.chars().filter(|c| *c == '\n').count() as f32 + 1.0;
+        let line = block_text
+            .chars()
+            .take(caret)
+            .filter(|c| *c == '\n')
+            .count();
+        rect.top() + line as f32 * (rect.height() / rows)
+    }
+
+    /// 主键导航事件(ArrowUp / ArrowDown)。
+    fn arrow(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// 键盘导航触发跟随:活动块(百行段落)持焦、ArrowDown 逐行下移,光标
+    /// 行越出视口底后,导航帧的跟随把光标行抬回视口内 —— 落光标的写回帧
+    /// (跟随关闭口径)出发时视口纹丝不动,跟随只由导航帧触发。
+    #[test]
+    fn live_keyboard_navigation_scrolls_caret_into_view() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(0),
+            ..LiveState::default()
+        };
+        // 落光标到块首但不开跟随(点击进编辑同款口径):视口从文档顶部出发
+        live.pending_caret = Some((0, 0));
+        live.caret_follow = false;
+        let top0 = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读");
+        assert_eq!(
+            live.blocks.len(),
+            2,
+            "百行软换行段落 = 一块 + 尾块:{:?}",
+            live.blocks
+        );
+        assert!(
+            top0.top() >= 0.0,
+            "出发时视口在文档顶部(实测 {})",
+            top0.top()
+        );
+
+        let down = arrow(egui::Key::ArrowDown);
+        // 空转一帧再进导航键:egui 0.36 的焦点锁过滤(set_focus_lock_
+        // filter)要在「持焦的下一帧 show()」才生效,焦点授予当帧的下一帧
+        // 立即按裸方向键会被 egui 的记忆层焦点导航抢走焦点(Live 面板里
+        // 富渲染块 Sense::click_and_drag 可聚焦,候选存在)。真机人类输入
+        // 点击→按键间隔 ≥100ms,早跨过这一帧;测试按真实输入节奏驱动。
+        let _ = live_scroll_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        for i in 0..45 {
+            let _ = live_scroll_frame(
+                &ctx,
+                0.1 + f64::from(i) * 0.1,
+                vec![down.clone()],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        // 光标写回/变化 → 请求滚动 → 动画完成(默认 ≤0.3s)→ 布局生效,各差一帧
+        for i in 0..3 {
+            let _ = live_scroll_frame(
+                &ctx,
+                6.0 + f64::from(i) * 0.1,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            6.4,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读");
+        assert!(
+            rect.top() < 0.0,
+            "键盘导航把视口推离文档顶部(实测 top {}):跟随发生了",
+            rect.top()
+        );
+        let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            caret,
+        );
+        assert!(
+            (-25.0..=625.0).contains(&y),
+            "光标行留在视口内(实测 y {y},视口 [0,600])"
+        );
+    }
+
+    /// 滚轮/空闲帧不触发跟随:光标留在文档头,滚轮把视口推进文档中部、
+    /// 光标行被甩出视口后,空闲帧一步也不许把视口拽回光标处(#29 红线在
+    /// Live 侧的同款)。
+    #[test]
+    fn live_wheel_and_idle_frames_do_not_steal_scroll() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(0),
+            ..LiveState::default()
+        };
+        live.pending_caret = Some((0, 0));
+        live.caret_follow = false;
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        let pointer = egui::pos2(400.0, 300.0);
+        let wheel = |delta: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: Default::default(),
+        };
+        // ① 滚轮下滚 10 格:内容上移,文档头(光标所在行)被甩出视口上方
+        for i in 0..10 {
+            let _ = live_scroll_frame(
+                &ctx,
+                0.1 + f64::from(i) * 0.1,
+                vec![egui::Event::PointerMoved(pointer), wheel(-120.0)],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        // 滚动带动画:空转几帧让偏移落到最终值
+        for i in 0..3 {
+            let _ = live_scroll_frame(
+                &ctx,
+                1.5 + f64::from(i) * 0.1,
+                vec![egui::Event::PointerMoved(pointer)],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let settled = live_scroll_frame(
+            &ctx,
+            1.9,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读")
+        .top();
+        assert!(settled < 0.0, "滚轮确实把视口推进文档(实测 top {settled})");
+
+        // ② 空闲帧:光标仍被甩在视口外的文档头,视口一步也不许动
+        for i in 0..6 {
+            let _ = live_scroll_frame(
+                &ctx,
+                3.0 + f64::from(i) * 0.1,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let after = live_scroll_frame(
+            &ctx,
+            3.7,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读")
+        .top();
+        assert!(
+            (after - settled).abs() < 1.0,
+            "空闲帧不得把视口拽回光标(稳定于 {settled},现在 {after})"
+        );
+    }
+
+    /// 跨块路由后目标块光标与滚动一致:尾块块首按 ↑ 路由到段落块末尾,
+    /// 落地帧把光标写进目标块持久 state 并**同帧**请求滚动,落定后光标行
+    /// 在视口内 —— 不出现「光标写了但视图没跟」的终态。
+    #[test]
+    fn live_cross_block_route_lands_caret_and_scroll_together() {
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        });
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(1),
+            ..LiveState::default()
+        };
+        // 尾块落光标到块首(不跟随):视口停在文档顶部,尾块在视口外
+        live.pending_caret = Some((1, 0));
+        live.caret_follow = false;
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        // ↑ 在块首 → 路由到段落块末尾
+        let _ = live_scroll_frame(
+            &ctx,
+            0.1,
+            vec![arrow(egui::Key::ArrowUp)],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(live.active, Some(0), "路由切换活动块:{live:?}");
+        assert_eq!(
+            live.pending_caret,
+            Some((0, live.block_char_len(&editor, 0))),
+            "交接点 = 上一块末尾"
+        );
+
+        // 落地帧:光标写进块 0 持久 state + 同帧请求滚动 + 焦点转移
+        let _ = live_scroll_frame(
+            &ctx,
+            0.2,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let caret = scroll_block_caret(&ctx, 0).expect("目标块光标已写入");
+        assert_eq!(caret, live.block_char_len(&editor, 0), "光标落在上一块末尾");
+        assert!(
+            ctx.memory(|mem| mem.has_focus(scroll_block_id(0))),
+            "焦点随路由转到目标块"
+        );
+        assert!(live.pending_caret.is_none(), "交接点已消费");
+
+        // 同帧性:写回帧(0.2)即请求滚动 —— 本测试已把滚动动画设为「一次
+        // 到位」(ScrollAnimation::none,#42 预览跳转同款),无头帧驱动下
+        // 请求经 落账→应用→布局 三帧可见:第 3 帧(0.23)必已离开文档顶
+        // 部;若写回与跟随差一帧(请求挪到 0.21),则要到第 4 帧才动 ——
+        // 0.23 这一眼把「同帧」钉到一帧分辨率。
+        for time in [0.21, 0.22] {
+            let _ = live_scroll_frame(
+                &ctx,
+                time,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let top_next = live_scroll_frame(
+            &ctx,
+            0.23,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读")
+        .top();
+        assert!(
+            top_next < 0.0,
+            "光标写回帧同帧请求了滚动(第 3 帧 top 已 {top_next})"
+        );
+
+        // 布局稳定后再量光标行落点
+        for time in [1.0, 1.5, 2.0] {
+            let _ = live_scroll_frame(
+                &ctx,
+                time,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            2.1,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读");
+        assert!(rect.top() < 0.0, "视口离开文档顶部(实测 {})", rect.top());
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            caret,
+        );
+        assert!(
+            (-25.0..=625.0).contains(&y),
+            "目标块光标行滚入视口(实测 y {y},视口 [0,600])"
+        );
+    }
+
+    /// 大纲跳转消费:Live 模式下 jump_to(与源码模式同一入口、同一时序
+    /// 口径)当帧把光标路由到目标块、写进持久 state 并请求滚动;请求即
+    /// 消费,光标回填随后续帧跟上。
+    #[test]
+    fn live_jump_to_routes_caret_and_scrolls_into_view() {
+        let mut text = String::from("# 顶\n\n");
+        for i in 0..100 {
+            text.push_str(&format!("行 {i:03}\n"));
+        }
+        text.push_str("\n# 底\n");
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        });
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(live.blocks.len(), 3, "标题/段落/标题:{:?}", live.blocks);
+
+        // 归约产出的跳转目标:底部标题行首(远在首屏之外)。目标块按**字节
+        // 归属**取(v1 块表现状:`# ` 标记可能归上一块尾,本例即如此),光标
+        // 仍落在与源码模式相同的文档位置 —— 同一入口同一落点。
+        let heading_byte = editor.text().find("# 底").expect("文档里有底部标题");
+        let target = live
+            .block_containing(heading_byte)
+            .expect("跳转字节必落在某块");
+        let target_local =
+            editor.byte_to_char(heading_byte) - editor.byte_to_char(live.blocks[target].start);
+        cursor.jump_to = Some(editor.byte_to_char(heading_byte));
+        let _ = live_scroll_frame(
+            &ctx,
+            0.1,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(live.active, Some(target), "跳转目标块成为活动块:{live:?}");
+        assert_eq!(
+            scroll_block_caret(&ctx, target),
+            Some(target_local),
+            "光标落在跳转字节处(块内偏移)"
+        );
+        assert!(
+            ctx.memory(|mem| mem.has_focus(scroll_block_id(target))),
+            "焦点交给目标块"
+        );
+        assert_eq!(cursor.jump_to, None, "跳转请求即消费,不悬置");
+
+        // 同帧性:跳转帧(0.1)即请求滚动(与跨块路由同一条口径:一次到位
+        // 动画 + 三帧可见,第 3 帧 0.13 必已离开文档顶部,差一帧的实现此
+        // 刻还不动)
+        for time in [0.11, 0.12] {
+            let _ = live_scroll_frame(
+                &ctx,
+                time,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let top_next = live_scroll_frame(
+            &ctx,
+            0.13,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读")
+        .top();
+        assert!(
+            top_next < 0.0,
+            "跳转帧同帧请求了滚动(第 3 帧 top 已 {top_next})"
+        );
+
+        // 布局稳定后再量光标行落点
+        for time in [1.0, 1.5, 2.0] {
+            let _ = live_scroll_frame(
+                &ctx,
+                time,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            2.1,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .expect("活动块响应可读");
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[target]),
+            target_local,
+        );
+        assert!(
+            (-25.0..=625.0).contains(&y),
+            "跳转落点(光标行)滚入视口(实测 y {y},视口 [0,600])"
+        );
+        assert_eq!(
+            cursor.byte,
+            Some(heading_byte),
+            "光标回填随跳转落位(标题行首字节)"
+        );
     }
 }

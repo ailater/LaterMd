@@ -203,6 +203,302 @@ fn is_segment_break(token: &Token<'_>) -> bool {
     }
 }
 
+/// 活动块**内联标记**字符的字节区间(LP2-1 半隐藏):升序、互不重叠、
+/// 相邻段已合并。
+///
+/// 「标记」= 渲染后不产生正文的源码字符:强调/粗体/删除线的 `*`/`_`/`~~`
+/// 定界符、行内代码的反引号、链接/图片的 `[`、`](目标 "标题")`、`!`、
+/// autolink 的 `<`/`>`。判定完全跟随 pulldown-cmark(与 vendored 解析器
+/// 同一套 options,铁律「单一解析器」):未闭合的 `**` 是普通文本不算
+/// 标记;围栏/缩进代码块的内容是 `Event::Text`,不算标记;嵌套强调每层
+/// 定界符都计入(`***x***` 合并出前后各一段 `***`)。块级标记(`#`、
+/// `>`、列表符、表格竖线)不在本口径内 —— LP2-1 只做内联。
+///
+/// 输入应是**单个块**的源码([`blocks`] 保证块可独立解析);返回区间是
+/// 块内偏移。pulldown 的 Start/End 事件区间覆盖整个构造(0.13 实测),
+/// 所以标记 = 「构造区间 − 内部内容区间」的缝隙。
+pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
+    inline_marks_with_pairs(text).segments
+}
+
+/// 一对成对的内联标记(LP2-2 选区扩展):一个内联构造两侧的标记,连同
+/// 整个构造的范围。嵌套构造(`***x***`、链接文本里的强调)每层各成一
+/// 对,区间彼此重叠是正常的 —— 它们本来就不是同一对。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkPair {
+    /// 完整构造(开标记 + 内容 + 闭标记),选区扩展的目标区间。
+    pub construct: Range<usize>,
+    /// 开侧标记,如 `**`;链接的开侧是 `[`。
+    pub opening: Range<usize>,
+    /// 闭侧标记;链接的闭侧是 `](目标 "标题")` 整段。
+    pub closing: Range<usize>,
+}
+
+/// [`inline_marks`] 的全量产出:半隐藏用的合并标记段(LP2-1)+ 选区
+/// 扩展用的成对表(LP2-2)。两份表出自**同一次**解析,缓存侧按修订号
+/// 一起换新,不会出现「段与配对来自不同版本文本」的错位。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InlineMarks {
+    /// 合并后的标记段(升序、互不重叠、相邻已合并)—— 半隐藏绘制的粒度。
+    pub segments: Vec<Range<usize>>,
+    /// 成对标记表 —— 配对显形与选区扩展的依据。
+    pub pairs: Vec<MarkPair>,
+}
+
+/// [`inline_marks`] 的成对扩展(LP2-2):同一次 pulldown 走查,除合并
+/// 标记段外,把每个定界构造的开/闭缝隙记成一对([`MarkPair`])。
+///
+/// 单侧孤标记(未闭合的 `**`、`` ` ``、`[`)在 pulldown 语义里是普通文
+/// 本,既不产段也不产对 —— 选区扩展对它们天然退化为「不扩展」。
+pub fn inline_marks_with_pairs(text: &str) -> InlineMarks {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    // 与 vendored parser.rs 同一套 options:预览把 `~~` 渲染成删除线、把
+    // `[x](y)` 渲染成链接,半隐藏的判定必须与渲染同一语义,否则会出现
+    // 「遮了不渲染的字符 / 漏了渲染的定界符」
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    // 开着的定界构造:起点 + 内部已覆盖(内容)区间。闭合时把缝隙记为标记。
+    let mut open: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
+    let mut marks = Vec::new();
+    let mut pairs = Vec::new();
+
+    for (event, span) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Link { .. }
+                | Tag::Image { .. },
+            ) => {
+                // 本构造区间先计入外层(嵌套强调之于链接文本),再开自己的栈帧
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span.clone());
+                }
+                open.push((span.start, Vec::new()));
+            }
+            Event::End(
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link
+                | TagEnd::Image,
+            ) => {
+                let Some((start, covered)) = open.pop() else {
+                    continue; // 解析器事件配平,这里只是防御
+                };
+                let end = span.end;
+                let mut covered = covered;
+                covered.sort_by_key(|range| range.start);
+                let mut gaps = Vec::new();
+                let mut cursor = start;
+                for inner in covered {
+                    let inner = inner.start.max(start)..inner.end.min(end);
+                    if inner.start > cursor {
+                        gaps.push(cursor..inner.start);
+                    }
+                    cursor = cursor.max(inner.end);
+                }
+                if cursor < end {
+                    gaps.push(cursor..end);
+                }
+                // 首末缝隙即开/闭两侧标记(它们天然贴着构造两端);只剩一个
+                // 缝隙的退化构造(如空文本链接)拆不出两侧,不成对
+                if gaps.len() >= 2 {
+                    let closing = gaps.last().expect("len >= 2").clone();
+                    pairs.push(MarkPair {
+                        construct: start..end,
+                        opening: gaps[0].clone(),
+                        closing,
+                    });
+                }
+                marks.extend(gaps);
+                // 本构造(含它自己的标记)对外层是内容
+                if let Some((_, parent)) = open.last_mut() {
+                    parent.push(start..end);
+                }
+            }
+            // 行内代码是单事件(区间含反引号与内容):两端的反引号串是标记
+            Event::Code(_) => {
+                let bytes = text.as_bytes();
+                let (start, end) = (span.start, span.end);
+                let mut ticks_start = start;
+                while ticks_start < end && bytes[ticks_start] == b'`' {
+                    ticks_start += 1;
+                }
+                let mut ticks_end = end;
+                while ticks_end > ticks_start && bytes[ticks_end - 1] == b'`' {
+                    ticks_end -= 1;
+                }
+                if start < ticks_start {
+                    marks.push(start..ticks_start);
+                }
+                if ticks_end < end {
+                    marks.push(ticks_end..end);
+                }
+                if start < ticks_start && ticks_end < end {
+                    pairs.push(MarkPair {
+                        construct: start..end,
+                        opening: start..ticks_start,
+                        closing: ticks_end..end,
+                    });
+                }
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span);
+                }
+            }
+            // 其余事件(Text/SoftBreak/块级 Start/End…):开着的构造把它们
+            // 视作内容;块级事件不会出现在内联构造内部,压栈无副作用
+            _ => {
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span);
+                }
+            }
+        }
+    }
+
+    // 排序 + 合并相邻/重叠段:`***` 会得到外层与内层各一片标记
+    marks.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in marks {
+        if range.is_empty() {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    InlineMarks {
+        segments: merged,
+        pairs,
+    }
+}
+
+/// 触发选区扩展的指针手势(LP2-2)。扩展是**一次性**的:只在事件帧传入
+/// [`mark_interaction`],静止帧传 `None` —— 选区不会被持续吸附到标记对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkGesture {
+    /// 双击:egui 已在帧内选出词,当前选区即词区间;扩展到包含它的
+    /// **最内层**标记对(嵌套时选最小的一对)。
+    DoubleClick,
+    /// 拖选松手:`anchor` 是按下时光标所在的块内字符偏移。选区整个含在
+    /// 标记对内、且锚点压着某一侧标记(含边界,单字符标记只有边界可压)
+    /// 时,扩展到该对。
+    DragRelease {
+        /// 按下帧的塌缩光标(块内字符偏移)。
+        anchor: usize,
+    },
+}
+
+/// 标记与光标/选区的交互决策(LP2-2)。
+///
+/// - `revealed`:与 `InlineMarks::segments` 平行的显形表。除 LP2-1 的
+///   「贴上/相交显形」外,被触碰标记的**配对另一侧**所在段一并显形
+///   (识别配对);
+/// - `expanded`:扩展后的选区(块内**字符偏移**,TextEdit 的域),无扩
+///   展时为 `None`。选区已含完整标记对时结果是同一区间(幂等)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkInteraction {
+    /// 与 `segments` 平行:`true` = 该段显形。
+    pub revealed: Vec<bool>,
+    /// 扩展后的选区(字符偏移);`None` = 本帧不扩展。
+    pub expanded: Option<Range<usize>>,
+}
+
+/// 计算标记的显形集合与选区扩展(LP2-2 的纯函数核心)。
+///
+/// 输入的 `caret`/`other`/`anchor` 是块内**字符偏移**(TextEdit 的光标
+/// 域),`marks` 是 [`inline_marks_with_pairs`] 的产出(字节域),函数内
+/// 部完成两域换算 —— 调用方不需要自己折算 CJK 偏移。
+pub fn mark_interaction(
+    text: &str,
+    marks: &InlineMarks,
+    caret: usize,
+    other: usize,
+    gesture: Option<MarkGesture>,
+) -> MarkInteraction {
+    let caret_byte = char_to_byte(text, caret);
+    let other_byte = char_to_byte(text, other);
+    let collapsed = caret_byte == other_byte;
+    // 「触碰」口径与 LP2-1 显形一致:塌缩光标紧邻也算(点击落在标记字形
+    // 上时光标停在其边界),非空选区取开区间相交。
+    let touches = |range: &Range<usize>| {
+        if collapsed {
+            range.start <= caret_byte && caret_byte <= range.end
+        } else {
+            let (low, high) = (caret_byte.min(other_byte), caret_byte.max(other_byte));
+            range.start < high && low < range.end
+        }
+    };
+    let within = |outer: &Range<usize>, inner: &Range<usize>| {
+        outer.start <= inner.start && inner.end <= outer.end
+    };
+    let mut revealed = Vec::with_capacity(marks.segments.len());
+    for segment in &marks.segments {
+        let partner = marks.pairs.iter().any(|pair| {
+            (touches(&pair.opening) || touches(&pair.closing))
+                && (within(segment, &pair.opening) || within(segment, &pair.closing))
+        });
+        revealed.push(touches(segment) || partner);
+    }
+
+    // 选区扩展:只在手势帧;候选对必须把当前选区整个含住(跨对选区不吸
+    // 附),拖选还要求锚点压着标记。取最内层(构造最短)的一对。
+    let expanded = gesture.and_then(|gesture| {
+        let selection = caret_byte.min(other_byte)..caret_byte.max(other_byte);
+        let mut best: Option<&MarkPair> = None;
+        for pair in &marks.pairs {
+            if !within(&pair.construct, &selection) {
+                continue;
+            }
+            let anchored = match gesture {
+                MarkGesture::DoubleClick => true,
+                MarkGesture::DragRelease { anchor } => {
+                    let anchor = char_to_byte(text, anchor);
+                    (pair.opening.start <= anchor && anchor <= pair.opening.end)
+                        || (pair.closing.start <= anchor && anchor <= pair.closing.end)
+                }
+            };
+            if !anchored {
+                continue;
+            }
+            let better = best.is_none_or(|current| {
+                pair.construct.len() < current.construct.len()
+                    || (pair.construct.len() == current.construct.len()
+                        && pair.opening.len() + pair.closing.len()
+                            > current.opening.len() + current.closing.len())
+            });
+            if better {
+                best = Some(pair);
+            }
+        }
+        best.map(|pair| {
+            byte_to_char(text, pair.construct.start)..byte_to_char(text, pair.construct.end)
+        })
+    });
+    MarkInteraction { revealed, expanded }
+}
+
+/// 块内字符偏移 → 字节偏移(越界钳到文末)。
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// 块内字节偏移 → 字符偏移(按「在该字节之前开始的字符数」计)。
+fn byte_to_char(text: &str, byte_index: usize) -> usize {
+    text.char_indices()
+        .take_while(|(byte, _)| *byte < byte_index)
+        .count()
+}
+
 /// `[[wikilink]]` 展开成的链接 scheme(P3「双向链接」)。
 ///
 /// 预览层按它拦截点击(打开同名文档),非本 scheme 的链接仍交系统浏览器。
@@ -266,30 +562,144 @@ pub fn wikilinks(text: &str) -> Vec<Wikilink> {
     links
 }
 
+/// 一处「区间替换」改写:源文本的 `[span]` 段在渲染文本里被 `replacement`
+/// 顶替。改写层(wikilink 展开,以及将来叠加同层的 emoji 短码改写)以它为
+/// 原子 —— 同一份清单既拼出渲染文本又回答偏移换算(见 [`OffsetMap`]),
+/// 两侧永不漂移。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    /// 被替换的源码字节区间。清单内各区间须升序且互不重叠。
+    pub span: Range<usize>,
+    /// 替换后的渲染文本(在渲染串里占据该位置的整段)。
+    pub replacement: String,
+}
+
+/// 「源码偏移 ↔ 渲染偏移」映射表(LP2-4):描述「改写层做了什么」,供预览
+/// 侧消费点(大纲跳转、section anchor)把源码偏移换算后再用。**只描述改写、
+/// 不做改写** —— 源码缓冲、rope、字节偏移、撤销栈一律不动,映射不回写任何
+/// 文本;它是与渲染文本同一次产出的**只读派生物**。
+///
+/// 换算语义(与「区间替换」的形状对齐):
+///
+/// - 区间之外的偏移,按前方各区间的累积长度差平移;
+/// - 落在区间内的源偏移,映到该段在渲染串里的**起点** —— 改写段内部没有
+///   更细的锚点,落点即段首(反向同理:渲染段内 → 源码段首);
+/// - 偏移恰在区间端点上按「区间外」处理(端点属于后文)。
+///
+/// **可组合**:每层改写各自产出一张表,第二层的区间基于第一层的**输出
+/// 文本**(改写按顺序串行发生),消费点把偏移按同一顺序串行穿过即可:
+/// `map2.source_to_rendered(map1.source_to_rendered(off))`。后续 #48 的
+/// emoji 短码改写与 wikilink 展开同层叠加时,照此再串一张表,无需预合并
+/// (预合并要把第二层区间反解回源码坐标,复杂度换不来收益)。app 侧
+/// `PreviewState::rendered` 的生产链(wikilink 展开 → 相对图片 URI 改写)
+/// 即此口径的实例。
+pub struct OffsetMap {
+    rewrites: Vec<Rewrite>,
+}
+
+impl OffsetMap {
+    /// 空表:恒等映射(无改写层)。
+    pub fn empty() -> Self {
+        Self {
+            rewrites: Vec::new(),
+        }
+    }
+
+    /// 从区间替换清单构造。清单须按 `span` 升序且互不重叠(生产者
+    /// [`expand_wikilinks_with_map`] 与改写扫描器都天然满足)。
+    pub fn from_rewrites(rewrites: Vec<Rewrite>) -> Self {
+        debug_assert!(
+            rewrites
+                .windows(2)
+                .all(|pair| pair[0].span.end <= pair[1].span.start),
+            "改写清单须升序且互不重叠: {rewrites:?}"
+        );
+        Self { rewrites }
+    }
+
+    /// 是否恒等(没有任何改写)。
+    pub fn is_identity(&self) -> bool {
+        self.rewrites.is_empty()
+    }
+
+    /// 把清单应用到源文本,拼出渲染文本 —— 与偏移换算共用同一份数据,
+    /// 「渲染串长什么样」与「偏移怎么换算」是单一事实来源。
+    pub fn apply(&self, text: &str) -> String {
+        if self.rewrites.is_empty() {
+            return text.to_owned();
+        }
+        let mut out = String::with_capacity(text.len() + 64);
+        let mut cursor = 0;
+        for rewrite in &self.rewrites {
+            out.push_str(&text[cursor..rewrite.span.start]);
+            out.push_str(&rewrite.replacement);
+            cursor = rewrite.span.end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    /// 源码字节偏移 → 渲染字节偏移。
+    pub fn source_to_rendered(&self, source_offset: usize) -> usize {
+        let mut delta: i64 = 0;
+        for rewrite in &self.rewrites {
+            let old_len = (rewrite.span.end - rewrite.span.start) as i64;
+            if rewrite.span.end <= source_offset {
+                delta += rewrite.replacement.len() as i64 - old_len;
+            } else if rewrite.span.start > source_offset {
+                break;
+            } else {
+                // 区间内:该段在渲染串里的起点(前方位移已累积进 delta)
+                return rewrite.span.start + delta.max(0) as usize;
+            }
+        }
+        (source_offset as i64 + delta).max(0) as usize
+    }
+
+    /// 渲染字节偏移 → 源码字节偏移([`Self::source_to_rendered`] 的逆:区间
+    /// 外平移互逆、段首互为原像;改写段内部没有更细锚点,映回源码段首)。
+    pub fn rendered_to_source(&self, rendered_offset: usize) -> usize {
+        let mut delta: i64 = 0;
+        for rewrite in &self.rewrites {
+            let old_len = (rewrite.span.end - rewrite.span.start) as i64;
+            let rendered_start = rewrite.span.start as i64 + delta;
+            let rendered_end = rendered_start + rewrite.replacement.len() as i64;
+            if rendered_end <= rendered_offset as i64 {
+                delta += rewrite.replacement.len() as i64 - old_len;
+            } else if rendered_start > rendered_offset as i64 {
+                break;
+            } else {
+                return rewrite.span.start;
+            }
+        }
+        (rendered_offset as i64 - delta).max(0) as usize
+    }
+}
+
 /// 把 `[[目标]]` 展开成 Markdown 链接 `[显示名](<wiki://目标>)`,供**预览
 /// 渲染**使用;源码本身一字不改(roadmap P0 验收:「`.md` 保持原样」)。
 ///
 /// 目标用尖括号包裹:CommonMark 的 `<…>` 链接目标允许空格,中文与带空格的
 /// 文档名才不会被解析器截断。
 pub fn expand_wikilinks(text: &str) -> String {
-    let links = wikilinks(text);
-    if links.is_empty() {
-        return text.to_owned();
-    }
-    let mut out = String::with_capacity(text.len() + links.len() * 8);
-    let mut cursor = 0;
-    for link in links {
-        out.push_str(&text[cursor..link.span.start]);
-        out.push('[');
-        out.push_str(&link.label);
-        out.push_str("](<");
-        out.push_str(WIKI_SCHEME);
-        out.push_str(&link.target);
-        out.push_str(">)");
-        cursor = link.span.end;
-    }
-    out.push_str(&text[cursor..]);
-    out
+    expand_wikilinks_with_map(text).0
+}
+
+/// [`expand_wikilinks`] 带偏移映射的版本:同一次扫描既产出渲染文本,也产出
+/// 「源码偏移 ↔ 渲染偏移」表(LP2-4)。渲染串由映射表自己拼出(`OffsetMap::
+/// apply`),**不存在「公式推导长度」这条近似路径** —— 预览侧消费(大纲跳
+/// 转/section anchor 的偏移换算)拿到的映射与渲染文本天然逐字节一致。
+pub fn expand_wikilinks_with_map(text: &str) -> (String, OffsetMap) {
+    let rewrites: Vec<Rewrite> = wikilinks(text)
+        .into_iter()
+        .map(|link| Rewrite {
+            replacement: format!("[{}](<{}{}>)", link.label, WIKI_SCHEME, link.target),
+            span: link.span,
+        })
+        .collect();
+    let map = OffsetMap::from_rewrites(rewrites);
+    let rendered = map.apply(text);
+    (rendered, map)
 }
 
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
@@ -451,6 +861,173 @@ mod tests {
             .tokens
             .iter()
             .any(|token| matches!(token, Token::Link { .. })));
+    }
+
+    /// LP2-4 偏移映射 · **无展开**:没有 wikilink 时表为恒等,`apply` 原样
+    /// 返回,全部偏移双向换算幂等。
+    #[test]
+    fn offset_map_is_identity_without_rewrites() {
+        let text = "# 标题\n\n正文没有链接。\n";
+        let (rendered, map) = expand_wikilinks_with_map(text);
+        assert_eq!(rendered, text, "无链接:渲染串即源码");
+        assert!(map.is_identity());
+        assert_eq!(map.apply(text), text);
+        for offset in [0, 1, 7, text.len()] {
+            assert_eq!(map.source_to_rendered(offset), offset);
+            assert_eq!(map.rendered_to_source(offset), offset);
+        }
+        // 空表(无改写层的组合另一侧)同样恒等
+        let empty = OffsetMap::empty();
+        assert_eq!(empty.source_to_rendered(5), 5);
+        assert_eq!(empty.rendered_to_source(5), 5);
+    }
+
+    /// LP2-4 偏移映射 · **wikilink 展开**:映射与展开输出同源 —— `apply`
+    /// 重建的渲染串与旧 `expand_wikilinks` 逐字节一致;链接之后的源偏移平移
+    /// 到渲染串里同一文本处,反向换算回到原处;段内偏移归段首;段首/段末
+    /// 两个端点互为原像。
+    #[test]
+    fn offset_map_translates_through_wikilink_expansion() {
+        let source = "见 [[架构决策]] 再谈。\n\n## 后续标题\n\n正文。\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        // 单一事实来源:渲染串由映射表自己拼出,与独立入口的展开一致
+        assert_eq!(rendered, expand_wikilinks(source));
+
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        assert_eq!(
+            map.source_to_rendered(heading_src),
+            heading_out,
+            "链接之后的偏移按累积位移平移"
+        );
+        assert_eq!(
+            map.rendered_to_source(heading_out),
+            heading_src,
+            "反向换算回到源码原处"
+        );
+
+        // 展开段内的偏移(源→渲染):归段首(改写段内没有更细的锚点)
+        let link_start = source.find("[[").expect("wikilink");
+        let link_end = source.find("]]").expect("wikilink end") + 2;
+        assert_eq!(map.source_to_rendered(link_start + 3), link_start);
+        // 渲染段内(渲染→源):映回源码段首
+        let rendered_seg_start = rendered.find("[架构决策]").expect("expanded segment");
+        assert_eq!(map.rendered_to_source(rendered_seg_start + 5), link_start);
+        // 段首互为原像、段末按「区间外」平移互逆
+        assert_eq!(map.source_to_rendered(link_start), rendered_seg_start);
+        assert_eq!(
+            map.rendered_to_source(map.source_to_rendered(link_end)),
+            link_end
+        );
+
+        // 链接之前的偏移原样(位移尚未累积)
+        assert_eq!(map.source_to_rendered(0), 0);
+        assert_eq!(map.source_to_rendered(link_start), rendered_seg_start);
+        assert_eq!(map.rendered_to_source(rendered_seg_start), link_start);
+    }
+
+    /// LP2-4 偏移映射 · **多链接**:每处 wikilink 各自贡献位移,第二个链接
+    /// 之后的偏移按两条展开的累积差平移;两个展开段之间的文本仍原样。
+    #[test]
+    fn offset_map_handles_multiple_links() {
+        let source = "首段 [[甲]] 中段文字。\n\n次段 [[乙]] 尾段。\n\n## 标题\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        assert_eq!(rendered, expand_wikilinks(source));
+
+        // 两个展开段的渲染起点
+        let first_out = rendered.find("[甲]").expect("first expanded");
+        let second_out = rendered.find("[乙]").expect("second expanded");
+        let first_src = source.find("[[甲]]").expect("first link");
+        let second_src = source.find("[[乙]]").expect("second link");
+        assert_eq!(map.source_to_rendered(first_src), first_out);
+        assert_eq!(map.source_to_rendered(second_src), second_out);
+
+        // 两段之间的文本(第一条展开已平移、第二条未):换算后仍在渲染串
+        // 里同一文本处
+        let between_src = source.find("中段文字").expect("text between links");
+        let between_out = rendered.find("中段文字").expect("same text in rendered");
+        assert_eq!(map.source_to_rendered(between_src), between_out);
+
+        // 尾部标题:两条展开的累积位移
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let heading_out = rendered.find("## 标题").expect("heading in rendered");
+        assert_eq!(map.source_to_rendered(heading_src), heading_out);
+        assert_eq!(map.rendered_to_source(heading_out), heading_src);
+        assert_eq!(
+            map.rendered_to_source(second_out + 1),
+            second_src,
+            "第二个渲染段内映回其源码段首"
+        );
+    }
+
+    /// LP2-4 偏移映射 · **带显示名**:`[[目标|显示名]]` 展开段的长度由真实
+    /// 替换串决定(label 与 target 不同长),映射按实际字节计,不存在
+    /// 「公式推导长度」的近似路径;CJK 多字节目标同样按字节平移。
+    #[test]
+    fn offset_map_labeled_wikilink_uses_actual_replacement_length() {
+        let source = "见 [[Note One|笔记]] 与 [[中文 文档]]。\n\n## 后\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        assert_eq!(rendered, expand_wikilinks(source));
+        assert!(
+            rendered
+                .starts_with("见 [笔记](<wiki://Note One>) 与 [中文 文档](<wiki://中文 文档>)。"),
+            "带显示名与带空格目标按真实替换串展开:{rendered}"
+        );
+
+        // 标题在两条展开之后:按两条真实替换串的累积长度差平移
+        let heading_src = source.find("## 后").expect("heading in source");
+        let heading_out = rendered.find("## 后").expect("heading in rendered");
+        assert_eq!(map.source_to_rendered(heading_src), heading_out);
+        assert_eq!(map.rendered_to_source(heading_out), heading_src);
+
+        // 累积位移非零(两条展开都变长),且正反换算在文档尾端仍闭合
+        assert_ne!(heading_src, heading_out, "展开确实改变了偏移");
+        assert_eq!(
+            map.source_to_rendered(source.len()),
+            rendered.len(),
+            "文末偏移平移到渲染串末尾"
+        );
+        assert_eq!(map.rendered_to_source(rendered.len()), source.len());
+    }
+
+    /// LP2-4 偏移映射 · **可组合口径**:两层改写各自一张表,第二层区间基于
+    /// 第一层输出,消费点按顺序串行穿过 —— 与 `PreviewState::rendered` 的
+    /// 生产链(wikilink 展开 → 相对图片 URI 改写)同构。这条用两张人造表
+    /// 把口径本身钉死(emoji 短码 #48 落地时照此再串一张)。
+    #[test]
+    fn offset_map_composes_by_serial_pass_through() {
+        // 第一层:wikilink 展开(真实生产者)
+        let source = "见 [[架构决策]] 后续。\n\n## 标题\n";
+        let (layer1_text, layer1) = expand_wikilinks_with_map(source);
+        // 第二层:在第一层输出之上再改写一处(占位 emoji 短码形态)
+        let needle = "后续";
+        let needle_at = layer1_text.find(needle).expect("needle in layer1 text");
+        let layer2 = OffsetMap::from_rewrites(vec![Rewrite {
+            span: needle_at..needle_at + needle.len(),
+            replacement: "\u{1f600}续".to_owned(),
+        }]);
+        let final_text = layer2.apply(&layer1_text);
+
+        // 串行穿过:标题偏移先平移过 wikilink 展开,再平移过第二层改写
+        let heading_src = source.find("## 标题").expect("heading");
+        let after1 = layer1.source_to_rendered(heading_src);
+        let after2 = layer2.source_to_rendered(after1);
+        assert_eq!(
+            final_text.find("## 标题"),
+            Some(after2),
+            "两层串行穿过的落点就是最终文本里的位置"
+        );
+        // 反向同理,两段逆穿回源码
+        assert_eq!(
+            layer1.rendered_to_source(layer2.rendered_to_source(after2)),
+            heading_src
+        );
+        // 第二层区间内的偏移归段首(第一层终点即第二层段首)
+        assert_eq!(
+            layer2.source_to_rendered(needle_at + 2),
+            needle_at,
+            "第二层区间内归该层段首(第一层坐标)"
+        );
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块
@@ -646,6 +1223,352 @@ mod tests {
                 prev_end = span.end;
             }
         }
+    }
+
+    // —— inline_marks(LP2-1 活动块内联标记半隐藏)——
+
+    /// 期望表断言:(字节起点, 字面文本) 双重核对 —— 区间序列与切片内容都
+    /// 必须对上,CJK 多字节的字节数写错时切片对照当场失败,不靠手算。
+    fn assert_marks(text: &str, marks: &[Range<usize>], expected: &[(usize, &str)]) {
+        let labeled: Vec<Range<usize>> = expected
+            .iter()
+            .map(|(start, label)| *start..*start + label.len())
+            .collect();
+        assert_eq!(marks, labeled, "期望字面 {expected:?}");
+        for (range, (_, label)) in marks.iter().zip(expected) {
+            assert_eq!(&text[range.clone()], *label);
+        }
+    }
+
+    /// 输出的形状永远合法:升序、互不重叠、非空、不越界。
+    fn assert_well_formed(text: &str, marks: &[Range<usize>]) {
+        let mut prev_end = 0;
+        for range in marks {
+            assert!(!range.is_empty(), "空区间: {marks:?}");
+            assert!(range.start >= prev_end, "重叠/乱序: {marks:?}");
+            assert!(range.end <= text.len(), "越界: {marks:?}");
+            prev_end = range.end;
+        }
+    }
+
+    /// 四种强调定界符 + 删除线:开/闭定界符各自成段,内容不标。
+    #[test]
+    fn inline_marks_covers_emphasis_delimiters() {
+        let text = "**b** *i* _u_ ~~s~~";
+        let marks = inline_marks(text);
+        assert_marks(
+            text,
+            &marks,
+            &[
+                (0, "**"),
+                (3, "**"),
+                (6, "*"),
+                (8, "*"),
+                (10, "_"),
+                (12, "_"),
+                (14, "~~"),
+                (17, "~~"),
+            ],
+        );
+        assert_well_formed(text, &marks);
+    }
+
+    /// 嵌套强调(`***x***`):内外层定界符合并成前后各一整段 `***`。
+    #[test]
+    fn inline_marks_merges_nested_emphasis() {
+        let text = "***both***";
+        assert_marks(text, &inline_marks(text), &[(0, "***"), (7, "***")]);
+
+        // 强调里套行内代码:代码反引号与强调定界符都标,内容不标
+        let text = "*a `b` c*";
+        assert_marks(
+            text,
+            &inline_marks(text),
+            &[(0, "*"), (3, "`"), (5, "`"), (8, "*")],
+        );
+    }
+
+    /// 行内代码:只标两端反引号串;双反引号包裹(内容本身含反引号)不误伤。
+    #[test]
+    fn inline_marks_tags_code_backticks_only() {
+        let text = "`code` 与 ``a ` b``";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(0, "`"), (5, "`"), (11, "``"), (18, "``")]);
+        // 内容不算标记
+        assert!(!marks.iter().any(|r| &text[r.clone()] == "code"));
+        assert!(!marks.iter().any(|r| text[r.clone()].contains('a')));
+    }
+
+    /// 链接与图片:括号与目标部分是标记,链接文本不标;autolink 只标尖括号。
+    #[test]
+    fn inline_marks_tags_link_brackets_and_destination() {
+        let text = "[点我](https://e.com)";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(0, "["), (7, "](https://e.com)")]);
+
+        let text = "![alt](img.png)";
+        assert_marks(text, &inline_marks(text), &[(0, "!["), (5, "](img.png)")]);
+
+        let text = "<https://auto.link>";
+        assert_marks(text, &inline_marks(text), &[(0, "<"), (18, ">")]);
+
+        // 链接文本里套粗体:粗体定界符与链接括号都标,且合并不重复
+        let text = "[**b**](u)";
+        assert_marks(text, &inline_marks(text), &[(0, "[**"), (4, "**](u)")]);
+    }
+
+    /// CJK 混排与 CRLF:字节区间落在字符边界上,判定不受多字节字符影响。
+    #[test]
+    fn inline_marks_handles_cjk_and_crlf() {
+        let text = "**中文**与*混排*和[链接](u)";
+        let marks = inline_marks(text);
+        assert_marks(
+            text,
+            &marks,
+            &[
+                (0, "**"),
+                (8, "**"),
+                (13, "*"),
+                (20, "*"),
+                (24, "["),
+                (31, "](u)"),
+            ],
+        );
+        assert_well_formed(text, &marks);
+        for range in &marks {
+            assert!(text.is_char_boundary(range.start) && text.is_char_boundary(range.end));
+        }
+
+        assert_marks(
+            "**b**\r\n尾行",
+            &inline_marks("**b**\r\n尾行"),
+            &[(0, "**"), (3, "**")],
+        );
+    }
+
+    /// 围栏/缩进代码块内容不算标记(里面的 `*`、`[` 是代码,遮了就改坏语义)。
+    #[test]
+    fn inline_marks_skips_code_block_contents() {
+        let text = "```rust\na * b [x](y) **z**\n```\n";
+        assert!(inline_marks(text).is_empty());
+
+        let text = "    indented *x* code\n";
+        assert!(inline_marks(text).is_empty());
+
+        // 块外的散置星号是普通文本(CommonMark:两侧无紧贴内容则不构成强调)
+        assert!(inline_marks("a * b").is_empty());
+    }
+
+    /// 未闭合的定界符是普通文本(pulldown 语义),不算标记。
+    #[test]
+    fn inline_marks_skips_unclosed_markers() {
+        assert!(inline_marks("未闭合 **bold").is_empty());
+        assert!(inline_marks("`unclosed code").is_empty());
+        assert!(inline_marks("[unclosed link").is_empty());
+    }
+
+    /// 列表/引用块内的行内标记照标(块级标记本身 `- `、`> ` 不标)。
+    #[test]
+    fn inline_marks_inside_list_and_quote_blocks() {
+        let text = "- 项目 **粗**\n";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(9, "**"), (14, "**")]);
+        assert!(marks[0].start > 2, "列表符 `- ` 不是标记: {marks:?}");
+
+        let text = "> 引用 *i*\n";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(9, "*"), (11, "*")]);
+        assert!(marks[0].start > 2, "引用符 `> ` 不是标记: {marks:?}");
+    }
+
+    /// 空输入与纯文本:无标记。
+    #[test]
+    fn inline_marks_empty_and_plain_text() {
+        assert!(inline_marks("").is_empty());
+        assert!(inline_marks("普通段落,没有标记。").is_empty());
+    }
+
+    // —— inline_mark_pairs / mark_interaction(LP2-2 选区扩展与配对显形)——
+
+    /// 期望表断言配对:(构造字面, 开标记字面, 闭标记字面) 三重核对。
+    fn assert_pairs(text: &str, pairs: &[MarkPair], expected: &[(&str, &str, &str)]) {
+        assert_eq!(
+            pairs.len(),
+            expected.len(),
+            "对数不符:{pairs:?} vs {expected:?}"
+        );
+        for (pair, (whole, opening, closing)) in pairs.iter().zip(expected) {
+            assert_eq!(&text[pair.construct.clone()], *whole);
+            assert_eq!(&text[pair.opening.clone()], *opening);
+            assert_eq!(&text[pair.closing.clone()], *closing);
+        }
+    }
+
+    /// 成对匹配:强调/行内代码/链接/图片/autolink 各自成对,开闭两侧
+    /// 字面与构造整段都对得上。
+    #[test]
+    fn mark_pairs_match_constructs() {
+        let text = "**b** `c` [t](u) ![a](i.png) <https://x.y>";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[
+                ("**b**", "**", "**"),
+                ("`c`", "`", "`"),
+                ("[t](u)", "[", "](u)"),
+                ("![a](i.png)", "![", "](i.png)"),
+                ("<https://x.y>", "<", ">"),
+            ],
+        );
+        // 段表与 LP2-1 完全一致(重构不得改半隐藏行为)
+        assert_eq!(marks.segments, inline_marks(text));
+    }
+
+    /// 嵌套:`***x***` 内外层各成一对(pulldown 给内层 Strong 与外层
+    /// Emphasis 不同的构造区间);链接文本里套强调,两对各自完整。
+    #[test]
+    fn mark_pairs_cover_nested_constructs_per_level() {
+        let text = "***x***";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[("**x**", "**", "**"), ("***x***", "*", "*")],
+        );
+
+        let text = "[**b**](u)";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[("**b**", "**", "**"), ("[**b**](u)", "[", "](u)")],
+        );
+    }
+
+    /// 单侧孤标记(未闭合)的退化:pulldown 视作普通文本,无段也无对,
+    /// 显形/扩展随之整体退化为「什么都不发生」。
+    #[test]
+    fn mark_pairs_skip_single_sided_orphans() {
+        for text in ["未闭合 **bold", "`半截代码", "[没目标"] {
+            let marks = inline_marks_with_pairs(text);
+            assert!(marks.segments.is_empty(), "{text:?}");
+            assert!(marks.pairs.is_empty(), "{text:?}");
+        }
+        // 空文本链接拆不出两侧,不成对(段仍在,半隐藏不受影响)
+        let marks = inline_marks_with_pairs("[](u)");
+        assert!(marks.pairs.is_empty());
+        assert_eq!(marks.segments.len(), 1, "{:?}", marks.segments);
+    }
+
+    /// 配对显形:光标/选区压住一侧标记,另一侧所在段同时显形 —— 这是
+    /// LP2-1 规则(只显形被压住的段)之上的增量。
+    #[test]
+    fn mark_interaction_reveals_partner_side() {
+        let text = "**b** x *i*";
+        let marks = inline_marks_with_pairs(text);
+
+        // 塌缩光标压住开 `**`(字节 0..2,取边界 1):开闭两段都显形,
+        // 无关的 `*i*` 两段保持半隐藏
+        let out = mark_interaction(text, &marks, 1, 1, None);
+        assert_eq!(out.revealed, vec![true, true, false, false]);
+        assert_eq!(out.expanded, None, "无手势不扩展");
+
+        // 非空选区只盖住开 `**`(字符 0..2):同样两段显形
+        let out = mark_interaction(text, &marks, 0, 2, None);
+        assert_eq!(out.revealed, vec![true, true, false, false]);
+
+        // 选区只盖内容 `b`(字符 2..3):不贴标记,全隐藏(LP2-1 口径保持)
+        let out = mark_interaction(text, &marks, 2, 3, None);
+        assert_eq!(out.revealed, vec![false, false, false, false]);
+    }
+
+    /// 双击扩展:词选区扩到包含它的**最内层**标记对;跨对/无对不扩展。
+    #[test]
+    fn mark_interaction_expands_double_click_to_innermost_pair() {
+        let text = "[**b**](u) 和 `c`";
+        let marks = inline_marks_with_pairs(text);
+
+        // 双击词 `b`(字符 3..4)→ 最内层是粗体对,不是外层链接对
+        let out = mark_interaction(text, &marks, 3, 4, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(1..6), "扩到 **b**,不带链接括号");
+
+        // 双击链接外的词 `和`(字符 11..12):无对包含,不扩展
+        let out = mark_interaction(text, &marks, 11, 12, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, None);
+
+        // 跨对选区(选了链接一半+一半正文)不吸附
+        let text2 = "**ab** cd *ef*";
+        let marks2 = inline_marks_with_pairs(text2);
+        let out = mark_interaction(text2, &marks2, 0, 9, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, None);
+    }
+
+    /// 拖选扩展:锚点压着标记(含边界,单字符标记只有边界可压)且选区
+    /// 整个含在构造内才扩展;从内容中部发起、或拖出构造外,保持原选区。
+    #[test]
+    fn mark_interaction_expands_drag_only_from_mark_anchor() {
+        let text = "前缀 **abcd** 后缀";
+        let marks = inline_marks_with_pairs(text);
+        // 字符:`前缀 `(3) + `**`(2) + `abcd`(4) + `**`(2) + ...
+        // 开 `**` = 字符 3..5,内容 5..9,构造 3..11
+
+        // 锚点在开 `**` 边界(字符 5 = opening.end),拖到内容中部松手
+        let out = mark_interaction(
+            text,
+            &marks,
+            5,
+            7,
+            Some(MarkGesture::DragRelease { anchor: 5 }),
+        );
+        assert_eq!(out.expanded, Some(3..11), "从标记内侧发起 → 扩到整对");
+
+        // 锚点在内容中部:普通拖选,不吸附
+        let out = mark_interaction(
+            text,
+            &marks,
+            6,
+            8,
+            Some(MarkGesture::DragRelease { anchor: 6 }),
+        );
+        assert_eq!(out.expanded, None);
+
+        // 锚点压标记但拖出构造(选区含构造外的前缀):不吸附
+        let out = mark_interaction(
+            text,
+            &marks,
+            0,
+            6,
+            Some(MarkGesture::DragRelease { anchor: 5 }),
+        );
+        assert_eq!(out.expanded, None);
+    }
+
+    /// 选区已含标记:显形两段全亮;扩展幂等(结果就是当前区间)。
+    #[test]
+    fn mark_interaction_idempotent_when_selection_already_covers_pair() {
+        let text = "**b** x";
+        let marks = inline_marks_with_pairs(text);
+        let out = mark_interaction(text, &marks, 0, 5, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(0..5));
+        assert_eq!(out.revealed, vec![true, true]);
+    }
+
+    /// CJK:字符偏移输入与字节区间标记在函数内部正确换算。
+    #[test]
+    fn mark_interaction_converts_cjk_char_and_byte_domains() {
+        let text = "**中文** 尾";
+        // 字符:0-1 `**`、2-3 中文、4-5 `**`;字节:开 0..2、闭 8..10
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(text, &marks.pairs, &[("**中文**", "**", "**")]);
+
+        // 光标停在闭 `**` 首边界(字符 4 = 字节 8):开闭两段都显形
+        let out = mark_interaction(text, &marks, 4, 4, None);
+        assert_eq!(out.revealed, vec![true, true]);
+
+        // 双击词「中文」(字符 2..4)→ 扩到字符 0..6
+        let out = mark_interaction(text, &marks, 2, 4, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(0..6));
     }
 
     /// 拥有型的意义:文档模型活得比源字符串久。

@@ -142,8 +142,10 @@ pub struct PreviewState {
     /// 当前快照的**源文本**(大纲 `span` 索引它,与编辑器缓冲同源)。
     ///
     /// 渲染走 [`Self::rendered`] —— wikilink 展开会改变偏移,渲染文本不能
-    /// 与源码偏移混用。`text` 是快照真源:大纲 `span` 索引它,预览跳转把
-    /// 它的偏移映射到 `rendered`(见 `ui::preview::map_source_offset`)。
+    /// 与源码偏移混用。`text` 是快照真源:大纲 `span` 索引它;LP2-4 起
+    /// 偏移换算走 [`Self::offset_map`],不再由此字段反推,字段保留作
+    /// 「大纲 span 锚定的文本」与快照一致性断言的锚点,非测试构建无读取。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub text: String,
     /// 快照对应的 [`EditorBuffer::revision`]。
     pub synced_rev: u64,
@@ -152,6 +154,11 @@ pub struct PreviewState {
     /// 喂给预览的**渲染文本**:`[[wikilink]]` 已展开成 `wiki://` 链接
     /// (P3 双向链接)。源码 `text` 一字不改 —— 展开只影响渲染。
     pub rendered: String,
+    /// 「源码偏移 ↔ 渲染偏移」映射表(LP2-4):与 `rendered` 同一次重建产出
+    /// (`latermd_md::expand_wikilinks_with_map`),两者单一事实来源。预览侧
+    /// 消费(大纲跳转/section anchor 的偏移换算,见 `ui::preview`),只读
+    /// 派生物,不回写编辑缓冲。
+    pub offset_map: latermd_md::OffsetMap,
     /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
     /// 面板收起期间悬置(消费只发生在预览绘制帧);快照 rebuild(文档
     /// 变更)即丢弃 —— 旧偏移对重建后的文本没有意义。
@@ -163,10 +170,13 @@ impl PreviewState {
     /// 以编辑器当前内容建立快照(文本 + 大纲)。
     pub fn new(editor: &EditorBuffer) -> Self {
         let text = editor.text().to_owned();
+        // 展开放在重建里而不是每帧:wikilink 展开要遍历全文,空闲帧
+        // 不该付这个代价(与「修订号前进才重建」同一条规则)。渲染串与
+        // 偏移映射同一次产出,消费侧换算与渲染文本永不漂移。
+        let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
         Self {
-            // 展开放在重建里而不是每帧:wikilink 展开要遍历全文,空闲帧
-            // 不该付这个代价(与「修订号前进才重建」同一条规则)
-            rendered: latermd_md::expand_wikilinks(&text),
+            rendered,
+            offset_map,
             outline: latermd_md::outline(&text),
             text,
             synced_rev: editor.revision(),
@@ -2871,6 +2881,47 @@ mod tests {
         assert_eq!(outline[0].text, "LaterMD");
         assert_eq!(outline[1].text, "常用元素");
         assert!(state.tabs.current().preview.text[outline[1].span.clone()].contains("## 常用元素"));
+    }
+
+    /// LP2-4:快照携带「源码偏移 ↔ 渲染偏移」映射,与 `rendered` 同次产出
+    /// 且换算正确(标题 span 穿表后落在渲染串的同一文本处)。映射只服务
+    /// 预览侧消费 —— 建快照前后,编辑缓冲的修订号与 dirty 标志分毫不动
+    /// (源码/rope/撤销栈不在映射的服务面内)。
+    #[test]
+    fn preview_offset_map_translates_without_touching_editor_buffer() {
+        let mut editor =
+            EditorBuffer::new("开场白。\n\n见 [[架构决策]] 的后续。\n\n## 标题\n\n正文。\n");
+        // 制造一个已编辑态:dirty=true、rev>0,任何对缓冲的写都会改变两者
+        editor.clear_dirty();
+        editor.insert_chars(0, "引:");
+        let (rev, dirty) = (editor.revision(), editor.is_dirty());
+        assert!(dirty, "前置:缓冲处于已编辑态,见证量非平凡");
+
+        let preview = PreviewState::new(&editor);
+        assert_eq!(editor.revision(), rev, "建快照不推进修订号");
+        assert_eq!(editor.is_dirty(), dirty, "建快照不动 dirty 标志");
+        assert_eq!(editor.text(), preview.text, "快照文本与缓冲一致(只读拷贝)");
+
+        // 渲染串与映射同源一致;标题(在 wikilink 之后)的源码偏移穿表后
+        // 落在渲染串的同一文本处,反向穿回
+        assert_eq!(
+            preview.rendered,
+            latermd_md::expand_wikilinks(preview.text.as_str())
+        );
+        let heading_src = preview.text.find("## 标题").expect("heading in snapshot");
+        let heading_out = preview
+            .rendered
+            .find("## 标题")
+            .expect("heading in rendered");
+        let mapped = preview.offset_map.source_to_rendered(heading_src);
+        assert_eq!(mapped, heading_out, "标题偏移按展开位移平移");
+        assert_eq!(
+            preview.offset_map.rendered_to_source(mapped),
+            heading_src,
+            "反向换算回到源码原处"
+        );
+        // 换算后取到的确实是渲染串里的标题文本(落点正确,不是恰好数字相等)
+        assert!(preview.rendered[mapped..].starts_with("## 标题"));
     }
 
     /// 大纲点击归约:跳过 span 吸收的前置换行落到标题行首,并按当前缓冲
