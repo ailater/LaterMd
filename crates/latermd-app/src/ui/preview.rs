@@ -85,23 +85,7 @@ pub(crate) fn resolve_relative_images<'a>(
     text: &'a str,
     base_dir: Option<&'a Path>,
 ) -> Cow<'a, str> {
-    let Some(base_dir) = base_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
-        return Cow::Borrowed(text);
-    };
-    let rewrites: Vec<(Range<usize>, String)> = inline_image_dests(text)
-        .into_iter()
-        .filter(|(_, dest, _)| is_relative(dest))
-        .map(|(span, dest, wrapped)| {
-            let mut uri = file_uri(base_dir, &dest);
-            // 原 `<…>` 形式保持包裹;拼出来的 URI 含空格时裸目标语法会被
-            // 截断,也要包。目标本身就在 `(` 与 `)` 之间,替换串带尖括号
-            // 仍是合法 Markdown。
-            if wrapped || uri.chars().any(char::is_whitespace) {
-                uri = format!("<{uri}>");
-            }
-            (span, uri)
-        })
-        .collect();
+    let rewrites = image_rewrites(text, base_dir);
     if rewrites.is_empty() {
         return Cow::Borrowed(text);
     }
@@ -114,6 +98,80 @@ pub(crate) fn resolve_relative_images<'a>(
     }
     out.push_str(&text[cursor..]);
     Cow::Owned(out)
+}
+
+/// 相对图片地址的 `(区间, 改写串)` 清单(改写逻辑见 [`resolve_relative_images`]);
+/// 偏移映射(`map_offset_through`)与字符串改写共用同一份,两处不漂移。
+fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<(Range<usize>, String)> {
+    let Some(base_dir) = base_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    inline_image_dests(text)
+        .into_iter()
+        .filter(|(_, dest, _)| is_relative(dest))
+        .map(|(span, dest, wrapped)| {
+            let mut uri = file_uri(base_dir, &dest);
+            // 原 `<…>` 形式保持包裹;拼出来的 URI 含空格时裸目标语法会被
+            // 截断,也要包。目标本身就在 `(` 与 `)` 之间,替换串带尖括号
+            // 仍是合法 Markdown。
+            if wrapped || uri.chars().any(char::is_whitespace) {
+                uri = format!("<{uri}>");
+            }
+            (span, uri)
+        })
+        .collect()
+}
+
+/// `[[wikilink]]` 展开对字节偏移的影响:`(区间, 展开后长度)` 清单,供
+/// [`map_offset_through`] 把源码偏移映射到展开文本。
+///
+/// 展开式 `[显示名](<wiki://目标>)` 的长度按字节算(与偏移口径一致),
+/// 与 `latermd_md::expand_wikilinks` 的输出逐字节对应(单测
+/// `wikilink_rewrite_lengths_match_expand` 锁死两者)。
+fn wikilink_rewrites(source: &str) -> Vec<(Range<usize>, usize)> {
+    latermd_md::wikilinks(source)
+        .into_iter()
+        .map(|link| {
+            let expanded_len =
+                link.label.len() + link.target.len() + latermd_md::WIKI_SCHEME.len() + 6;
+            (link.span, expanded_len)
+        })
+        .collect()
+}
+
+/// 把一处字节偏移穿过一条「区间替换」链:偏移在被替换区间内 → 映到该区间
+/// 起点之后的对应位置(改写段内部没有更细的锚点,落点即段首);其余偏移
+/// 平移前方位移的累积长度差。`rewrites` 按区间升序(两个生产者都满足)。
+fn map_offset_through(offset: usize, rewrites: &[(Range<usize>, usize)]) -> usize {
+    let mut delta: i64 = 0;
+    for (span, new_len) in rewrites {
+        if span.end <= offset {
+            delta += *new_len as i64 - (span.end - span.start) as i64;
+        } else if span.start > offset {
+            break;
+        } else {
+            return span.start + delta as usize;
+        }
+    }
+    (offset as i64 + delta) as usize
+}
+
+/// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
+/// 偏移。两层改写:wikilink 展开(源文本 → `PreviewState::rendered`)与
+/// 相对图片 `file://` 改写(`rendered` → 最终渲染文本)。两层都是「区间
+/// 替换」,串行映射即可。
+fn map_source_offset(
+    source: &str,
+    rendered: &str,
+    base_dir: Option<&Path>,
+    offset: usize,
+) -> usize {
+    let after_wikilinks = map_offset_through(offset, &wikilink_rewrites(source));
+    let image_deltas: Vec<(Range<usize>, usize)> = image_rewrites(rendered, base_dir)
+        .into_iter()
+        .map(|(span, uri)| (span, uri.len()))
+        .collect();
+    map_offset_through(after_wikilinks, &image_deltas)
 }
 
 /// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
@@ -557,7 +615,7 @@ pub fn ui(
     outbox: &mut Vec<Message>,
 ) {
     let label_id = tab_preview_id(tab_id);
-    egui::ScrollArea::vertical()
+    let scrolled = egui::ScrollArea::vertical()
         .id_salt(label_id.with("scroll"))
         // 不收缩宽度,让 wrap 以面板宽为界
         .auto_shrink([false, false])
@@ -602,29 +660,57 @@ pub fn ui(
                 .code_block_buttons(&code_copy_buttons)
                 .show(ui);
             handler.drain_into(outbox);
+
+            // 大纲跳转的预览侧(#42):源码偏移(大纲 span 口径)先穿过两层
+            // 渲染改写(wikilink 展开 + 相对图片 URI)映射到喂给 label 的文本
+            // 偏移,再查 vendored 块表拿目标块 rect。两件事都必须发生在
+            // ScrollArea 闭包内、label 渲染之后:scroll_to_rect 写的是本 pass
+            // 的滚动目标,由 ScrollArea 收尾消费 —— 闭包外写会在下一帧开头被
+            // 清空,永远不生效(用户反馈「就源码跳转了」的断点就在这);块表
+            // 也只在渲染当帧有效,同帧先写后读。块缺失(空文档/未渲染)就
+            // 不滚,下一帧有表了也不会再滚 —— 滚动目标消费即清空,一次语义。
+            if let Some(target) = preview.scroll_target.take() {
+                let offset = map_source_offset(&preview.text, &preview.rendered, base_dir, target);
+                if let Some(block) = egui_markdown::block_rect_at_offset(ui, label_id, offset) {
+                    ui.scroll_to_rect_animation(
+                        block.rect,
+                        Some(egui::Align::Center),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
+            }
         });
 
-    // 大纲跳转的预览侧:把字节偏移换算成 y 再滚过去。锚点是上一行渲染时
-    // vendored 层记录下的(section → y),这里只做查表 + 请求滚动。
-    if let Some(target) = preview.scroll_target.take() {
-        if let Some(anchors) = egui_markdown::section_anchors(panel, label_id) {
-            // 取「起点不超过目标」的最后一个锚点:标题所在节的顶部
-            let anchor = anchors
-                .iter()
-                .rev()
-                .find(|anchor| anchor.byte_start <= target)
-                .or_else(|| anchors.first());
-            if let Some(anchor) = anchor {
-                panel.scroll_to_rect(
-                    egui::Rect::from_min_size(
-                        egui::pos2(panel.min_rect().left(), anchor.y),
-                        egui::vec2(panel.available_width().max(1.0), 1.0),
-                    ),
-                    Some(egui::Align::TOP),
-                );
-            }
-        }
-    }
+    // 滚动位置探针(照 copy_button_probe 的 data 手法):ScrollArea 的持久
+    // state key 由其内部 id 链派生,外部无法稳定复现;测试用本探针断言
+    // 「大纲点击真的滚动了预览、落点方位正确」。生产代码不读它。
+    panel.ctx().data_mut(|d| {
+        d.insert_temp(
+            scroll_probe_id(tab_id),
+            ScrollProbe {
+                offset: scrolled.state.offset.y,
+                viewport: scrolled.inner_rect,
+                content_height: scrolled.content_size.y,
+            },
+        )
+    });
+}
+
+/// 预览滚动位置探针的 data 键(每 tab 一份;写入见 [`ui`] 消费段)。
+fn scroll_probe_id(tab_id: u64) -> egui::Id {
+    egui::Id::new("latermd-preview-scroll-offset").with(tab_id)
+}
+
+/// 探针载荷(仅测试读):帧末滚动偏移 + 视口矩形 + 内容高度 —— 无头测试
+/// 用这三样把 `Align::Center` 的换算(块中心 − 视口中心,再钳到
+/// `[0, 内容高 − 视口高]`)复算一遍,做「跳转落点方位」的精确断言。
+/// 生产只写不读,字段读取都活在 `cfg(test)`,非测试构建豁免 dead_code。
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ScrollProbe {
+    offset: f32,
+    viewport: egui::Rect,
+    content_height: f32,
 }
 
 #[cfg(test)]
@@ -867,6 +953,260 @@ mod tests {
         output.drop_without_applying_deltas();
         assert_eq!(preview.scroll_target, None, "滚动目标只消费一次");
         assert!(outbox.is_empty(), "滚动不产消息");
+    }
+
+    /// 展开长度公式与 `expand_wikilinks` 的实际输出逐字节一致 —— 公式错了
+    /// 偏移映射就会漂,这条把两者锁死。样本覆盖中文/带空格目标/显示名与
+    /// 目标不同名(展开式字节长度各不相同)。
+    #[test]
+    fn wikilink_rewrite_lengths_match_expand() {
+        let source = "见 [[架构决策]] 与 [[Note One|笔记一]]、[[中文 文档]]。\n";
+        let expanded = latermd_md::expand_wikilinks(source);
+        let rewrites = wikilink_rewrites(source);
+        // 逐段重建展开文本,长度必须与真实展开一字不差
+        let mut rebuilt = String::new();
+        let mut cursor = 0;
+        for (span, new_len) in &rewrites {
+            rebuilt.push_str(&source[cursor..span.start]);
+            let target = &latermd_md::expand_wikilinks(&source[span.clone()]);
+            assert_eq!(target.len(), *new_len, "span {span:?} 展开长度公式漂移");
+            rebuilt.push_str(target.as_str());
+            cursor = span.end;
+        }
+        rebuilt.push_str(&source[cursor..]);
+        assert_eq!(rebuilt, expanded, "公式重建与 expand 输出不一致");
+    }
+
+    /// 偏移映射三层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
+    /// 相对图片改写叠加在同一映射里;偏移落在改写区间内归段首。
+    #[test]
+    fn map_source_offset_through_both_rewrites() {
+        // 无改写:恒等
+        assert_eq!(map_source_offset("# h\n", "# h\n", None, 3), 3);
+
+        // wikilink 改写:[[架构决策]](12 字节)→ [架构决策](<wiki://架构决策>)
+        // (2+12+2+4+8+12+2=…);标题在 wikilink 之后,映射后偏移必须落在
+        // 展开文本里同一个标题的字节上。
+        let source = "见 [[架构决策]] 再谈。\n\n## 后续标题\n\n正文。\n";
+        let rendered = latermd_md::expand_wikilinks(source);
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        let mapped = map_source_offset(source, &rendered, None, heading_src);
+        assert_eq!(mapped, heading_out, "wikilink 之后的偏移按平移映射");
+
+        // 偏移落在 wikilink 区间内(点击目标是标题,标题不会落在链接里,
+        // 但边界语义仍要确定):归改写段首。
+        let link_start = source.find("[[").expect("wikilink");
+        let in_link = link_start + 3;
+        let mapped_in = map_source_offset(source, &rendered, None, in_link);
+        assert_eq!(
+            &rendered[mapped_in..].chars().take(3).collect::<String>(),
+            "[架构",
+            "区间内偏移归改写段首: {mapped_in}"
+        );
+
+        // 图片层叠加:渲染文本里相对图片地址换成 file:// URI 后,标题偏移
+        // 再平移一次。
+        let doc = "![图](./x.png)\n\n## 标题\n";
+        let base = Some(Path::new("/doc"));
+        let with_uri = resolve_relative_images(doc, base);
+        let heading = doc.find("## 标题").expect("heading");
+        let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
+        let mapped_img = map_source_offset(doc, doc, base, heading);
+        assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
+    }
+
+    /// 端到端:scroll_target 指向文档尾部标题,一帧 `ui()` 后预览 ScrollArea
+    /// 真的滚动了(断点修复的回归锁 —— 修复前滚动指令写在 ScrollArea 闭包
+    /// 外,永远不生效)。
+    #[test]
+    fn outline_jump_actually_scrolls_preview() {
+        let ctx = egui::Context::default();
+        let mut doc = String::from("# 顶部\n\n");
+        for i in 0..30 {
+            doc.push_str(&format!("第 {i} 段正文,占高度用。\n\n"));
+        }
+        doc.push_str("# 底部标题\n\n收尾。\n");
+        let heading = doc.find("# 底部标题").expect("tail heading");
+        let mut preview = PreviewState {
+            rendered: doc.clone(),
+            text: doc.clone(),
+            synced_rev: 0,
+            outline: Vec::new(),
+            scroll_target: Some(heading),
+        };
+        let mut outbox = Vec::new();
+        let mut scroll_offset = 0.0f32;
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        // 3 帧 + 虚拟时间推进:滚动即使带动画也在第 2/3 帧到位,一次到位
+        // (ScrollAnimation::none)则在第 1 帧就到。
+        for frame in 0..3 {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64),
+                    ..Default::default()
+                },
+                |panel| {
+                    ui(
+                        panel,
+                        &mut preview,
+                        &AiState::default(),
+                        1,
+                        false,
+                        None,
+                        &mut outbox,
+                    );
+                    scroll_offset = panel
+                        .ctx()
+                        .data(|d| d.get_temp::<ScrollProbe>(scroll_probe_id(1)))
+                        .map_or(0.0, |probe| probe.offset);
+                },
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(preview.scroll_target, None, "目标消费一次");
+        assert!(
+            scroll_offset > 50.0,
+            "预览应滚动到尾部标题,实际 offset={scroll_offset}"
+        );
+    }
+
+    /// 端到端**真点击路径**(#42 M2 验收主轴):`State` 归约
+    /// `OutlineItemClicked`(源码 jump + 预览请求**双栏登记**)→ 预览消费帧
+    /// 查块表滚动。落点断言不用「滚了一点」这类糊口径,而是复算 egui
+    /// `Align::Center` 的换算(目标块中心 − 视口中心,再钳到
+    /// `[0, 内容高 − 视口高]`,同帧 `end()` 内已钳完)误差 ≤1px;顶/中/尾
+    /// 三个目标落点有序且可区分 —— 方位对应目标块,不是「随便滚了一下」。
+    #[test]
+    fn outline_click_via_state_scrolls_preview_centered_on_target_block() {
+        let mut doc = String::from("# 顶部\n\n");
+        for i in 0..30 {
+            doc.push_str(&format!("第 {i} 段正文,占高度用。\n\n"));
+        }
+        doc.push_str("## 中部标题\n\n");
+        for i in 0..15 {
+            doc.push_str(&format!("续 {i} 段正文。\n\n"));
+        }
+        doc.push_str("# 尾部标题\n\n收尾。\n");
+
+        // 走完整链:换文档(生产同步规则 = 修订号前进才 rebuild,此处直接
+        // 调同一 API)→ 从大纲取真实条目 span → 归约 → 渲染两帧(第 2 帧
+        // 确认落点稳定,不是动画中间态)。
+        let jump = |heading: &str| -> (f32, f32, f32) {
+            let mut state = crate::state::State::default();
+            {
+                let tab = state.tabs.current_mut();
+                tab.editor.replace_all(&doc);
+                tab.preview.rebuild(&tab.editor);
+            }
+            let span = state
+                .tabs
+                .current()
+                .preview
+                .outline
+                .iter()
+                .find(|item| item.text == heading)
+                .unwrap_or_else(|| panic!("大纲缺 {heading}"))
+                .span
+                .clone();
+            state.apply(Message::OutlineItemClicked(span.clone()));
+            // 归约帧双栏都在场:预览请求登记 + 源码跳转请求登记(本测试
+            // 不画编辑器,jump_to 应保持待消费)
+            assert_eq!(
+                state.tabs.current().preview.scroll_target,
+                Some(span.start),
+                "{heading}: 预览请求已登记"
+            );
+            assert!(
+                state.tabs.current().cursor.jump_to.is_some(),
+                "{heading}: 源码侧请求同帧登记(双栏)"
+            );
+
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+            let mut outbox = Vec::new();
+            let mut block_rect = None;
+            let mut probe = None;
+            for frame in 0..2 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |panel| {
+                        {
+                            let tab = state.tabs.current_mut();
+                            ui(
+                                panel,
+                                &mut tab.preview,
+                                &AiState::default(),
+                                1,
+                                false,
+                                None,
+                                &mut outbox,
+                            );
+                        }
+                        if frame == 0 {
+                            // 与生产消费同帧读块表(帧号键控,跨帧即 None):
+                            // 拿到的就是生产 `scroll_to_rect_animation` 滚向
+                            // 的那个块。首帧滚动起点是 0,记录 rect 即内容坐标。
+                            let tab = state.tabs.current();
+                            let mapped = map_source_offset(
+                                &tab.preview.text,
+                                &tab.preview.rendered,
+                                None,
+                                span.start,
+                            );
+                            block_rect = egui_markdown::block_rect_at_offset(
+                                panel,
+                                tab_preview_id(1),
+                                mapped,
+                            )
+                            .map(|block| block.rect);
+                        }
+                        probe = panel
+                            .ctx()
+                            .data(|d| d.get_temp::<ScrollProbe>(scroll_probe_id(1)));
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            let block = block_rect.unwrap_or_else(|| panic!("{heading}: 目标块不在表内"));
+            let probe = probe.expect("探针已写入");
+            assert_eq!(
+                state.tabs.current().preview.scroll_target,
+                None,
+                "{heading}: 请求消费一次即清"
+            );
+            (
+                probe.offset,
+                block.center().y - probe.viewport.center().y,
+                (probe.content_height - probe.viewport.height()).max(0.0),
+            )
+        };
+
+        let (top, top_expected, top_max) = jump("顶部");
+        let (mid, mid_expected, mid_max) = jump("中部标题");
+        let (tail, tail_expected, tail_max) = jump("尾部标题");
+        for (name, offset, expected, max) in [
+            ("顶部", top, top_expected, top_max),
+            ("中部标题", mid, mid_expected, mid_max),
+            ("尾部标题", tail, tail_expected, tail_max),
+        ] {
+            let want = expected.clamp(0.0, max);
+            assert!(
+                (offset - want).abs() <= 1.0,
+                "{name}: 偏移 {offset} 应等于 Center 换算+钳制 {want}(expected={expected}, max={max})"
+            );
+        }
+        assert!(top < 1.0, "顶部标题钳在文档顶: {top}");
+        assert!(mid > 50.0, "中部标题真的滚了: {mid}");
+        assert!(
+            top < mid && mid < tail,
+            "落点按目标块方位有序: top={top} mid={mid} tail={tail}"
+        );
     }
 
     /// 相对图片地址解析(B 段验收的单测层):改写只发生在渲染字符串上,
