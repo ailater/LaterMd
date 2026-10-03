@@ -403,6 +403,33 @@ fn texture_for(
     Some(handle)
 }
 
+/// 预览内联 emoji(#48 B2)的纹理入口:与面板**同一份会话缓存**—— 面板
+/// 先开则预览直接命中,反之亦然,同一 Context 内每枚至多解码一次(A2 的
+/// 节奏承诺不变)。表外字符 / 解码失败返回 `None`,调用方保持透明占位
+/// 不动(不画黑块不 panic,任务书 B2 的回落口径)。
+///
+/// 命中走只读 `data`(读锁 + 句柄克隆,emoji 密集文档的每帧常态);未命中
+/// 的解码与 `load_texture` **必须在 data 锁外**做 —— `load_texture` 内部经
+/// `Context::input` 再入 Context 写锁,包在 `data_mut` 闭包里会自锁死
+/// (egui 0.36 实测,#48 B2 开发期踩过),写回用单键 insert,不整表进出。
+pub(crate) fn inline_texture(ui: &egui::Ui, glyph: &str) -> Option<egui::TextureHandle> {
+    if let Some(handle) = ui
+        .ctx()
+        .data(|data| data.get_temp::<TextureCache>(texture_cache_id()))
+        .and_then(|cache| cache.get(glyph).cloned())
+    {
+        return Some(handle);
+    }
+    // 表外字符直接判None:不画图是确定性结论,不为它动缓存
+    let png = twemoji_png(glyph)?;
+    let handle = decode_texture(ui.ctx(), glyph, png)?;
+    ui.ctx().data_mut(|data| {
+        data.get_temp_mut_or_insert_with(texture_cache_id(), TextureCache::default)
+            .insert(glyph.to_owned(), handle.clone());
+    });
+    Some(handle)
+}
+
 /// Emoji 面板状态(归约置 `open`,UI 改 `query` / `group`)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmojiPanelState {
