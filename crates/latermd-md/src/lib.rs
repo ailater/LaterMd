@@ -218,6 +218,39 @@ fn is_segment_break(token: &Token<'_>) -> bool {
 /// 块内偏移。pulldown 的 Start/End 事件区间覆盖整个构造(0.13 实测),
 /// 所以标记 = 「构造区间 − 内部内容区间」的缝隙。
 pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
+    inline_marks_with_pairs(text).segments
+}
+
+/// 一对成对的内联标记(LP2-2 选区扩展):一个内联构造两侧的标记,连同
+/// 整个构造的范围。嵌套构造(`***x***`、链接文本里的强调)每层各成一
+/// 对,区间彼此重叠是正常的 —— 它们本来就不是同一对。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkPair {
+    /// 完整构造(开标记 + 内容 + 闭标记),选区扩展的目标区间。
+    pub construct: Range<usize>,
+    /// 开侧标记,如 `**`;链接的开侧是 `[`。
+    pub opening: Range<usize>,
+    /// 闭侧标记;链接的闭侧是 `](目标 "标题")` 整段。
+    pub closing: Range<usize>,
+}
+
+/// [`inline_marks`] 的全量产出:半隐藏用的合并标记段(LP2-1)+ 选区
+/// 扩展用的成对表(LP2-2)。两份表出自**同一次**解析,缓存侧按修订号
+/// 一起换新,不会出现「段与配对来自不同版本文本」的错位。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InlineMarks {
+    /// 合并后的标记段(升序、互不重叠、相邻已合并)—— 半隐藏绘制的粒度。
+    pub segments: Vec<Range<usize>>,
+    /// 成对标记表 —— 配对显形与选区扩展的依据。
+    pub pairs: Vec<MarkPair>,
+}
+
+/// [`inline_marks`] 的成对扩展(LP2-2):同一次 pulldown 走查,除合并
+/// 标记段外,把每个定界构造的开/闭缝隙记成一对([`MarkPair`])。
+///
+/// 单侧孤标记(未闭合的 `**`、`` ` ``、`[`)在 pulldown 语义里是普通文
+/// 本,既不产段也不产对 —— 选区扩展对它们天然退化为「不扩展」。
+pub fn inline_marks_with_pairs(text: &str) -> InlineMarks {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
     // 与 vendored parser.rs 同一套 options:预览把 `~~` 渲染成删除线、把
@@ -232,6 +265,7 @@ pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
     // 开着的定界构造:起点 + 内部已覆盖(内容)区间。闭合时把缝隙记为标记。
     let mut open: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
     let mut marks = Vec::new();
+    let mut pairs = Vec::new();
 
     for (event, span) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
@@ -261,17 +295,29 @@ pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
                 let end = span.end;
                 let mut covered = covered;
                 covered.sort_by_key(|range| range.start);
+                let mut gaps = Vec::new();
                 let mut cursor = start;
                 for inner in covered {
                     let inner = inner.start.max(start)..inner.end.min(end);
                     if inner.start > cursor {
-                        marks.push(cursor..inner.start);
+                        gaps.push(cursor..inner.start);
                     }
                     cursor = cursor.max(inner.end);
                 }
                 if cursor < end {
-                    marks.push(cursor..end);
+                    gaps.push(cursor..end);
                 }
+                // 首末缝隙即开/闭两侧标记(它们天然贴着构造两端);只剩一个
+                // 缝隙的退化构造(如空文本链接)拆不出两侧,不成对
+                if gaps.len() >= 2 {
+                    let closing = gaps.last().expect("len >= 2").clone();
+                    pairs.push(MarkPair {
+                        construct: start..end,
+                        opening: gaps[0].clone(),
+                        closing,
+                    });
+                }
+                marks.extend(gaps);
                 // 本构造(含它自己的标记)对外层是内容
                 if let Some((_, parent)) = open.last_mut() {
                     parent.push(start..end);
@@ -294,6 +340,13 @@ pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
                 }
                 if ticks_end < end {
                     marks.push(ticks_end..end);
+                }
+                if start < ticks_start && ticks_end < end {
+                    pairs.push(MarkPair {
+                        construct: start..end,
+                        opening: start..ticks_start,
+                        closing: ticks_end..end,
+                    });
                 }
                 if let Some((_, covered)) = open.last_mut() {
                     covered.push(span);
@@ -321,7 +374,129 @@ pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
             _ => merged.push(range),
         }
     }
-    merged
+    InlineMarks {
+        segments: merged,
+        pairs,
+    }
+}
+
+/// 触发选区扩展的指针手势(LP2-2)。扩展是**一次性**的:只在事件帧传入
+/// [`mark_interaction`],静止帧传 `None` —— 选区不会被持续吸附到标记对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkGesture {
+    /// 双击:egui 已在帧内选出词,当前选区即词区间;扩展到包含它的
+    /// **最内层**标记对(嵌套时选最小的一对)。
+    DoubleClick,
+    /// 拖选松手:`anchor` 是按下时光标所在的块内字符偏移。选区整个含在
+    /// 标记对内、且锚点压着某一侧标记(含边界,单字符标记只有边界可压)
+    /// 时,扩展到该对。
+    DragRelease {
+        /// 按下帧的塌缩光标(块内字符偏移)。
+        anchor: usize,
+    },
+}
+
+/// 标记与光标/选区的交互决策(LP2-2)。
+///
+/// - `revealed`:与 `InlineMarks::segments` 平行的显形表。除 LP2-1 的
+///   「贴上/相交显形」外,被触碰标记的**配对另一侧**所在段一并显形
+///   (识别配对);
+/// - `expanded`:扩展后的选区(块内**字符偏移**,TextEdit 的域),无扩
+///   展时为 `None`。选区已含完整标记对时结果是同一区间(幂等)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkInteraction {
+    /// 与 `segments` 平行:`true` = 该段显形。
+    pub revealed: Vec<bool>,
+    /// 扩展后的选区(字符偏移);`None` = 本帧不扩展。
+    pub expanded: Option<Range<usize>>,
+}
+
+/// 计算标记的显形集合与选区扩展(LP2-2 的纯函数核心)。
+///
+/// 输入的 `caret`/`other`/`anchor` 是块内**字符偏移**(TextEdit 的光标
+/// 域),`marks` 是 [`inline_marks_with_pairs`] 的产出(字节域),函数内
+/// 部完成两域换算 —— 调用方不需要自己折算 CJK 偏移。
+pub fn mark_interaction(
+    text: &str,
+    marks: &InlineMarks,
+    caret: usize,
+    other: usize,
+    gesture: Option<MarkGesture>,
+) -> MarkInteraction {
+    let caret_byte = char_to_byte(text, caret);
+    let other_byte = char_to_byte(text, other);
+    let collapsed = caret_byte == other_byte;
+    // 「触碰」口径与 LP2-1 显形一致:塌缩光标紧邻也算(点击落在标记字形
+    // 上时光标停在其边界),非空选区取开区间相交。
+    let touches = |range: &Range<usize>| {
+        if collapsed {
+            range.start <= caret_byte && caret_byte <= range.end
+        } else {
+            let (low, high) = (caret_byte.min(other_byte), caret_byte.max(other_byte));
+            range.start < high && low < range.end
+        }
+    };
+    let within = |outer: &Range<usize>, inner: &Range<usize>| {
+        outer.start <= inner.start && inner.end <= outer.end
+    };
+    let mut revealed = Vec::with_capacity(marks.segments.len());
+    for segment in &marks.segments {
+        let partner = marks.pairs.iter().any(|pair| {
+            (touches(&pair.opening) || touches(&pair.closing))
+                && (within(segment, &pair.opening) || within(segment, &pair.closing))
+        });
+        revealed.push(touches(segment) || partner);
+    }
+
+    // 选区扩展:只在手势帧;候选对必须把当前选区整个含住(跨对选区不吸
+    // 附),拖选还要求锚点压着标记。取最内层(构造最短)的一对。
+    let expanded = gesture.and_then(|gesture| {
+        let selection = caret_byte.min(other_byte)..caret_byte.max(other_byte);
+        let mut best: Option<&MarkPair> = None;
+        for pair in &marks.pairs {
+            if !within(&pair.construct, &selection) {
+                continue;
+            }
+            let anchored = match gesture {
+                MarkGesture::DoubleClick => true,
+                MarkGesture::DragRelease { anchor } => {
+                    let anchor = char_to_byte(text, anchor);
+                    (pair.opening.start <= anchor && anchor <= pair.opening.end)
+                        || (pair.closing.start <= anchor && anchor <= pair.closing.end)
+                }
+            };
+            if !anchored {
+                continue;
+            }
+            let better = best.is_none_or(|current| {
+                pair.construct.len() < current.construct.len()
+                    || (pair.construct.len() == current.construct.len()
+                        && pair.opening.len() + pair.closing.len()
+                            > current.opening.len() + current.closing.len())
+            });
+            if better {
+                best = Some(pair);
+            }
+        }
+        best.map(|pair| {
+            byte_to_char(text, pair.construct.start)..byte_to_char(text, pair.construct.end)
+        })
+    });
+    MarkInteraction { revealed, expanded }
+}
+
+/// 块内字符偏移 → 字节偏移(越界钳到文末)。
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// 块内字节偏移 → 字符偏移(按「在该字节之前开始的字符数」计)。
+fn byte_to_char(text: &str, byte_index: usize) -> usize {
+    text.char_indices()
+        .take_while(|(byte, _)| *byte < byte_index)
+        .count()
 }
 
 /// `[[wikilink]]` 展开成的链接 scheme(P3「双向链接」)。
@@ -930,6 +1105,189 @@ mod tests {
     fn inline_marks_empty_and_plain_text() {
         assert!(inline_marks("").is_empty());
         assert!(inline_marks("普通段落,没有标记。").is_empty());
+    }
+
+    // —— inline_mark_pairs / mark_interaction(LP2-2 选区扩展与配对显形)——
+
+    /// 期望表断言配对:(构造字面, 开标记字面, 闭标记字面) 三重核对。
+    fn assert_pairs(text: &str, pairs: &[MarkPair], expected: &[(&str, &str, &str)]) {
+        assert_eq!(
+            pairs.len(),
+            expected.len(),
+            "对数不符:{pairs:?} vs {expected:?}"
+        );
+        for (pair, (whole, opening, closing)) in pairs.iter().zip(expected) {
+            assert_eq!(&text[pair.construct.clone()], *whole);
+            assert_eq!(&text[pair.opening.clone()], *opening);
+            assert_eq!(&text[pair.closing.clone()], *closing);
+        }
+    }
+
+    /// 成对匹配:强调/行内代码/链接/图片/autolink 各自成对,开闭两侧
+    /// 字面与构造整段都对得上。
+    #[test]
+    fn mark_pairs_match_constructs() {
+        let text = "**b** `c` [t](u) ![a](i.png) <https://x.y>";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[
+                ("**b**", "**", "**"),
+                ("`c`", "`", "`"),
+                ("[t](u)", "[", "](u)"),
+                ("![a](i.png)", "![", "](i.png)"),
+                ("<https://x.y>", "<", ">"),
+            ],
+        );
+        // 段表与 LP2-1 完全一致(重构不得改半隐藏行为)
+        assert_eq!(marks.segments, inline_marks(text));
+    }
+
+    /// 嵌套:`***x***` 内外层各成一对(pulldown 给内层 Strong 与外层
+    /// Emphasis 不同的构造区间);链接文本里套强调,两对各自完整。
+    #[test]
+    fn mark_pairs_cover_nested_constructs_per_level() {
+        let text = "***x***";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[("**x**", "**", "**"), ("***x***", "*", "*")],
+        );
+
+        let text = "[**b**](u)";
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(
+            text,
+            &marks.pairs,
+            &[("**b**", "**", "**"), ("[**b**](u)", "[", "](u)")],
+        );
+    }
+
+    /// 单侧孤标记(未闭合)的退化:pulldown 视作普通文本,无段也无对,
+    /// 显形/扩展随之整体退化为「什么都不发生」。
+    #[test]
+    fn mark_pairs_skip_single_sided_orphans() {
+        for text in ["未闭合 **bold", "`半截代码", "[没目标"] {
+            let marks = inline_marks_with_pairs(text);
+            assert!(marks.segments.is_empty(), "{text:?}");
+            assert!(marks.pairs.is_empty(), "{text:?}");
+        }
+        // 空文本链接拆不出两侧,不成对(段仍在,半隐藏不受影响)
+        let marks = inline_marks_with_pairs("[](u)");
+        assert!(marks.pairs.is_empty());
+        assert_eq!(marks.segments.len(), 1, "{:?}", marks.segments);
+    }
+
+    /// 配对显形:光标/选区压住一侧标记,另一侧所在段同时显形 —— 这是
+    /// LP2-1 规则(只显形被压住的段)之上的增量。
+    #[test]
+    fn mark_interaction_reveals_partner_side() {
+        let text = "**b** x *i*";
+        let marks = inline_marks_with_pairs(text);
+
+        // 塌缩光标压住开 `**`(字节 0..2,取边界 1):开闭两段都显形,
+        // 无关的 `*i*` 两段保持半隐藏
+        let out = mark_interaction(text, &marks, 1, 1, None);
+        assert_eq!(out.revealed, vec![true, true, false, false]);
+        assert_eq!(out.expanded, None, "无手势不扩展");
+
+        // 非空选区只盖住开 `**`(字符 0..2):同样两段显形
+        let out = mark_interaction(text, &marks, 0, 2, None);
+        assert_eq!(out.revealed, vec![true, true, false, false]);
+
+        // 选区只盖内容 `b`(字符 2..3):不贴标记,全隐藏(LP2-1 口径保持)
+        let out = mark_interaction(text, &marks, 2, 3, None);
+        assert_eq!(out.revealed, vec![false, false, false, false]);
+    }
+
+    /// 双击扩展:词选区扩到包含它的**最内层**标记对;跨对/无对不扩展。
+    #[test]
+    fn mark_interaction_expands_double_click_to_innermost_pair() {
+        let text = "[**b**](u) 和 `c`";
+        let marks = inline_marks_with_pairs(text);
+
+        // 双击词 `b`(字符 3..4)→ 最内层是粗体对,不是外层链接对
+        let out = mark_interaction(text, &marks, 3, 4, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(1..6), "扩到 **b**,不带链接括号");
+
+        // 双击链接外的词 `和`(字符 11..12):无对包含,不扩展
+        let out = mark_interaction(text, &marks, 11, 12, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, None);
+
+        // 跨对选区(选了链接一半+一半正文)不吸附
+        let text2 = "**ab** cd *ef*";
+        let marks2 = inline_marks_with_pairs(text2);
+        let out = mark_interaction(text2, &marks2, 0, 9, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, None);
+    }
+
+    /// 拖选扩展:锚点压着标记(含边界,单字符标记只有边界可压)且选区
+    /// 整个含在构造内才扩展;从内容中部发起、或拖出构造外,保持原选区。
+    #[test]
+    fn mark_interaction_expands_drag_only_from_mark_anchor() {
+        let text = "前缀 **abcd** 后缀";
+        let marks = inline_marks_with_pairs(text);
+        // 字符:`前缀 `(3) + `**`(2) + `abcd`(4) + `**`(2) + ...
+        // 开 `**` = 字符 3..5,内容 5..9,构造 3..11
+
+        // 锚点在开 `**` 边界(字符 5 = opening.end),拖到内容中部松手
+        let out = mark_interaction(
+            text,
+            &marks,
+            5,
+            7,
+            Some(MarkGesture::DragRelease { anchor: 5 }),
+        );
+        assert_eq!(out.expanded, Some(3..11), "从标记内侧发起 → 扩到整对");
+
+        // 锚点在内容中部:普通拖选,不吸附
+        let out = mark_interaction(
+            text,
+            &marks,
+            6,
+            8,
+            Some(MarkGesture::DragRelease { anchor: 6 }),
+        );
+        assert_eq!(out.expanded, None);
+
+        // 锚点压标记但拖出构造(选区含构造外的前缀):不吸附
+        let out = mark_interaction(
+            text,
+            &marks,
+            0,
+            6,
+            Some(MarkGesture::DragRelease { anchor: 5 }),
+        );
+        assert_eq!(out.expanded, None);
+    }
+
+    /// 选区已含标记:显形两段全亮;扩展幂等(结果就是当前区间)。
+    #[test]
+    fn mark_interaction_idempotent_when_selection_already_covers_pair() {
+        let text = "**b** x";
+        let marks = inline_marks_with_pairs(text);
+        let out = mark_interaction(text, &marks, 0, 5, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(0..5));
+        assert_eq!(out.revealed, vec![true, true]);
+    }
+
+    /// CJK:字符偏移输入与字节区间标记在函数内部正确换算。
+    #[test]
+    fn mark_interaction_converts_cjk_char_and_byte_domains() {
+        let text = "**中文** 尾";
+        // 字符:0-1 `**`、2-3 中文、4-5 `**`;字节:开 0..2、闭 8..10
+        let marks = inline_marks_with_pairs(text);
+        assert_pairs(text, &marks.pairs, &[("**中文**", "**", "**")]);
+
+        // 光标停在闭 `**` 首边界(字符 4 = 字节 8):开闭两段都显形
+        let out = mark_interaction(text, &marks, 4, 4, None);
+        assert_eq!(out.revealed, vec![true, true]);
+
+        // 双击词「中文」(字符 2..4)→ 扩到字符 0..6
+        let out = mark_interaction(text, &marks, 2, 4, Some(MarkGesture::DoubleClick));
+        assert_eq!(out.expanded, Some(0..6));
     }
 
     /// 拥有型的意义:文档模型活得比源字符串久。

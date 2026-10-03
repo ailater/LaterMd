@@ -13,6 +13,11 @@
 //! (v2)在活动块内做**内联标记半隐藏**:正文正常显示,`**` 等标记字符以半
 //! 透明遮罩弱化,光标/选区贴上的段显形 —— 区间提取是纯函数
 //! `latermd_md::inline_marks`,绘制是纯叠加,不碰 TextEdit 的状态与命中测试。
+//! LP2-2 加**选区扩展与配对显形**:选区/光标触碰某标记时其配对另一侧同
+//! 时显形;从标记内侧发起的双击/拖选把选区一次性扩到完整标记对(内容+
+//! 两侧标记),让编辑标记本身有可及入口 —— 决策是纯函数
+//! `latermd_md::mark_interaction`,选区仍在块内闭合(v1 既定,块是独立
+//! TextEdit,不引入跨块选区行为变更)。
 
 use std::ops::Range;
 
@@ -57,10 +62,15 @@ pub struct LiveState {
     pub pending_caret: Option<(usize, usize)>,
     /// 块表对应的修订号;只在修订号前进时重算块。
     synced_rev: Option<u64>,
-    /// 活动块的内联标记缓存(LP2-1 半隐藏):(修订号, 块序号) → 块内字节
-    /// 区间。与块表同一条纪律:修订号不动就不重解析(打一个字的代价 =
-    /// 重解析活动块,与 v1 每次编辑重算整篇块表同一量级)。
-    marks: Option<(u64, usize, Vec<Range<usize>>)>,
+    /// 活动块的内联标记缓存(LP2-1 半隐藏 + LP2-2 选区扩展):(修订号,
+    /// 块序号) → 标记段与成对表(同一次解析的产出,不会互相错位)。与块
+    /// 表同一条纪律:修订号不动就不重解析(打一个字的代价 = 重解析活动
+    /// 块,与 v1 每次编辑重算整篇块表同一量级)。
+    marks: Option<(u64, usize, latermd_md::InlineMarks)>,
+    /// 拖选锚点(LP2-2):活动块 TextEdit 上**按下帧**的塌缩光标(块内
+    /// 字符偏移),拖选松手帧用于「从标记发起的拖选扩展到完整标记对」。
+    /// 生命周期 = 一次按压:松手帧消费,按在别处的按下帧清除。
+    drag_anchor: Option<usize>,
 }
 
 impl LiveState {
@@ -108,6 +118,7 @@ impl LiveState {
         self.pending_caret = None;
         self.synced_rev = None;
         self.marks = None;
+        self.drag_anchor = None;
     }
 }
 
@@ -198,9 +209,10 @@ pub fn ui(
                         buffer: editor,
                         range: range.clone(),
                     };
+                    // 稳定 id:按块序号(不带长度/hash),AGENTS §6.7 的红线
+                    let response_id = editor_id.with(("live-block", index));
                     let output = egui::TextEdit::multiline(&mut buffer)
-                        // 稳定 id:按块序号(不带长度/hash),AGENTS §6.7 的红线
-                        .id(editor_id.with(("live-block", index)))
+                        .id(response_id)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                         .desired_rows(lines.clamp(1, 40))
@@ -235,10 +247,17 @@ pub fn ui(
                             editor.byte_to_char(live.blocks[index].start) + range.primary.index.0,
                         )
                     });
-                    // LP2-1 内联标记半隐藏:标记字符半透明弱化;光标贴上/选区
-                    // 压住的段显形。纯绘制叠加 —— 不挂 widget(不参与命中
-                    // 测试),也不碰 TextEdit 的状态(跨块 caret 路由照旧)。
-                    {
+                    // LP2-1 内联标记半隐藏 + LP2-2 选区扩展。显形集合与扩
+                    // 展选区都是纯函数(`latermd_md::mark_interaction`),绘
+                    // 制仍是纯叠加 —— 不挂 widget(不参与命中测试)。交互
+                    // 边界:双击帧把 egui 选出的词扩到最内层标记对;拖选松
+                    // 手帧只有「锚点压着标记发起」的拖选才扩(从内容中部
+                    // 发起的普通拖选保持原样);键盘选区/三击选行不扩展。
+                    // 光标取 `output.state`(帧内真值)而非 `output.cursor_
+                    // range`:后者在焦点门控的键盘事件段产出,指针交互(选
+                    // 词/拖选/按压塌缩)发生在其后、只改 state —— 用陈旧值
+                    // 会把按压点读成旧光标。
+                    if let Some(cursor_range) = output.state.cursor.char_range() {
                         let rev = editor.revision();
                         if !matches!(&live.marks, Some((r, i, _)) if *r == rev && *i == index) {
                             // 与 galley 同一份文本:本帧的编辑发生在 show()
@@ -247,21 +266,82 @@ pub fn ui(
                             live.marks = Some((
                                 rev,
                                 index,
-                                latermd_md::inline_marks(BlockBuffer::slice(editor.text(), &range)),
+                                latermd_md::inline_marks_with_pairs(BlockBuffer::slice(
+                                    editor.text(),
+                                    &range,
+                                )),
                             ));
                         }
-                        let marks: &[Range<usize>] = match &live.marks {
-                            Some((_, _, marks)) => marks,
-                            None => &[],
+                        let bundle: &latermd_md::InlineMarks = match &live.marks {
+                            Some((_, _, bundle)) => bundle,
+                            None => unreachable!("缓存已在上一行建立"),
                         };
+                        let caret = cursor_range.primary.index.0;
+                        let other = cursor_range.secondary.index.0;
+
+                        // 手势判定。egui 在 show() 内部已处理双击选词(词选
+                        // 区就在本帧的 cursor_range 里)与按下塌缩光标;这里
+                        // 只读信号:双击 → 扩词;松手 + 非空选区 + 锚点 → 扩
+                        // 拖选;按下帧记/清锚点(按在别处清,防跨按压串帧)。
+                        let double_clicked = output.response.response.double_clicked();
+                        let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
+                        let primary_released = ui.input(|input| input.pointer.primary_released());
+                        if primary_pressed {
+                            live.drag_anchor = if output.response.response.contains_pointer() {
+                                Some(caret)
+                            } else {
+                                None
+                            };
+                        }
+                        let gesture = if double_clicked {
+                            live.drag_anchor = None;
+                            Some(latermd_md::MarkGesture::DoubleClick)
+                        } else if primary_released {
+                            match (live.drag_anchor.take(), caret != other) {
+                                (Some(anchor), true) => {
+                                    Some(latermd_md::MarkGesture::DragRelease { anchor })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        let interaction = latermd_md::mark_interaction(
+                            BlockBuffer::slice(editor.text(), &range),
+                            bundle,
+                            caret,
+                            other,
+                            gesture,
+                        );
                         paint_mark_fades(
                             ui,
                             &output.galley,
                             output.galley_pos,
                             BlockBuffer::slice(editor.text(), &range),
-                            marks,
-                            output.cursor_range,
+                            &bundle.segments,
+                            &interaction.revealed,
                         );
+                        // 扩展写回:与 pending_caret 同一条通道(改 TextEdit
+                        // 光标状态,下一帧生效);primary 方向保留手势原方向。
+                        if let Some(expanded) = interaction.expanded {
+                            let (low, high) = (expanded.start, expanded.end);
+                            if low != caret.min(other) || high != caret.max(other) {
+                                let mut state = output.state.clone();
+                                let (primary, secondary) = if caret <= other {
+                                    (low, high)
+                                } else {
+                                    (high, low)
+                                };
+                                state
+                                    .cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(primary),
+                                        egui::text::CCursor::new(secondary),
+                                    )));
+                                state.store(ui.ctx(), response_id);
+                            }
+                        }
                     }
                     let response = output.response.response;
                     // 上一帧交过来的光标:落到本块的指定字符偏移并要焦点
@@ -313,10 +393,12 @@ pub fn ui(
     if let Some(index) = activate {
         live.active = Some(index);
         live.pending_caret = Some((index, live.block_char_len(editor, index)));
+        live.drag_anchor = None;
     }
     if let Some(route) = route {
         live.active = Some(route.0);
         live.pending_caret = Some(route);
+        live.drag_anchor = None;
     }
 
     // 快照同步(与源码模式同一条规则:仅修订号前进时重建)
@@ -373,27 +455,20 @@ const MARK_FADE_ALPHA: u8 = 166;
 /// 把活动块里的内联标记以半透明遮罩弱化(LP2-1)。
 ///
 /// 遮罩 = 编辑框背景色 × α 叠在标记字形上,视觉即「标记变淡」,不改
-/// TextEdit 的任何状态。显形口径(「该段标记」= `inline_marks` 合并出的
-/// 一个连续区间):
-/// - 非空选区与标记相交 → 显形(拖选经过就能看清);
-/// - 空 caret 贴上或落入 → 显形。取「贴上也算」:点击落在标记字形上时
-///   光标常停在其边界上,严格取内部会把「点一下显形」做成哑的。
+/// TextEdit 的任何状态。显形与否由调用方经 [`latermd_md::mark_interaction`]
+/// 算好(`revealed` 与 `marks` 平行):光标/选区贴上的段显形,被触碰标
+/// 记的**配对另一侧**所在段也显形(LP2-2)。
 fn paint_mark_fades(
     ui: &egui::Ui,
     galley: &egui::Galley,
     galley_pos: egui::Pos2,
     block_text: &str,
     marks: &[Range<usize>],
-    cursor: Option<egui::text::CCursorRange>,
+    revealed: &[bool],
 ) {
     if marks.is_empty() {
         return;
     }
-    let Some(cursor) = cursor else {
-        return;
-    };
-    let caret = cursor.primary.index.0.min(cursor.secondary.index.0);
-    let other = cursor.primary.index.0.max(cursor.secondary.index.0);
     let bg = ui.visuals().text_edit_bg_color();
     let fade = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), MARK_FADE_ALPHA);
     let painter = ui.painter();
@@ -401,7 +476,7 @@ fn paint_mark_fades(
     // 遍历换算全部区间(标记已升序,逐段各扫一遍前文是 O(len×段数))
     let mut chars = 0usize;
     let mut walk = block_text.char_indices().peekable();
-    for mark in marks {
+    for (index, mark) in marks.iter().enumerate() {
         while walk.next_if(|(byte, _)| *byte < mark.start).is_some() {
             chars += 1;
         }
@@ -409,12 +484,7 @@ fn paint_mark_fades(
         while walk.next_if(|(byte, _)| *byte < mark.end).is_some() {
             chars += 1;
         }
-        let visible = if caret < other {
-            start < other && caret < chars // 选区与标记相交
-        } else {
-            start <= caret && caret <= chars
-        };
-        if visible {
+        if revealed.get(index).copied().unwrap_or(false) {
             continue;
         }
         for rect in galley_mark_rects(galley, start..chars) {
@@ -867,6 +937,9 @@ mod tests {
         )
     }
 
+    /// 遮罩取证帧驱动共用的编辑器 id(各测试独立 `Context`,不互扰)。
+    const FADE_EDITOR_ID: &str = "live-fade";
+
     /// 跑一帧 Live 面板(生产入口 `super::ui`),取证半透明遮罩矩形
     /// (以遮罩色从帧 shapes 里挑 Rect,与 #38/#41 的 shapes 取证同款)。
     fn live_fade_frame(
@@ -877,9 +950,25 @@ mod tests {
         cursor: &mut OutlineCursor,
         live: &mut LiveState,
     ) -> Vec<egui::Rect> {
+        live_timed_frame(ctx, 0.0, events, editor, preview, cursor, live)
+    }
+
+    /// 带 `RawInput.time` 的帧驱动(LP2-2 手势测试专用):双击判定依赖
+    /// 相邻两次 click 的时间差(input_state 的 max_double_click_delay),
+    /// 必须显式给每帧一个递增时钟。
+    fn live_timed_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
         let mut fade = egui::Color32::TRANSPARENT;
         let output = ctx.run_ui(
             egui::RawInput {
+                time: Some(time),
                 events,
                 ..Default::default()
             },
@@ -890,7 +979,7 @@ mod tests {
                     preview,
                     cursor,
                     live,
-                    egui::Id::new("live-fade"),
+                    egui::Id::new(FADE_EDITOR_ID),
                 );
                 let bg = ui.visuals().text_edit_bg_color();
                 fade = egui::Color32::from_rgba_unmultiplied(
@@ -942,7 +1031,9 @@ mod tests {
         assert_eq!(editor.text(), before, "渲染不改动缓冲");
         assert!(!editor.is_dirty(), "渲染不置脏");
         assert_eq!(
-            live.marks.as_ref().map(|(_, _, marks)| marks.len()),
+            live.marks
+                .as_ref()
+                .map(|(_, _, bundle)| bundle.segments.len()),
             Some(6),
             "六段标记:{:?}",
             live.marks
@@ -962,7 +1053,9 @@ mod tests {
             &mut live,
         );
         assert_eq!(
-            live.marks.as_ref().map(|(_, _, marks)| marks.len()),
+            live.marks
+                .as_ref()
+                .map(|(_, _, bundle)| bundle.segments.len()),
             Some(6)
         );
 
@@ -1156,14 +1249,340 @@ mod tests {
         );
         let (rev_after, _, marks) = live.marks.clone().expect("缓存已重算");
         assert!(rev_after > rev_before, "修订号前进,缓存键换新");
-        assert_eq!(marks.len(), 6, "标记段数不变:{marks:?}");
+        assert_eq!(marks.segments.len(), 6, "标记段数不变:{:?}", marks.segments);
         // 插入点在开 `**` 之后:闭 `**` 及其后所有区间右移一个 CJK 字(3 字节)
         let text_now = editor.text();
-        assert_eq!(&text_now[marks[1].clone()], "**", "闭 ** 仍标对位置");
         assert_eq!(
-            marks[1],
+            &text_now[marks.segments[1].clone()],
+            "**",
+            "闭 ** 仍标对位置"
+        );
+        assert_eq!(
+            marks.segments[1],
             11..13,
             "原 8..10 平移一个 CJK 字(3 字节):{marks:?}"
+        );
+    }
+
+    // —— LP2-2 选区扩展与配对显形 ——
+
+    /// 手势测试文档:一对 `**` 包着四个等宽字母(内容中部/四分位的点击
+    /// 坐标可从两枚遮罩矩形折算),后跟普通文本。
+    const GESTURE_DOC: &str = "**abcd** 常规文本\n";
+    const GESTURE_BLOCK: usize = 0;
+    /// `**abcd**` 的完整字符区间(选区扩展的目标)。
+    const GESTURE_PAIR: Range<usize> = 0..8;
+
+    fn gesture_state(text: &str) -> (EditorBuffer, PreviewState, OutlineCursor, LiveState) {
+        let editor = EditorBuffer::new(text);
+        let preview = PreviewState::new(&editor);
+        (
+            editor,
+            preview,
+            OutlineCursor::default(),
+            LiveState {
+                active: Some(GESTURE_BLOCK),
+                ..LiveState::default()
+            },
+        )
+    }
+
+    /// 跑一帧带时钟的 Live 面板,返回遮罩矩形(双击判定依赖帧时间)。
+    fn gesture_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
+        live_timed_frame(ctx, time, events, editor, preview, cursor, live)
+    }
+
+    /// 活动块 TextEdit 的当前选区 (min, max)(字符偏移)。
+    fn block_selection(ctx: &egui::Context) -> Option<(usize, usize)> {
+        let id = egui::Id::new(FADE_EDITOR_ID).with(("live-block", GESTURE_BLOCK));
+        egui::widgets::text_edit::TextEditState::load(ctx, id).and_then(|state| {
+            state.cursor.char_range().map(|range| {
+                let (a, b) = (range.primary.index.0, range.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+        })
+    }
+
+    /// 主键按下/抬起事件。
+    fn button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// 两枚 `**` 遮罩矩形按 x 排序成 (开侧, 闭侧)。
+    fn pair_rects(rects: &[egui::Rect]) -> (egui::Rect, egui::Rect) {
+        let mut sorted = rects.to_vec();
+        sorted.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+        assert_eq!(sorted.len(), 2, "恰两枚 `**` 遮罩:{rects:?}");
+        (sorted[0], sorted[1])
+    }
+
+    /// 渲染不 panic 且无副作用:标记块 + 非空选区状态连跑三帧(含选
+    /// 区触碰标记的形态),缓冲不动、不置脏。
+    #[test]
+    fn live_renders_marks_and_selection_frames_without_panic() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        // 直接把一个非空选区写进 TextEdit 状态(盖住链接开 `[` 与部分内容,
+        // 触碰标记的形态)
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(9),
+                egui::text::CCursor::new(14),
+            )));
+        state.store(&ctx, id);
+
+        let before = editor.text().to_owned();
+        for _ in 0..3 {
+            let _ = live_fade_frame(
+                &ctx,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(editor.text(), before, "渲染不改动缓冲");
+        assert!(!editor.is_dirty(), "渲染不置脏");
+    }
+
+    /// 双击标记对内的词:选区一次性扩到完整标记对(内容+两侧标记),
+    /// 扩展后两段标记随选区显形;再跑一帧不二次改写(扩展不持续吸附)。
+    #[test]
+    fn live_double_click_inside_pair_expands_selection_once() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = gesture_state(GESTURE_DOC);
+        live.pending_caret = Some((GESTURE_BLOCK, 12)); // 光标放普通文本里
+        let _ = gesture_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let rects = gesture_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (opening, closing) = pair_rects(&rects);
+        // 内容中部 = 四个等宽字母的正中(b/c 边界)
+        let content_mid = egui::pos2((opening.right() + closing.left()) / 2.0, opening.center().y);
+
+        // 双击 = 两次完整点击,第二次抬起帧 egui 判定 double_click 并选词
+        for (time, pressed) in [(0.10, true), (0.15, false), (0.25, true), (0.30, false)] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                vec![button_event(content_mid, pressed)],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "双击词 abcd → 扩到 **abcd**"
+        );
+
+        // 稳定帧:选区保持原样,盖住整对 → 两段标记显形(遮罩清零)
+        let rects = gesture_frame(
+            &ctx,
+            0.40,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(rects.is_empty(), "扩展选区盖住整对,两段都显形:{rects:?}");
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "扩展是一次性的,静止帧不再改写选区"
+        );
+        assert_eq!(editor.text(), GESTURE_DOC, "手势不改文本");
+    }
+
+    /// 拖选松手:从标记上发起(锚点压着开 `**`)→ 扩到整对;从内容中部
+    /// 发起的普通拖选 → 保持原选区不吸附(最小惊讶)。
+    #[test]
+    fn live_drag_release_expands_only_from_mark_anchor() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = gesture_state(GESTURE_DOC);
+        live.pending_caret = Some((GESTURE_BLOCK, 12));
+        let _ = gesture_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let rects = gesture_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (opening, closing) = pair_rects(&rects);
+        let on_mark = egui::pos2(opening.left() + opening.width() * 0.25, opening.center().y);
+        let content_mid = egui::pos2((opening.right() + closing.left()) / 2.0, opening.center().y);
+        let content_quarter = egui::pos2(
+            opening.right() + (closing.left() - opening.right()) * 0.25,
+            opening.center().y,
+        );
+
+        // ① 按在开 `**` 上、拖到内容中部松手 → 扩到整对
+        for (time, events) in [
+            (0.10, vec![egui::Event::PointerMoved(on_mark)]),
+            (0.15, vec![button_event(on_mark, true)]),
+            (0.30, vec![egui::Event::PointerMoved(content_mid)]),
+            (0.40, vec![button_event(content_mid, false)]),
+        ] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(
+            block_selection(&ctx),
+            Some((GESTURE_PAIR.start, GESTURE_PAIR.end)),
+            "从标记发起的拖选松手 → 扩到 **abcd**"
+        );
+
+        // ② 从内容中部(四分位)发起、拖到闭 `**` 边界松手 → 保持原选区
+        for (time, events) in [
+            (0.60, vec![egui::Event::PointerMoved(content_quarter)]),
+            (0.65, vec![button_event(content_quarter, true)]),
+            (
+                0.80,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    closing.left(),
+                    opening.center().y,
+                ))],
+            ),
+            (
+                0.90,
+                vec![button_event(
+                    egui::pos2(closing.left(), opening.center().y),
+                    false,
+                )],
+            ),
+        ] {
+            let _ = gesture_frame(
+                &ctx,
+                time,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        // 锚点在 b/c 之间的内容里:普通拖选,选区保持 bcd(3..6)不吸附
+        assert_eq!(
+            block_selection(&ctx),
+            Some((3, 6)),
+            "内容中部发起的拖选不扩展:{:?}",
+            block_selection(&ctx)
+        );
+        assert_eq!(editor.text(), GESTURE_DOC, "手势不改文本");
+    }
+
+    /// 配对显形:选区只盖住一侧标记,配对**另一侧**所在段同时显形 ——
+    /// 这是 LP2-1「只显形被压住的段」之上的增量(该实现会留 3 枚遮罩)。
+    #[test]
+    fn live_selection_on_mark_reveals_partner_segment() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state("**粗** x *i*\n");
+        // 光标放到两组标记之间的 `x` 上(字符 6):不贴任何标记
+        live.pending_caret = Some((0, 6));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(base.len(), 4, "两对标记四枚遮罩:{base:?}");
+
+        // 非空选区只盖住开 `**`(字符 0..2):开闭两段显形,`*i*` 仍半隐藏
+        let id = egui::Id::new("live-fade").with(("live-block", 0));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(2),
+            )));
+        state.store(&ctx, id);
+        let rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            rects.len(),
+            2,
+            "配对闭侧显形 + 无关的 *i* 两段保持半隐藏:{rects:?}"
         );
     }
 }
