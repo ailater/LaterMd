@@ -203,6 +203,127 @@ fn is_segment_break(token: &Token<'_>) -> bool {
     }
 }
 
+/// 活动块**内联标记**字符的字节区间(LP2-1 半隐藏):升序、互不重叠、
+/// 相邻段已合并。
+///
+/// 「标记」= 渲染后不产生正文的源码字符:强调/粗体/删除线的 `*`/`_`/`~~`
+/// 定界符、行内代码的反引号、链接/图片的 `[`、`](目标 "标题")`、`!`、
+/// autolink 的 `<`/`>`。判定完全跟随 pulldown-cmark(与 vendored 解析器
+/// 同一套 options,铁律「单一解析器」):未闭合的 `**` 是普通文本不算
+/// 标记;围栏/缩进代码块的内容是 `Event::Text`,不算标记;嵌套强调每层
+/// 定界符都计入(`***x***` 合并出前后各一段 `***`)。块级标记(`#`、
+/// `>`、列表符、表格竖线)不在本口径内 —— LP2-1 只做内联。
+///
+/// 输入应是**单个块**的源码([`blocks`] 保证块可独立解析);返回区间是
+/// 块内偏移。pulldown 的 Start/End 事件区间覆盖整个构造(0.13 实测),
+/// 所以标记 = 「构造区间 − 内部内容区间」的缝隙。
+pub fn inline_marks(text: &str) -> Vec<Range<usize>> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    // 与 vendored parser.rs 同一套 options:预览把 `~~` 渲染成删除线、把
+    // `[x](y)` 渲染成链接,半隐藏的判定必须与渲染同一语义,否则会出现
+    // 「遮了不渲染的字符 / 漏了渲染的定界符」
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    // 开着的定界构造:起点 + 内部已覆盖(内容)区间。闭合时把缝隙记为标记。
+    let mut open: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
+    let mut marks = Vec::new();
+
+    for (event, span) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Link { .. }
+                | Tag::Image { .. },
+            ) => {
+                // 本构造区间先计入外层(嵌套强调之于链接文本),再开自己的栈帧
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span.clone());
+                }
+                open.push((span.start, Vec::new()));
+            }
+            Event::End(
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link
+                | TagEnd::Image,
+            ) => {
+                let Some((start, covered)) = open.pop() else {
+                    continue; // 解析器事件配平,这里只是防御
+                };
+                let end = span.end;
+                let mut covered = covered;
+                covered.sort_by_key(|range| range.start);
+                let mut cursor = start;
+                for inner in covered {
+                    let inner = inner.start.max(start)..inner.end.min(end);
+                    if inner.start > cursor {
+                        marks.push(cursor..inner.start);
+                    }
+                    cursor = cursor.max(inner.end);
+                }
+                if cursor < end {
+                    marks.push(cursor..end);
+                }
+                // 本构造(含它自己的标记)对外层是内容
+                if let Some((_, parent)) = open.last_mut() {
+                    parent.push(start..end);
+                }
+            }
+            // 行内代码是单事件(区间含反引号与内容):两端的反引号串是标记
+            Event::Code(_) => {
+                let bytes = text.as_bytes();
+                let (start, end) = (span.start, span.end);
+                let mut ticks_start = start;
+                while ticks_start < end && bytes[ticks_start] == b'`' {
+                    ticks_start += 1;
+                }
+                let mut ticks_end = end;
+                while ticks_end > ticks_start && bytes[ticks_end - 1] == b'`' {
+                    ticks_end -= 1;
+                }
+                if start < ticks_start {
+                    marks.push(start..ticks_start);
+                }
+                if ticks_end < end {
+                    marks.push(ticks_end..end);
+                }
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span);
+                }
+            }
+            // 其余事件(Text/SoftBreak/块级 Start/End…):开着的构造把它们
+            // 视作内容;块级事件不会出现在内联构造内部,压栈无副作用
+            _ => {
+                if let Some((_, covered)) = open.last_mut() {
+                    covered.push(span);
+                }
+            }
+        }
+    }
+
+    // 排序 + 合并相邻/重叠段:`***` 会得到外层与内层各一片标记
+    marks.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in marks {
+        if range.is_empty() {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// `[[wikilink]]` 展开成的链接 scheme(P3「双向链接」)。
 ///
 /// 预览层按它拦截点击(打开同名文档),非本 scheme 的链接仍交系统浏览器。
@@ -646,6 +767,169 @@ mod tests {
                 prev_end = span.end;
             }
         }
+    }
+
+    // —— inline_marks(LP2-1 活动块内联标记半隐藏)——
+
+    /// 期望表断言:(字节起点, 字面文本) 双重核对 —— 区间序列与切片内容都
+    /// 必须对上,CJK 多字节的字节数写错时切片对照当场失败,不靠手算。
+    fn assert_marks(text: &str, marks: &[Range<usize>], expected: &[(usize, &str)]) {
+        let labeled: Vec<Range<usize>> = expected
+            .iter()
+            .map(|(start, label)| *start..*start + label.len())
+            .collect();
+        assert_eq!(marks, labeled, "期望字面 {expected:?}");
+        for (range, (_, label)) in marks.iter().zip(expected) {
+            assert_eq!(&text[range.clone()], *label);
+        }
+    }
+
+    /// 输出的形状永远合法:升序、互不重叠、非空、不越界。
+    fn assert_well_formed(text: &str, marks: &[Range<usize>]) {
+        let mut prev_end = 0;
+        for range in marks {
+            assert!(!range.is_empty(), "空区间: {marks:?}");
+            assert!(range.start >= prev_end, "重叠/乱序: {marks:?}");
+            assert!(range.end <= text.len(), "越界: {marks:?}");
+            prev_end = range.end;
+        }
+    }
+
+    /// 四种强调定界符 + 删除线:开/闭定界符各自成段,内容不标。
+    #[test]
+    fn inline_marks_covers_emphasis_delimiters() {
+        let text = "**b** *i* _u_ ~~s~~";
+        let marks = inline_marks(text);
+        assert_marks(
+            text,
+            &marks,
+            &[
+                (0, "**"),
+                (3, "**"),
+                (6, "*"),
+                (8, "*"),
+                (10, "_"),
+                (12, "_"),
+                (14, "~~"),
+                (17, "~~"),
+            ],
+        );
+        assert_well_formed(text, &marks);
+    }
+
+    /// 嵌套强调(`***x***`):内外层定界符合并成前后各一整段 `***`。
+    #[test]
+    fn inline_marks_merges_nested_emphasis() {
+        let text = "***both***";
+        assert_marks(text, &inline_marks(text), &[(0, "***"), (7, "***")]);
+
+        // 强调里套行内代码:代码反引号与强调定界符都标,内容不标
+        let text = "*a `b` c*";
+        assert_marks(
+            text,
+            &inline_marks(text),
+            &[(0, "*"), (3, "`"), (5, "`"), (8, "*")],
+        );
+    }
+
+    /// 行内代码:只标两端反引号串;双反引号包裹(内容本身含反引号)不误伤。
+    #[test]
+    fn inline_marks_tags_code_backticks_only() {
+        let text = "`code` 与 ``a ` b``";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(0, "`"), (5, "`"), (11, "``"), (18, "``")]);
+        // 内容不算标记
+        assert!(!marks.iter().any(|r| &text[r.clone()] == "code"));
+        assert!(!marks.iter().any(|r| text[r.clone()].contains('a')));
+    }
+
+    /// 链接与图片:括号与目标部分是标记,链接文本不标;autolink 只标尖括号。
+    #[test]
+    fn inline_marks_tags_link_brackets_and_destination() {
+        let text = "[点我](https://e.com)";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(0, "["), (7, "](https://e.com)")]);
+
+        let text = "![alt](img.png)";
+        assert_marks(text, &inline_marks(text), &[(0, "!["), (5, "](img.png)")]);
+
+        let text = "<https://auto.link>";
+        assert_marks(text, &inline_marks(text), &[(0, "<"), (18, ">")]);
+
+        // 链接文本里套粗体:粗体定界符与链接括号都标,且合并不重复
+        let text = "[**b**](u)";
+        assert_marks(text, &inline_marks(text), &[(0, "[**"), (4, "**](u)")]);
+    }
+
+    /// CJK 混排与 CRLF:字节区间落在字符边界上,判定不受多字节字符影响。
+    #[test]
+    fn inline_marks_handles_cjk_and_crlf() {
+        let text = "**中文**与*混排*和[链接](u)";
+        let marks = inline_marks(text);
+        assert_marks(
+            text,
+            &marks,
+            &[
+                (0, "**"),
+                (8, "**"),
+                (13, "*"),
+                (20, "*"),
+                (24, "["),
+                (31, "](u)"),
+            ],
+        );
+        assert_well_formed(text, &marks);
+        for range in &marks {
+            assert!(text.is_char_boundary(range.start) && text.is_char_boundary(range.end));
+        }
+
+        assert_marks(
+            "**b**\r\n尾行",
+            &inline_marks("**b**\r\n尾行"),
+            &[(0, "**"), (3, "**")],
+        );
+    }
+
+    /// 围栏/缩进代码块内容不算标记(里面的 `*`、`[` 是代码,遮了就改坏语义)。
+    #[test]
+    fn inline_marks_skips_code_block_contents() {
+        let text = "```rust\na * b [x](y) **z**\n```\n";
+        assert!(inline_marks(text).is_empty());
+
+        let text = "    indented *x* code\n";
+        assert!(inline_marks(text).is_empty());
+
+        // 块外的散置星号是普通文本(CommonMark:两侧无紧贴内容则不构成强调)
+        assert!(inline_marks("a * b").is_empty());
+    }
+
+    /// 未闭合的定界符是普通文本(pulldown 语义),不算标记。
+    #[test]
+    fn inline_marks_skips_unclosed_markers() {
+        assert!(inline_marks("未闭合 **bold").is_empty());
+        assert!(inline_marks("`unclosed code").is_empty());
+        assert!(inline_marks("[unclosed link").is_empty());
+    }
+
+    /// 列表/引用块内的行内标记照标(块级标记本身 `- `、`> ` 不标)。
+    #[test]
+    fn inline_marks_inside_list_and_quote_blocks() {
+        let text = "- 项目 **粗**\n";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(9, "**"), (14, "**")]);
+        assert!(marks[0].start > 2, "列表符 `- ` 不是标记: {marks:?}");
+
+        let text = "> 引用 *i*\n";
+        let marks = inline_marks(text);
+        assert_marks(text, &marks, &[(9, "*"), (11, "*")]);
+        assert!(marks[0].start > 2, "引用符 `> ` 不是标记: {marks:?}");
+    }
+
+    /// 空输入与纯文本:无标记。
+    #[test]
+    fn inline_marks_empty_and_plain_text() {
+        assert!(inline_marks("").is_empty());
+        assert!(inline_marks("普通段落,没有标记。").is_empty());
     }
 
     /// 拥有型的意义:文档模型活得比源字符串久。

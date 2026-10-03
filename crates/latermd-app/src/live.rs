@@ -9,8 +9,10 @@
 //! 块表来自 `latermd_md::blocks`(字节区间**连续覆盖全文**):这是安全底线
 //! —— 若有字节落在任何块之外,在那儿敲一个字符就会静默丢失。
 //!
-//! v1 的范围(roadmap「内联标记半隐藏 v1 可简化」):块是**整块**切换,不做
-//! 行内标记的半隐藏(如只对 `**` 隐藏一半)。改块的代价是整块源码裸出来。
+//! v1 的范围(roadmap「内联标记半隐藏 v1 可简化」):块是**整块**切换。LP2-1
+//! (v2)在活动块内做**内联标记半隐藏**:正文正常显示,`**` 等标记字符以半
+//! 透明遮罩弱化,光标/选区贴上的段显形 —— 区间提取是纯函数
+//! `latermd_md::inline_marks`,绘制是纯叠加,不碰 TextEdit 的状态与命中测试。
 
 use std::ops::Range;
 
@@ -55,6 +57,10 @@ pub struct LiveState {
     pub pending_caret: Option<(usize, usize)>,
     /// 块表对应的修订号;只在修订号前进时重算块。
     synced_rev: Option<u64>,
+    /// 活动块的内联标记缓存(LP2-1 半隐藏):(修订号, 块序号) → 块内字节
+    /// 区间。与块表同一条纪律:修订号不动就不重解析(打一个字的代价 =
+    /// 重解析活动块,与 v1 每次编辑重算整篇块表同一量级)。
+    marks: Option<(u64, usize, Vec<Range<usize>>)>,
 }
 
 impl LiveState {
@@ -101,6 +107,7 @@ impl LiveState {
         self.active = None;
         self.pending_caret = None;
         self.synced_rev = None;
+        self.marks = None;
     }
 }
 
@@ -228,6 +235,34 @@ pub fn ui(
                             editor.byte_to_char(live.blocks[index].start) + range.primary.index.0,
                         )
                     });
+                    // LP2-1 内联标记半隐藏:标记字符半透明弱化;光标贴上/选区
+                    // 压住的段显形。纯绘制叠加 —— 不挂 widget(不参与命中
+                    // 测试),也不碰 TextEdit 的状态(跨块 caret 路由照旧)。
+                    {
+                        let rev = editor.revision();
+                        if !matches!(&live.marks, Some((r, i, _)) if *r == rev && *i == index) {
+                            // 与 galley 同一份文本:本帧的编辑发生在 show()
+                            // 内部,这里取的也是编辑后的同一切片,缓存键即
+                            // 编辑后的修订号 —— 区间与字形永远对得上
+                            live.marks = Some((
+                                rev,
+                                index,
+                                latermd_md::inline_marks(BlockBuffer::slice(editor.text(), &range)),
+                            ));
+                        }
+                        let marks: &[Range<usize>] = match &live.marks {
+                            Some((_, _, marks)) => marks,
+                            None => &[],
+                        };
+                        paint_mark_fades(
+                            ui,
+                            &output.galley,
+                            output.galley_pos,
+                            BlockBuffer::slice(editor.text(), &range),
+                            marks,
+                            output.cursor_range,
+                        );
+                    }
                     let response = output.response.response;
                     // 上一帧交过来的光标:落到本块的指定字符偏移并要焦点
                     // (放在回填之后 —— `output.state` 在这里被移走)
@@ -329,6 +364,92 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect) -> bool {
             .iter()
             .any(|cmd| matches!(cmd, egui::OutputCommand::OpenUrl(_)))
     })
+}
+
+/// 标记半隐藏的遮罩不透明度(遮罩色 = 编辑框背景色)。「弱化但可辨识」,
+/// 不做用户可调的透明度配置面(规格口径)。
+const MARK_FADE_ALPHA: u8 = 166;
+
+/// 把活动块里的内联标记以半透明遮罩弱化(LP2-1)。
+///
+/// 遮罩 = 编辑框背景色 × α 叠在标记字形上,视觉即「标记变淡」,不改
+/// TextEdit 的任何状态。显形口径(「该段标记」= `inline_marks` 合并出的
+/// 一个连续区间):
+/// - 非空选区与标记相交 → 显形(拖选经过就能看清);
+/// - 空 caret 贴上或落入 → 显形。取「贴上也算」:点击落在标记字形上时
+///   光标常停在其边界上,严格取内部会把「点一下显形」做成哑的。
+fn paint_mark_fades(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    block_text: &str,
+    marks: &[Range<usize>],
+    cursor: Option<egui::text::CCursorRange>,
+) {
+    if marks.is_empty() {
+        return;
+    }
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let caret = cursor.primary.index.0.min(cursor.secondary.index.0);
+    let other = cursor.primary.index.0.max(cursor.secondary.index.0);
+    let bg = ui.visuals().text_edit_bg_color();
+    let fade = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), MARK_FADE_ALPHA);
+    let painter = ui.painter();
+    // 标记是字节区间,TextEdit 的光标是字符偏移(相对同一份块文本);一次
+    // 遍历换算全部区间(标记已升序,逐段各扫一遍前文是 O(len×段数))
+    let mut chars = 0usize;
+    let mut walk = block_text.char_indices().peekable();
+    for mark in marks {
+        while walk.next_if(|(byte, _)| *byte < mark.start).is_some() {
+            chars += 1;
+        }
+        let start = chars;
+        while walk.next_if(|(byte, _)| *byte < mark.end).is_some() {
+            chars += 1;
+        }
+        let visible = if caret < other {
+            start < other && caret < chars // 选区与标记相交
+        } else {
+            start <= caret && caret <= chars
+        };
+        if visible {
+            continue;
+        }
+        for rect in galley_mark_rects(galley, start..chars) {
+            painter.rect_filled(
+                rect.translate(galley_pos.to_vec2()),
+                egui::CornerRadius::ZERO,
+                fade,
+            );
+        }
+    }
+}
+
+/// 标记字符区间(字符偏移)在 galley 里占的矩形(相对 galley 原点),按行
+/// 切分 —— 折行/换行会把一段标记拆成多行多矩形。
+fn galley_mark_rects(galley: &egui::Galley, char_range: Range<usize>) -> Vec<egui::Rect> {
+    let mut rects = Vec::new();
+    let mut row_start = 0;
+    for row in &galley.rows {
+        let row_chars = row.char_count_excluding_newline().0;
+        let start = char_range.start.max(row_start);
+        let end = char_range.end.min(row_start + row_chars);
+        if end > start {
+            let x0 = row.pos.x + row.x_offset(egui::text::CharIndex(start - row_start));
+            let x1 = row.pos.x + row.x_offset(egui::text::CharIndex(end - row_start));
+            rects.push(egui::Rect::from_min_max(
+                egui::pos2(x0.min(x1), row.min_y()),
+                egui::pos2(x0.max(x1), row.max_y()),
+            ));
+        }
+        row_start += row.char_count_including_newline().0;
+        if row_start >= char_range.end {
+            break;
+        }
+    }
+    rects
 }
 
 #[cfg(test)]
@@ -722,5 +843,327 @@ mod tests {
             "链接点击打开 URL"
         );
         assert_eq!(live.active, Some(1), "链接点击不切进编辑:{live:?}");
+    }
+
+    // —— LP2-1 活动块内联标记半隐藏 ——
+
+    /// 半隐藏态的测试文档:六段标记(开/闭 `**`、`[`、`](…)`、开/闭 `` ` ``),
+    /// 光标目标「粗体」两字之间 = 字符 3,不贴任何标记。
+    const FADE_DOC: &str = "**粗体** 与 [链接](https://e.com) 和 `代码`\n";
+    const FADE_BLOCK: usize = 0;
+    const FADE_CARET_CONTENT: usize = 3;
+
+    fn fade_state(text: &str) -> (EditorBuffer, PreviewState, OutlineCursor, LiveState) {
+        let editor = EditorBuffer::new(text);
+        let preview = PreviewState::new(&editor);
+        (
+            editor,
+            preview,
+            OutlineCursor::default(),
+            LiveState {
+                active: Some(FADE_BLOCK),
+                ..LiveState::default()
+            },
+        )
+    }
+
+    /// 跑一帧 Live 面板(生产入口 `super::ui`),取证半透明遮罩矩形
+    /// (以遮罩色从帧 shapes 里挑 Rect,与 #38/#41 的 shapes 取证同款)。
+    fn live_fade_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+    ) -> Vec<egui::Rect> {
+        let mut fade = egui::Color32::TRANSPARENT;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    live,
+                    egui::Id::new("live-fade"),
+                );
+                let bg = ui.visuals().text_edit_bg_color();
+                fade = egui::Color32::from_rgba_unmultiplied(
+                    bg.r(),
+                    bg.g(),
+                    bg.b(),
+                    super::MARK_FADE_ALPHA,
+                );
+            },
+        );
+        let rects = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Rect(shape) if shape.fill == fade => Some(shape.rect),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        rects
+    }
+
+    /// 光标在正文里:全部标记半隐藏,渲染一帧不 panic、不改动缓冲、不置脏。
+    #[test]
+    fn live_fades_marks_when_caret_in_content() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+
+        // 经 v1 的 pending_caret 把光标交到正文中间(第一帧只落光标)
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        let before = editor.text().to_owned();
+        let rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(editor.text(), before, "渲染不改动缓冲");
+        assert!(!editor.is_dirty(), "渲染不置脏");
+        assert_eq!(
+            live.marks.as_ref().map(|(_, _, marks)| marks.len()),
+            Some(6),
+            "六段标记:{:?}",
+            live.marks
+        );
+        assert!(
+            rects.len() >= 6,
+            "每段标记至少一枚遮罩(折行只会更多):{:?}",
+            rects
+        );
+        // 标记缓存命中:再跑一帧仍是六段(修订号未动不重解析)
+        live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            live.marks.as_ref().map(|(_, _, marks)| marks.len()),
+            Some(6)
+        );
+
+        // 暗色主题:遮罩色随 visuals 取,同样逐段落位(存在性,非目视裁决)
+        ctx.set_visuals(egui::Visuals::dark());
+        let dark = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(dark.len() >= 6, "暗色下遮罩仍在:{dark:?}");
+    }
+
+    /// 光标贴上标记 → 该段显形;选区压住标记 → 相交段显形。
+    #[test]
+    fn live_reveals_mark_under_caret_or_selection() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(base >= 6);
+
+        // 光标挪进开头的 `**`(两星之间 = 字符 1)→ 该段显形
+        live.pending_caret = Some((FADE_BLOCK, 1));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let on_mark = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            on_mark < base,
+            "光标贴上后应有标记段显形:{on_mark} vs 基准 {base}"
+        );
+
+        // 选区盖住链接前后(字符 9..14:`[`、链接文本、`)` → 链接两段显形
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        let mut state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("状态已就位");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(9),
+                egui::text::CCursor::new(14),
+            )));
+        state.store(&ctx, id);
+        let selected = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            selected + 2 <= base,
+            "链接两段(`[` 与 `](…)`)应显形:{selected} vs 基准 {base}"
+        );
+    }
+
+    /// 点击半隐藏的标记:遮罩不参与命中测试 —— TextEdit 照常获得焦点,光标
+    /// 落到标记上,下一帧该段显形。
+    #[test]
+    fn live_click_on_faded_mark_focuses_editor_and_reveals() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let base_rects = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(base_rects.len() >= 6);
+
+        // 点最靠左的遮罩矩形(即开头的 `**`)中心
+        let target = base_rects
+            .iter()
+            .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+            .expect("至少一枚遮罩")
+            .center();
+        for events in click_events(target) {
+            let _ = live_fade_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        let id = egui::Id::new("live-fade").with(("live-block", FADE_BLOCK));
+        assert!(
+            ctx.memory(|mem| mem.has_focus(id)),
+            "点击应命中活动块 TextEdit 本体(遮罩不参与 hit-test)"
+        );
+        let clicked = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        )
+        .len();
+        assert!(
+            clicked < base_rects.len(),
+            "点击落点在标记上,该段应显形:{clicked} vs 基准 {}",
+            base_rects.len()
+        );
+    }
+
+    /// 编辑语义不回退:活动块里打一个字仍直落同一份全文缓冲(undo 栈共用),
+    /// 标记缓存随修订号前进失效重算。
+    #[test]
+    fn live_typing_in_active_block_updates_marks_cache() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = fade_state(FADE_DOC);
+        live.pending_caret = Some((FADE_BLOCK, FADE_CARET_CONTENT));
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let _ = live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (rev_before, _, _) = live.marks.clone().expect("缓存已建立");
+
+        // 在「粗体」内容里插一个字(走 BlockBuffer 同一条路,= TextEdit 打字)
+        editor.insert_chars(FADE_CARET_CONTENT, "字");
+        assert!(editor.text().contains("粗字体**"), "落在同一份缓冲");
+        assert!(editor.is_dirty());
+
+        live_fade_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (rev_after, _, marks) = live.marks.clone().expect("缓存已重算");
+        assert!(rev_after > rev_before, "修订号前进,缓存键换新");
+        assert_eq!(marks.len(), 6, "标记段数不变:{marks:?}");
+        // 插入点在开 `**` 之后:闭 `**` 及其后所有区间右移一个 CJK 字(3 字节)
+        let text_now = editor.text();
+        assert_eq!(&text_now[marks[1].clone()], "**", "闭 ** 仍标对位置");
+        assert_eq!(
+            marks[1],
+            11..13,
+            "原 8..10 平移一个 CJK 字(3 字节):{marks:?}"
+        );
     }
 }
