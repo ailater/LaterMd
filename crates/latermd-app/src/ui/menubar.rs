@@ -19,6 +19,9 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
             for cmd in Command::FILE {
                 item(ui, cmd, keymap, outbox);
             }
+            // 快速打开(#24):「打开」的模糊搜索形态,弹浮层而非系统对话框,
+            // 紧随文件组列出(Ctrl/Cmd+P)
+            item(ui, Command::QuickOpen, keymap, outbox);
             // 标签命令挂在「文件」尾部(编辑器惯例:文件 → 关闭标签页),
             // 与 Ctrl+Tab / Ctrl+W / Ctrl+Shift+T 的快捷键入口互为可发现性
             ui.separator();

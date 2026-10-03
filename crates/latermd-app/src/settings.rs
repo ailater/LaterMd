@@ -1331,6 +1331,26 @@ mod tests {
         let _ = rect;
     }
 
+    /// 快捷键页对快速打开(#24 C2)可见可改绑:整页按 `Command::ALL`
+    /// 遍历渲染一帧不 panic,QuickOpen 行因出厂有绑定而显示键位文本
+    /// (非「未绑定」占位)。
+    #[test]
+    fn keymap_page_renders_with_quick_open_bound() {
+        let keymap = Keymap::builtin();
+        assert!(
+            keymap.get(Command::QuickOpen).is_some(),
+            "QuickOpen 出厂有绑定,行上显示键位而非「未绑定」"
+        );
+        let ctx = egui::Context::default();
+        let mut settings = SettingsState::default();
+        let mut outbox = Vec::new();
+        ctx.run_ui(RawInput::default(), |ui| {
+            keymap_page(ui, &mut settings, &keymap, &mut outbox);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "渲染不产出消息");
+    }
+
     /// 快捷键行的键位文本:已绑定显示组合键,未绑定显示「未绑定」。
     #[test]
     fn shortcut_text_shows_binding_or_placeholder() {

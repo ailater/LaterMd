@@ -42,6 +42,7 @@ use crate::theme::{
 };
 use crate::ui::emoji_panel::EmojiPanelState;
 use crate::ui::image_dialog::ImageDialogState;
+use crate::ui::quick_open::QuickOpenState;
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
@@ -253,6 +254,11 @@ pub struct State {
     /// 缓存随 query/文档变化重扫;跳转经 `pending_selection`(字符偏移,
     /// 与格式动作同一契约)。
     pub find: FindBarState,
+    /// 「快速打开」浮层(#24,Cmd/Ctrl+P):open/query/selected 与文件
+    /// 候选快照。查询词与选中下标归 UI 原地持有(与 `image_dialog` /
+    /// `emoji` 持草稿同款分工),开关与快照在归约([`Message::ToggleQuickOpen`]
+    /// → [`State::toggle_quick_open`])。
+    pub quick_open: QuickOpenState,
     /// 在途 AI 流的发起标签 id;`None` = 无流。发起时锁定,收尾
     /// (成功/失败/作废)清除 —— [`Message::AiChunk`] / [`Message::AiDone`]
     /// 的写入目标由它决定,与 `tabs.active` 无关:切标签不中断也不改道。
@@ -397,6 +403,7 @@ impl Default for State {
             layout_written: LayoutSettings::default(),
             tabs: TabsState::new(SAMPLE_MD),
             find: FindBarState::default(),
+            quick_open: QuickOpenState::default(),
             ai_active_tab: None,
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
@@ -453,6 +460,9 @@ pub enum Message {
     RightPanelToggled,
     /// 切换禅定模式(docs/ui-shell-redesign.md §7;M4 实现,命令层先挂上)。
     ZenToggled,
+    /// 切换「快速打开」浮层(#24):C2 的最小状态只翻转可见标志;
+    /// 查询词、选中项与候选快照等完整状态与浮层绘制在 C3 接入。
+    ToggleQuickOpen,
     /// 请求一次 Markdown 格式动作(docs/ui-shell-redesign.md §6.4)。
     ///
     /// 工具条按钮与快捷键两个入口同源;真正的语义全在
@@ -757,6 +767,7 @@ impl State {
             Message::SidebarToggled => self.toggle_left_panel(),
             Message::RightPanelToggled => self.toggle_right_panel(),
             Message::ZenToggled => self.toggle_zen(),
+            Message::ToggleQuickOpen => self.toggle_quick_open(),
             Message::FormatRequested(action) => self.apply_format(action),
             Message::FindBarToggled(open) => self.toggle_find(open),
             Message::FindQueryChanged(query) => self.find_query_changed(query),
@@ -1587,6 +1598,19 @@ impl State {
     fn rescan_find_after_tab_switch(&mut self, previous_tab: u64) {
         if self.find.open && self.tabs.current().id != previous_tab {
             self.find_rescan();
+        }
+    }
+
+    /// 快速打开(#24)的开关归约:开 = 拍文件快照(`latermd_search::list_files`,
+    /// 与文件树 `find_by_name`、MCP 同一份实现)+ 复位查询词/选中项;关 =
+    /// 只翻标志。列表目录是本地磁盘毫秒级 IO,同步在归约做 —— 与文件树
+    /// `ensure_loaded` 同口径。
+    fn toggle_quick_open(&mut self) {
+        if self.quick_open.open {
+            self.quick_open.close();
+        } else {
+            self.quick_open
+                .open_snapshot(self.file_tree.root.as_deref());
         }
     }
 
@@ -2800,6 +2824,24 @@ mod tests {
 
         state.apply(Message::SidebarToggled);
         assert!(state.layout.left && !state.layout.right, "只开左栏");
+    }
+
+    /// 快速打开(#24)的开关归约:`ToggleQuickOpen` 翻转可见标志,再翻
+    /// 一次回闭;打开时快照/查询词/选中项一并复位,关闭只翻标志(C3 起
+    /// 快照落在 `QuickOpenState`,不再只是 C2 的裸 bool)。
+    #[test]
+    fn toggle_quick_open_flips_flag_only() {
+        let mut state = State::default();
+        assert!(!state.quick_open.open, "出厂关闭");
+
+        state.apply(Message::ToggleQuickOpen);
+        assert!(state.quick_open.open);
+        assert!(state.quick_open.files.is_empty(), "无根:文件组为空");
+        assert_eq!(state.quick_open.query, "");
+        assert_eq!(state.quick_open.selected, 0);
+
+        state.apply(Message::ToggleQuickOpen);
+        assert!(!state.quick_open.open, "再按一次关闭");
     }
 
     /// 面板开合落到 `layout.json`,重启(`load_from`)后逐项一致。写盘在帧末
