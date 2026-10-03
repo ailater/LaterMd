@@ -36,7 +36,6 @@ const NEG: i64 = i64::MIN / 4;
 /// 空 query 约定返回 `Some(0)` —— 不筛掉任何候选;调用方(浮层)也可以
 /// 在输入为空时短路、直接按原序展示,两条路等价(见 [`rank`] 对空 query
 /// 的行为)。
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn score(query: &str, candidate: &str) -> Option<i64> {
     let q: Vec<char> = query.to_lowercase().chars().collect();
     let c: Vec<char> = candidate.to_lowercase().chars().collect();
@@ -93,7 +92,6 @@ fn hit_score(c: &[char], j: usize) -> i64 {
 /// 按 [`score`] 给候选打分并**降序稳定排序**,返回**(候选下标, 分数)**;
 /// 未命中(`None`)的候选被剔除,同分保持输入顺序(Rust `sort_by` 稳定)。
 /// 空 query 时全部候选以 0 分原序返回,与 [`score`] 的空 query 约定一致。
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn rank<T: AsRef<str>>(query: &str, candidates: &[T]) -> Vec<(usize, i64)> {
     let mut hits: Vec<(usize, i64)> = candidates
         .iter()

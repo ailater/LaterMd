@@ -16,8 +16,10 @@ const AUTOSAVE_WRITE_RETRY: std::time::Duration = std::time::Duration::from_secs
 
 impl LaterMdApp {
     /// `logic` 帧的全部归约逻辑。单独成函数是因为 [`eframe::Frame`] 的字段
-    /// 是 `pub(crate)`,测试里造不出来;归约本身不碰 frame。
-    fn reduce(&mut self, ctx: &egui::Context) {
+    /// 是 `pub(crate)`,测试里造不出来;归约本身不碰 frame。`pub(crate)`
+    /// 与 [`Self::draw`] 同理:本模块测试与 `ui::quick_open` 的无头帧
+    /// (reduce→draw 完整顺序)同用。
+    pub(crate) fn reduce(&mut self, ctx: &egui::Context) {
         // 只做状态归约,严格禁止在此绘制任何 UI(docs/adr-005 §2.3)。
         let LaterMdApp {
             state,
@@ -609,6 +611,15 @@ impl LaterMdApp {
         // 文档)。返回的单元响应只供面板自身测试定位,生产路径忽略。
         if self.state.emoji.open {
             let _cells = crate::ui::emoji_panel::panel(ui, &mut self.state.emoji, outbox);
+        }
+
+        // 快速打开(#24,Cmd/Ctrl+P):文件树全部 md 与命令全集的统一入口
+        // 浮层。查询词与选中下标归 UI 原地持有,快照与开关在归约
+        // (`ToggleQuickOpen`);选中文件走文件树点击同一条 `FileSelected`
+        // (→ `open_path`),选中命令直接执行 `cmd.message()`。返回的浮窗
+        // 响应只供无头测试定位浮层矩形,生产路径忽略。
+        if self.state.quick_open.open {
+            let _window = crate::ui::quick_open::panel(ui, &mut self.state.quick_open, outbox);
         }
     }
 

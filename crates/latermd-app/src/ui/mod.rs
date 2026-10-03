@@ -11,6 +11,7 @@ pub mod image_dialog;
 pub mod layout;
 pub mod menubar;
 pub mod preview;
+pub mod quick_open;
 pub mod sidebar;
 pub mod tabs;
 pub mod titlebar;
