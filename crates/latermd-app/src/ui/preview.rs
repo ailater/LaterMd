@@ -121,19 +121,22 @@ fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<latermd_md::Rewrit
 }
 
 /// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
-/// 偏移。两层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
-/// `latermd_md::OffsetMap`):wikilink 展开(源文本 → `rendered`,表由
-/// `PreviewState` 与渲染串同次产出持有)与相对图片 `file://` 改写
+/// 偏移。三层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
+/// `latermd_md::OffsetMap`):wikilink 展开(源文本 → 展开后,表由
+/// `PreviewState::offset_map` 持有)、emoji 链接改写(展开后 → `rendered`,
+/// `PreviewState::emoji_map`,#48 B1)与相对图片 `file://` 改写
 /// (`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
 fn map_source_offset(
     offset_map: &latermd_md::OffsetMap,
+    emoji_map: &latermd_md::OffsetMap,
     rendered: &str,
     base_dir: Option<&Path>,
     offset: usize,
 ) -> usize {
     let after_wikilinks = offset_map.source_to_rendered(offset);
+    let after_emoji = emoji_map.source_to_rendered(after_wikilinks);
     let image_map = latermd_md::OffsetMap::from_rewrites(image_rewrites(rendered, base_dir));
-    image_map.source_to_rendered(after_wikilinks)
+    image_map.source_to_rendered(after_emoji)
 }
 
 /// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
@@ -632,8 +635,13 @@ pub fn ui(
             // 也只在渲染当帧有效,同帧先写后读。块缺失(空文档/未渲染)就
             // 不滚,下一帧有表了也不会再滚 —— 滚动目标消费即清空,一次语义。
             if let Some(target) = preview.scroll_target.take() {
-                let offset =
-                    map_source_offset(&preview.offset_map, &preview.rendered, base_dir, target);
+                let offset = map_source_offset(
+                    &preview.offset_map,
+                    &preview.emoji_map,
+                    &preview.rendered,
+                    base_dir,
+                    target,
+                );
                 if let Some(block) = egui_markdown::block_rect_at_offset(ui, label_id, offset) {
                     ui.scroll_to_rect_animation(
                         block.rect,
@@ -679,6 +687,7 @@ struct ScrollProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::emoji_data;
     use eframe::egui::RawInput;
 
     /// 造一个指定流式/最近 prompt 的 AI 状态(卡片状态的三个输入)。
@@ -816,6 +825,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text,
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -899,6 +909,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.to_owned(),
             offset_map: latermd_md::OffsetMap::empty(),
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -922,14 +933,15 @@ mod tests {
     }
 
     /// 偏移映射三层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
-    /// 相对图片改写叠加在同一映射里;偏移落在改写区间内归段首。
-    /// (展开层的「映射与展开输出逐字节一致」由 latermd-md 的
-    /// `expand_wikilinks_with_map` 测试直接锁死 —— 本侧只验两层串行穿过。)
+    /// emoji 链接与相对图片改写按同一顺序叠加;偏移落在改写区间内归段首。
+    /// (各层的「映射与输出逐字节一致」由 latermd-md 的
+    /// `expand_wikilinks_with_map` / `expand_emoji_links` 测试直接锁死 ——
+    /// 本侧只验三层串行穿过。)
     #[test]
     fn map_source_offset_through_both_rewrites() {
         // 无改写:恒等
         let identity = latermd_md::OffsetMap::empty();
-        assert_eq!(map_source_offset(&identity, "# h\n", None, 3), 3);
+        assert_eq!(map_source_offset(&identity, &identity, "# h\n", None, 3), 3);
 
         // wikilink 改写:[[架构决策]](12 字节)→ [架构决策](<wiki://架构决策>)
         // (2+12+2+4+8+12+2=…);标题在 wikilink 之后,映射后偏移必须落在
@@ -938,29 +950,138 @@ mod tests {
         let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(source);
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
-        let mapped = map_source_offset(&offset_map, &rendered, None, heading_src);
+        let mapped = map_source_offset(&offset_map, &identity, &rendered, None, heading_src);
         assert_eq!(mapped, heading_out, "wikilink 之后的偏移按平移映射");
 
         // 偏移落在 wikilink 区间内(点击目标是标题,标题不会落在链接里,
         // 但边界语义仍要确定):归改写段首。
         let link_start = source.find("[[").expect("wikilink");
         let in_link = link_start + 3;
-        let mapped_in = map_source_offset(&offset_map, &rendered, None, in_link);
+        let mapped_in = map_source_offset(&offset_map, &identity, &rendered, None, in_link);
         assert_eq!(
             &rendered[mapped_in..].chars().take(3).collect::<String>(),
             "[架构",
             "区间内偏移归改写段首: {mapped_in}"
         );
 
+        // emoji 层叠加(#48 B1):展开文本里的覆盖枚改写成链接后,标题偏移
+        // 在 wikilink 平移之上再平移一次。
+        let source = "见 [[架构决策]] 与 😀 再谈。\n\n## 后续标题\n\n正文。\n";
+        let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(source);
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        let mapped = map_source_offset(&offset_map, &emoji_map, &rendered, None, heading_src);
+        assert_eq!(mapped, heading_out, "emoji 改写叠加平移");
+
         // 图片层叠加:渲染文本里相对图片地址换成 file:// URI 后,标题偏移
-        // 再平移一次。
-        let doc = "![图](./x.png)\n\n## 标题\n";
+        // 再平移一次(与 emoji 层共存,三层全穿)。`rendered` 是 emoji 层的
+        // 真实输出 —— 图片层扫描的正是这份字符串(生产同款口径)。
+        let doc = "![图](./x.png) 😀\n\n## 标题\n";
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(doc, emoji_data::covered_glyphs());
         let base = Some(Path::new("/doc"));
-        let with_uri = resolve_relative_images(doc, base);
+        let with_uri = resolve_relative_images(&rendered, base);
         let heading = doc.find("## 标题").expect("heading");
         let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
-        let mapped_img = map_source_offset(&identity, doc, base, heading);
+        let mapped_img = map_source_offset(&identity, &emoji_map, &rendered, base, heading);
         assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
+    }
+
+    /// #48 B1 覆盖集的数据卫生:全表 272 枚改写后能被解析成链接,href 剥
+    /// scheme 前缀还原原文(可逆口径),且载荷不含尖括号目标的非法字符
+    /// (`>`、换行、空白 —— 含则改写产物不是合法 CommonMark)。
+    #[test]
+    fn covered_glyphs_round_trip_through_emoji_links() {
+        let covered = emoji_data::covered_glyphs();
+        assert_eq!(covered.len(), 272, "面板数据表全量");
+        for glyph in covered {
+            for c in glyph.chars() {
+                assert!(
+                    !matches!(c, '>' | '<' | '\n' | '\r' | ' ' | '\t'),
+                    "{glyph:?} 含尖括号目标非法字符"
+                );
+            }
+            let (rendered, _) = latermd_md::expand_emoji_links(glyph, covered);
+            assert_eq!(
+                rendered,
+                format!("[{g}](<{}{g}>)", latermd_md::EMOJI_SCHEME, g = glyph),
+                "{glyph:?} 单枚文档改写形状"
+            );
+            // 可逆:href 剥前缀还原原文,且真能被解析成链接 token
+            let href = format!("{}{}", latermd_md::EMOJI_SCHEME, glyph);
+            assert_eq!(href.strip_prefix(latermd_md::EMOJI_SCHEME), Some(*glyph));
+            let doc = latermd_md::parse(&rendered);
+            assert!(
+                doc.tokens.iter().any(|token| match token {
+                    egui_markdown::types::Token::Link {
+                        href: found, text, ..
+                    } => found.as_ref() == href && text.as_ref() == *glyph,
+                    _ => false,
+                }),
+                "{glyph:?} 未解析成 emoji:// 链接"
+            );
+        }
+    }
+
+    /// #48 B1 接线回归:emoji 改写后的渲染串过生产入口 `ui()` 明暗两主题
+    /// 各渲染一帧不 panic,emoji 密集文档的正文/标题/列表文字仍在;围栏
+    /// 代码块的 emoji 保持原字符(未被改写,代码路径零牵连)。
+    /// (链接的样式与点击行为归 #48 B2 的 handler 接线,本测只钉 B1 的
+    /// 改写不破坏渲染。)
+    #[test]
+    fn preview_ui_renders_emoji_rewritten_doc_without_panic() {
+        let doc = "# 标题 😀 一\n\n正文 😀🚀 密集 💡 段。\n\n- 项 🚀\n\n> 引 😀\n\n```rust\nlet e = \"😀\";\n```\n";
+        let (after_wikilinks, _) = latermd_md::expand_wikilinks_with_map(doc);
+        let (rendered, _) =
+            latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+        assert!(
+            rendered.contains("正文 [😀](<emoji://😀>)[🚀](<emoji://🚀>)"),
+            "前置:改写确实发生(断言非恒真):{rendered}"
+        );
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            // OffsetMap 不 Clone,两帧各建一份(纯函数,同输入同产出)
+            let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(doc);
+            let (frame_rendered, emoji_map) =
+                latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+            assert_eq!(frame_rendered, rendered, "纯函数:两帧改写产出一致");
+            let mut preview = PreviewState {
+                rendered: frame_rendered,
+                offset_map,
+                emoji_map,
+                text: doc.to_owned(),
+                synced_rev: 0,
+                outline: Vec::new(),
+                scroll_target: None,
+            };
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(RawInput::default(), |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    7,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            });
+            let painted = painted_text(&output);
+            output.drop_without_applying_deltas();
+            for expected in ["标题", "密集", "项", "let e = \"😀\";"] {
+                assert!(
+                    painted.iter().any(|t| t.contains(expected)),
+                    "dark={dark} 缺 {expected}:{painted:?}"
+                );
+            }
+        }
     }
 
     /// 端到端:scroll_target 指向文档尾部标题,一帧 `ui()` 后预览 ScrollArea
@@ -978,6 +1099,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.clone(),
             offset_map: latermd_md::OffsetMap::empty(),
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.clone(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1103,6 +1225,7 @@ mod tests {
                             let tab = state.tabs.current();
                             let mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.emoji_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1258,6 +1381,7 @@ mod tests {
                             let tab = state.tabs.current();
                             mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.emoji_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1437,6 +1561,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: doc.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1534,6 +1659,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: rendered.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: rendered.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1618,6 +1744,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered,
             offset_map,
+            emoji_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1748,6 +1875,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                emoji_map: latermd_md::OffsetMap::empty(),
                 text: doc.clone(),
                 synced_rev: 0,
                 outline: Vec::new(),

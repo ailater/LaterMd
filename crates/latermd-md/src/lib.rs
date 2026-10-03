@@ -9,6 +9,7 @@
 //!
 //! 数据层 crate:不依赖 egui/eframe;把 token 流翻译为绘制是 UI 侧的职责。
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use egui_markdown::types::{TableData, Token};
@@ -622,6 +623,13 @@ impl OffsetMap {
         self.rewrites.is_empty()
     }
 
+    /// 改写清单(测试契约用:断言区间形状与字符边界;生产侧不该读它,
+    /// 消费偏移换算而非清单本身)。
+    #[cfg(test)]
+    pub fn rewrites_for_test(&self) -> &[Rewrite] {
+        &self.rewrites
+    }
+
     /// 把清单应用到源文本,拼出渲染文本 —— 与偏移换算共用同一份数据,
     /// 「渲染串长什么样」与「偏移怎么换算」是单一事实来源。
     pub fn apply(&self, text: &str) -> String {
@@ -700,6 +708,135 @@ pub fn expand_wikilinks_with_map(text: &str) -> (String, OffsetMap) {
     let map = OffsetMap::from_rewrites(rewrites);
     let rendered = map.apply(text);
     (rendered, map)
+}
+
+/// emoji 链接改写产出链接的 scheme(#48 B1):预览层按前缀拦截(inline
+/// widget 画纹理、点击吞掉),非本 scheme 的链接照常走默认行为。
+pub const EMOJI_SCHEME: &str = "emoji://";
+
+/// 把 `covered` 覆盖的 emoji 改写成 `[原文](<emoji://原文>)`,供**预览渲染**
+/// 使用;源码一字不动 —— 与 [`expand_wikilinks`] 同一承诺、同一层叠加。
+/// 载荷用原文直书而非百分号编码:尖括号目标允许除换行与 `>` 外的一切
+/// 字符,emoji 覆盖集不含这两者,反向解码 = 剥 [`EMOJI_SCHEME`] 前缀,
+/// 与 `wiki://` 的既有口径一致。
+///
+/// 叠加顺序固定:**wikilink 展开 → 本层 → 相对图片 URI**。wikilink 展开把
+/// `[[X]]` 变成链接后,本层才能把它的文本/目标整体豁免;反过来会把 wikilink
+/// 拆坏(裸 `[[…]]` 在 pulldown 眼里不是链接)。
+///
+/// 豁免纪律(照 [`wikilinks`] 与 app 侧 `inline_image_dests` 的先例,机制上
+/// 直接走与渲染同一套 pulldown-cmark —— 铁律「单一解析器」,LP2-1
+/// `inline_marks` 的同款做法):
+///
+/// - 围栏与缩进代码块内不改写(代码块里没有链接语法,改写会字面显示),
+///   区间含 fence 行与 info string;
+/// - 行内代码 `` `…` `` 内不改写;
+/// - 已在链接/图片的**文本或目标**里不改写 —— 嵌套链接不是合法
+///   CommonMark,改写会把既有链接拆坏(展开过的 wikilink 靠这条被保护);
+/// - HTML 块、行内 HTML 标签、脚注引用与脚注定义(含 `[^标签]:`)不改写。
+///
+/// 快路径:文本不含任何覆盖枚的首字符时不启动解析,直接恒等返回 ——
+/// 多数文档没有 emoji,不该为它付整篇解析。
+pub fn expand_emoji_links(text: &str, covered: &HashSet<&str>) -> (String, OffsetMap) {
+    let map = OffsetMap::from_rewrites(emoji_rewrites(text, covered));
+    (map.apply(text), map)
+}
+
+/// [`expand_emoji_links`] 的扫描核心(私有):覆盖枚的区间替换清单。
+fn emoji_rewrites(text: &str, covered: &HashSet<&str>) -> Vec<Rewrite> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+
+    // 覆盖集的形状:首字符集(快路径粗筛)与最长枚的字符数(前缀长优先
+    // 匹配 —— 旗帜与带 FE0F 的形态是两字符,短匹配会把它们的尾巴吃剩)。
+    let mut first_chars = HashSet::new();
+    let mut max_chars = 0_usize;
+    for glyph in covered {
+        let mut chars = glyph.chars();
+        if let Some(first) = chars.next() {
+            first_chars.insert(first);
+            max_chars = max_chars.max(1 + chars.count());
+        }
+    }
+    if max_chars == 0 || !text.chars().any(|c| first_chars.contains(&c)) {
+        return Vec::new();
+    }
+
+    // 与 vendored parser.rs 同一套 options:渲染认得的构造这里才认得,
+    // 否则会出现「改写了不渲染成链接的字符 / 漏豁免渲染认的构造」。
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    // 豁免区间:pulldown 0.13 的 Start 事件区间覆盖整个构造(含代码块的
+    // fence 与链接的目标部分;LP2-1 inline_marks 依赖的同一事实,本轮探针
+    // 复证)。脚注定义的区间含标签行,正文一并豁免是保守方向(漏改写只是
+    // 该处黑白,不改写错才拆语法)。
+    let mut exempt: Vec<Range<usize>> = Vec::new();
+    for (event, span) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::CodeBlock { .. }
+                | Tag::Link { .. }
+                | Tag::Image { .. }
+                | Tag::HtmlBlock
+                | Tag::FootnoteDefinition(_),
+            )
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_) => exempt.push(span),
+            _ => {}
+        }
+    }
+    exempt.sort_unstable_by_key(|span| span.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in exempt {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+
+    let mut rewrites = Vec::new();
+    let mut skip = 0_usize;
+    let mut index = 0_usize;
+    // 各候选前缀的字节长度表,循环外建好复用(每位置最多 max_chars 个)
+    let mut prefix: Vec<usize> = Vec::with_capacity(max_chars);
+    while index < text.len() {
+        while skip < merged.len() && merged[skip].end <= index {
+            skip += 1;
+        }
+        if skip < merged.len() && merged[skip].start <= index {
+            index = merged[skip].end;
+            continue;
+        }
+        prefix.clear();
+        let mut bytes = 0_usize;
+        for c in text[index..].chars().take(max_chars) {
+            bytes += c.len_utf8();
+            prefix.push(bytes);
+        }
+        let mut matched = 0_usize;
+        for len in prefix.iter().rev() {
+            if covered.contains(&text[index..index + *len]) {
+                matched = *len;
+                break;
+            }
+        }
+        if matched > 0 {
+            let glyph = &text[index..index + matched];
+            rewrites.push(Rewrite {
+                span: index..index + matched,
+                replacement: format!("[{glyph}](<{EMOJI_SCHEME}{glyph}>)"),
+            });
+            index += matched;
+        } else {
+            index += text[index..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    rewrites
 }
 
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
@@ -1028,6 +1165,202 @@ mod tests {
             needle_at,
             "第二层区间内归该层段首(第一层坐标)"
         );
+    }
+
+    // —— expand_emoji_links(#48 B1 预览 emoji 链接改写)——
+
+    /// 测试用覆盖集。
+    fn cover(glyphs: &[&'static str]) -> HashSet<&'static str> {
+        glyphs.iter().copied().collect()
+    }
+
+    /// 渲染串里的全部 `(链接文本, href)`,按文档序(表格单元格递归)。
+    fn link_pairs(doc: &MarkdownDoc) -> Vec<(String, String)> {
+        fn collect(tokens: &[Token<'_>], out: &mut Vec<(String, String)>) {
+            for token in tokens {
+                match token {
+                    Token::Link { text, href, .. } => {
+                        out.push((text.to_string(), href.to_string()));
+                    }
+                    Token::Table(data) => {
+                        for cell in &data.headers {
+                            collect(cell, out);
+                        }
+                        for row in &data.rows {
+                            for cell in row {
+                                collect(cell, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        collect(&doc.tokens, &mut out);
+        out
+    }
+
+    /// 正文/标题/列表/引用/表格单元里的 emoji 都改写成链接,且改写结果
+    /// 真能被解析成 `emoji://` 链接(预览拦截的前提)。
+    #[test]
+    fn expand_emoji_links_rewrites_body_heading_list_quote() {
+        let covered = cover(&["😀", "🚀"]);
+        let text = "前 😀 中\n\n# 标题 🚀\n\n- 项 😀\n\n> 引 💡引用 😀\n\n| a 😀 | b |\n|---|---|\n| 🚀 | 2 |\n";
+        let (rendered, map) = expand_emoji_links(text, &covered);
+        assert_eq!(
+            rendered,
+            "前 [😀](<emoji://😀>) 中\n\n# 标题 [🚀](<emoji://🚀>)\n\n- 项 [😀](<emoji://😀>)\n\n> 引 💡引用 [😀](<emoji://😀>)\n\n| a [😀](<emoji://😀>) | b |\n|---|---|\n| [🚀](<emoji://🚀>) | 2 |\n"
+        );
+        assert_eq!(map.rendered_to_source(rendered.len()), text.len());
+        assert_eq!(
+            link_pairs(&parse(&rendered)),
+            vec![
+                ("😀".to_owned(), "emoji://😀".to_owned()),
+                ("🚀".to_owned(), "emoji://🚀".to_owned()),
+                ("😀".to_owned(), "emoji://😀".to_owned()),
+                ("😀".to_owned(), "emoji://😀".to_owned()),
+                ("😀".to_owned(), "emoji://😀".to_owned()),
+                ("🚀".to_owned(), "emoji://🚀".to_owned()),
+            ]
+        );
+    }
+
+    /// 代码区豁免:``` 与 ~~~ 围栏(含 info string)、缩进代码块、行内代码
+    /// 内的 emoji 一律不改写;围栏外的裸 emoji 照常改写。
+    #[test]
+    fn expand_emoji_links_skips_code_blocks_and_inline_code() {
+        let covered = cover(&["😀"]);
+        let text = "```rust\nlet s = \"😀\";\n```\n\n~~~\n~~~ 内 😀\n~~~\n\n    缩进 😀 代码\n\n行内 `code 😀` 后 😀\n";
+        let (rendered, map) = expand_emoji_links(text, &covered);
+        assert_eq!(
+            rendered,
+            "```rust\nlet s = \"😀\";\n```\n\n~~~\n~~~ 内 😀\n~~~\n\n    缩进 😀 代码\n\n行内 `code 😀` 后 [😀](<emoji://😀>)\n"
+        );
+        assert_eq!(map.rewrites_for_test().len(), 1);
+
+        // emoji 只在代码区:首字符命中快路径、完整解析启动,但全部豁免 → 恒等
+        let only_code = "```rust\nlet s = \"😀\";\n```\n";
+        let (rendered, map) = expand_emoji_links(only_code, &covered);
+        assert_eq!(rendered, only_code);
+        assert!(map.is_identity());
+    }
+
+    /// 既有链接的文本与目标里的 emoji 不改写(嵌套链接不是合法
+    /// CommonMark);链接前后的裸 emoji 照常改写。
+    #[test]
+    fn expand_emoji_links_skips_existing_link_text_and_destinations() {
+        let covered = cover(&["😀", "🌞"]);
+        let text = "首 😀 与 [链 😀 接](https://e.com/😀) 与 ![图 🌞](x.png) 尾 😀\n";
+        let (rendered, _) = expand_emoji_links(text, &covered);
+        assert_eq!(
+            rendered,
+            "首 [😀](<emoji://😀>) 与 [链 😀 接](https://e.com/😀) 与 ![图 🌞](x.png) 尾 [😀](<emoji://😀>)\n"
+        );
+    }
+
+    /// 与 wikilink 层叠加(wikilink 先、emoji 后):展开出的链接文本/目标
+    /// 整体豁免不拆坏;两层偏移映射串行穿过落在渲染串同一文本处。
+    #[test]
+    fn expand_emoji_links_stacks_after_wikilink_expansion() {
+        let covered = cover(&["😀"]);
+        let source = "见 [[目标😀]] 与 😀\n\n## 标题\n";
+        let (layer1, map1) = expand_wikilinks_with_map(source);
+        let (rendered, map2) = expand_emoji_links(&layer1, &covered);
+        assert_eq!(
+            rendered,
+            "见 [目标😀](<wiki://目标😀>) 与 [😀](<emoji://😀>)\n\n## 标题\n"
+        );
+
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let after1 = map1.source_to_rendered(heading_src);
+        let heading_out = rendered.find("## 标题").expect("heading in rendered");
+        assert_eq!(map2.source_to_rendered(after1), heading_out);
+        assert_eq!(
+            map1.rendered_to_source(map2.rendered_to_source(heading_out)),
+            heading_src,
+            "两层逆穿回源码原处"
+        );
+    }
+
+    /// 恒等路径:无覆盖枚首字符的文档、覆盖集之外的 emoji、空覆盖集,
+    /// 一律原样返回且映射为恒等(快路径不启动解析)。
+    #[test]
+    fn expand_emoji_links_identity_without_covered_hits() {
+        let covered = cover(&["😀"]);
+        for text in ["没有 emoji 的普通文档\n\n## 标题\n", "覆盖集外的 🥶 直显\n"]
+        {
+            let (rendered, map) = expand_emoji_links(text, &covered);
+            assert_eq!(rendered, text);
+            assert!(map.is_identity());
+        }
+        let (rendered, map) = expand_emoji_links("文档 😀", &cover(&[]));
+        assert_eq!(rendered, "文档 😀");
+        assert!(map.is_identity());
+    }
+
+    /// CJK 混排边界:改写区间都落在字符边界上;连续 emoji 逐枚改写;
+    /// 两字符枚(旗帜、带 FE0F)长优先匹配,裸形(无 FE0F)不吃错。
+    #[test]
+    fn expand_emoji_links_cjk_boundaries_and_multichar_glyphs() {
+        let covered = cover(&["😀", "🇨🇳", "✌️"]);
+        let text = "中😀文😀😀两枚🇨🇳与✌️收尾";
+        let (rendered, map) = expand_emoji_links(text, &covered);
+        assert_eq!(
+            rendered,
+            "中[😀](<emoji://😀>)文[😀](<emoji://😀>)[😀](<emoji://😀>)两枚[🇨🇳](<emoji://🇨🇳>)与[✌️](<emoji://✌️>)收尾"
+        );
+        for rewrite in map.rewrites_for_test() {
+            assert!(text.is_char_boundary(rewrite.span.start));
+            assert!(text.is_char_boundary(rewrite.span.end));
+        }
+
+        // 裸 ✌(无 FE0F)不在覆盖集,不改写
+        let (rendered, _) = expand_emoji_links("裸 ✌ 不改写", &covered);
+        assert_eq!(rendered, "裸 ✌ 不改写");
+    }
+
+    /// HTML 与脚注豁免:HTML 块、脚注引用 `[^😀]`、脚注定义(含标签行)
+    /// 全部原样;普通段落照常改写。
+    #[test]
+    fn expand_emoji_links_skips_html_and_footnotes() {
+        let covered = cover(&["😀"]);
+        let text = "<div>\n块 😀\n</div>\n\n引用[^😀]。\n\n[^😀]: 定义 😀\n\n尾 😀\n";
+        let (rendered, map) = expand_emoji_links(text, &covered);
+        assert_eq!(
+            rendered,
+            "<div>\n块 😀\n</div>\n\n引用[^😀]。\n\n[^😀]: 定义 😀\n\n尾 [😀](<emoji://😀>)\n"
+        );
+        assert_eq!(map.rewrites_for_test().len(), 1);
+    }
+
+    /// 幂等:自己产出的 `[😀](<emoji://😀>)` 是链接构造,二次穿过整体
+    /// 豁免,不再改写(流式重建反复穿过同层的稳态保证)。
+    #[test]
+    fn expand_emoji_links_is_idempotent_on_own_output() {
+        let covered = cover(&["😀", "🚀"]);
+        let (once, _) = expand_emoji_links("a 😀 b 🚀", &covered);
+        let (twice, map) = expand_emoji_links(&once, &covered);
+        assert_eq!(twice, once);
+        assert!(map.is_identity());
+    }
+
+    /// 偏移映射:emoji 层单独一张表 —— 改写段内归段首、段外平移、文末
+    /// 闭合(与 wikilink 层同语义,消费点串行穿过)。
+    #[test]
+    fn expand_emoji_links_map_translates_offsets() {
+        let covered = cover(&["😀"]);
+        let source = "前 😀 中\n\n## 标题\n";
+        let (rendered, map) = expand_emoji_links(source, &covered);
+        let heading_src = source.find("## 标题").expect("heading");
+        assert_eq!(
+            map.source_to_rendered(heading_src),
+            rendered.find("## 标题").expect("heading in rendered")
+        );
+        assert_eq!(map.rendered_to_source(rendered.len()), source.len());
+        let emoji_at = source.find("😀").expect("emoji");
+        assert_eq!(map.source_to_rendered(emoji_at + 1), emoji_at, "段内归段首");
+        assert_eq!(map.source_to_rendered(0), 0, "段前原样");
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块
