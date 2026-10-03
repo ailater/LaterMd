@@ -562,30 +562,144 @@ pub fn wikilinks(text: &str) -> Vec<Wikilink> {
     links
 }
 
+/// 一处「区间替换」改写:源文本的 `[span]` 段在渲染文本里被 `replacement`
+/// 顶替。改写层(wikilink 展开,以及将来叠加同层的 emoji 短码改写)以它为
+/// 原子 —— 同一份清单既拼出渲染文本又回答偏移换算(见 [`OffsetMap`]),
+/// 两侧永不漂移。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    /// 被替换的源码字节区间。清单内各区间须升序且互不重叠。
+    pub span: Range<usize>,
+    /// 替换后的渲染文本(在渲染串里占据该位置的整段)。
+    pub replacement: String,
+}
+
+/// 「源码偏移 ↔ 渲染偏移」映射表(LP2-4):描述「改写层做了什么」,供预览
+/// 侧消费点(大纲跳转、section anchor)把源码偏移换算后再用。**只描述改写、
+/// 不做改写** —— 源码缓冲、rope、字节偏移、撤销栈一律不动,映射不回写任何
+/// 文本;它是与渲染文本同一次产出的**只读派生物**。
+///
+/// 换算语义(与「区间替换」的形状对齐):
+///
+/// - 区间之外的偏移,按前方各区间的累积长度差平移;
+/// - 落在区间内的源偏移,映到该段在渲染串里的**起点** —— 改写段内部没有
+///   更细的锚点,落点即段首(反向同理:渲染段内 → 源码段首);
+/// - 偏移恰在区间端点上按「区间外」处理(端点属于后文)。
+///
+/// **可组合**:每层改写各自产出一张表,第二层的区间基于第一层的**输出
+/// 文本**(改写按顺序串行发生),消费点把偏移按同一顺序串行穿过即可:
+/// `map2.source_to_rendered(map1.source_to_rendered(off))`。后续 #48 的
+/// emoji 短码改写与 wikilink 展开同层叠加时,照此再串一张表,无需预合并
+/// (预合并要把第二层区间反解回源码坐标,复杂度换不来收益)。app 侧
+/// `PreviewState::rendered` 的生产链(wikilink 展开 → 相对图片 URI 改写)
+/// 即此口径的实例。
+pub struct OffsetMap {
+    rewrites: Vec<Rewrite>,
+}
+
+impl OffsetMap {
+    /// 空表:恒等映射(无改写层)。
+    pub fn empty() -> Self {
+        Self {
+            rewrites: Vec::new(),
+        }
+    }
+
+    /// 从区间替换清单构造。清单须按 `span` 升序且互不重叠(生产者
+    /// [`expand_wikilinks_with_map`] 与改写扫描器都天然满足)。
+    pub fn from_rewrites(rewrites: Vec<Rewrite>) -> Self {
+        debug_assert!(
+            rewrites
+                .windows(2)
+                .all(|pair| pair[0].span.end <= pair[1].span.start),
+            "改写清单须升序且互不重叠: {rewrites:?}"
+        );
+        Self { rewrites }
+    }
+
+    /// 是否恒等(没有任何改写)。
+    pub fn is_identity(&self) -> bool {
+        self.rewrites.is_empty()
+    }
+
+    /// 把清单应用到源文本,拼出渲染文本 —— 与偏移换算共用同一份数据,
+    /// 「渲染串长什么样」与「偏移怎么换算」是单一事实来源。
+    pub fn apply(&self, text: &str) -> String {
+        if self.rewrites.is_empty() {
+            return text.to_owned();
+        }
+        let mut out = String::with_capacity(text.len() + 64);
+        let mut cursor = 0;
+        for rewrite in &self.rewrites {
+            out.push_str(&text[cursor..rewrite.span.start]);
+            out.push_str(&rewrite.replacement);
+            cursor = rewrite.span.end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    /// 源码字节偏移 → 渲染字节偏移。
+    pub fn source_to_rendered(&self, source_offset: usize) -> usize {
+        let mut delta: i64 = 0;
+        for rewrite in &self.rewrites {
+            let old_len = (rewrite.span.end - rewrite.span.start) as i64;
+            if rewrite.span.end <= source_offset {
+                delta += rewrite.replacement.len() as i64 - old_len;
+            } else if rewrite.span.start > source_offset {
+                break;
+            } else {
+                // 区间内:该段在渲染串里的起点(前方位移已累积进 delta)
+                return rewrite.span.start + delta.max(0) as usize;
+            }
+        }
+        (source_offset as i64 + delta).max(0) as usize
+    }
+
+    /// 渲染字节偏移 → 源码字节偏移([`Self::source_to_rendered`] 的逆:区间
+    /// 外平移互逆、段首互为原像;改写段内部没有更细锚点,映回源码段首)。
+    pub fn rendered_to_source(&self, rendered_offset: usize) -> usize {
+        let mut delta: i64 = 0;
+        for rewrite in &self.rewrites {
+            let old_len = (rewrite.span.end - rewrite.span.start) as i64;
+            let rendered_start = rewrite.span.start as i64 + delta;
+            let rendered_end = rendered_start + rewrite.replacement.len() as i64;
+            if rendered_end <= rendered_offset as i64 {
+                delta += rewrite.replacement.len() as i64 - old_len;
+            } else if rendered_start > rendered_offset as i64 {
+                break;
+            } else {
+                return rewrite.span.start;
+            }
+        }
+        (rendered_offset as i64 - delta).max(0) as usize
+    }
+}
+
 /// 把 `[[目标]]` 展开成 Markdown 链接 `[显示名](<wiki://目标>)`,供**预览
 /// 渲染**使用;源码本身一字不改(roadmap P0 验收:「`.md` 保持原样」)。
 ///
 /// 目标用尖括号包裹:CommonMark 的 `<…>` 链接目标允许空格,中文与带空格的
 /// 文档名才不会被解析器截断。
 pub fn expand_wikilinks(text: &str) -> String {
-    let links = wikilinks(text);
-    if links.is_empty() {
-        return text.to_owned();
-    }
-    let mut out = String::with_capacity(text.len() + links.len() * 8);
-    let mut cursor = 0;
-    for link in links {
-        out.push_str(&text[cursor..link.span.start]);
-        out.push('[');
-        out.push_str(&link.label);
-        out.push_str("](<");
-        out.push_str(WIKI_SCHEME);
-        out.push_str(&link.target);
-        out.push_str(">)");
-        cursor = link.span.end;
-    }
-    out.push_str(&text[cursor..]);
-    out
+    expand_wikilinks_with_map(text).0
+}
+
+/// [`expand_wikilinks`] 带偏移映射的版本:同一次扫描既产出渲染文本,也产出
+/// 「源码偏移 ↔ 渲染偏移」表(LP2-4)。渲染串由映射表自己拼出(`OffsetMap::
+/// apply`),**不存在「公式推导长度」这条近似路径** —— 预览侧消费(大纲跳
+/// 转/section anchor 的偏移换算)拿到的映射与渲染文本天然逐字节一致。
+pub fn expand_wikilinks_with_map(text: &str) -> (String, OffsetMap) {
+    let rewrites: Vec<Rewrite> = wikilinks(text)
+        .into_iter()
+        .map(|link| Rewrite {
+            replacement: format!("[{}](<{}{}>)", link.label, WIKI_SCHEME, link.target),
+            span: link.span,
+        })
+        .collect();
+    let map = OffsetMap::from_rewrites(rewrites);
+    let rendered = map.apply(text);
+    (rendered, map)
 }
 
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
@@ -747,6 +861,173 @@ mod tests {
             .tokens
             .iter()
             .any(|token| matches!(token, Token::Link { .. })));
+    }
+
+    /// LP2-4 偏移映射 · **无展开**:没有 wikilink 时表为恒等,`apply` 原样
+    /// 返回,全部偏移双向换算幂等。
+    #[test]
+    fn offset_map_is_identity_without_rewrites() {
+        let text = "# 标题\n\n正文没有链接。\n";
+        let (rendered, map) = expand_wikilinks_with_map(text);
+        assert_eq!(rendered, text, "无链接:渲染串即源码");
+        assert!(map.is_identity());
+        assert_eq!(map.apply(text), text);
+        for offset in [0, 1, 7, text.len()] {
+            assert_eq!(map.source_to_rendered(offset), offset);
+            assert_eq!(map.rendered_to_source(offset), offset);
+        }
+        // 空表(无改写层的组合另一侧)同样恒等
+        let empty = OffsetMap::empty();
+        assert_eq!(empty.source_to_rendered(5), 5);
+        assert_eq!(empty.rendered_to_source(5), 5);
+    }
+
+    /// LP2-4 偏移映射 · **wikilink 展开**:映射与展开输出同源 —— `apply`
+    /// 重建的渲染串与旧 `expand_wikilinks` 逐字节一致;链接之后的源偏移平移
+    /// 到渲染串里同一文本处,反向换算回到原处;段内偏移归段首;段首/段末
+    /// 两个端点互为原像。
+    #[test]
+    fn offset_map_translates_through_wikilink_expansion() {
+        let source = "见 [[架构决策]] 再谈。\n\n## 后续标题\n\n正文。\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        // 单一事实来源:渲染串由映射表自己拼出,与独立入口的展开一致
+        assert_eq!(rendered, expand_wikilinks(source));
+
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        assert_eq!(
+            map.source_to_rendered(heading_src),
+            heading_out,
+            "链接之后的偏移按累积位移平移"
+        );
+        assert_eq!(
+            map.rendered_to_source(heading_out),
+            heading_src,
+            "反向换算回到源码原处"
+        );
+
+        // 展开段内的偏移(源→渲染):归段首(改写段内没有更细的锚点)
+        let link_start = source.find("[[").expect("wikilink");
+        let link_end = source.find("]]").expect("wikilink end") + 2;
+        assert_eq!(map.source_to_rendered(link_start + 3), link_start);
+        // 渲染段内(渲染→源):映回源码段首
+        let rendered_seg_start = rendered.find("[架构决策]").expect("expanded segment");
+        assert_eq!(map.rendered_to_source(rendered_seg_start + 5), link_start);
+        // 段首互为原像、段末按「区间外」平移互逆
+        assert_eq!(map.source_to_rendered(link_start), rendered_seg_start);
+        assert_eq!(
+            map.rendered_to_source(map.source_to_rendered(link_end)),
+            link_end
+        );
+
+        // 链接之前的偏移原样(位移尚未累积)
+        assert_eq!(map.source_to_rendered(0), 0);
+        assert_eq!(map.source_to_rendered(link_start), rendered_seg_start);
+        assert_eq!(map.rendered_to_source(rendered_seg_start), link_start);
+    }
+
+    /// LP2-4 偏移映射 · **多链接**:每处 wikilink 各自贡献位移,第二个链接
+    /// 之后的偏移按两条展开的累积差平移;两个展开段之间的文本仍原样。
+    #[test]
+    fn offset_map_handles_multiple_links() {
+        let source = "首段 [[甲]] 中段文字。\n\n次段 [[乙]] 尾段。\n\n## 标题\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        assert_eq!(rendered, expand_wikilinks(source));
+
+        // 两个展开段的渲染起点
+        let first_out = rendered.find("[甲]").expect("first expanded");
+        let second_out = rendered.find("[乙]").expect("second expanded");
+        let first_src = source.find("[[甲]]").expect("first link");
+        let second_src = source.find("[[乙]]").expect("second link");
+        assert_eq!(map.source_to_rendered(first_src), first_out);
+        assert_eq!(map.source_to_rendered(second_src), second_out);
+
+        // 两段之间的文本(第一条展开已平移、第二条未):换算后仍在渲染串
+        // 里同一文本处
+        let between_src = source.find("中段文字").expect("text between links");
+        let between_out = rendered.find("中段文字").expect("same text in rendered");
+        assert_eq!(map.source_to_rendered(between_src), between_out);
+
+        // 尾部标题:两条展开的累积位移
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let heading_out = rendered.find("## 标题").expect("heading in rendered");
+        assert_eq!(map.source_to_rendered(heading_src), heading_out);
+        assert_eq!(map.rendered_to_source(heading_out), heading_src);
+        assert_eq!(
+            map.rendered_to_source(second_out + 1),
+            second_src,
+            "第二个渲染段内映回其源码段首"
+        );
+    }
+
+    /// LP2-4 偏移映射 · **带显示名**:`[[目标|显示名]]` 展开段的长度由真实
+    /// 替换串决定(label 与 target 不同长),映射按实际字节计,不存在
+    /// 「公式推导长度」的近似路径;CJK 多字节目标同样按字节平移。
+    #[test]
+    fn offset_map_labeled_wikilink_uses_actual_replacement_length() {
+        let source = "见 [[Note One|笔记]] 与 [[中文 文档]]。\n\n## 后\n";
+        let (rendered, map) = expand_wikilinks_with_map(source);
+        assert_eq!(rendered, expand_wikilinks(source));
+        assert!(
+            rendered
+                .starts_with("见 [笔记](<wiki://Note One>) 与 [中文 文档](<wiki://中文 文档>)。"),
+            "带显示名与带空格目标按真实替换串展开:{rendered}"
+        );
+
+        // 标题在两条展开之后:按两条真实替换串的累积长度差平移
+        let heading_src = source.find("## 后").expect("heading in source");
+        let heading_out = rendered.find("## 后").expect("heading in rendered");
+        assert_eq!(map.source_to_rendered(heading_src), heading_out);
+        assert_eq!(map.rendered_to_source(heading_out), heading_src);
+
+        // 累积位移非零(两条展开都变长),且正反换算在文档尾端仍闭合
+        assert_ne!(heading_src, heading_out, "展开确实改变了偏移");
+        assert_eq!(
+            map.source_to_rendered(source.len()),
+            rendered.len(),
+            "文末偏移平移到渲染串末尾"
+        );
+        assert_eq!(map.rendered_to_source(rendered.len()), source.len());
+    }
+
+    /// LP2-4 偏移映射 · **可组合口径**:两层改写各自一张表,第二层区间基于
+    /// 第一层输出,消费点按顺序串行穿过 —— 与 `PreviewState::rendered` 的
+    /// 生产链(wikilink 展开 → 相对图片 URI 改写)同构。这条用两张人造表
+    /// 把口径本身钉死(emoji 短码 #48 落地时照此再串一张)。
+    #[test]
+    fn offset_map_composes_by_serial_pass_through() {
+        // 第一层:wikilink 展开(真实生产者)
+        let source = "见 [[架构决策]] 后续。\n\n## 标题\n";
+        let (layer1_text, layer1) = expand_wikilinks_with_map(source);
+        // 第二层:在第一层输出之上再改写一处(占位 emoji 短码形态)
+        let needle = "后续";
+        let needle_at = layer1_text.find(needle).expect("needle in layer1 text");
+        let layer2 = OffsetMap::from_rewrites(vec![Rewrite {
+            span: needle_at..needle_at + needle.len(),
+            replacement: "\u{1f600}续".to_owned(),
+        }]);
+        let final_text = layer2.apply(&layer1_text);
+
+        // 串行穿过:标题偏移先平移过 wikilink 展开,再平移过第二层改写
+        let heading_src = source.find("## 标题").expect("heading");
+        let after1 = layer1.source_to_rendered(heading_src);
+        let after2 = layer2.source_to_rendered(after1);
+        assert_eq!(
+            final_text.find("## 标题"),
+            Some(after2),
+            "两层串行穿过的落点就是最终文本里的位置"
+        );
+        // 反向同理,两段逆穿回源码
+        assert_eq!(
+            layer1.rendered_to_source(layer2.rendered_to_source(after2)),
+            heading_src
+        );
+        // 第二层区间内的偏移归段首(第一层终点即第二层段首)
+        assert_eq!(
+            layer2.source_to_rendered(needle_at + 2),
+            needle_at,
+            "第二层区间内归该层段首(第一层坐标)"
+        );
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块
