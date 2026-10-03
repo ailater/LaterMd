@@ -15,6 +15,7 @@
 //! (刷新时机在归约侧),本层零 git 调用;回滚按钮只发消息,checkout
 //! 在确认模态之后(见 `ui::layout`)。
 
+use crate::backlink_panel::{jump_target, Backlink, BacklinkState, BacklinkStatus};
 use crate::command::Command;
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
 use crate::git_panel::GitPanelState;
@@ -64,6 +65,7 @@ pub fn ui(
     outline: OutlineView<'_>,
     search: &mut SearchState,
     git: &GitPanelState,
+    backlinks: &BacklinkState,
     outbox: &mut Vec<Message>,
 ) -> SidebarBands {
     let left = panel.max_rect().left();
@@ -88,6 +90,13 @@ pub fn ui(
             SidebarTab::Search => search_panel(ui, search, file_tree.root.as_deref(), outbox),
             SidebarTab::Outline => outline_panel(ui, outline, outbox),
             SidebarTab::Git => git_panel(ui, git, outbox),
+            SidebarTab::Backlinks => backlinks_panel(
+                ui,
+                backlinks,
+                file_tree.root.as_deref(),
+                current_file,
+                outbox,
+            ),
         });
     let y4 = panel.cursor().top();
 
@@ -402,6 +411,78 @@ fn snippet(line: &str) -> String {
         let cut: String = line.chars().take(SNIPPET_MAX_CHARS).collect();
         format!("{cut}…")
     }
+}
+
+/// Backlinks 页(#15):状态行 + 「谁链接了当前文档」列表。
+///
+/// 数据是 `BacklinkState` 的只读快照(触发与扫描都在归约侧,见
+/// `crate::backlink_panel` 模块文档),本层零 IO;点击只发
+/// [`Message::WikilinkClicked`],打开与切标签在归约的 `open_wikilink`。
+/// 无根/文档未落盘/扫描中/无引用四种空态给弱提示。
+fn backlinks_panel(
+    panel: &mut egui::Ui,
+    backlinks: &BacklinkState,
+    root: Option<&Path>,
+    current_file: Option<&Path>,
+    outbox: &mut Vec<Message>,
+) {
+    let Some(_root) = root else {
+        panel.weak("反向链接需要一个根目录:先在「文件」页选择");
+        return;
+    };
+    let Some(_doc) = current_file else {
+        panel.weak("保存文档后,这里会列出谁链接了它");
+        return;
+    };
+    // 防抖排程中与进行中都算「扫描中」(300ms 窗口里面板不该空白)
+    if backlinks.status == BacklinkStatus::Scanning || backlinks.debounce_due.is_some() {
+        panel.weak("扫描中…");
+    } else {
+        match &backlinks.status {
+            BacklinkStatus::Finished if backlinks.links.is_empty() => {
+                panel.weak("没有文档链接到这里");
+            }
+            BacklinkStatus::Finished => {
+                panel.weak(format!("共 {} 处引用", backlinks.links.len()));
+            }
+            BacklinkStatus::Failed(msg) => {
+                panel.weak(format!("⚠ {msg}"));
+            }
+            BacklinkStatus::Idle | BacklinkStatus::Scanning => {}
+        }
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt("backlinks-scroll")
+        .auto_shrink([false, false])
+        .show(panel, |ui| {
+            for link in &backlinks.links {
+                backlink_row(ui, link, outbox);
+            }
+            if backlinks.truncated {
+                ui.weak(format!("已达 {} 条上限,后续引用未显示", MAX_HITS));
+            }
+        });
+}
+
+/// 单条反向链接:第一行「相对根的来源路径:行号」,第二行命中行摘要;
+/// 整块一个 SelectableLabel,点击发 [`Message::WikilinkClicked`] 走
+/// `open_wikilink` 同一条跳转链路(已开切标签、缺失落提示)。返回行响应,
+/// 独立成函数便于点击测试定位。
+fn backlink_row(ui: &mut egui::Ui, link: &Backlink, outbox: &mut Vec<Message>) -> egui::Response {
+    let text = format!(
+        "{}:{}\n{}",
+        link.path.display(),
+        link.line_no,
+        snippet(&link.line_text)
+    );
+    let response = ui.selectable_label(false, text);
+    if response.clicked() {
+        outbox.push(Message::WikilinkClicked {
+            target: jump_target(&link.path),
+        });
+    }
+    response
 }
 
 /// Files 页:顶部根目录选择行 + 懒加载目录树。
@@ -1295,6 +1376,177 @@ mod tests {
         );
     }
 
+    /// 反向链接面板渲染矩阵(#15):无根/未落盘/扫描中(进行中与防抖排程)/
+    /// 无引用/失败各渲染一帧不 panic,弱提示进文本层;有结果时来源文件名、
+    /// 行号与摘要可见,超长摘要按字符截断加省略号。
+    #[test]
+    fn backlinks_panel_renders_states_without_panic() {
+        let ctx = egui::Context::default();
+        let root = PathBuf::from("/vault");
+        let doc = root.join("note.md");
+
+        // 渲染矩阵的单一场景:根/文档是否存在 + 面板状态 + 期望弱提示
+        struct Case<'a> {
+            name: &'static str,
+            root: Option<&'a Path>,
+            doc: Option<&'a Path>,
+            state: BacklinkState,
+            hint: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "无根",
+                root: None,
+                doc: Some(&doc),
+                state: BacklinkState::default(),
+                hint: "反向链接需要一个根目录",
+            },
+            Case {
+                name: "未落盘",
+                root: Some(&root),
+                doc: None,
+                state: BacklinkState::default(),
+                hint: "保存文档后",
+            },
+            Case {
+                name: "扫描中",
+                root: Some(&root),
+                doc: Some(&doc),
+                state: BacklinkState {
+                    status: BacklinkStatus::Scanning,
+                    ..BacklinkState::default()
+                },
+                hint: "扫描中",
+            },
+            Case {
+                name: "防抖排程中",
+                root: Some(&root),
+                doc: Some(&doc),
+                state: BacklinkState {
+                    debounce_due: Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    ),
+                    ..BacklinkState::default()
+                },
+                hint: "扫描中",
+            },
+            Case {
+                name: "无引用",
+                root: Some(&root),
+                doc: Some(&doc),
+                state: BacklinkState {
+                    status: BacklinkStatus::Finished,
+                    ..BacklinkState::default()
+                },
+                hint: "没有文档链接到这里",
+            },
+            Case {
+                name: "失败",
+                root: Some(&root),
+                doc: Some(&doc),
+                state: BacklinkState {
+                    status: BacklinkStatus::Failed("线程没起来".to_owned()),
+                    ..BacklinkState::default()
+                },
+                hint: "⚠ 线程没起来",
+            },
+        ];
+        for case in cases {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                backlinks_panel(ui, &case.state, case.root, case.doc, &mut Vec::new());
+            });
+            let texts = shape_texts(&output);
+            output.drop_without_applying_deltas();
+            assert!(
+                texts.iter().any(|t| t.contains(case.hint)),
+                "{}:弱提示应进文本层:{texts:?}",
+                case.name
+            );
+        }
+
+        // 有结果:来源路径:行号 + 摘要可见;超长摘要截断(带省略号)。
+        let mut state = BacklinkState {
+            status: BacklinkStatus::Finished,
+            truncated: true,
+            ..BacklinkState::default()
+        };
+        state.links.push(Backlink {
+            path: PathBuf::from("sub/a.md"),
+            line_no: 2,
+            target: "note".to_owned(),
+            line_text: "界".repeat(SNIPPET_MAX_CHARS + 30),
+        });
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            backlinks_panel(ui, &state, Some(&root), Some(&doc), &mut Vec::new());
+        });
+        let texts = shape_texts(&output);
+        output.drop_without_applying_deltas();
+        assert!(
+            texts.iter().any(|t| t.contains("sub/a.md:2")),
+            "来源路径与行号可见:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains('…')),
+            "超长摘要截断:{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|t| t.matches('界').count() <= SNIPPET_MAX_CHARS),
+            "长行的摘要按字符截断,不整段进文本层:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("上限")),
+            "截断提示行可见:{texts:?}"
+        );
+    }
+
+    /// 点击反向链接行:发出携带跳转目标串的 WikilinkClicked(来源相对
+    /// 路径剥 md 后缀);仅渲染不产生消息。
+    #[test]
+    fn clicking_backlink_row_sends_wikilink_message() {
+        let ctx = egui::Context::default();
+        let link = Backlink {
+            path: PathBuf::from("sub/b.md"),
+            line_no: 1,
+            target: "note".to_owned(),
+            line_text: "子目录来源 [[note.md]]".to_owned(),
+        };
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+
+        ctx.run_ui(RawInput::default(), |ui| {
+            rect.set(backlink_row(ui, &link, &mut outbox).rect);
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                backlink_row(ui, &link, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::WikilinkClicked {
+                target: "sub/b".to_owned()
+            }],
+            "点击走 WikilinkClicked,载荷是剥后缀的来源相对路径"
+        );
+    }
+
     /// Git 面板渲染矩阵:降级文案、干净工作区、改动列表 + 选中 diff +
     /// 历史,三条路径都不 panic;点击改动行发 GitFileSelected。
     #[test]
@@ -1592,7 +1844,8 @@ mod tests {
 
     // —— M2 三段式(docs/ui-shell-redesign.md §5)——
 
-    /// 四段顺序 helper:一行一 `NAV_ROW_H`,自上而下不重叠。
+    /// 导航行顺序 helper:一行一 `NAV_ROW_H`,自上而下不重叠;第 5 行是
+    /// 反向链接(#15,追加在尾部不打乱既有四行)。
     #[test]
     fn nav_row_center_y_follows_tab_order() {
         let row = crate::ui::tokens::NAV_ROW_H;
@@ -1605,10 +1858,15 @@ mod tests {
             100.0 + row * 3.5,
             "Git 是第四行"
         );
+        assert_eq!(
+            nav_row_center_y(100.0, SidebarTab::Backlinks),
+            100.0 + row * 4.5,
+            "反向链接是第五行"
+        );
         let ys = SidebarTab::ALL.map(|tab| nav_row_center_y(0.0, tab));
         assert!(
             ys.windows(2).all(|pair| pair[1] > pair[0]),
-            "四行自上而下:{ys:?}"
+            "五行自上而下:{ys:?}"
         );
     }
 
@@ -1732,6 +1990,7 @@ mod tests {
     ) -> SidebarBands {
         let mut tab = tab;
         let mut search = SearchState::default();
+        let backlinks = BacklinkState::default();
         let mut outbox = Vec::new();
         super::ui(
             ui,
@@ -1744,6 +2003,7 @@ mod tests {
             },
             &mut search,
             git,
+            &backlinks,
             &mut outbox,
         )
     }
@@ -1757,6 +2017,7 @@ mod tests {
         git: &GitPanelState,
         outbox: &mut Vec<Message>,
     ) {
+        let backlinks = BacklinkState::default();
         super::ui(
             ui,
             active,
@@ -1768,6 +2029,7 @@ mod tests {
             },
             search,
             git,
+            &backlinks,
             outbox,
         );
     }

@@ -217,6 +217,17 @@ pub fn trim_line_terminator(line: &[u8]) -> String {
         .to_owned()
 }
 
+/// 取 lossy 全文第 `line_breaks` 个换行之后的那一行(0 起 = 第一行),
+/// 剥掉尾部 `\r`。行号由同一份全文的换行计数折算而来,必然命中;越界
+/// (防御分支)返回空串。
+fn line_at(text: &str, line_breaks: usize) -> String {
+    text.split('\n')
+        .nth(line_breaks)
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_owned()
+}
+
 /// 同步搜索结果(MCP `search_docs` 的返回体)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchOutcome {
@@ -428,6 +439,9 @@ pub struct Backlink {
     /// 目标原文(`[[目标|显示名]]` 的前半段,保留用户写的 `.md` 后缀与
     /// 路径写法,面板原样展示)。
     pub target: String,
+    /// 链接所在行的文本(剥掉行终止符):反向链接面板的命中行摘要数据源,
+    /// 长行由展示层截断。
+    pub line_text: String,
 }
 
 /// 反向链接扫描结果。
@@ -535,6 +549,7 @@ pub fn backlinks(
                 path: path.strip_prefix(root).unwrap_or(path).to_path_buf(),
                 line_no: newlines + 1,
                 target: link.target.clone(),
+                line_text: line_at(&text, newlines),
             });
         }
         // 反向链接量级小:不因装满提前停,收全 → 排序 → 截断才确定
@@ -938,8 +953,9 @@ mod tests {
         root
     }
 
-    /// 拍平成可比较三元组(路径转 `/` 分隔,断言跨平台稳定)。
-    fn backlink_triples(outcome: &BacklinkOutcome) -> Vec<(String, usize, String)> {
+    /// 拍平成可比较四元组(路径转 `/` 分隔,断言跨平台稳定;含行文本,
+    /// 反向链接面板的摘要数据源)。
+    fn backlink_triples(outcome: &BacklinkOutcome) -> Vec<(String, usize, String, String)> {
         outcome
             .backlinks
             .iter()
@@ -948,6 +964,7 @@ mod tests {
                     link.path.to_string_lossy().replace('\\', "/"),
                     link.line_no,
                     link.target.clone(),
+                    link.line_text.clone(),
                 )
             })
             .collect()
@@ -965,12 +982,37 @@ mod tests {
         assert_eq!(
             backlink_triples(&outcome),
             vec![
-                ("a.md".into(), 3, "note".into()),
-                ("b.md".into(), 1, "note".into()),
-                ("b.md".into(), 1, "note.md".into()),
-                ("code.md".into(), 5, "note".into()),
-                ("note.md".into(), 2, "note".into()),
-                ("notes/c.md".into(), 1, "note".into()),
+                ("a.md".into(), 3, "note".into(), "见 [[note]]".into()),
+                (
+                    "b.md".into(),
+                    1,
+                    "note".into(),
+                    "[[note.md]] 与 [[note|显示名]]".into()
+                ),
+                (
+                    "b.md".into(),
+                    1,
+                    "note.md".into(),
+                    "[[note.md]] 与 [[note|显示名]]".into()
+                ),
+                (
+                    "code.md".into(),
+                    5,
+                    "note".into(),
+                    "正文 [[note]] 算".into()
+                ),
+                (
+                    "note.md".into(),
+                    2,
+                    "note".into(),
+                    "自链 [[note]] 也算".into()
+                ),
+                (
+                    "notes/c.md".into(),
+                    1,
+                    "note".into(),
+                    "子目录来源 [[note]]".into()
+                ),
             ],
             "行号按 span 起点前的换行数折算;同文件同行按目标排序"
         );
@@ -1006,7 +1048,12 @@ mod tests {
         let outcome = backlinks(&root, &root.join("Mixed Case.md"), || false, MAX_HITS);
         assert_eq!(
             backlink_triples(&outcome),
-            vec![("from.md".into(), 1, "mixed case".into())]
+            vec![(
+                "from.md".into(),
+                1,
+                "mixed case".into(),
+                "见 [[mixed case]]".into()
+            )]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1030,8 +1077,18 @@ mod tests {
         assert_eq!(
             backlink_triples(&outcome),
             vec![
-                ("src.md".into(), 1, "dir/goal".into()),
-                ("src.md".into(), 2, "DIR/GOAL.md".into()),
+                (
+                    "src.md".into(),
+                    1,
+                    "dir/goal".into(),
+                    "[[dir/goal]] 命中".into()
+                ),
+                (
+                    "src.md".into(),
+                    2,
+                    "DIR/GOAL.md".into(),
+                    "[[DIR/GOAL.md]] 大写也命中".into()
+                ),
             ],
             "第 3 行 [[other/goal]] 指向另一目录,不命中"
         );
@@ -1054,7 +1111,12 @@ mod tests {
         let outcome = backlinks(&root, &root.join("ghost.md"), || false, MAX_HITS);
         assert_eq!(
             backlink_triples(&outcome),
-            vec![("ref.md".into(), 1, "ghost".into())]
+            vec![(
+                "ref.md".into(),
+                1,
+                "ghost".into(),
+                "指向未落盘的 [[ghost]]".into()
+            )]
         );
         let _ = std::fs::remove_dir_all(&root);
     }

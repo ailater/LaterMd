@@ -136,6 +136,22 @@ impl LaterMdApp {
         if state.search.is_running() {
             ctx.request_repaint();
         }
+        // 反向链接的同款三段(#15):去抖到点在归约侧发起(end_of_logic 的
+        // 快照比对顺延计时,这里到点帧触发);等待中按剩余时长要帧,扫描
+        // 进行中持续要帧,结果到达下一帧收流,Finished 后自然停。
+        if state
+            .backlinks
+            .debounce_due
+            .is_some_and(|due| due <= std::time::Instant::now())
+        {
+            state.apply(Message::BacklinksRequested);
+        }
+        if let Some(due) = state.backlinks.debounce_due {
+            ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
+        }
+        if state.backlinks.is_scanning() {
+            ctx.request_repaint();
+        }
         // Git 状态轮询:有文件树根且尚未降级才轮询(无根无事可刷;非 git
         // 目录零轮询——重探由换根/切 Git 页触发,egui 得以收敛到深度空闲,
         // 这正是 search 去抖测试守护的不变量)。到点即刷(同步毫秒级,见
@@ -274,6 +290,7 @@ impl LaterMdApp {
                     },
                     &mut self.state.search,
                     &self.state.git,
+                    &self.state.backlinks,
                     &mut self.outbox,
                 );
             });
