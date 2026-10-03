@@ -21,6 +21,10 @@ pub enum Command {
     New,
     /// 打开已有文件。
     Open,
+    /// 快速打开…(#24):居中浮层模糊搜文件树全部 md(打开)与命令全集
+    /// (执行)。命令与键位先注册(本条),浮层状态机与绘制在 C3 接入,
+    /// 归约暂只翻转最小标志。
+    QuickOpen,
     /// 保存;从未落盘时等价于另存为。
     Save,
     /// 另存为(总是弹框)。
@@ -120,9 +124,10 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 37] = [
+    pub const ALL: [Command; 38] = [
         Self::New,
         Self::Open,
+        Self::QuickOpen,
         Self::Save,
         Self::SaveAs,
         Self::ExportHtml,
@@ -190,6 +195,7 @@ impl Command {
         match self {
             Self::New => "new",
             Self::Open => "open",
+            Self::QuickOpen => "quick_open",
             Self::Save => "save",
             Self::SaveAs => "save_as",
             Self::ExportHtml => "export_html",
@@ -233,6 +239,7 @@ impl Command {
         match self {
             Self::New => "新建",
             Self::Open => "打开",
+            Self::QuickOpen => "快速打开…",
             Self::Save => "保存",
             Self::SaveAs => "另存为",
             Self::ExportHtml => "导出 HTML",
@@ -287,6 +294,8 @@ impl Command {
         let shortcut = match self {
             Self::New => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N),
             Self::Open => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O),
+            // 快速打开(#24):VS Code / 主流编辑器同款;出厂表 P 键无占用者
+            Self::QuickOpen => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::P),
             Self::Save => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S),
             Self::SaveAs => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::S)
@@ -386,6 +395,8 @@ impl Command {
         match self {
             Self::New => Icon::New,
             Self::Open => Icon::Open,
+            // 快速打开是「搜文件」,与文档内查找共用放大镜
+            Self::QuickOpen => Icon::Search,
             Self::Save => Icon::Save,
             Self::SaveAs => Icon::SaveAs,
             Self::ExportHtml => Icon::Export,
@@ -425,6 +436,7 @@ impl Command {
         match self {
             Self::New => Message::FileCommand(FileCmd::New),
             Self::Open => Message::FileCommand(FileCmd::Open),
+            Self::QuickOpen => Message::ToggleQuickOpen,
             Self::Save => Message::FileCommand(FileCmd::Save),
             Self::SaveAs => Message::FileCommand(FileCmd::SaveAs),
             Self::ExportHtml => Message::ExportHtml,
@@ -852,5 +864,61 @@ mod tests {
             },
         );
         output.drop_without_applying_deltas();
+    }
+
+    /// 快速打开(#24 C2)默认键位:Cmd/Ctrl+P,出厂表无第二个占用者
+    /// (撞键拒绝口径,decisions-pending.md 现状登记在 #22「界面打磨
+    /// 批次」;本文件既有测试注释引作 #9,与该文件现状不符)。真按键
+    /// 只触发这一条,消息映射到 `Message::ToggleQuickOpen`。
+    #[test]
+    fn quick_open_is_ctrl_p_and_conflict_free() {
+        let ctrl_p = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND,
+            key: Key::P,
+        };
+        assert_eq!(
+            Command::QuickOpen.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(ctrl_p),
+            "QuickOpen 出厂默认 = Cmd/Ctrl+P"
+        );
+        assert_eq!(Keymap::builtin().get(Command::QuickOpen), Some(ctrl_p));
+        assert_eq!(
+            Keymap::builtin().conflict(Command::QuickOpen, ctrl_p),
+            None,
+            "Cmd/Ctrl+P 不该撞任何出厂键位"
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::P, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::QuickOpen]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(Command::QuickOpen.message(), Message::ToggleQuickOpen);
+    }
+
+    /// ALL 数组与命令集同步:新命令忘了进 ALL 的话,快捷键派发、设置页
+    /// 遍历与 keymap 存档都会漏掉它。长度与无重复钉在这里,加命令时随
+    /// 实现更新。
+    #[test]
+    fn all_commands_listed_exactly_once() {
+        assert_eq!(Command::ALL.len(), 38);
+        let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), Command::ALL.len(), "ALL 里不得有重复命令");
     }
 }

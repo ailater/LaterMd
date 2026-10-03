@@ -253,6 +253,9 @@ pub struct State {
     /// 缓存随 query/文档变化重扫;跳转经 `pending_selection`(字符偏移,
     /// 与格式动作同一契约)。
     pub find: FindBarState,
+    /// 「快速打开」浮层是否可见(#24):C2 的最小状态,归约只翻转;
+    /// 查询词、选中项与候选快照在 C3 接入。
+    pub quick_open_open: bool,
     /// 在途 AI 流的发起标签 id;`None` = 无流。发起时锁定,收尾
     /// (成功/失败/作废)清除 —— [`Message::AiChunk`] / [`Message::AiDone`]
     /// 的写入目标由它决定,与 `tabs.active` 无关:切标签不中断也不改道。
@@ -397,6 +400,7 @@ impl Default for State {
             layout_written: LayoutSettings::default(),
             tabs: TabsState::new(SAMPLE_MD),
             find: FindBarState::default(),
+            quick_open_open: false,
             ai_active_tab: None,
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
@@ -453,6 +457,9 @@ pub enum Message {
     RightPanelToggled,
     /// 切换禅定模式(docs/ui-shell-redesign.md §7;M4 实现,命令层先挂上)。
     ZenToggled,
+    /// 切换「快速打开」浮层(#24):C2 的最小状态只翻转可见标志;
+    /// 查询词、选中项与候选快照等完整状态与浮层绘制在 C3 接入。
+    ToggleQuickOpen,
     /// 请求一次 Markdown 格式动作(docs/ui-shell-redesign.md §6.4)。
     ///
     /// 工具条按钮与快捷键两个入口同源;真正的语义全在
@@ -757,6 +764,7 @@ impl State {
             Message::SidebarToggled => self.toggle_left_panel(),
             Message::RightPanelToggled => self.toggle_right_panel(),
             Message::ZenToggled => self.toggle_zen(),
+            Message::ToggleQuickOpen => self.quick_open_open = !self.quick_open_open,
             Message::FormatRequested(action) => self.apply_format(action),
             Message::FindBarToggled(open) => self.toggle_find(open),
             Message::FindQueryChanged(query) => self.find_query_changed(query),
@@ -2800,6 +2808,20 @@ mod tests {
 
         state.apply(Message::SidebarToggled);
         assert!(state.layout.left && !state.layout.right, "只开左栏");
+    }
+
+    /// 快速打开(#24 C2)的最小归约:`ToggleQuickOpen` 只翻转可见标志,
+    /// 再翻一次回闭;不牵连任何其他状态(完整浮层状态机在 C3)。
+    #[test]
+    fn toggle_quick_open_flips_flag_only() {
+        let mut state = State::default();
+        assert!(!state.quick_open_open, "出厂关闭");
+
+        state.apply(Message::ToggleQuickOpen);
+        assert!(state.quick_open_open);
+
+        state.apply(Message::ToggleQuickOpen);
+        assert!(!state.quick_open_open, "再按一次关闭");
     }
 
     /// 面板开合落到 `layout.json`,重启(`load_from`)后逐项一致。写盘在帧末
