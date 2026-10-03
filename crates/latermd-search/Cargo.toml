@@ -3,7 +3,7 @@ name = "latermd-search"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Markdown vault retrieval: gitignore-aware walk and regex line search (sync + streaming, no UI deps)"
+description = "Markdown vault retrieval: gitignore-aware walk, regex line search and wikilink backlink scan (sync + streaming, no UI deps)"
 
 [dependencies]
 # 目录遍历(ADR-004 清单;遵循 .gitignore,ADR-005 §4.1)。list_files 的 glob
@@ -14,3 +14,6 @@ ignore = "0.4.33"
 grep-searcher = "0.1.17"
 # 正则(ADR-004 清单);bytes 变体匹配 LineIter 的 &[u8] 产出
 regex = "1.13.1"
+# 反向链接扫描的 wikilink 抽取复用数据层的单一实现(铁律一:不引第二套
+# 方言)。workspace 内 path 依赖,latermd-md 不依赖 egui,本 crate 仍无 UI 依赖。
+latermd-md = { path = "../latermd-md" }

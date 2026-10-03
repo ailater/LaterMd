@@ -1,17 +1,22 @@
-//! 文档库检索核心:`.gitignore` 感知的目录遍历 + 逐行正则匹配。
+//! 文档库检索核心:`.gitignore` 感知的目录遍历 + 逐行正则匹配 + wikilink
+//! 反向链接扫描。
 //!
 //! 本 crate 是**侧边栏搜索与 MCP `search_docs` / `list_files` 的单一实现**
 //! (docs/mcp-plan.md §3 方案 A:不复制一份给 MCP,否则两套 `.gitignore`
 //! 语义与两套截断上限必然漂移)。**不依赖 egui/eframe**(铁律二),因此
 //! MCP server(后台线程)与 GUI 归约都能直接调。
 //!
-//! 两套入口共用同一段遍历主体(私有 `scan`):
+//! 搜索的两套入口与 [`backlinks`] 共用同一段遍历骨架(私有 `walk_markdown`):
 //!
 //! - [`SearchService`]:后台线程 + 有界 channel,供 UI 流式取用。取消是
 //!   **代际号语义** —— `spawn`/`cancel` 都推进全局代际,旧线程在检查点
 //!   自行退出,迟到的旧代事件由接收端按代际丢弃;UI 侧 `try_recv` 永不
 //!   阻塞,也不 join 后台线程。
 //! - [`search_sync`]:在调用线程一次跑完,供无 UI 的消费者(MCP 工具)使用。
+//!
+//! [`backlinks`] 反向链接扫描只做同步直扫:单文档被引量级小,面板要
+//! 完整列表而非流式增量,不值得复制一套 channel + 代际号;可中断性由
+//! `stop` 闭包保留(取舍见 decisions-pending #87)。
 //!
 //! 行迭代用 `grep_searcher::LineIter`(ripgrep 同款行语义)。不走
 //! `Searcher::search_*` 的原因:那组 API 全部要求 `grep_matcher::Matcher`
@@ -111,21 +116,20 @@ fn compile(query: &SearchQuery) -> Result<Regex, SearchError> {
         .map_err(|error| SearchError::InvalidPattern(error.to_string()))
 }
 
-/// 遍历 + 逐行匹配的两用主体,被 [`SearchService`] 与 [`search_sync`] 共用。
+/// 遍历骨架:`.gitignore` 感知(require_git(false):无 `.git` 的普通目录
+/// 也吃自己写的 .gitignore,与文件树同一直觉)+ Markdown 扩展名过滤 +
+/// 单文件大小上限 + 整读进内存。被 [`scan`] 与 [`backlinks`] 共用 ——
+/// 搜索与反向链接的「哪些文件算数」是同一件事,共用一段实现防两套语义
+/// 漂移(与模块头「单一实现」同源)。
 ///
-/// - `stop`:外部取消检查点(代际号),返回 true 立即结束且**不算截断**。
-/// - `emit`:返回 false 表示「已装满,别再给了」,此时判为截断。
-///
-/// 取消检查点在「每进一个条目」与「每发一条命中」;单文件的行循环里不查
-/// —— 内存中扫一遍是毫秒级,不值得为此加原子读。
-fn scan(
+/// `visit` 收到(路径, 全文字节);返回 false 表示调用方已装满,立即结束。
+/// 返回值:false = 被 `stop` 取消或 `visit` 要求提前结束。
+/// 遍历错误(权限、条目消失)跳过:导航类扫描不因个别条目失败而整体失败。
+fn walk_markdown(
     root: &Path,
-    regex: &Regex,
-    stop: impl Fn() -> bool,
-    mut emit: impl FnMut(SearchResult) -> bool,
+    stop: &impl Fn() -> bool,
+    mut visit: impl FnMut(&Path, &[u8]) -> bool,
 ) -> bool {
-    // require_git(false):无 .git 的普通目录也吃自己写的 .gitignore,与
-    // 文件树同一直觉;遍历错误(权限、条目消失)跳过
     for entry in WalkBuilder::new(root).require_git(false).build().flatten() {
         if stop() {
             return false;
@@ -146,28 +150,51 @@ fn scan(
         if metadata.len() > MAX_FILE_BYTES {
             continue;
         }
-        // 读失败(权限、竞争删除)跳过该文件:搜索是导航手段,不因个别
-        // 文件不可读而整体失败
+        // 读失败(权限、竞争删除)跳过该文件,理由同上
         let Ok(haystack) = std::fs::read(path) else {
             continue;
         };
-        for (index, line) in LineIter::new(b'\n', &haystack).enumerate() {
+        if !visit(path, &haystack) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 遍历 + 逐行匹配的两用主体,被 [`SearchService`] 与 [`search_sync`] 共用。
+///
+/// - `stop`:外部取消检查点(代际号),返回 true 立即结束且**不算截断**。
+/// - `emit`:返回 false 表示「已装满,别再给了」,此时判为截断。
+///
+/// 取消检查点在「每进一个条目」与「每发一条命中」;单文件的行循环里不查
+/// —— 内存中扫一遍是毫秒级,不值得为此加原子读。
+fn scan(
+    root: &Path,
+    regex: &Regex,
+    stop: impl Fn() -> bool,
+    mut emit: impl FnMut(SearchResult) -> bool,
+) -> bool {
+    let mut truncated = false;
+    walk_markdown(root, &stop, |path, haystack| {
+        for (index, line) in LineIter::new(b'\n', haystack).enumerate() {
             if !regex.is_match(line) {
                 continue;
             }
             if stop() {
-                return false;
+                return false; // 取消,不算截断(truncated 保持 false)
             }
             if !emit(SearchResult {
                 path: path.to_path_buf(),
                 line_no: index + 1,
                 line_text: trim_line_terminator(line),
             }) {
-                return true; // 调用方装满 = 截断
+                truncated = true; // 调用方装满 = 截断
+                return false;
             }
         }
-    }
-    false
+        true
+    });
+    truncated
 }
 
 /// 扩展名是否 Markdown。
@@ -388,6 +415,137 @@ pub fn list_files(
     let truncated = entries.len() > limit;
     entries.truncate(limit);
     Ok(ListOutcome { entries, truncated })
+}
+
+/// 一条反向链接:来源文档里指向目标文档的一处 `[[wikilink]]`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backlink {
+    /// 来源文档相对遍历根的路径(与 [`FileEntry`] 同口径,不暴露绝对路径,
+    /// 消费方拿它即可跳转打开来源文档)。
+    pub path: PathBuf,
+    /// 链接所在行,1 起(按链接 span 起点之前的换行数折算)。
+    pub line_no: usize,
+    /// 目标原文(`[[目标|显示名]]` 的前半段,保留用户写的 `.md` 后缀与
+    /// 路径写法,面板原样展示)。
+    pub target: String,
+}
+
+/// 反向链接扫描结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BacklinkOutcome {
+    /// 按(来源路径, 行号, 目标)排序:同一来源的引用按行自上而下聚在一起。
+    pub backlinks: Vec<Backlink>,
+    /// 条数达到 `max_hits` 被截断。排序后截断,截哪几条是确定性的
+    /// (与 [`list_files`] 同款纪律)。
+    pub truncated: bool,
+}
+
+/// 剥掉末段的一个 `.md` / `.markdown` 后缀(`[[同名.md]]` 与 `[[同名]]`
+/// 互容;`.markdown` 与 `.md` 互不为对方后缀,剥谁先谁后结果唯一)。
+fn strip_md_extension(name: &str) -> &str {
+    if let Some(stem) = name.strip_suffix(".markdown") {
+        stem
+    } else {
+        name.strip_suffix(".md").unwrap_or(name)
+    }
+}
+
+/// 相对路径比较键:分隔符统一 `/`、丢空段与 `.`、末段剥一个 md 后缀、
+/// 小写。含 `..`(越出库根)或剥完为空返回 `None`,不参与匹配。
+fn path_key(segments: Vec<String>) -> Option<String> {
+    if segments.iter().any(|segment| segment == "..") {
+        return None;
+    }
+    let mut parts: Vec<String> = segments
+        .into_iter()
+        .filter(|segment| !segment.is_empty() && segment != ".")
+        .collect();
+    let last = parts.pop()?;
+    let mut key: Vec<String> = parts.into_iter().map(|part| part.to_lowercase()).collect();
+    key.push(strip_md_extension(&last).to_lowercase());
+    Some(key.join("/"))
+}
+
+/// wikilink 目标串是否指向 `doc_rel`(目标文档相对遍历根的路径)。
+///
+/// - 目标不含 `/`:按文件名 —— 剥一个 `.md`/`.markdown` 后缀后与目标文档
+///   的 stem 忽略大小写全等(decisions-pending #26 `find_by_name` 的 stem
+///   口径 + #87 的后缀容错,扩展名本身不限 md/markdown)。
+/// - 目标含 `/`:按相对路径 —— 两侧都归一化分隔符、末段剥后缀后忽略
+///   大小写全等,与 `find_by_name`「带 `/` 按相对路径直取」正向对称,
+///   不同目录的同名文档不被 `[[dir/doc]]` 误伤。
+///
+/// 围栏代码块内的 `[[..]]` 不进入本函数(由 [`latermd_md::wikilinks`] 在
+/// 抽取时豁免);目标里的 `#` 锚点(`[[doc#章节]]`)不剥,与正向解析同口径。
+fn target_matches_doc(target: &str, doc_rel: &Path) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    if target.contains('/') || target.contains('\\') {
+        // 目标串两种分隔符都认;文档路径交给 Path::components 归一
+        let target_key = path_key(target.split(['/', '\\']).map(str::to_owned).collect());
+        let doc_key = path_key(
+            doc_rel
+                .components()
+                .filter_map(|component| component.as_os_str().to_str().map(str::to_owned))
+                .collect(),
+        );
+        return target_key.is_some_and(|key| Some(key) == doc_key);
+    }
+    doc_rel.file_stem().is_some_and(|stem| {
+        strip_md_extension(target).to_lowercase() == stem.to_string_lossy().to_lowercase()
+    })
+}
+
+/// 反向链接扫描:全仓找出「哪些文档通过 `[[wikilink]]` 指向指定文档」
+/// (反向链接面板的底层单一实现)。
+///
+/// - `doc`:目标文档路径。在遍历根之内取相对路径,之外原样使用;文件名
+///   (stem)与相对路径两把匹配钥匙都从它派生,不要求该文档已落盘。
+/// - 匹配口径(decisions-pending #26 / #87):目标不含 `/` 按文件名 stem
+///   忽略大小写全等(`[[同名]]`/`[[同名.md]]` 互容),含 `/` 按相对路径
+///   全等;围栏代码块内的 `[[..]]` 由 `latermd_md::wikilinks` 抽取时豁免。
+///   **不校验目标文档存在**——扫描是纯文本匹配,`[[ghost]]` 指向未落盘的
+///   ghost 同样计入(悬空引用与「未保存文档已被引用」由此天然覆盖)。
+/// - 形态:同步直扫(反向链接量级小,面板要完整列表而非流式增量,不为
+///   一次直扫复制 SearchService 的 channel + 代际号);`stop` 短路保留,
+///   大仓可随时中断 —— 中断时返回已收到的部分,不置 `truncated`。
+pub fn backlinks(
+    root: &Path,
+    doc: &Path,
+    stop: impl Fn() -> bool,
+    max_hits: usize,
+) -> BacklinkOutcome {
+    let doc_rel = doc.strip_prefix(root).unwrap_or(doc);
+    let mut outcome = BacklinkOutcome::default();
+    walk_markdown(root, &stop, |path, haystack| {
+        // 坏档替换 U+FFFD 继续:不因个别非 UTF-8 文件让整次扫描失败
+        // (span 与行号都基于同一份 lossy 串,自洽)
+        let text = String::from_utf8_lossy(haystack);
+        for link in latermd_md::wikilinks(&text) {
+            if !target_matches_doc(&link.target, doc_rel) {
+                continue;
+            }
+            let newlines = text.as_bytes()[..link.span.start]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count();
+            outcome.backlinks.push(Backlink {
+                path: path.strip_prefix(root).unwrap_or(path).to_path_buf(),
+                line_no: newlines + 1,
+                target: link.target.clone(),
+            });
+        }
+        // 反向链接量级小:不因装满提前停,收全 → 排序 → 截断才确定
+        true
+    });
+    outcome.backlinks.sort_by(|left, right| {
+        (&left.path, left.line_no, &left.target).cmp(&(&right.path, right.line_no, &right.target))
+    });
+    outcome.truncated = outcome.backlinks.len() > max_hits;
+    outcome.backlinks.truncate(max_hits);
+    outcome
 }
 
 #[cfg(test)]
@@ -750,6 +908,177 @@ mod tests {
         let root = sample_vault("list-bad-glob");
         let outcome = list_files(&root, None, Some("[[["), MAX_LIST_ENTRIES);
         assert!(outcome.is_err() || outcome.is_ok(), "不 panic 即可");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── 反向链接扫描(backlinks)──────────────────────────────────
+
+    /// 反向链接样本库:目标文档 `note.md` 被多个文件以多种写法引用,外加
+    /// 四类负样本(gitignore 排除、围栏代码块、draft 镜像、无链接文档)。
+    fn backlink_vault(name: &str) -> PathBuf {
+        let root = temp_vault(name);
+        // 目标文档自身带一处自链(第 2 行):自链也是真实引用,计入
+        std::fs::write(root.join("note.md"), "我是 note\n自链 [[note]] 也算\n").unwrap();
+        std::fs::write(root.join("a.md"), "第一行\n第二行\n见 [[note]]\n").unwrap();
+        // 同一行两条:`.md` 后缀写法 + 带显示名写法(目标都取前半段)
+        std::fs::write(root.join("b.md"), "[[note.md]] 与 [[note|显示名]]\n").unwrap();
+        std::fs::create_dir(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/c.md"), "子目录来源 [[note]]\n").unwrap();
+        std::fs::write(root.join("plain.md"), "没有链接\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        std::fs::write(root.join("ignored.md"), "[[note]] 不该出现\n").unwrap();
+        // 围栏代码块里的 [[..]] 不算链接;围栏后的正文链接照算(第 5 行)
+        std::fs::write(
+            root.join("code.md"),
+            "```rust\nlet grid = [[note]];\nlet x = grid[[note]][0];\n```\n正文 [[note]] 算\n",
+        )
+        .unwrap();
+        // autosave 镜像(#18)不是 Markdown,天然不入扫描
+        std::fs::write(root.join("note.md.latermd-draft"), "[[note]] 镜像不算\n").unwrap();
+        root
+    }
+
+    /// 拍平成可比较三元组(路径转 `/` 分隔,断言跨平台稳定)。
+    fn backlink_triples(outcome: &BacklinkOutcome) -> Vec<(String, usize, String)> {
+        outcome
+            .backlinks
+            .iter()
+            .map(|link| {
+                (
+                    link.path.to_string_lossy().replace('\\', "/"),
+                    link.line_no,
+                    link.target.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// 多文件互链 + 自链 + `.md` 后缀容错 + 带显示名 + 子目录来源;来源路径
+    /// 是相对路径;gitignore 排除项、代码块内 `[[..]]`、draft 镜像、无链接
+    /// 文档全部不出现(集合精确相等同时覆盖正负样本)。
+    #[test]
+    fn backlinks_collect_references_across_files() {
+        let root = backlink_vault("collect");
+        let outcome = backlinks(&root, &root.join("note.md"), || false, MAX_HITS);
+
+        assert!(!outcome.truncated);
+        assert_eq!(
+            backlink_triples(&outcome),
+            vec![
+                ("a.md".into(), 3, "note".into()),
+                ("b.md".into(), 1, "note".into()),
+                ("b.md".into(), 1, "note.md".into()),
+                ("code.md".into(), 5, "note".into()),
+                ("note.md".into(), 2, "note".into()),
+                ("notes/c.md".into(), 1, "note".into()),
+            ],
+            "行号按 span 起点前的换行数折算;同文件同行按目标排序"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CJK 与带空格目标:无后缀与 `.md` 后缀两写法都命中。
+    #[test]
+    fn backlinks_match_cjk_and_spaced_targets() {
+        let root = temp_vault("cjk-space");
+        std::fs::write(root.join("笔记 一.md"), "目标文档\n").unwrap();
+        std::fs::write(root.join("from.md"), "见 [[笔记 一]] 与 [[笔记 一.md]]\n").unwrap();
+
+        let outcome = backlinks(&root, &root.join("笔记 一.md"), || false, MAX_HITS);
+        assert_eq!(
+            outcome
+                .backlinks
+                .iter()
+                .map(|link| (link.line_no, link.target.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, "笔记 一".to_owned()), (1, "笔记 一.md".to_owned())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 文件名匹配忽略大小写(与 find_by_name 的 stem 口径一致,#26)。
+    #[test]
+    fn backlinks_file_name_match_is_case_insensitive() {
+        let root = temp_vault("case");
+        std::fs::write(root.join("Mixed Case.md"), "目标\n").unwrap();
+        std::fs::write(root.join("from.md"), "见 [[mixed case]]\n").unwrap();
+
+        let outcome = backlinks(&root, &root.join("Mixed Case.md"), || false, MAX_HITS);
+        assert_eq!(
+            backlink_triples(&outcome),
+            vec![("from.md".into(), 1, "mixed case".into())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 路径式目标按相对路径匹配(#87):大小写不敏感、`.md` 后缀容错;
+    /// 不同目录的同名文档不被 `[[other/goal]]` 误伤。
+    #[test]
+    fn backlinks_match_path_targets_by_relative_path() {
+        let root = temp_vault("path-target");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("dir/Goal.md"), "目标\n").unwrap();
+        std::fs::write(root.join("other/Goal.md"), "同名不同目录\n").unwrap();
+        std::fs::write(
+            root.join("src.md"),
+            "[[dir/goal]] 命中\n[[DIR/GOAL.md]] 大写也命中\n[[other/goal]] 不指向 dir\n",
+        )
+        .unwrap();
+
+        let outcome = backlinks(&root, &root.join("dir/Goal.md"), || false, MAX_HITS);
+        assert_eq!(
+            backlink_triples(&outcome),
+            vec![
+                ("src.md".into(), 1, "dir/goal".into()),
+                ("src.md".into(), 2, "DIR/GOAL.md".into()),
+            ],
+            "第 3 行 [[other/goal]] 指向另一目录,不命中"
+        );
+
+        // 换成 .markdown 扩展名后,无后缀/带 .md 的路径目标都仍命中
+        // (stem 与扩展名互不绑定)
+        std::fs::remove_file(root.join("dir/Goal.md")).unwrap();
+        std::fs::write(root.join("dir/Goal.markdown"), "换扩展名\n").unwrap();
+        let outcome = backlinks(&root, &root.join("dir/Goal.markdown"), || false, MAX_HITS);
+        assert_eq!(outcome.backlinks.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 悬空引用计入:目标文档不存在,指向它的引用照报(#87 的口径)。
+    #[test]
+    fn backlinks_count_dangling_references() {
+        let root = temp_vault("dangling");
+        std::fs::write(root.join("ref.md"), "指向未落盘的 [[ghost]]\n").unwrap();
+
+        let outcome = backlinks(&root, &root.join("ghost.md"), || false, MAX_HITS);
+        assert_eq!(
+            backlink_triples(&outcome),
+            vec![("ref.md".into(), 1, "ghost".into())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// stop 短路:发起即取消,一条不扫、不 panic,也不算截断。
+    #[test]
+    fn backlinks_stop_short_circuits() {
+        let root = backlink_vault("stop");
+        let outcome = backlinks(&root, &root.join("note.md"), || true, MAX_HITS);
+        assert!(outcome.backlinks.is_empty());
+        assert!(!outcome.truncated, "取消不算截断");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 上限截断:收全 → 排序 → 截断,保留的是排序后的前 N 条(确定性,
+    /// 与 list_files 同款纪律)。
+    #[test]
+    fn backlinks_truncate_after_sort() {
+        let root = backlink_vault("truncate");
+        let full = backlinks(&root, &root.join("note.md"), || false, MAX_HITS);
+        let capped = backlinks(&root, &root.join("note.md"), || false, 2);
+
+        assert!(capped.truncated);
+        assert_eq!(capped.backlinks, full.backlinks[..2].to_vec());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
