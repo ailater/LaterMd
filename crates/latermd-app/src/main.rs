@@ -28,6 +28,7 @@ mod filetree;
 #[cfg(test)]
 mod font_metrics_repro;
 mod fonts;
+mod fuzzy;
 mod git_diff;
 mod git_panel;
 mod keymap;
