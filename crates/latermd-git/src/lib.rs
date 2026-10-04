@@ -28,6 +28,15 @@ const MAX_DIFF_BYTES: usize = 64 * 1024;
 const TRUNCATION_NOTICE: &str = "\n…(diff 超过 64KB,已截断)\n";
 /// pathspec 命中二进制文件(无文本 diff)时的占位输出。
 const BINARY_NOTICE: &str = "(二进制文件,无文本 diff)\n";
+/// 行级结构([`FileDiff`])命中二进制文件时的占位文案,渲染层直接显示;
+/// 与 BINARY_NOTICE 是同一份字面量文案(测试
+/// `notices_share_text_between_unified_and_structured` 钉住,改文案两处
+/// 一起改)。注:diff_file 现状对二进制实际输出 libgit2 原生
+/// "Binary files … differ" 文本,不走 BINARY_NOTICE 分支。
+pub const DIFF_BINARY_PLACEHOLDER: &str = "(二进制文件,无文本 diff)";
+/// 行级结构([`FileDiff`])超上限截断时的提示文案,渲染层追加;
+/// 与 [`diff_file`] 的 TRUNCATION_NOTICE 同一来源(同上被测试钉住)。
+pub const DIFF_TRUNCATION_PLACEHOLDER: &str = "…(diff 超过 64KB,已截断)";
 
 /// 单文件状态码,与 `git status --short` 语义一致:
 /// `M` 已修改、`A` 已暂存新增、`U` 未合并(冲突)、`D` 已删除、`?` 未跟踪。
@@ -101,6 +110,58 @@ pub struct BlameLine {
     pub short_hash: String,
     /// 该提交的首行说明。
     pub subject: String,
+}
+
+/// 行级 diff 中一行的分类。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DiffLineKind {
+    /// 上下文行:两侧都有,`old_lineno`/`new_lineno` 均有效。
+    Context,
+    /// 删除行:只在旧侧,`old_lineno` 有效、`new_lineno` 为 `None`。
+    Deleted,
+    /// 新增行:只在新侧,`new_lineno` 有效、`old_lineno` 为 `None`。
+    Added,
+}
+
+/// 行级 diff 的一行。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiffLine {
+    /// 旧文件行号(1 起);删除行与上下文行有,新增行为 `None`。
+    pub old_lineno: Option<u32>,
+    /// 新文件行号(1 起);新增行与上下文行有,删除行为 `None`。
+    pub new_lineno: Option<u32>,
+    /// 行分类。
+    pub kind: DiffLineKind,
+    /// 行文本(已去行尾 `\n`/`\r`,UTF-8 字符边界完整,不会截半字符)。
+    pub text: String,
+}
+
+/// 行级 diff 的一个 hunk:hunk 头的行号范围 + 顺序行序列。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiffHunk {
+    /// 旧侧起始行号(hunk 头 `@@ -old_start,old_lines`;全新文件为 0)。
+    pub old_start: u32,
+    /// 旧侧行数。
+    pub old_lines: u32,
+    /// 新侧起始行号(`@@ +new_start,new_lines`;整文件删除为 0)。
+    pub new_start: u32,
+    /// 新侧行数。
+    pub new_lines: u32,
+    /// 行序列,按 diff 输出顺序(上下文/删除/新增交错)。
+    pub lines: Vec<DiffLine>,
+}
+
+/// 单文件的行级结构化 diff([`diff_file_lines`] 的返回)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FileDiff {
+    /// hunk 序列;无改动或二进制文件时为空。
+    pub hunks: Vec<DiffHunk>,
+    /// pathspec 命中二进制文件(无文本 diff):`hunks` 为空,渲染层显示
+    /// [`DIFF_BINARY_PLACEHOLDER`]。
+    pub binary: bool,
+    /// 输出超过 ~64KB 上限在行边界截断(整行丢弃,不截半字符):渲染层
+    /// 追加 [`DIFF_TRUNCATION_PLACEHOLDER`]。
+    pub truncated: bool,
 }
 
 /// [`log`] 的默认条数上限。
@@ -201,21 +262,8 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitInfo>, String> {
 /// ~64KB 上限时截断并追加提示行。
 pub fn diff_file(root: &Path, path: &str) -> Result<String, String> {
     let repo = open_repo(root)?;
-    if repo
-        .is_empty()
-        .map_err(|error| format!("检查仓库状态失败: {error}"))?
-    {
-        return Err("仓库还没有任何提交,没有 HEAD 可对比".to_owned());
-    }
-    let tree = repo
-        .head()
-        .and_then(|head| head.peel_to_tree())
-        .map_err(|error| format!("读取 HEAD 失败: {error}"))?;
-    let mut options = DiffOptions::new();
-    options.pathspec(path);
-    let diff = repo
-        .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))
-        .map_err(|error| format!("计算 diff 失败: {error}"))?;
+    let tree = head_tree(&repo)?;
+    let diff = head_to_workdir_diff(&repo, &tree, path)?;
     let mut text = String::new();
     for index in 0..diff.deltas().len() {
         match Patch::from_diff(&diff, index).map_err(|error| format!("生成 diff 失败: {error}"))?
@@ -231,6 +279,41 @@ pub fn diff_file(root: &Path, path: &str) -> Result<String, String> {
         }
     }
     Ok(truncate_diff(&text))
+}
+
+/// 单文件 HEAD 与工作区(含暂存区)的行级结构化 diff(双栏对比视图的
+/// 数据源)。
+///
+/// 仓库打开、pathspec 路径解析、HEAD 对 workdir+index 的 diff 口径与
+/// [`diff_file`] 完全一致:无改动返回空 `hunks`(由调用方显示「无改动」);
+/// 空仓库返回 Err;未跟踪文件不参与;pathspec 命中二进制文件时 `binary`
+/// 置位、`hunks` 为空。行号是 1 起的真实文件行号(新增行只有新侧、删除
+/// 行只有旧侧、上下文行两侧都有),hunk 头的行号范围与 unified 输出一致。
+/// 输出超过 ~64KB 上限时在行边界截断(整行丢弃,绝不截半字符)并置
+/// `truncated`。
+pub fn diff_file_lines(root: &Path, path: &str) -> Result<FileDiff, String> {
+    let repo = open_repo(root)?;
+    let tree = head_tree(&repo)?;
+    let diff = head_to_workdir_diff(&repo, &tree, path)?;
+    let mut result = FileDiff {
+        hunks: Vec::new(),
+        binary: false,
+        truncated: false,
+    };
+    // 与 diff_file 同款字节预算,pathspec 命中多个 delta 时跨文件续算
+    let mut used = 0usize;
+    for index in 0..diff.deltas().len() {
+        if result.truncated {
+            break;
+        }
+        match Patch::from_diff(&diff, index).map_err(|error| format!("生成 diff 失败: {error}"))?
+        {
+            // None = 该 delta 无文本 diff(二进制文件)
+            None => result.binary = true,
+            Some(mut patch) => used = collect_diff_lines(&mut patch, &mut result, used)?,
+        }
+    }
+    Ok(result)
 }
 
 /// 单文件的行级归属,基于 HEAD 提交内容;未提交的工作区行不参与
@@ -280,6 +363,118 @@ pub fn checkout_file(root: &Path, path: &str) -> Result<(), String> {
     builder.path(path).force();
     repo.checkout_head(Some(&mut builder))
         .map_err(|error| format!("恢复文件失败: {error}"))
+}
+
+/// HEAD 提交的 tree(diff 的对比基准)。空仓库(没有 HEAD 提交)返回
+/// Err——diff_file 与 diff_file_lines 共用的前置检查。
+fn head_tree(repo: &Repository) -> Result<git2::Tree<'_>, String> {
+    if repo
+        .is_empty()
+        .map_err(|error| format!("检查仓库状态失败: {error}"))?
+    {
+        return Err("仓库还没有任何提交,没有 HEAD 可对比".to_owned());
+    }
+    repo.head()
+        .and_then(|head| head.peel_to_tree())
+        .map_err(|error| format!("读取 HEAD 失败: {error}"))
+}
+
+/// 按 pathspec 算 HEAD tree 对 workdir(含 index)的 diff;diff_file 与
+/// diff_file_lines 共用,保证两套输出基于同一份 diff。
+fn head_to_workdir_diff<'a>(
+    repo: &'a Repository,
+    tree: &'a git2::Tree<'_>,
+    path: &str,
+) -> Result<git2::Diff<'a>, String> {
+    let mut options = DiffOptions::new();
+    options.pathspec(path);
+    repo.diff_tree_to_workdir_with_index(Some(tree), Some(&mut options))
+        .map_err(|error| format!("计算 diff 失败: {error}"))
+}
+
+/// 走 patch 的行回调把内容行收进 `result`,按 hunk 分组;`used` 是之前
+/// delta 已累计的近似输出字节数(返回值供后续 delta 续算)。累计超过
+/// [`MAX_DIFF_BYTES`] 即在行边界截断:引发超限的行整行丢弃、`truncated`
+/// 置位,之后回调空转不再累计——libgit2 的 print 回调返回 false 会变成
+/// GIT_EUSER 错误,空转(数据本就在内存 patch 里)比吞错误干净。
+fn collect_diff_lines(
+    patch: &mut Patch<'_>,
+    result: &mut FileDiff,
+    mut used: usize,
+) -> Result<usize, String> {
+    // 当前 hunk 的头四元组;libgit2 对 hunk 内每一行都回传同一组值,
+    // 变化即开新 hunk。
+    let mut current: Option<(u32, u32, u32, u32)> = None;
+    let mut callback = |_delta: git2::DiffDelta<'_>,
+                        hunk: Option<git2::DiffHunk<'_>>,
+                        line: git2::DiffLine<'_>|
+     -> bool {
+        if line.origin() == 'B' {
+            // libgit2 的二进制提示行("Binary files a/x and b/x differ"):
+            // 无文本 diff,置标记、不产生行条目。实测 libgit2 1.9.7 对
+            // 二进制文件的 Patch::from_diff 返回 Some 而非 None,二进制
+            // 靠这里检测(外层 None 分支只是兜底)。
+            result.binary = true;
+            return true;
+        }
+        if !matches!(line.origin(), ' ' | '+' | '-') {
+            // 文件头(F)/hunk 头(H)与 "\ No newline at end of file"
+            // 之类的 EOF 提示行(=<>):不是文件内容行,无行号意义,
+            // 不产生条目。
+            return true;
+        }
+        let mut text = String::from_utf8_lossy(line.content()).into_owned();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        if text.ends_with('\r') {
+            text.pop();
+        }
+        // 每行 = 前缀 1 + 文本 + 换行 1,与 unified 文本的字节数同量级;
+        // 不含文件头/hunk 头,是防无界列表的保护值,不追求与 diff_file
+        // 的截断点逐字节一致。
+        used += text.len() + 2;
+        if used > MAX_DIFF_BYTES {
+            result.truncated = true;
+            return true;
+        }
+        let header = match hunk {
+            Some(h) => (h.old_start(), h.old_lines(), h.new_start(), h.new_lines()),
+            // 内容行必在 hunk 内,这只是防御
+            None => (0, 0, 0, 0),
+        };
+        if current != Some(header) {
+            current = Some(header);
+            result.hunks.push(DiffHunk {
+                old_start: header.0,
+                old_lines: header.1,
+                new_start: header.2,
+                new_lines: header.3,
+                lines: Vec::new(),
+            });
+        }
+        let kind = match line.origin() {
+            '+' => DiffLineKind::Added,
+            '-' => DiffLineKind::Deleted,
+            _ => DiffLineKind::Context,
+        };
+        result
+            .hunks
+            .last_mut()
+            .expect("hunk 已在上一分支压入")
+            .lines
+            .push(DiffLine {
+                old_lineno: line.old_lineno(),
+                new_lineno: line.new_lineno(),
+                kind,
+                text,
+            });
+        true
+    };
+    patch
+        .print(&mut callback)
+        .map_err(|error| format!("生成 diff 失败: {error}"))?;
+    Ok(used)
 }
 
 /// 打开仓库根;非 git 目录返回面向用户的错误。
@@ -507,6 +702,376 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 跑 git 拿 stdout(行级 diff 与 git CLI 的对照 oracle 用;fixture
+    /// 装配仍走 run_git)。
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git 输出应为 UTF-8")
+    }
+
+    /// 解析 `git diff --no-color HEAD -- <path>`(单文件输出)的 unified
+    /// 文本为 hunk/行结构,作行级 API 的对照 oracle:文件头/索引行与
+    /// "\ No newline" 提示行不产生条目,与实现对 EOFNL 行的口径一致。
+    fn parse_unified(text: &str) -> Vec<DiffHunk> {
+        let mut hunks = Vec::new();
+        let (mut old_no, mut new_no) = (0u32, 0u32);
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("@@ ") {
+                // "@@ -1,3 +1,3 @@ 上下文" → "-1,3 +1,3"
+                let body = rest.split(" @@").next().unwrap_or_default();
+                let mut specs = body.split_whitespace();
+                let old = specs
+                    .next()
+                    .unwrap_or_default()
+                    .strip_prefix('-')
+                    .unwrap_or_default();
+                let new = specs
+                    .next()
+                    .unwrap_or_default()
+                    .strip_prefix('+')
+                    .unwrap_or_default();
+                let range = |spec: &str| match spec.split_once(',') {
+                    Some((start, count)) => (start.parse().unwrap(), count.parse().unwrap()),
+                    None => (spec.parse().unwrap(), 1),
+                };
+                let (old_start, old_lines) = range(old);
+                let (new_start, new_lines) = range(new);
+                hunks.push(DiffHunk {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                    lines: Vec::new(),
+                });
+                old_no = old_start;
+                new_no = new_start;
+            } else if let Some(hunk) = hunks.last_mut() {
+                // 首个 @@ 之前的文件头("--- a/x" 等)进不了这个分支
+                let kind = match line.as_bytes().first() {
+                    Some(b' ') => DiffLineKind::Context,
+                    Some(b'+') => DiffLineKind::Added,
+                    Some(b'-') => DiffLineKind::Deleted,
+                    _ => continue, // "\ No newline" 提示行等
+                };
+                let text = line[1..].to_owned();
+                let (old_lineno, new_lineno) = match kind {
+                    DiffLineKind::Context => (Some(old_no), Some(new_no)),
+                    DiffLineKind::Added => (None, Some(new_no)),
+                    DiffLineKind::Deleted => (Some(old_no), None),
+                };
+                match kind {
+                    DiffLineKind::Context => {
+                        old_no += 1;
+                        new_no += 1;
+                    }
+                    DiffLineKind::Added => new_no += 1,
+                    DiffLineKind::Deleted => old_no += 1,
+                }
+                hunk.lines.push(DiffLine {
+                    old_lineno,
+                    new_lineno,
+                    kind,
+                    text,
+                });
+            }
+        }
+        hunks
+    }
+
+    /// 两套输出的占位文案必须同源:unified 的 BINARY/TRUNCATION 与行级
+    /// 结构的 PLACEHOLDER 是同一份字面量的两处排版(行级无换行),改一处
+    /// 不改另一处这里会红。
+    #[test]
+    fn notices_share_text_between_unified_and_structured() {
+        assert_eq!(BINARY_NOTICE, format!("{DIFF_BINARY_PLACEHOLDER}\n"));
+        assert_eq!(
+            TRUNCATION_NOTICE,
+            format!("\n{DIFF_TRUNCATION_PLACEHOLDER}\n")
+        );
+    }
+
+    /// 修改行场景:hunk 头、行号(删除行只有旧侧、新增行只有新侧、上下文
+    /// 双侧)与行分类;无改动文件是空 hunks;空仓库是显式 Err(与
+    /// diff_file 同款文案)。
+    #[test]
+    fn diff_file_lines_reports_hunks_lines_and_kinds() {
+        let dir = temp_repo("diff-lines");
+        let error = diff_file_lines(&dir, "a.md").unwrap_err();
+        assert!(error.contains("没有任何提交"), "{error}");
+        std::fs::write(dir.join("a.md"), "一\n二\n三\n").unwrap();
+        std::fs::write(dir.join("clean.md"), "不变\n").unwrap();
+        commit_all(&dir, "init");
+
+        let clean = diff_file_lines(&dir, "clean.md").unwrap();
+        assert_eq!(clean.hunks, Vec::new(), "无改动是空 hunks");
+        assert!(!clean.binary && !clean.truncated);
+
+        std::fs::write(dir.join("a.md"), "一\n二改\n三\n").unwrap();
+        let got = diff_file_lines(&dir, "a.md").unwrap();
+        assert_eq!(
+            got.hunks,
+            vec![DiffHunk {
+                old_start: 1,
+                old_lines: 3,
+                new_start: 1,
+                new_lines: 3,
+                lines: vec![
+                    DiffLine {
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        kind: DiffLineKind::Context,
+                        text: "一".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(2),
+                        new_lineno: None,
+                        kind: DiffLineKind::Deleted,
+                        text: "二".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                        kind: DiffLineKind::Added,
+                        text: "二改".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(3),
+                        new_lineno: Some(3),
+                        kind: DiffLineKind::Context,
+                        text: "三".to_owned(),
+                    },
+                ],
+            }],
+            "{got:?}"
+        );
+        assert!(!got.binary && !got.truncated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 纯新增文件(暂存区新文件参与 diff):hunk 旧侧 0,0,全部 Added,
+    /// 新侧行号从 1 连续。
+    #[test]
+    fn diff_file_lines_on_added_file_is_all_additions() {
+        let dir = temp_repo("diff-lines-add");
+        std::fs::write(dir.join("a.md"), "一\n").unwrap();
+        commit_all(&dir, "init");
+        std::fs::write(dir.join("new.md"), "新1\n新2\n").unwrap();
+        run_git(&dir, &["add", "new.md"]);
+
+        let got = diff_file_lines(&dir, "new.md").unwrap();
+        assert_eq!(got.hunks.len(), 1);
+        let hunk = &got.hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_lines), (0, 0), "旧侧不存在");
+        assert_eq!((hunk.new_start, hunk.new_lines), (1, 2));
+        let added: Vec<(Option<u32>, Option<u32>, &str)> = hunk
+            .lines
+            .iter()
+            .map(|line| (line.old_lineno, line.new_lineno, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![(None, Some(1), "新1"), (None, Some(2), "新2")],
+            "{added:?}"
+        );
+        assert!(got.hunks[0]
+            .lines
+            .iter()
+            .all(|line| line.kind == DiffLineKind::Added));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 纯删除行:删除行只有旧侧行号,其余为上下文,新侧行号重排。
+    #[test]
+    fn diff_file_lines_on_deleted_line() {
+        let dir = temp_repo("diff-lines-del");
+        std::fs::write(dir.join("a.md"), "一\n二\n三\n四\n五\n").unwrap();
+        commit_all(&dir, "init");
+        std::fs::write(dir.join("a.md"), "一\n二\n四\n五\n").unwrap();
+
+        let got = diff_file_lines(&dir, "a.md").unwrap();
+        assert_eq!(got.hunks.len(), 1);
+        let hunk = &got.hunks[0];
+        assert_eq!(
+            (
+                hunk.old_start,
+                hunk.old_lines,
+                hunk.new_start,
+                hunk.new_lines
+            ),
+            (1, 5, 1, 4)
+        );
+        let summary: Vec<(Option<u32>, Option<u32>, DiffLineKind, &str)> = hunk
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.old_lineno,
+                    line.new_lineno,
+                    line.kind,
+                    line.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Some(1), Some(1), DiffLineKind::Context, "一"),
+                (Some(2), Some(2), DiffLineKind::Context, "二"),
+                (Some(3), None, DiffLineKind::Deleted, "三"),
+                (Some(4), Some(3), DiffLineKind::Context, "四"),
+                (Some(5), Some(4), DiffLineKind::Context, "五"),
+            ],
+            "{summary:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CJK 与 emoji(含 ZWJ 序列)行文本逐字符正确:content 按 UTF-8
+    /// 字符边界整行透传,不存在截半字符。
+    #[test]
+    fn diff_file_lines_preserves_cjk_and_emoji_chars() {
+        let dir = temp_repo("diff-lines-cjk");
+        std::fs::write(dir.join("cjk.md"), "中文 🚀 内容\n第二行\n").unwrap();
+        commit_all(&dir, "init");
+        let replacement = "第二行改成 👨‍👩‍👧 家庭";
+        std::fs::write(dir.join("cjk.md"), format!("中文 🚀 内容\n{replacement}\n")).unwrap();
+
+        let got = diff_file_lines(&dir, "cjk.md").unwrap();
+        let added: Vec<&DiffLine> = got.hunks[0]
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Added)
+            .collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].text, replacement);
+        assert_eq!(
+            added[0].text.chars().collect::<Vec<_>>(),
+            replacement.chars().collect::<Vec<_>>(),
+            "逐字符相等"
+        );
+        assert!(
+            added[0].text.len() > added[0].text.chars().count(),
+            "确有多字节字符且未被截半: {} 字节 / {} 字符",
+            added[0].text.len(),
+            added[0].text.chars().count()
+        );
+        assert_eq!(
+            added[0].text.chars().filter(|c| *c == '\u{200d}').count(),
+            2,
+            "ZWJ 序列完整"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 二进制文件:无文本 diff,binary 置位、hunks 为空。现状注意:
+    /// libgit2 1.9.7 下 diff_file 对二进制输出原生 "Binary files … differ"
+    /// 文本而不是 BINARY_NOTICE 占位(from_diff 不返回 None),行级 API
+    /// 按 origin='B' 检测,比文本口径更结构化;diff_file 行为保持不动。
+    #[test]
+    fn diff_file_lines_marks_binary_files() {
+        let dir = temp_repo("diff-lines-bin");
+        std::fs::write(dir.join("bin.bin"), [1u8, 0, 2, 0]).unwrap();
+        commit_all(&dir, "init");
+        std::fs::write(dir.join("bin.bin"), [3u8, 0, 4, 0]).unwrap();
+
+        let got = diff_file_lines(&dir, "bin.bin").unwrap();
+        assert!(got.binary, "{got:?}");
+        assert_eq!(got.hunks, Vec::new());
+        assert!(!got.truncated);
+        assert!(
+            diff_file(&dir, "bin.bin").unwrap().contains("Binary files"),
+            "钉住 diff_file 对二进制的现状输出(libgit2 原生文本)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超过 ~64KB 上限在行边界截断:整行丢弃(保留行与文件行全等,UTF-8
+    /// 不截半字符)、行号连续无跳号、truncated 置位。
+    #[test]
+    fn diff_file_lines_truncates_on_line_boundary() {
+        let dir = temp_repo("diff-lines-cap");
+        std::fs::write(dir.join("big.md"), "小\n").unwrap();
+        commit_all(&dir, "init");
+        let file_lines: Vec<String> = (0..30_000).map(|i| format!("长行内容{i:05}")).collect();
+        std::fs::write(dir.join("big.md"), format!("{}\n", file_lines.join("\n"))).unwrap();
+
+        let got = diff_file_lines(&dir, "big.md").unwrap();
+        assert!(got.truncated, "30_000 行必然超预算");
+        assert!(!got.binary);
+        assert_eq!(got.hunks.len(), 1);
+        let lines = &got.hunks[0].lines;
+        assert!(
+            lines.len() < 30_001 && lines.len() > 1_000,
+            "在预算处停止: {}",
+            lines.len()
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Deleted && line.text == "小"),
+            "旧内容行仍在"
+        );
+        let added: Vec<&DiffLine> = lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Added)
+            .collect();
+        assert!(!added.is_empty());
+        // 新侧行号从 1 连续无跳号:行边界丢行,而非把某行截成两半
+        let line_nos: Vec<u32> = added.iter().filter_map(|line| line.new_lineno).collect();
+        assert_eq!(
+            line_nos,
+            (1..=line_nos.len() as u32).collect::<Vec<_>>(),
+            "行号连续"
+        );
+        // 每个保留行与文件里对应行全等(UTF-8 字符边界完好)
+        for line in &added {
+            assert_eq!(
+                line.text,
+                file_lines[line.new_lineno.expect("上面已过滤") as usize - 1],
+                "行 {} 必须是完整行",
+                line.new_lineno.expect("上面已过滤")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 抽样与 git CLI 对照:hunk 头、行号与分类逐项等于
+    /// `git diff --no-color HEAD -- <path>` 的解析结果(修改/删除/新增
+    /// 三个样例钉住)。
+    #[test]
+    fn diff_file_lines_matches_git_cli_output() {
+        let dir = temp_repo("diff-lines-cli");
+        std::fs::write(dir.join("mod.md"), "一\n二\n三\n").unwrap();
+        std::fs::write(dir.join("del.md"), "一\n二\n三\n四\n五\n").unwrap();
+        commit_all(&dir, "init");
+        std::fs::write(dir.join("mod.md"), "一\n二改\n三\n").unwrap();
+        std::fs::write(dir.join("del.md"), "一\n二\n四\n五\n").unwrap();
+        std::fs::write(dir.join("add.md"), "新1\n新2\n").unwrap();
+        run_git(&dir, &["add", "add.md"]);
+
+        for path in ["mod.md", "del.md", "add.md"] {
+            let got = diff_file_lines(&dir, path).unwrap();
+            let cli = git_stdout(&dir, &["diff", "--no-color", "HEAD", "--", path]);
+            assert_eq!(
+                got.hunks,
+                parse_unified(&cli),
+                "path={path} 与 git CLI 输出不一致\ncli={cli}"
+            );
+            assert!(!got.binary && !got.truncated);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// blame 行级归属各自的提交;未提交过的文件是显式 Err。
     #[test]
     fn blame_attributes_lines_to_their_commits() {
@@ -569,6 +1134,7 @@ mod tests {
         assert!(status(&dir, DEFAULT_STATUS_LIMIT).is_err());
         assert!(log(&dir, DEFAULT_LOG_LIMIT).is_err());
         assert!(diff_file(&dir, "a.md").is_err());
+        assert!(diff_file_lines(&dir, "a.md").is_err());
         assert!(blame_file(&dir, "a.md").is_err());
         assert!(checkout_file(&dir, "a.md").is_err());
         let _ = std::fs::remove_dir_all(&dir);
