@@ -487,6 +487,7 @@ scrollbench: 没有采到帧
 ## 9. M3 复测与两轮修复(2026-10-04,#52 streaming-cache-blockkey M3·拍板①执行)—— **每行成本趋稳达成,10000 行档对 R1 −99.94%,M0 验证 4 凭本节数字销账**
 
 > 前置:M1(`be05b52` 分段准入放宽)与 M2(`ccc2945` 块级缓存 key 换块内容 hash)已落在本分支。本节 = 同命令复测 → 发现新超线性 → 两轮修复(预算 2 轮,§公共约束)→ 终测判定与滚动路径回归归因。修复均属 vendor ①类(独立 `vendor:` commit 由编排收口,vendor/README 变更表 + vendored CHANGELOG 已登记)。
+> **落库时序(2026-10-05 独立评审补记)**:销账落档 commit `3f19c2e` 只含 docs 五件——M3 代码在该时点系未提交工作区(6 文件 +401/−50),git 历史中 M3 不存在;纯 HEAD(3f19c2e)检出实跑 `cargo test -p egui_markdown --all-features` = **147** passed,§9.7 的 **152** passed 与本节全部终测数字对应叠加工作区 M3 后的代码。复现本节数字须以 M3 收口后的独立 `vendor:` commit 为检出基点(hash 收口后在 decisions-pending #77 销账注记与 vendor/README.md 变更表 M3 行回填);`3f19c2e` 的 `vendor:` 前缀系销账落档误用,勿据其认定 M3 已落库。M1/M2 hash 不受影响。
 > **执行环境**:与 §1 相同(Deepin 25 / X11 / rustc 1.98.0);bench 二进制因 vendor 改动重编为 `target/release/deps/longdoc-b3c9b69313f2cdbc`(R1/R3 为 `longdoc-9a3abfe4edeb0714`,载体源码 `benches/longdoc.rs` 全程零改动,`git diff` 确认)。
 
 ### 9.1 首轮复测(仅 M1+M2,未修)—— 发现曲线**二次方**

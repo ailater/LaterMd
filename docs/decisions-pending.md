@@ -751,6 +751,8 @@
 - **如何改**:拍板①时——按「先分段准入、再块级 key」两步走 vendor ①类最小补丁(独立 `vendor:` commit + vendor/README.md 变更表 ①类登记 + `vendor/egui_markdown/check.sh` 六项;①类按上游 CONTRIBUTING 标准保持可 cherry-pick),注意两处连带语义:`debug_assert!(layout.segment_breaks.is_empty())`(`label.rs:692`)的两侧一致性约束、以及块序号作 id 成分时编辑中部不得挪移后续块序号(AGENTS §6.7 widget id 纪律);完成后按 perf-recheck §2 同一条命令复测,验收口径 = 每行成本随规模趋稳(亚线性),M0 挂账凭新数字销账。拍板③时——改动局限 crates/(流式路径按文档规模切渲染配置或关流式预览),一个 PR 可完成,但流式写作的产品体验降级需坤哥先认。
 
 > **已拍板执行(2026-10-04 授权,扩队 #52)——已按①落地并销账**:#77 修复路径①两步(M1 分段准入放宽 + M2 块级缓存 key 换块内容 hash,`be05b52`/`ccc2945`)+ M3 复测追加修复两处(anchors 记录二次方 → 单遍扫描;flush 命中帧 O(n) job 拷贝+哈希 → shaped galley 缓存)全部落地;验收按 perf-recheck §2 同命令复测:每行成本 0.0718 → 0.0536 → 0.0551 µs(下降后趋稳),10000 行档 550.75 µs 对 R1 1001.7 ms −99.945%,M0 验证 4 已销(m0-report §4.4)。数字与逐字输出见 [perf-recheck-2026-10.md](perf-recheck-2026-10.md) §9。本注记不改动上方原条目,翻案仍按其「如何改」。
+>
+> **落库时序勘误(2026-10-05 独立评审补记)**:本注记与 m0-report §4.4 落档的 commit `3f19c2e` 虽带 `vendor:` 前缀,但**只含 docs 五件、不含任何 M3 代码**;销账时点 M3 的 vendor 改动(label.rs / layout.rs / tests/cache.rs / tests/section_anchors.rs / CHANGELOG / vendor README,共 +401/−50)系**未提交工作区**——纯 HEAD(3f19c2e)检出实跑 `cargo test -p egui_markdown --all-features` = 147 passed,本注记引用的 152 passed 与 550.75µs 终测数字对应的是叠加工作区 M3 后的代码。复现销账数字须以 M3 收口后的独立 `vendor:` commit 为检出基点(收口后在本注记与 vendor/README.md 变更表 M3 行回填 hash)。M1(`be05b52`)/M2(`ccc2945`)已在 git 历史,不受影响。
 
 ## #78 #42 M1 偏移→预览块位置通道选 vendor ①类而非 app-only(2026-10-03,#42 outline-preview-jump M1·自动拍板)
 

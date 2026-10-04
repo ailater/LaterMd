@@ -21,6 +21,22 @@ fn painted_text_with(ctx: &Context, text: &str, scroll_code_blocks: bool) -> Vec
   out
 }
 
+/// Same as [`painted_text`], on a viewport tall enough that no range is culled.
+fn painted_text_tall(ctx: &Context, text: &str) -> Vec<String> {
+  let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(500.0, 12000.0));
+  let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+    let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
+    MarkdownLabel::new(Id::new("test-tall"), text).wrap().show(&mut child);
+  });
+
+  let mut out = Vec::new();
+  for clipped in &output.shapes {
+    collect(&clipped.shape, &mut out);
+  }
+  output.textures_delta.clear();
+  out
+}
+
 fn collect(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
   match shape {
     egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_owned()),
@@ -151,4 +167,101 @@ fn needs_segmentation_matches_build_layout() {
     }
   });
   output.textures_delta.clear();
+}
+
+/// A repeated frame of an unchanged segmented document hits the flush ranges'
+/// shaped-galley cache: what is painted and the anchors recorded must be
+/// byte-identical to the frame that shaped them.
+#[test]
+fn repeat_frame_reuses_shaped_galley_identically() {
+  use egui_markdown::section_anchors;
+  let body: String = (0..520).map(|i| format!("    let step_{i} = log.tail()?;\n")).collect();
+  let doc = format!("Intro.\n\n```rust\nfn claim() {{\n{body}}}\n```\n\nOutro.");
+
+  let ctx = Context::default();
+  let id = Id::new("shaped-repeat");
+  // Tall enough that no flush range is ever viewport-culled: culling is a warm-frame
+  // behavior and would legitimately paint fewer shapes on the second frame.
+  let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(500.0, 12000.0));
+  let mut frames = Vec::new();
+  for _ in 0..2 {
+    let mut anchors = None;
+    let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+      let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
+      MarkdownLabel::new(id, &doc).wrap().show(&mut child);
+      anchors = section_anchors(&child, id);
+    });
+    let mut painted = Vec::new();
+    for clipped in &output.shapes {
+      collect(&clipped.shape, &mut painted);
+    }
+    output.textures_delta.clear();
+    frames.push((painted, anchors.unwrap_or_default()));
+  }
+
+  let (first, second) = (&frames[0], &frames[1]);
+  assert!(!first.0.is_empty(), "nothing painted on the shaping frame");
+  assert_eq!(first.0, second.0, "cached-galley frame painted different text");
+  assert_eq!(first.1, second.1, "cached-galley frame recorded different anchors");
+}
+
+/// Changing the wrap width must re-shape the cached flush ranges: the anchors
+/// after a resize must match a context that has only ever seen the new width —
+/// a stale shaped galley would keep the old geometry.
+#[test]
+fn wrap_change_reshapes_cached_galley() {
+  use egui_markdown::section_anchors;
+  let paragraph = "长段落需要换行来检验宽度变化确实改变了排版:".to_string()
+    + &"雾凇沆沆沆沆 ".repeat(40)
+    + "\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾段 another wrapping sensitive line of latin text.\n";
+
+  let render_at = |ctx: &Context, width: f32| -> Vec<egui_markdown::SectionAnchor> {
+    let id = Id::new("shaped-resize");
+    let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(width, 2000.0));
+    let mut anchors = None;
+    let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+      let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
+      MarkdownLabel::new(id, &paragraph).wrap().show(&mut child);
+      anchors = section_anchors(&child, id);
+    });
+    output.textures_delta.clear();
+    anchors.unwrap_or_default()
+  };
+
+  let resized = Context::default();
+  let wide = render_at(&resized, 500.0);
+  let _narrow_first = render_at(&resized, 220.0);
+  let narrow_second = render_at(&resized, 220.0);
+
+  let fresh = Context::default();
+  let narrow_fresh = render_at(&fresh, 220.0);
+
+  assert!(!wide.is_empty() && !narrow_second.is_empty());
+  // The wrap change must actually matter for geometry: some anchor moved.
+  let wide_bottom = wide.iter().map(|a| a.y).fold(0.0f32, f32::max);
+  let narrow_bottom = narrow_second.iter().map(|a| a.y).fold(0.0f32, f32::max);
+  assert!(
+    (wide_bottom - narrow_bottom).abs() > 1.0,
+    "wrap change did not change layout: {wide_bottom} vs {narrow_bottom}"
+  );
+  assert_eq!(narrow_second, narrow_fresh, "resized context kept stale galley geometry");
+}
+
+/// Appending a line to an admitted (non-scrolling) fence must paint the new
+/// line — the fence's flush range is rebuilt while other ranges reuse their
+/// shaped galleys.
+#[test]
+fn streaming_append_to_admitted_fence_is_reflected() {
+  let body = |lines: usize| {
+    let inner: String = (0..lines).map(|i| format!("    let step_{i} = log.tail()?;\n")).collect();
+    format!("Intro.\n\n```rust\nfn claim() {{\n{inner}}}\n```\n\nOutro.")
+  };
+
+  let ctx = Context::default();
+  let before = painted_text_tall(&ctx, &body(520));
+  assert!(before.iter().any(|t| t.contains("step_519")), "first render missing tail line: {before:?}");
+
+  let after = painted_text_tall(&ctx, &body(521));
+  assert!(after.iter().any(|t| t.contains("step_520")), "appended line not painted: {after:?}");
+  assert!(after.iter().any(|t| t.contains("Intro.")) && after.iter().any(|t| t.contains("Outro.")));
 }

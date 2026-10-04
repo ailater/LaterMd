@@ -87,11 +87,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shifts later blocks to fresh (never stale) entries. Rendering output is unchanged: cache
   keys only decide when a block is re-laid-out, and a second frame on a hot context paints
   the same shapes as a cold one.
+- A flush range now remembers the galley shaped from its cached job — with the section
+  anchors relative to the galley origin — keyed by the wrap width/zoom it was shaped at. A
+  repeat frame at the same wrap paints from the remembered galley instead of re-hashing the
+  whole job through `Fonts::layout_job`; on a document whose highlighting splits every code
+  line into its own section, that hash dominated an otherwise fully-cached frame. A wrap or
+  zoom change falls back to the normal shape path, and a `map_job` on the trailing range
+  opts out. Painted output and recorded anchors are identical to the shaping frame.
+- The style-and-handler share of the block-widget height-cache key is hashed once per
+  rendered range instead of once per block.
+- `code_block_admits_segmentation` rejects a body shorter than the threshold by byte length
+  before counting lines, so documents full of small fences skip the line scan.
 
 ### Fixed
 
 - `TextWrapMode::Truncate` on the surrounding `Ui`, and now on the widget builders, truncates
   the text. It previously behaved as wrap.
+- Section anchors are now computed in a single forward sweep over sections and rows. The
+  previous per-section restart — re-counting the text prefix and re-walking the rows from
+  the top for every section — made anchor recording O(sections × rows), which dominated
+  large documents whose highlighting emits one section per code line (a fully-cached
+  8k-line fence spent ~200 ms per frame recording anchors). Anchor values are unchanged.
 
 ## [0.1.0] - 2026-03-23
 

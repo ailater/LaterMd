@@ -20,9 +20,9 @@ use crate::types::Token;
 const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
 
 /// Resolve the row height for a given font size under the user's
-/// [`MarkdownStyle::line_height_ratio`](style::MarkdownStyle::line_height_ratio)
+/// [`MarkdownStyle::line_height_ratio`](MarkdownStyle::line_height_ratio)
 /// and the host-declared fallback floor
-/// [`MarkdownStyle::min_line_height_em`](style::MarkdownStyle::min_line_height_em).
+/// [`MarkdownStyle::min_line_height_em`](MarkdownStyle::min_line_height_em).
 ///
 /// A single fixed pixel height cannot serve both sizes in one document: at the
 /// default 13pt body font, 13pt * 1.30 is about 17px, but H1 renders at 20.8pt and
@@ -255,7 +255,7 @@ fn apply_bold(format: &mut TextFormat, ui: &Ui, has_bold: bool) {
 }
 
 /// Whether a fenced code block is large enough to be laid out as its own segment under
-/// [`MarkdownStyle::segmentation_admission`](style::MarkdownStyle::segmentation_admission).
+/// [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission).
 ///
 /// The threshold is measured per code block (its line count), not per document (token or
 /// byte totals): [`build_layout`] runs on whole documents *and* on individual flushed
@@ -265,7 +265,9 @@ fn apply_bold(format: &mut TextFormat, ui: &Ui, has_bold: bool) {
 /// the threshold cannot shift the token indices later block widgets bake into their ids.
 #[inline]
 pub fn code_block_admits_segmentation(text: &str, style: &MarkdownStyle) -> bool {
-  text.lines().count() >= style.segmentation_admission
+  // A line is at least one byte, so a body shorter than the threshold cannot
+  // reach it — skip the line scan for the common small-fence case.
+  text.len() >= style.segmentation_admission && text.lines().count() >= style.segmentation_admission
 }
 
 /// Whether a token stream contains anything that [`build_layout`] would report as a segment
@@ -273,7 +275,7 @@ pub fn code_block_admits_segmentation(text: &str, style: &MarkdownStyle) -> bool
 ///
 /// Must stay in sync with every `segment_breaks.push` in [`build_layout`] — pass
 /// `segment_large_code_blocks: true` there. A fence whose line count reaches
-/// [`MarkdownStyle::segmentation_admission`](style::MarkdownStyle::segmentation_admission)
+/// [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission)
 /// counts as a break in both. It exists so a caller can make that decision without paying
 /// for a full layout it would then discard.
 pub fn needs_segmentation(
@@ -300,7 +302,7 @@ pub fn needs_segmentation(
 /// Returns segment breaks for tokens that need separate rendering (tables, images, blockquotes).
 ///
 /// `segment_large_code_blocks` decides whether a non-scrolling fence whose line count
-/// reaches [`MarkdownStyle::segmentation_admission`](style::MarkdownStyle::segmentation_admission)
+/// reaches [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission)
 /// is reported as a segment break. Whole-document callers pass `true` to stay in sync
 /// with [`needs_segmentation`]; a caller laying out a single admitted fence as its own
 /// flushed range passes `false` so the fence renders inline within that range instead
