@@ -170,6 +170,13 @@ cargo bench -p latermd-app --bench longdoc -- streaming_append
 - **期间未做修复**:M0(2026-09-25)→ 复测 R1 轮(2026-10-02 上午)→ 复测 R3 轮(2026-10-02)之间产品代码零变更(criterion 对 R1 轮三档全部「No change in performance detected」,p=0.29–0.84);主导修复(布局缓存失效粒度块级化)机制位置在 vendored 层,属 ①类改动,需求已挂 [decisions-pending.md](decisions-pending.md) #77 待人工拍板。**本小节不改变 M0 挂账状态,「P1 开工前必解」维持;拍板修复后按 perf-recheck §6 口径复跑,每行成本随规模趋稳(亚线性)方可销账。**
 - 逐字输出、增长曲线判定与 R1/R3 前后对比表见 [perf-recheck-2026-10.md](perf-recheck-2026-10.md) §2/§5/§8。
 
+### 4.4 复测销账(2026-10-04,#52 拍板①修复后)—— **销账**
+
+- **修复**:decisions-pending #77 拍板①两步 vendor ①类补丁(M1 分段准入放宽 `be05b52` + M2 块级缓存 key 换块内容 hash `ccc2945`)落地后,M3 复测发现并又修两处主导项(#52 第三步:anchors 记录 O(sections×rows) 二次方 → 单遍扫描;flush 命中帧 O(n) job 拷贝+哈希 → shaped galley 缓存)。修复全程细节、逐字输出与测试证据见 [perf-recheck-2026-10.md](perf-recheck-2026-10.md) §9。**M3 代码载体注记**:销账落档 commit `3f19c2e` 只含 docs 五件、不含 M3 代码——M3 vendor 改动在销账时点系未提交工作区(纯 HEAD 检出 vendored 测试 = 147 passed;下条「152 测试全绿」系叠加工作区 M3 的数字),复现销账数字以 M3 收口后的独立 `vendor:` commit 为检出基点,hash 收口后在 perf-recheck §9 前置注记与 decisions-pending #77 回填。
+- **销账数字**(同 §4.2 命令,`cargo bench -p latermd-app --bench longdoc -- streaming_append`,2026-10-04 终测):追加 1 行 + 整帧渲染中值 = **500 行 35.886 µs(0.0718 µs/行)/ 2,000 行 107.29 µs(0.0536 µs/行)/ 10,000 行 550.75 µs(0.0551 µs/行)**——每行成本**下降后趋稳**(R1 为 67.6→73.2→100.2 µs 随规模上升),10,000 行档对 M0 基线 789.3 ms **−99.93%**(对 R1 1001.7 ms −99.945%)。增长曲线:×4 规模成本 ×2.99、×5 规模成本 ×5.13、总体 ×20 规模成本 ×15.34;如实注记:2000→10000 段与线性持平(+2.6%),残余线性项 ≈0.05 µs/行(整篇 parse/哈希/anchors 记录),增量消除属另一工程量级,不在本次验收内。
+- **原痛点消除**:§4.2「超 ~1,300 行单 chunk 成本即超 100 ms 吐字节奏」——现 10,000 行档单 chunk 550.75 µs = 100 ms 预算的 **0.55%**(余量 181×),三档全部深藏预算内。「P1 开工前必解」解除。
+- **连带核对**:长文档滚动路径(long_doc_100k)冷首帧持平(123.90 ms vs R1 123.49 ms),稳态两档 +47%/+54% 的回归经 A/B 定位主因为 **#42 块表记录(main 既有,先于本分支)**,本分支可解释净贡献 ≈ +6%(M2 内容寻址 cull 的代价 − 本步复用收益),距 55 fps 预算余量 34×;像素零变化否决线维持(vendored 152 测试全绿)。#42 每帧记录成本挂 decisions-pending 新条目待其归属模块处理。
+
 ## 附加验证 5:中文渲染 —— Linux 通过,字体方案定案
 
 - **实现**:`crates/latermd-app/src/fonts.rs` —— 候选路径表读系统字体,`FontData::from_owned` 注入,`push` 到 `Proportional` / `Monospace` 两族**末尾**作回退(拉丁仍走内置字体,CJK 落到系统字体);候选全失配时界面显示警告,不静默。

@@ -44,6 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block element keeps the plain `block_spacing`, and setting the field to `0.0` makes the
   spacer row exactly `block_spacing` tall. The spacer row counts towards a
   `max_rows` / truncate budget.
+- `MarkdownStyle::segmentation_admission` (default `500`): a fenced code block whose body
+  reaches this many lines is laid out as its own segment — the way tables, images and
+  blockquotes already are — even when code blocks are not scrollable. The threshold is
+  measured per code block (its line count), not per document (token or byte totals):
+  `build_layout` runs on whole documents *and* on individual flushed ranges, and a
+  whole-document measure is not knowable from inside a range, so the two callers would
+  disagree about the same tokens; a per-block measure decides identically in every
+  context, and admission never inserts or removes tokens, so a fence crossing the
+  threshold cannot shift the token indices later block widgets bake into their ids. The
+  admitted fence renders as its own flushed range with the same in-galley shape (padding,
+  highlighting, wrapping, background), but laid out, cached and viewport-culled per
+  block, so appending lines to it no longer re-lays-out the rest of the document. The
+  default is deliberately conservative: a hand-written document almost never carries a
+  single 500-line fence, so ordinary documents keep the whole-document galley path — and
+  its pixel output — unchanged. `usize::MAX` disables admission entirely.
 
 ### Changed
 
@@ -58,10 +73,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer reads `ui.wrap_mode()` itself. A caller that caches the resulting job must write the
   live wrap values over it before each shape, as `MarkdownLabel` already does.
 
+- **Breaking:** `needs_segmentation` now takes `style: &MarkdownStyle`, and `build_layout`
+  takes `segment_large_code_blocks: bool` before `style`, so both can honor
+  `MarkdownStyle::segmentation_admission`. Whole-document callers pass `true` to stay in
+  sync with `needs_segmentation`; a caller laying out a single admitted fence as its own
+  flushed range passes `false` so the fence renders inline within that range.
+- The height caches behind off-screen culling of block widgets (tables, scrolling code
+  blocks, images) are now keyed by each block's own token — plus the style and link-handler
+  id the previous whole-document key covered — instead of by the hash of the whole document
+  text. Appending at the end of a document (streaming output) now re-measures only the
+  edited block; every other off-screen block culls from its cached height. The entry stays
+  keyed by token index, so an edit that changes the token count earlier in the document
+  shifts later blocks to fresh (never stale) entries. Rendering output is unchanged: cache
+  keys only decide when a block is re-laid-out, and a second frame on a hot context paints
+  the same shapes as a cold one.
+- A flush range now remembers the galley shaped from its cached job — with the section
+  anchors relative to the galley origin — keyed by the wrap width/zoom it was shaped at. A
+  repeat frame at the same wrap paints from the remembered galley instead of re-hashing the
+  whole job through `Fonts::layout_job`; on a document whose highlighting splits every code
+  line into its own section, that hash dominated an otherwise fully-cached frame. A wrap or
+  zoom change falls back to the normal shape path, and a `map_job` on the trailing range
+  opts out. Painted output and recorded anchors are identical to the shaping frame.
+- The style-and-handler share of the block-widget height-cache key is hashed once per
+  rendered range instead of once per block.
+- `code_block_admits_segmentation` rejects a body shorter than the threshold by byte length
+  before counting lines, so documents full of small fences skip the line scan.
+
 ### Fixed
 
 - `TextWrapMode::Truncate` on the surrounding `Ui`, and now on the widget builders, truncates
   the text. It previously behaved as wrap.
+- Section anchors are now computed in a single forward sweep over sections and rows. The
+  previous per-section restart — re-counting the text prefix and re-walking the rows from
+  the top for every section — made anchor recording O(sections × rows), which dominated
+  large documents whose highlighting emits one section per code line (a fully-cached
+  8k-line fence spent ~200 ms per frame recording anchors). Anchor values are unchanged.
 
 ## [0.1.0] - 2026-03-23
 

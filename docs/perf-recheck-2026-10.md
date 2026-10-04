@@ -481,3 +481,186 @@ scrollbench: 没有采到帧
 10000 行档 R3 对 M0 换算:993.94 / 789.3 = +25.9%,与 R1 的 +26.9% 同量级(R1 用中值 1001.7;两轮各自中值对同一 M0 基准,差异在轮间噪声内)。
 
 **一句话结论:R2 未做修复,复测即原水位——流式 O(n) 未解(曲线与绝对值均与 R1 无统计差异),滚动渲染路径维持优于 M0,真窗口 vsync 口径维持 blocked_external。** 修复验收命令与口径见 §6 第二条(拍板后复跑 §2 命令,判据 = 每行成本随规模趋稳);环境恢复后跑 §3b 命令与 m0-report §2.2 同表对照。
+
+---
+
+## 9. M3 复测与两轮修复(2026-10-04,#52 streaming-cache-blockkey M3·拍板①执行)—— **每行成本趋稳达成,10000 行档对 R1 −99.94%,M0 验证 4 凭本节数字销账**
+
+> 前置:M1(`be05b52` 分段准入放宽)与 M2(`ccc2945` 块级缓存 key 换块内容 hash)已落在本分支。本节 = 同命令复测 → 发现新超线性 → 两轮修复(预算 2 轮,§公共约束)→ 终测判定与滚动路径回归归因。修复均属 vendor ①类(独立 `vendor:` commit 由编排收口,vendor/README 变更表 + vendored CHANGELOG 已登记)。
+> **落库时序(2026-10-05 独立评审补记)**:销账落档 commit `3f19c2e` 只含 docs 五件——M3 代码在该时点系未提交工作区(6 文件 +401/−50),git 历史中 M3 不存在;纯 HEAD(3f19c2e)检出实跑 `cargo test -p egui_markdown --all-features` = **147** passed,§9.7 的 **152** passed 与本节全部终测数字对应叠加工作区 M3 后的代码。复现本节数字须以 M3 收口后的独立 `vendor:` commit 为检出基点(hash 收口后在 decisions-pending #77 销账注记与 vendor/README.md 变更表 M3 行回填);`3f19c2e` 的 `vendor:` 前缀系销账落档误用,勿据其认定 M3 已落库。M1/M2 hash 不受影响。
+> **执行环境**:与 §1 相同(Deepin 25 / X11 / rustc 1.98.0);bench 二进制因 vendor 改动重编为 `target/release/deps/longdoc-b3c9b69313f2cdbc`(R1/R3 为 `longdoc-9a3abfe4edeb0714`,载体源码 `benches/longdoc.rs` 全程零改动,`git diff` 确认)。
+
+### 9.1 首轮复测(仅 M1+M2,未修)—— 发现曲线**二次方**
+
+命令 = §2 同款:
+
+```bash
+cargo bench -p latermd-app --bench longdoc -- streaming_append
+```
+
+逐字输出(2026-10-04,全量):
+
+```
+    Finished `bench` profile [optimized] target(s) in 0.15s
+     Running benches/longdoc.rs (target/release/deps/longdoc-b3c9b69313f2cdbc)
+Gnuplot not found, using plotters backend
+long doc: 100251 chars, 3704 lines
+Benchmarking streaming_append_by_lines/append_1_line_at_500
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Collecting 10 samples in estimated 5.0325 s (5775 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Analyzing
+streaming_append_by_lines/append_1_line_at_500
+                        time:   [882.66 µs 894.34 µs 902.31 µs]
+                        change: [-97.392% -97.363% -97.336%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Collecting 10 samples in estimated 5.0503 s (385 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Analyzing
+streaming_append_by_lines/append_1_line_at_2000
+                        time:   [12.670 ms 12.782 ms 12.923 ms]
+                        change: [-91.350% -91.167% -90.961%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking streaming_append_by_lines/append_1_line_at_10000
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Collecting 10 samples in estimated 6.3504 s (20 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Analyzing
+streaming_append_by_lines/append_1_line_at_10000
+                        time:   [317.08 ms 320.46 ms 323.62 ms]
+                        change: [-68.326% -67.758% -67.216%] (p = 0.00 < 0.05)
+                        Performance has improved.
+```
+
+(`change:` 对照的是 criterion 上一轮存档 = R3 §8,故百分比是「M1+M2 对未修」的改善。)三档绝对值全部大幅变好(10000 行档 1001.7ms → 320.46ms,−68%),**但增长曲线恶化**:
+
+| 档位 | 中值 | µs/行 | 规模增长 | 成本增长 |
+|---|---|---|---|---|
+| 500 行 | 894.34 µs | 1.789 µs | — | — |
+| 2,000 行 | 12.782 ms | 6.391 µs | ×4 | **×14.28** |
+| 10,000 行 | 320.46 ms | 32.05 µs | ×5 | **×25.07** |
+
+成本 ≈ 规模的 1.93 次方——**二次方**。按 §0 口径未达「每行成本趋稳」,激活修复轮。
+
+### 9.2 根因定位(一次性探针,照 R1 §4-C 手法,测完已删)
+
+临时探针 `crates/latermd-app/examples/streaming_profile.rs`(分阶段计时 + vendor 内临时 eprintln 行级计时,**测完已删,工作区净**),关键逐字证据:
+
+1. **追加帧不重排版、不重高亮**:bench 文档追加行落在闭合围栏**之后**,fence token 不变 → flush 缓存命中(sections=32013, rows=8003, 8000 行档 `layout_job` 命中仅 ~1.0ms/帧,`highlight_code` 零调用)。M1/M2 机制按设计工作。
+2. **热点 = `record_section_anchors`**:`compute_section_anchors`(label.rs)对**每个 section**从头重扫全部 rows + `job.text[..byte_start].chars().count()` O(n) 前缀重算。syntect 每个 code line 出一个 section → 8000 行 fence = 32013 sections × 8003 rows,单帧逐字实测:
+
+```
+[probe] render_galley sections=32013 rows=8003 glyphs=262970
+[probe] record_section_anchors 197.223478ms
+[probe] record_text_blocks 3.989µs
+[probe] run_ui total 198.182835ms | ui closure 198.156ms
+```
+
+   195-205ms/帧,占整帧(198-207ms)的 **98%**——这就是二次方项。它同时是 R1 §2「线性偏超线性」里被线性项掩盖的隐藏二次项(外推 R1 10000 行档约 +300ms,与 R1 的 ×6.84>×5 相符):M1/M2 把线性主项杀掉后它显形。
+3. 修复轮 1 后剩余主导 = flush 命中帧的 `cached.layout.job.clone()`(整 job 深拷贝)+ `Fonts::layout_job` 整 job 哈希找 galley(8k 行 ~1.0ms/帧)。
+
+### 9.3 修复轮 1:anchors 单遍扫描(label.rs `compute_section_anchors`)
+
+sections 与 rows 都按文档序,byte→char 游标与 row 游标各自只前进,一遍扫完;空行 `max(1)` 语义、末段沉底、byte_start 越界钳制等边界逐项保持。**值完全不变**(等价改写)。复测逐字输出:
+
+```
+Benchmarking streaming_append_by_lines/append_1_line_at_500
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Collecting 10 samples in estimated 5.0059 s (44k iterations)
+streaming_append_by_lines/append_1_line_at_500
+                        time:   [115.03 µs 116.18 µs 117.29 µs]
+                        change: [-87.024% -86.859% -86.700%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Collecting 10 samples in estimated 5.0195 s (11k iterations)
+streaming_append_by_lines/append_1_line_at_2000
+                        time:   [439.07 µs 443.34 µs 447.79 µs]
+                        change: [-96.656% -96.588% -96.520%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking streaming_append_by_lines/append_1_line_at_10000
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Collecting 10 samples in estimated 5.0919 s (2200 iterations)
+streaming_append_by_lines/append_1_line_at_10000
+                        time:   [2.2843 ms 2.3220 ms 2.3791 ms]
+                        change: [-99.282% -99.270% -99.257%] (p = 0.00 < 0.05)
+                        Performance has improved.
+```
+
+二次方项消除:500→2000 ×3.82(×4 规模)、2000→10000 ×5.24(×5 规模)——回到「线性小系数」(0.232→0.222→0.232 µs/行,趋稳但增长不显著低于规模)。未达验收,进入修复轮 2(预算最后一轮)。
+
+### 9.4 修复轮 2:flush 缓存记住 shaped galley(+ 三项 perf 收尾)
+
+- `CachedFlushRange` 增 `CachedShapedGalley { max_width, break_anywhere, pixels_per_point, galley, anchors }`:命中帧直接用已 shape 的 galley(与相对 anchors),跳过整 job 深拷贝与整 job 哈希;key 失配(换宽/换缩放)回落常规 shaping 路径;`map_job` 存在时的尾段不参与复用(app 未用 map_job,上游语义保留)。
+- 连带三项:块高缓存 key 的 style+handler 份额从每块一哈希提为每 range 一哈希;`code_block_admits_segmentation` 字节长度快速否决(行数 ≤ 字节数,短 fence 免逐行扫描);anchors 随 shaped galley 缓存免重算。
+- **踩坑(已写注释)**:egui 0.36 `Context::pixels_per_point` 取 context **写锁**,在 `ui.data_mut` 闭包内调用会自死锁——本仓测试当场抓到(10s RwLock 超时),读 ppp 必须提到 data 锁外。
+
+终测(命令同 §2,逐字):
+
+```
+Benchmarking streaming_append_by_lines/append_1_line_at_500
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Collecting 10 samples in estimated 5.0017 s (133k iterations)
+streaming_append_by_lines/append_1_line_at_500
+                        time:   [35.206 µs 35.886 µs 36.482 µs]
+                        change: [-5.5497% -3.8234% -1.9321%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Collecting 10 samples in estimated 5.0042 s (46k iterations)
+streaming_append_by_lines/append_1_line_at_2000
+                        time:   [104.88 µs 107.29 µs 109.56 µs]
+                        change: [-6.3825% -4.5591% -2.5805%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking streaming_append_by_lines/append_1_line_at_10000
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Collecting 10 samples in estimated 5.0246 s (9075 iterations)
+streaming_append_by_lines/append_1_line_at_10000
+                        time:   [546.50 µs 550.75 µs 555.65 µs]
+                        change: [-5.5887% -4.1767% -2.6438%] (p = 0.00 < 0.05)
+                        Performance has improved.
+```
+
+### 9.5 判定(口径 = §0 / 任务书「每行成本随规模趋稳(亚线性)」)
+
+| 档位 | M3 终测中值 | µs/行 | R1 中值 | 对 R1 | M0 中值 | 对 M0 |
+|---|---|---|---|---|---|---|
+| 500 行 | 35.886 µs | **0.0718 µs** | 33.800 ms | **−99.89%** | 38.7 ms | −99.91% |
+| 2,000 行 | 107.29 µs | **0.0536 µs** | 146.46 ms | **−99.93%** | 154.7 ms | −99.93% |
+| 10,000 行 | 550.75 µs | **0.0551 µs** | 1001.7 ms | **−99.945%** | 789.3 ms | −99.93% |
+
+- **每行成本随规模**:0.0718 → 0.0536 → 0.0551 µs——**下降后趋稳**(末两档差 +2.8%,在 §0 的 ±5% 持平带宽内;R1 是 67.6→73.2→100.2 随规模上升)。✅
+- **成本增长 vs 规模增长**:500→2000 成本 ×2.99(规模 ×4,低 25%);2000→10000 成本 ×5.13(规模 ×5,+2.6% 与线性持平);总体 ×20 规模成本 ×15.34(低 23%)。如实记录:2000→10000 段未达「显著低于」,残余线性项 = 整篇 parse/哈希/anchors 记录,合计 ~0.05 µs/行——两轮修复预算已用于两个主导项(二次方 anchors 与 O(n) job 拷贝+哈希),不再扩面(增量解析属另一工程量级)。
+- **M0 验证 4 的原始痛点**(m0-report §4.2「超 ~1,300 行单 chunk 成本超 100ms 吐字节奏」):现 10000 行单 chunk = 550.75 µs = 100ms 预算的 **0.55%**(余量 181×);三档全部深藏预算内。**验证 4 凭本节销账**(m0-report §4.4 已按新数字落档)。
+
+### 9.6 滚动路径回归核对(long_doc_100k,与本步否决线)—— 回归属实但主因不在本步
+
+修复后同命令复跑 `cargo bench -p latermd-app --bench longdoc -- long_doc_100k`,逐字:
+
+```
+long_doc_100k/cold_first_frame
+                        time:   [122.53 ms 123.90 ms 125.44 ms]
+                        change: [-1.7899% -0.7989% +0.1813%] (p = 0.15 > 0.05)
+long_doc_100k/steady_state_top
+                        time:   [522.86 µs 528.05 µs 532.83 µs]
+                        change: [+28.190% +29.619% +31.083%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+long_doc_100k/steady_state_scroll_middle
+                        time:   [559.06 µs 571.32 µs 578.67 µs]
+                        change: [+28.359% +32.214% +36.216%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+```
+
+冷首帧持平;稳态两档对 R1(358.83/371.36 µs)+47%/+54%。**A/B 定位**(临时 env 开关逐项关断,测完还原,工作区净)定出构成:
+
+| 分量 | 稳态 top 影响 | 归属 |
+|---|---|---|
+| #42 块表记录(block_span_rects,main `85cdf93`) | **+136 µs/帧** | **main 既有,先于本分支**(R1 基线 2026-10-02 未含 #42;`git log 618b3ab..origin/main -- vendor/` 仅此一个 vendor commit) |
+| M1 准入门逐行扫描 | +29 µs/帧 | 本分支 M1;**本轮已修**(字节长度快速否决,终测数字已含) |
+| M2 块 key 内容哈希 | +36 µs/帧 | 本分支 M2 的固有代价(内容寻址 cull 的语义必需,换 streaming 正确性,接受) |
+| 本步 shaped galley 复用 | **−14 µs/帧** | 本轮 M3(净改善) |
+| 残余未归因 | ~30-40 µs | 轮间噪声/环境漂移量级(cold 帧持平佐证环境可比) |
+
+即:**去掉 main 既有的 #42 分量后,观测差 +33µs(+9%),其中可解释的本分支净贡献 = M2(+36)− 本步复用(−14)≈ +22µs(+6%)(M1 的 +29 已在本轮修掉),其余落在轮间噪声/环境漂移带内**;且距 18.18ms(55fps)预算余量仍有 34×。像素零变化否决线维持(152 项 vendored 测试全绿,含 M2 的热缓存像素指纹测试与本轮新增等价/复用测试)。#42 块表的每帧记录成本已按五要素登记 decisions-pending 新条目,交其归属模块处理,不在本步范围。
+
+### 9.7 测试与验证(全部实跑)
+
+- vendored:`cargo test -p egui_markdown --all-features` **152 passed / 0 failed**(含新增 5 测:section_anchors.rs +2——等价 oracle(4 文档矩阵,测试内嵌旧算法对照)+ 520 行 admitted fence 每行有锚;cache.rs +3——重复帧 painted text+anchors 逐项相等 / 换宽后 anchors == 全新 ctx 同宽 / admitted fence 流式追加新行可见)。
+- 变异验证 2 次:row 游标「匹配即前进」→ 等价断言 8≠15 失败;丢弃 shaped galley 宽度 key → 换宽测试失败;还原后全绿(断言非恒真)。
+- 探针载体 `streaming_profile.rs` 测完已删;vendor 内临时插桩(env 门控 eprintln/计时器/关断开关)全部还原,`git diff vendor/` 仅剩本轮正式改动。
+- 六项门禁(fmt/三轮 clippy/test/doc)与 `vendor/egui_markdown/check.sh` 在本模块收尾时实跑,结果见 auto-plan/README 修订记录;真机目视项见 notes(blocked_external)。

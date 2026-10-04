@@ -52,7 +52,7 @@ fn block_code_widget_fires_once_per_matching_fence_in_order() {
 fn default_handler_keeps_fence_in_galley_path() {
   let doc = "```ai\njust a code block\n```\n";
   let md = egui_markdown::parse(doc);
-  assert!(!layout::needs_segmentation(&md.tokens, false, None));
+  assert!(!layout::needs_segmentation(&md.tokens, false, None, &MarkdownStyle::default()));
 
   let ctx = Context::default();
   let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen()), ..Default::default() }, |ui| {
@@ -84,7 +84,7 @@ fn needs_segmentation_matches_build_layout_with_widget_handler() {
   let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen()), ..Default::default() }, |ui| {
     for doc in docs {
       let md = egui_markdown::parse(doc);
-      let predicted = layout::needs_segmentation(&md.tokens, false, Some(&handler));
+      let predicted = layout::needs_segmentation(&md.tokens, false, Some(&handler), &style);
       let built = layout::build_layout(
         ui,
         &md.tokens,
@@ -95,6 +95,7 @@ fn needs_segmentation_matches_build_layout_with_widget_handler() {
         false,
         Some(&handler),
         false,
+        true,
         &style,
         Default::default(),
       );

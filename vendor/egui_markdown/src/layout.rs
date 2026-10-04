@@ -20,9 +20,9 @@ use crate::types::Token;
 const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
 
 /// Resolve the row height for a given font size under the user's
-/// [`MarkdownStyle::line_height_ratio`](style::MarkdownStyle::line_height_ratio)
+/// [`MarkdownStyle::line_height_ratio`](MarkdownStyle::line_height_ratio)
 /// and the host-declared fallback floor
-/// [`MarkdownStyle::min_line_height_em`](style::MarkdownStyle::min_line_height_em).
+/// [`MarkdownStyle::min_line_height_em`](MarkdownStyle::min_line_height_em).
 ///
 /// A single fixed pixel height cannot serve both sizes in one document: at the
 /// default 13pt body font, 13pt * 1.30 is about 17px, but H1 renders at 20.8pt and
@@ -254,19 +254,41 @@ fn apply_bold(format: &mut TextFormat, ui: &Ui, has_bold: bool) {
   }
 }
 
+/// Whether a fenced code block is large enough to be laid out as its own segment under
+/// [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission).
+///
+/// The threshold is measured per code block (its line count), not per document (token or
+/// byte totals): [`build_layout`] runs on whole documents *and* on individual flushed
+/// ranges, and a whole-document measure is not knowable from inside a range, so the two
+/// callers would disagree about the same tokens. A per-block measure decides identically
+/// in every context, and admission never inserts or removes tokens, so a fence crossing
+/// the threshold cannot shift the token indices later block widgets bake into their ids.
+#[inline]
+pub fn code_block_admits_segmentation(text: &str, style: &MarkdownStyle) -> bool {
+  // A line is at least one byte, so a body shorter than the threshold cannot
+  // reach it — skip the line scan for the common small-fence case.
+  text.len() >= style.segmentation_admission && text.lines().count() >= style.segmentation_admission
+}
+
 /// Whether a token stream contains anything that [`build_layout`] would report as a segment
 /// break, which means whether it must use the segmented render path.
 ///
-/// Must stay in sync with every `segment_breaks.push` in [`build_layout`]. It exists so a
-/// caller can make that decision without paying for a full layout it would then discard.
+/// Must stay in sync with every `segment_breaks.push` in [`build_layout`] — pass
+/// `segment_large_code_blocks: true` there. A fence whose line count reaches
+/// [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission)
+/// counts as a break in both. It exists so a caller can make that decision without paying
+/// for a full layout it would then discard.
 pub fn needs_segmentation(
   tokens: &[Token<'_>],
   scroll_code_blocks: bool,
   link_handler: Option<&dyn LinkHandler>,
+  style: &MarkdownStyle,
 ) -> bool {
   tokens.iter().any(|token| match token {
-    Token::CodeBlock { language, .. } => {
-      scroll_code_blocks || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref()))
+    Token::CodeBlock { text, language } => {
+      scroll_code_blocks
+        || code_block_admits_segmentation(text, style)
+        || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref()))
     }
     Token::Link { href, .. } => link_handler.is_some_and(|h| h.is_block_widget(href)),
     Token::Image { .. } | Token::Table(_) | Token::BlockquoteStart | Token::BlockquoteEnd => true,
@@ -278,6 +300,13 @@ pub fn needs_segmentation(
 ///
 /// Converts tokens into styled text sections suitable for galley layout.
 /// Returns segment breaks for tokens that need separate rendering (tables, images, blockquotes).
+///
+/// `segment_large_code_blocks` decides whether a non-scrolling fence whose line count
+/// reaches [`MarkdownStyle::segmentation_admission`](MarkdownStyle::segmentation_admission)
+/// is reported as a segment break. Whole-document callers pass `true` to stay in sync
+/// with [`needs_segmentation`]; a caller laying out a single admitted fence as its own
+/// flushed range passes `false` so the fence renders inline within that range instead
+/// of being reported as a break again.
 ///
 /// `max_width` and `break_anywhere` seed [`LayoutJob::wrap`]. Callers that cache the
 /// resulting job should re-apply the live wrap width (and break flag) before shaping,
@@ -293,6 +322,7 @@ pub fn build_layout(
   break_anywhere: bool,
   link_handler: Option<&dyn LinkHandler>,
   scroll_code_blocks: bool,
+  segment_large_code_blocks: bool,
   style: &MarkdownStyle,
   code_theme: CodeThemeArg<'_>,
 ) -> LayoutResult {
@@ -387,7 +417,10 @@ pub fn build_layout(
         section_to_token.push(token_index);
       }
       Token::CodeBlock { text, language } => {
-        if scroll_code_blocks || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref())) {
+        if scroll_code_blocks
+          || (segment_large_code_blocks && code_block_admits_segmentation(text.as_ref(), style_ref))
+          || link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref()))
+        {
           segment_breaks.push(token_index);
         } else {
           let lang = language.as_deref().unwrap_or(style_ref.default_code_language.as_str());

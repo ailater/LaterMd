@@ -14,7 +14,9 @@ use epaint::{
 
 #[cfg(not(feature = "syntax_highlighting"))]
 use crate::layout::highlight_code;
-use crate::layout::{build_layout, needs_segmentation, section_for_char, CodeThemeArg, LayoutResult};
+use crate::layout::{
+  build_layout, code_block_admits_segmentation, needs_segmentation, section_for_char, CodeThemeArg, LayoutResult,
+};
 #[cfg(feature = "syntax_highlighting")]
 use crate::layout::{scrolling_code_galley, StreamingCodeCache};
 use crate::link::LinkHandler;
@@ -47,6 +49,37 @@ struct CachedFlushRange {
   ctx_hash: u64,
   layout: Arc<LayoutResult>,
   tokens: Arc<Vec<Token<'static>>>,
+  /// The range's shaped galley from a previous frame, valid while the wrap it
+  /// was shaped at still holds. See [`CachedShapedGalley`].
+  galley: Option<CachedShapedGalley>,
+}
+
+/// A galley shaped from a flush range's cached job, at one wrap and zoom.
+///
+/// [`Fonts::layout_job`](egui::epaint::text::Fonts::layout_job) finds a cached
+/// galley by hashing the whole job — for a large range that hash dominates an
+/// otherwise fully-cached frame. The shaped result is kept here instead, keyed
+/// by the wrap inputs that produced it (the job itself is pinned by the range's
+/// `ctx_hash`, and `pixels_per_point` by egui's own galley cache). The inputs
+/// re-shape deterministically, so a hit is exactly what `layout_job` would
+/// return; any mismatch falls back to the normal shape path.
+#[derive(Clone)]
+struct CachedShapedGalley {
+  max_width: f32,
+  break_anywhere: bool,
+  pixels_per_point: f32,
+  galley: Arc<Galley>,
+  /// Section anchors relative to the galley origin, from the shaping pass.
+  anchors: Vec<SectionAnchor>,
+}
+
+/// What [`MarkdownLabel::render_galley`] shapes and paints.
+enum ShapedJob {
+  /// A fresh job to wrap and shape through the font layer.
+  Job(LayoutJob),
+  /// A galley already shaped from the identical job at the current wrap, with
+  /// its section anchors as laid out relative to the galley origin.
+  Galley { galley: Arc<Galley>, anchors: Vec<SectionAnchor> },
 }
 
 #[cfg(not(feature = "syntax_highlighting"))]
@@ -60,6 +93,40 @@ struct CachedCodeBlock {
 fn hash_text(text: &str, style: &MarkdownStyle, handler: Option<&dyn LinkHandler>) -> u64 {
   let mut hasher = std::collections::hash_map::DefaultHasher::new();
   text.hash(&mut hasher);
+  style.hash(&mut hasher);
+  if let Some(h) = handler {
+    h.id().hash(&mut hasher);
+  }
+  hasher.finish()
+}
+
+/// Identity of one block widget's own content: its token, plus the same context a
+/// whole-document [`hash_text`] key covers (style, handler id).
+///
+/// The height cache under `("block_sz", index)` keys its entry by token index and
+/// verifies it with this hash, so the hash range must be exactly the block: the
+/// whole-document hash would invalidate every block on any edit. The block's
+/// *source span* looks like a cheaper range (one contiguous `&str` hash), but spans
+/// tile the source contiguously: a block's span absorbs the blank separators before
+/// it and stops at the end of the block body (the closing fence line is not part of
+/// it), so the same construct at a different position hashes differently. The token
+/// is exact — an identical token renders an identical widget at the same height,
+/// including nested table cells. Keeping style and handler id in the key preserves
+/// the old invalidation: a style change still re-measures every block.
+#[inline]
+fn hash_block_content(token: &Token<'_>, style_context: u64) -> u64 {
+  let mut hasher = std::collections::hash_map::DefaultHasher::new();
+  token.hash(&mut hasher);
+  style_context.hash(&mut hasher);
+  hasher.finish()
+}
+
+/// The style-and-handler share of [`hash_block_content`]'s key, hashed once per
+/// range instead of per block: hashing the full [`MarkdownStyle`] for every
+/// block widget is measurable on table-heavy documents with hundreds of blocks
+/// per frame.
+fn hash_block_context(style: &MarkdownStyle, handler: Option<&dyn LinkHandler>) -> u64 {
+  let mut hasher = std::collections::hash_map::DefaultHasher::new();
   style.hash(&mut hasher);
   if let Some(h) = handler {
     h.id().hash(&mut hasher);
@@ -148,12 +215,18 @@ fn record_widget_block(ui: &egui::Ui, id: Id, span: std::ops::Range<usize>, befo
 
 /// Cull an off-screen block widget using its cached height.
 ///
+/// The entry is keyed by the block's token index and verified by the block's
+/// content hash ([`hash_block_content`]): the index is stable while edits append
+/// at the end of the document, and an edit that changes the token count earlier
+/// shifts later indices to fresh — never stale — entries. A hash match therefore
+/// means the cached height was measured for this exact block.
+///
 /// Returns `Some(rect)` when the block was culled — the rect it would have
 /// occupied, so callers can still record its geometry — and `None` when the
 /// block must be rendered normally.
-fn try_cull_block(ui: &mut Ui, block_sz_id: Id, text_hash: u64) -> Option<Rect> {
+fn try_cull_block(ui: &mut Ui, block_sz_id: Id, content_hash: u64) -> Option<Rect> {
   let (cached_hash, cached_height) = ui.data(|d| d.get_temp::<(u64, f32)>(block_sz_id))?;
-  if cached_hash != text_hash {
+  if cached_hash != content_hash {
     return None;
   }
   let size = Vec2::new(ui.available_width(), cached_height);
@@ -165,9 +238,9 @@ fn try_cull_block(ui: &mut Ui, block_sz_id: Id, text_hash: u64) -> Option<Rect> 
   Some(est_rect)
 }
 
-fn cache_block_height(ui: &mut Ui, block_sz_id: Id, text_hash: u64, before_y: f32) {
+fn cache_block_height(ui: &mut Ui, block_sz_id: Id, content_hash: u64, before_y: f32) {
   let height = ui.min_rect().bottom() - before_y;
-  ui.data_mut(|d| d.insert_temp(block_sz_id, (text_hash, height)));
+  ui.data_mut(|d| d.insert_temp(block_sz_id, (content_hash, height)));
 }
 
 /// Convert borrowed tokens to owned ('static) by converting CowStr::Borrowed to Boxed.
@@ -427,26 +500,44 @@ fn block_needle<'a, 's>(token: &'a Token<'s>) -> Option<&'a str> {
 /// accumulating gives each row's character range; a section starts at the row that
 /// contains its first character. `PlacedRow::pos.y` is relative to the galley
 /// origin, which is exactly what a `ScrollArea` caller needs.
+///
+/// Sections and rows are both in document order, so two cursors that only move
+/// forward locate every section's row in one sweep. Restarting the row walk (and
+/// re-counting the text prefix) for each section made this O(sections × rows),
+/// which dominates large documents whose highlighting emits one section per code
+/// line — exactly the shape a streaming AI response produces.
 fn compute_section_anchors(galley: &egui::epaint::text::Galley) -> Vec<SectionAnchor> {
-  let mut anchors = Vec::with_capacity(galley.job.sections.len());
-  for (index, section) in galley.job.sections.iter().enumerate() {
+  let sections = &galley.job.sections;
+  let text = &galley.job.text;
+  let mut anchors = Vec::with_capacity(sections.len());
+  let mut byte_cursor = 0usize;
+  // Chars in `text[..byte_cursor]`, accumulated section by section.
+  let mut chars_before = 0usize;
+  let mut row_index = 0usize;
+  // Chars the rows before `row_index` account for.
+  let mut row_chars_before = 0usize;
+  for (index, section) in sections.iter().enumerate() {
     // byte_start is already absolute within `galley.job.text`
     let byte_start = section.byte_range.start.0;
     // Convert to a char offset: rows are counted in chars, bytes are not.
-    let char_start = galley.job.text[..byte_start.min(galley.job.text.len())].chars().count();
+    let limit = byte_start.min(text.len());
+    chars_before += text[byte_cursor..limit].chars().count();
+    byte_cursor = limit;
+    let char_start = chars_before;
     let mut y = f32::NAN;
-    // Walk the rows from the top for **this** section: an empty row contributes
-    // no glyphs, so it must still advance the cursor by one visual line.
-    let mut char_cursor = 0usize;
-    for row in &galley.rows {
+    // Advance the shared row cursor: an empty row contributes no glyphs, so it
+    // must still advance the cursor by one visual line.
+    while row_index < galley.rows.len() {
+      let row = &galley.rows[row_index];
       let row_len = row.row.glyphs.len();
-      if char_start < char_cursor + row_len.max(1) {
+      if char_start < row_chars_before + row_len.max(1) {
         y = row.pos.y;
         break;
       }
-      char_cursor += row_len.max(1);
+      row_chars_before += row_len.max(1);
+      row_index += 1;
     }
-    if y.is_nan() && index + 1 == galley.job.sections.len() {
+    if y.is_nan() && index + 1 == sections.len() {
       // Trailing empty section: park it at the very bottom rather than dropping it
       y = galley.rect.bottom();
     }
@@ -692,6 +783,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       false,
+      false,
       style,
       code_theme,
     );
@@ -717,6 +809,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.max_width,
       wrap.break_anywhere,
       self.link_handler,
+      false,
       false,
       style,
       code_theme,
@@ -774,14 +867,14 @@ impl<'a> MarkdownLabel<'a> {
         let Some(layout) = cached.layout.clone() else {
           // 布局缺失(分段渲染路径):缓存里留有 spans,块表记录照常可用。
           let md = Markdown { s: text, tokens: (*tokens).clone(), spans: (*spans).clone() };
-          self.render_segmented(ui, &md, &font, color, style, text_hash);
+          self.render_segmented(ui, &md, &font, color, style);
           return;
         };
 
-        self.render_galley(
+        let _ = self.render_galley(
           ui,
           &tokens,
-          layout.job.clone(),
+          ShapedJob::Job(layout.job.clone()),
           &layout.section_to_token,
           &layout.code_block_spans,
           &layout.code_block_info,
@@ -797,13 +890,16 @@ impl<'a> MarkdownLabel<'a> {
       }
     }
 
-    // Cache miss - parse and build layout.
+    // Cache miss - parse and build layout. The full-text parse and the owned-token copy
+    // are a small fraction of what re-rendering costs (layout dominates), so this
+    // whole-document gate keeps the full-text hash; per-block keying is a segmented-path
+    // concern and lives in its own caches (per-range flushes, per-block heights).
     let md = parser::parse(text);
     let owned_tokens = Arc::new(tokens_to_owned(&md.tokens));
 
     // Decide the render path before laying anything out: a whole-document layout is useless
     // to the segmented path, and building one per keystroke doubles the cost of every edit.
-    if needs_segmentation(&md.tokens, self.scroll_code_blocks, self.link_handler) {
+    if needs_segmentation(&md.tokens, self.scroll_code_blocks, self.link_handler, style) {
       let owned_spans = Arc::new(md.spans.clone());
       ui.data_mut(|d| {
         d.insert_temp(
@@ -811,7 +907,7 @@ impl<'a> MarkdownLabel<'a> {
           CachedMarkdownLayout { text_hash, layout: None, tokens: owned_tokens, spans: owned_spans },
         );
       });
-      self.render_segmented(ui, &md, &font, color, style, text_hash);
+      self.render_segmented(ui, &md, &font, color, style);
       return;
     }
 
@@ -827,6 +923,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       self.scroll_code_blocks,
+      true,
       style,
       code_theme,
     );
@@ -845,10 +942,10 @@ impl<'a> MarkdownLabel<'a> {
       );
     });
 
-    self.render_galley(
+    let _ = self.render_galley(
       ui,
       &md.tokens,
-      layout.job.clone(),
+      ShapedJob::Job(layout.job.clone()),
       &layout.section_to_token,
       &layout.code_block_spans,
       &layout.code_block_info,
@@ -862,16 +959,8 @@ impl<'a> MarkdownLabel<'a> {
     );
   }
 
-  fn render_segmented(
-    &self,
-    ui: &mut Ui,
-    md: &Markdown<'_>,
-    font: &FontId,
-    color: Color32,
-    style: &MarkdownStyle,
-    text_hash: u64,
-  ) {
-    self.render_token_range(ui, md, font, color, 0, md.tokens.len(), style, text_hash);
+  fn render_segmented(&self, ui: &mut Ui, md: &Markdown<'_>, font: &FontId, color: Color32, style: &MarkdownStyle) {
+    self.render_token_range(ui, md, font, color, 0, md.tokens.len(), style);
   }
 
   /// Recursively render a range of tokens, handling blockquotes and tables as sub-regions.
@@ -885,10 +974,17 @@ impl<'a> MarkdownLabel<'a> {
     start: usize,
     end: usize,
     style: &MarkdownStyle,
-    text_hash: u64,
   ) {
     let mut text_start = start;
     let mut i = start;
+
+    // Block-widget height caches are keyed by the block's own token, not by the
+    // document hash: appending at the end of the document leaves every earlier block's
+    // cached height valid, so only the edited block re-measures. The style and
+    // handler parts of the key are hashed once here — per-block re-hashing of the
+    // full style is measurable on table-heavy documents.
+    let block_context = hash_block_context(style, self.link_handler);
+    let block_key = |index: usize| hash_block_content(&md.tokens[index], block_context);
 
     let block_spacing = style.block_spacing;
     // Before rendering a block element, add spacing if there was preceding content.
@@ -914,11 +1010,11 @@ impl<'a> MarkdownLabel<'a> {
       match &md.tokens[i] {
         Token::Table(data) => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -937,7 +1033,7 @@ impl<'a> MarkdownLabel<'a> {
             self.link_handler,
           );
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -945,7 +1041,7 @@ impl<'a> MarkdownLabel<'a> {
         Token::CodeBlock { text, language }
           if self.link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref())) =>
         {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let before_rect = ui.available_rect_before_wrap();
           let handler = self.link_handler.unwrap();
           handler.block_code_widget(ui, text, language.as_deref());
@@ -955,11 +1051,11 @@ impl<'a> MarkdownLabel<'a> {
         }
         Token::CodeBlock { text, language } if self.scroll_code_blocks => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -979,7 +1075,24 @@ impl<'a> MarkdownLabel<'a> {
             self.code_theme_arg(),
           );
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
+          i += 1;
+          text_start = i;
+          after_block(&mut i, &mut text_start, end, ui);
+        }
+        // A non-scrolling fence that reached the admission threshold becomes its own
+        // flushed range: the same galley shape it would have inside a whole-document
+        // galley (padding, highlighting, wrapping, background), but laid out, cached
+        // and viewport-culled per block, so appending lines to it does not re-layout
+        // the rest of the document. The single-fence flush passes `false` so the fence
+        // renders inline within its own range instead of being reported as a break
+        // again. Culling reuses the per-range size cache; block-widget culling
+        // (`try_cull_block`) is unaffected.
+        Token::CodeBlock { text, .. } if code_block_admits_segmentation(text.as_ref(), style) => {
+          let had_content = text_start < i;
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
+          before_block(had_content, ui);
+          self.flush_text_range(ui, md, font, color, i, i + 1, style, false);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -987,11 +1100,11 @@ impl<'a> MarkdownLabel<'a> {
         #[cfg(feature = "images")]
         Token::Image { url, .. } => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -1002,17 +1115,17 @@ impl<'a> MarkdownLabel<'a> {
           let image = egui::Image::new(url.as_ref()).max_width(ui.available_width()).show_loading_spinner(true);
           ui.add(image);
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
         }
         #[cfg(not(feature = "images"))]
         Token::Image { alt, url, .. } => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -1025,13 +1138,13 @@ impl<'a> MarkdownLabel<'a> {
             ui.ctx().open_url(OpenUrl::new_tab(url.to_string()));
           }
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
         }
         Token::Link { text, href, .. } if self.link_handler.is_some_and(|h| h.is_block_widget(href)) => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let before_rect = ui.available_rect_before_wrap();
           let handler = self.link_handler.unwrap();
           handler.block_widget(ui, text, href);
@@ -1040,7 +1153,7 @@ impl<'a> MarkdownLabel<'a> {
           text_start = i;
         }
         Token::BlockquoteStart => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
 
           // Find the matching BlockquoteEnd.
           let bq_start = i + 1;
@@ -1069,7 +1182,7 @@ impl<'a> MarkdownLabel<'a> {
           child_rect.min.x += indent;
 
           let mut child_ui = ui.new_child(UiBuilder::new().id_salt(self.id.with(("bq", i))).max_rect(child_rect));
-          self.render_token_range(&mut child_ui, md, font, color, bq_content_start, bq_end, style, text_hash);
+          self.render_token_range(&mut child_ui, md, font, color, bq_content_start, bq_end, style);
 
           let bq_stroke =
             Stroke::new(style.blockquote.stroke_width, ui.visuals().widgets.noninteractive.bg_stroke.color);
@@ -1093,7 +1206,7 @@ impl<'a> MarkdownLabel<'a> {
           after_block(&mut i, &mut text_start, end, ui);
         }
         Token::BlockquoteEnd => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           i += 1;
           text_start = i;
         }
@@ -1104,10 +1217,15 @@ impl<'a> MarkdownLabel<'a> {
     }
 
     // Flush remaining text.
-    self.flush_text_range(ui, md, font, color, text_start, end, style);
+    self.flush_text_range(ui, md, font, color, text_start, end, style, true);
   }
 
   /// Render a range of non-break tokens as an interactive galley.
+  ///
+  /// `segment_large_code_blocks` is passed through to [`build_layout`]: plain text
+  /// ranges pass `true` (they contain no admitted fence, and a disagreement here is
+  /// what the segment-break debug assert catches), while the single-fence range an
+  /// admitted fence renders as passes `false` so the fence renders inline.
   #[allow(clippy::too_many_arguments)]
   fn flush_text_range(
     &self,
@@ -1118,6 +1236,7 @@ impl<'a> MarkdownLabel<'a> {
     start: usize,
     end: usize,
     style: &MarkdownStyle,
+    segment_large_code_blocks: bool,
   ) {
     if start >= end {
       return;
@@ -1167,10 +1286,41 @@ impl<'a> MarkdownLabel<'a> {
 
     if let Some(cached) = ui.data(|d| d.get_temp::<CachedFlushRange>(cache_id)) {
       if cached.ctx_hash == ctx_hash {
-        let size = self.render_galley(
+        // The shaped galley can only be reused when no per-frame job transform
+        // (`map_job` on the trailing range) would have shaped a different one.
+        let reusable = !apply_map_job || self.map_job.is_none();
+        // Read before any `data_mut` below: `pixels_per_point` acquires the
+        // context write lock in egui 0.36 and would self-deadlock inside it.
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        if let Some(shaped) = &cached.galley {
+          if reusable
+            && shaped.max_width == max_width
+            && shaped.break_anywhere == wrap.break_anywhere
+            && shaped.pixels_per_point == pixels_per_point
+          {
+            let (size, _, _) = self.render_galley(
+              ui,
+              &cached.tokens,
+              ShapedJob::Galley { galley: Arc::clone(&shaped.galley), anchors: shaped.anchors.clone() },
+              &cached.layout.section_to_token,
+              &cached.layout.code_block_spans,
+              &cached.layout.code_block_info,
+              &cached.layout.hr_positions,
+              &cached.layout.inline_widget_spans,
+              start,
+              &md.spans,
+              color,
+              style,
+              apply_map_job,
+            );
+            ui.data_mut(|d| d.insert_temp(size_cache_id, (ctx_hash, max_width, size)));
+            return;
+          }
+        }
+        let (size, galley, relative_anchors) = self.render_galley(
           ui,
           &cached.tokens,
-          cached.layout.job.clone(),
+          ShapedJob::Job(cached.layout.job.clone()),
           &cached.layout.section_to_token,
           &cached.layout.code_block_spans,
           &cached.layout.code_block_info,
@@ -1182,6 +1332,24 @@ impl<'a> MarkdownLabel<'a> {
           style,
           apply_map_job,
         );
+        let shaped = reusable.then(|| CachedShapedGalley {
+          max_width,
+          break_anywhere: wrap.break_anywhere,
+          pixels_per_point,
+          galley,
+          anchors: relative_anchors,
+        });
+        ui.data_mut(|d| {
+          d.insert_temp(
+            cache_id,
+            CachedFlushRange {
+              ctx_hash,
+              layout: Arc::clone(&cached.layout),
+              tokens: Arc::clone(&cached.tokens),
+              galley: shaped,
+            },
+          )
+        });
         ui.data_mut(|d| d.insert_temp(size_cache_id, (ctx_hash, max_width, size)));
         return;
       }
@@ -1199,19 +1367,17 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       false,
+      segment_large_code_blocks,
       style,
       code_theme,
     );
     debug_assert!(layout.segment_breaks.is_empty());
     let owned = Arc::new(tokens_to_owned(token_slice));
     let layout = Arc::new(layout);
-    ui.data_mut(|d| {
-      d.insert_temp(cache_id, CachedFlushRange { ctx_hash, layout: Arc::clone(&layout), tokens: Arc::clone(&owned) })
-    });
-    let size = self.render_galley(
+    let (size, galley, relative_anchors) = self.render_galley(
       ui,
       token_slice,
-      layout.job.clone(),
+      ShapedJob::Job(layout.job.clone()),
       &layout.section_to_token,
       &layout.code_block_spans,
       &layout.code_block_info,
@@ -1223,18 +1389,34 @@ impl<'a> MarkdownLabel<'a> {
       style,
       apply_map_job,
     );
+    let reusable = !apply_map_job || self.map_job.is_none();
+    // Read before taking the data lock: `pixels_per_point` acquires the context
+    // write lock in egui 0.36 and would self-deadlock inside `data_mut`.
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let shaped = reusable.then(|| CachedShapedGalley {
+      max_width,
+      break_anywhere: wrap.break_anywhere,
+      pixels_per_point,
+      galley,
+      anchors: relative_anchors,
+    });
+    ui.data_mut(|d| {
+      d.insert_temp(
+        cache_id,
+        CachedFlushRange { ctx_hash, layout: Arc::clone(&layout), tokens: Arc::clone(&owned), galley: shaped },
+      )
+    });
     ui.data_mut(|d| d.insert_temp(size_cache_id, (ctx_hash, max_width, size)));
   }
 
   /// Publish the geometry of every section under this label's id.
   ///
-  /// `origin_y` is the label's own top in the parent's coordinate space; anchors
-  /// are stored absolute so a `ScrollArea` can `scroll_to_rect` them directly.
-  fn record_section_anchors(&self, ui: &egui::Ui, galley: &egui::epaint::text::Galley, origin_y: f32) {
-    let anchors: Vec<SectionAnchor> = compute_section_anchors(galley)
-      .into_iter()
-      .map(|anchor| SectionAnchor { byte_start: anchor.byte_start, y: anchor.y + origin_y })
-      .collect();
+  /// `anchors` are relative to the galley origin; `origin_y` is the label's own
+  /// top in the parent's coordinate space, and anchors are stored absolute so a
+  /// `ScrollArea` can `scroll_to_rect` them directly.
+  fn record_section_anchors(&self, ui: &egui::Ui, anchors: &[SectionAnchor], origin_y: f32) {
+    let anchors: Vec<SectionAnchor> =
+      anchors.iter().map(|anchor| SectionAnchor { byte_start: anchor.byte_start, y: anchor.y + origin_y }).collect();
     ui.data_mut(|d| d.insert_temp(self.id.with("section-anchors"), anchors));
   }
 
@@ -1312,7 +1494,7 @@ impl<'a> MarkdownLabel<'a> {
     &self,
     ui: &mut Ui,
     tokens: &[Token<'_>],
-    job: LayoutJob,
+    shaped: ShapedJob,
     section_to_token: &[usize],
     code_block_spans: &[(usize, usize)],
     code_block_info: &[(String, String)],
@@ -1323,16 +1505,22 @@ impl<'a> MarkdownLabel<'a> {
     color: Color32,
     style: &MarkdownStyle,
     apply_map_job: bool,
-  ) -> Vec2 {
+  ) -> (Vec2, Arc<Galley>, Vec<SectionAnchor>) {
     let wrap = self.resolve_wrap(ui);
-    let mut job = job;
-    Self::apply_live_wrap(&wrap, &mut job);
-    if apply_map_job {
-      if let Some(map_job) = &self.map_job {
-        job = map_job(ui.ctx(), job);
+    let (galley, relative_anchors) = match shaped {
+      ShapedJob::Galley { galley, anchors } => (galley, anchors),
+      ShapedJob::Job(mut job) => {
+        Self::apply_live_wrap(&wrap, &mut job);
+        if apply_map_job {
+          if let Some(map_job) = &self.map_job {
+            job = map_job(ui.ctx(), job);
+          }
+        }
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let anchors = compute_section_anchors(&galley);
+        (galley, anchors)
       }
-    }
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    };
     let code_block_rects = paint::compute_code_block_rects(ui, code_block_spans, &galley);
     let available_width = ui.available_width();
     // Decorations (code block backgrounds, horizontal rules) span the allocated width, so a
@@ -1346,18 +1534,18 @@ impl<'a> MarkdownLabel<'a> {
 
     if !self.interactable {
       let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-      self.record_section_anchors(ui, &galley, rect.min.y);
+      self.record_section_anchors(ui, &relative_anchors, rect.min.y);
       self.record_text_blocks(ui, &galley, rect, tokens, token_base, source_spans);
       paint_decorations(ui, hr_positions, &galley, &code_block_rects, rect.min, decoration_width, style);
       ui.painter().galley(rect.min, galley.clone(), color);
       if let Some(handler) = self.link_handler {
         paint_inline_widgets(ui, handler, tokens, inline_widget_spans, &galley, rect.min);
       }
-      return size;
+      return (size, galley, relative_anchors);
     }
 
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    self.record_section_anchors(ui, &galley, rect.min.y);
+    self.record_section_anchors(ui, &relative_anchors, rect.min.y);
     self.record_text_blocks(ui, &galley, rect, tokens, token_base, source_spans);
     paint_decorations(ui, hr_positions, &galley, &code_block_rects, response.rect.min, decoration_width, style);
 
@@ -1382,7 +1570,7 @@ impl<'a> MarkdownLabel<'a> {
     if self.interactable && response.clicked() {
       self.handle_click(ui, tokens, section_to_token, hovered_section);
     }
-    size
+    (size, galley, relative_anchors)
   }
 
   #[allow(clippy::too_many_arguments)]
