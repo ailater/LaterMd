@@ -127,7 +127,7 @@ fn needs_segmentation_matches_build_layout() {
     for doc in docs {
       for scroll_code_blocks in [false, true] {
         let md = egui_markdown::parse(doc);
-        let predicted = layout::needs_segmentation(&md.tokens, scroll_code_blocks, None);
+        let predicted = layout::needs_segmentation(&md.tokens, scroll_code_blocks, None, &style);
         let built = layout::build_layout(
           ui,
           &md.tokens,
@@ -138,6 +138,7 @@ fn needs_segmentation_matches_build_layout() {
           false,
           None,
           scroll_code_blocks,
+          true,
           &style,
           Default::default(),
         );

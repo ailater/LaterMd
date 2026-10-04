@@ -14,7 +14,9 @@ use epaint::{
 
 #[cfg(not(feature = "syntax_highlighting"))]
 use crate::layout::highlight_code;
-use crate::layout::{build_layout, needs_segmentation, section_for_char, CodeThemeArg, LayoutResult};
+use crate::layout::{
+  build_layout, code_block_admits_segmentation, needs_segmentation, section_for_char, CodeThemeArg, LayoutResult,
+};
 #[cfg(feature = "syntax_highlighting")]
 use crate::layout::{scrolling_code_galley, StreamingCodeCache};
 use crate::link::LinkHandler;
@@ -692,6 +694,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       false,
+      false,
       style,
       code_theme,
     );
@@ -717,6 +720,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.max_width,
       wrap.break_anywhere,
       self.link_handler,
+      false,
       false,
       style,
       code_theme,
@@ -803,7 +807,7 @@ impl<'a> MarkdownLabel<'a> {
 
     // Decide the render path before laying anything out: a whole-document layout is useless
     // to the segmented path, and building one per keystroke doubles the cost of every edit.
-    if needs_segmentation(&md.tokens, self.scroll_code_blocks, self.link_handler) {
+    if needs_segmentation(&md.tokens, self.scroll_code_blocks, self.link_handler, style) {
       let owned_spans = Arc::new(md.spans.clone());
       ui.data_mut(|d| {
         d.insert_temp(
@@ -827,6 +831,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       self.scroll_code_blocks,
+      true,
       style,
       code_theme,
     );
@@ -914,7 +919,7 @@ impl<'a> MarkdownLabel<'a> {
       match &md.tokens[i] {
         Token::Table(data) => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
@@ -945,7 +950,7 @@ impl<'a> MarkdownLabel<'a> {
         Token::CodeBlock { text, language }
           if self.link_handler.is_some_and(|h| h.is_block_code_widget(language.as_deref())) =>
         {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let before_rect = ui.available_rect_before_wrap();
           let handler = self.link_handler.unwrap();
           handler.block_code_widget(ui, text, language.as_deref());
@@ -955,7 +960,7 @@ impl<'a> MarkdownLabel<'a> {
         }
         Token::CodeBlock { text, language } if self.scroll_code_blocks => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
@@ -984,10 +989,27 @@ impl<'a> MarkdownLabel<'a> {
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
         }
+        // A non-scrolling fence that reached the admission threshold becomes its own
+        // flushed range: the same galley shape it would have inside a whole-document
+        // galley (padding, highlighting, wrapping, background), but laid out, cached
+        // and viewport-culled per block, so appending lines to it does not re-layout
+        // the rest of the document. The single-fence flush passes `false` so the fence
+        // renders inline within its own range instead of being reported as a break
+        // again. Culling reuses the per-range size cache; block-widget culling
+        // (`try_cull_block`) is unaffected.
+        Token::CodeBlock { text, .. } if code_block_admits_segmentation(text.as_ref(), style) => {
+          let had_content = text_start < i;
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
+          before_block(had_content, ui);
+          self.flush_text_range(ui, md, font, color, i, i + 1, style, false);
+          i += 1;
+          text_start = i;
+          after_block(&mut i, &mut text_start, end, ui);
+        }
         #[cfg(feature = "images")]
         Token::Image { url, .. } => {
           let had_content = text_start < i;
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
@@ -1009,7 +1031,7 @@ impl<'a> MarkdownLabel<'a> {
         }
         #[cfg(not(feature = "images"))]
         Token::Image { alt, url, .. } => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
           if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
@@ -1031,7 +1053,7 @@ impl<'a> MarkdownLabel<'a> {
           after_block(&mut i, &mut text_start, end, ui);
         }
         Token::Link { text, href, .. } if self.link_handler.is_some_and(|h| h.is_block_widget(href)) => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let before_rect = ui.available_rect_before_wrap();
           let handler = self.link_handler.unwrap();
           handler.block_widget(ui, text, href);
@@ -1040,7 +1062,7 @@ impl<'a> MarkdownLabel<'a> {
           text_start = i;
         }
         Token::BlockquoteStart => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
 
           // Find the matching BlockquoteEnd.
           let bq_start = i + 1;
@@ -1093,7 +1115,7 @@ impl<'a> MarkdownLabel<'a> {
           after_block(&mut i, &mut text_start, end, ui);
         }
         Token::BlockquoteEnd => {
-          self.flush_text_range(ui, md, font, color, text_start, i, style);
+          self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           i += 1;
           text_start = i;
         }
@@ -1104,10 +1126,15 @@ impl<'a> MarkdownLabel<'a> {
     }
 
     // Flush remaining text.
-    self.flush_text_range(ui, md, font, color, text_start, end, style);
+    self.flush_text_range(ui, md, font, color, text_start, end, style, true);
   }
 
   /// Render a range of non-break tokens as an interactive galley.
+  ///
+  /// `segment_large_code_blocks` is passed through to [`build_layout`]: plain text
+  /// ranges pass `true` (they contain no admitted fence, and a disagreement here is
+  /// what the segment-break debug assert catches), while the single-fence range an
+  /// admitted fence renders as passes `false` so the fence renders inline.
   #[allow(clippy::too_many_arguments)]
   fn flush_text_range(
     &self,
@@ -1118,6 +1145,7 @@ impl<'a> MarkdownLabel<'a> {
     start: usize,
     end: usize,
     style: &MarkdownStyle,
+    segment_large_code_blocks: bool,
   ) {
     if start >= end {
       return;
@@ -1199,6 +1227,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       false,
+      segment_large_code_blocks,
       style,
       code_theme,
     );

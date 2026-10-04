@@ -44,6 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block element keeps the plain `block_spacing`, and setting the field to `0.0` makes the
   spacer row exactly `block_spacing` tall. The spacer row counts towards a
   `max_rows` / truncate budget.
+- `MarkdownStyle::segmentation_admission` (default `500`): a fenced code block whose body
+  reaches this many lines is laid out as its own segment — the way tables, images and
+  blockquotes already are — even when code blocks are not scrollable. The threshold is
+  measured per code block (its line count), not per document (token or byte totals):
+  `build_layout` runs on whole documents *and* on individual flushed ranges, and a
+  whole-document measure is not knowable from inside a range, so the two callers would
+  disagree about the same tokens; a per-block measure decides identically in every
+  context, and admission never inserts or removes tokens, so a fence crossing the
+  threshold cannot shift the token indices later block widgets bake into their ids. The
+  admitted fence renders as its own flushed range with the same in-galley shape (padding,
+  highlighting, wrapping, background), but laid out, cached and viewport-culled per
+  block, so appending lines to it no longer re-lays-out the rest of the document. The
+  default is deliberately conservative: a hand-written document almost never carries a
+  single 500-line fence, so ordinary documents keep the whole-document galley path — and
+  its pixel output — unchanged. `usize::MAX` disables admission entirely.
 
 ### Changed
 
@@ -57,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `build_layout` now takes `max_width: f32` and `break_anywhere: bool`, and no
   longer reads `ui.wrap_mode()` itself. A caller that caches the resulting job must write the
   live wrap values over it before each shape, as `MarkdownLabel` already does.
+
+- **Breaking:** `needs_segmentation` now takes `style: &MarkdownStyle`, and `build_layout`
+  takes `segment_large_code_blocks: bool` before `style`, so both can honor
+  `MarkdownStyle::segmentation_admission`. Whole-document callers pass `true` to stay in
+  sync with `needs_segmentation`; a caller laying out a single admitted fence as its own
+  flushed range passes `false` so the fence renders inline within that range.
 
 ### Fixed
 

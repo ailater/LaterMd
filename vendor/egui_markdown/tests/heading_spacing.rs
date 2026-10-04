@@ -21,6 +21,7 @@ fn galley_rows(doc: &str, body_size: f32, style: &MarkdownStyle) -> (Vec<(f32, f
       false,
       None,
       false,
+      false,
       style,
       Default::default(),
     );
@@ -52,6 +53,7 @@ fn section_rows(doc: &str, body_size: f32, style: &MarkdownStyle) -> Vec<(f32, O
       screen.width(),
       false,
       None,
+      false,
       false,
       style,
       Default::default(),

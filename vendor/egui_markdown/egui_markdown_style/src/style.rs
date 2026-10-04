@@ -73,6 +73,26 @@ pub struct MarkdownStyle {
   /// get no spacer. The spacer row counts towards a `max_rows` / truncate budget.
   #[cfg_attr(feature = "serde", serde(default = "default_heading_space_above"))]
   pub heading_space_above: f32,
+  /// Minimum number of lines in a fenced code block for it to be laid out as its
+  /// own segment — the way tables, images and blockquotes already are — even when
+  /// code blocks are not scrollable. Default: `500`.
+  ///
+  /// The threshold is measured **per code block** (its line count), not per document
+  /// (token or byte totals): `build_layout` runs on whole documents *and* on individual
+  /// flushed ranges, and a whole-document measure is not knowable from inside a range,
+  /// so the two callers would disagree about the same tokens. A per-block measure
+  /// decides identically in every context, and admission never inserts or removes
+  /// tokens, so a fence crossing the threshold cannot shift the token indices that
+  /// later block widgets bake into their ids.
+  ///
+  /// The default is deliberately conservative: a hand-written document almost never
+  /// carries a single 500-line fence, so ordinary documents keep the whole-document
+  /// galley path — and its pixel output — unchanged. Long fences (pasted logs,
+  /// streaming LLM output) are exactly the case where re-laying-out the whole document
+  /// on every append stops being affordable, and they flip to per-block layout and
+  /// caching instead.
+  #[cfg_attr(feature = "serde", serde(default = "default_segmentation_admission"))]
+  pub segmentation_admission: usize,
   /// Language used for syntax highlighting when no language is specified.
   pub default_code_language: String,
 }
@@ -97,6 +117,13 @@ fn default_heading_space_above() -> f32 {
   4.0
 }
 
+/// Serde default for [`MarkdownStyle::segmentation_admission`]: a fence must
+/// reach 500 lines before it is laid out as its own segment.
+#[cfg(feature = "serde")]
+fn default_segmentation_admission() -> usize {
+  500
+}
+
 impl Default for MarkdownStyle {
   fn default() -> Self {
     Self {
@@ -112,6 +139,7 @@ impl Default for MarkdownStyle {
       line_height_ratio: 1.30,
       min_line_height_em: 1.0,
       heading_space_above: 4.0,
+      segmentation_admission: 500,
       default_code_language: String::new(),
     }
   }
@@ -131,6 +159,7 @@ impl Hash for MarkdownStyle {
     self.line_height_ratio.to_bits().hash(state);
     self.min_line_height_em.to_bits().hash(state);
     self.heading_space_above.to_bits().hash(state);
+    self.segmentation_admission.hash(state);
     self.default_code_language.hash(state);
   }
 }
@@ -174,6 +203,11 @@ impl MarkdownStyle {
     ui.horizontal(|ui| {
       ui.label("Heading space above:");
       ui.add(DragValue::new(&mut self.heading_space_above).range(0.0..=40.0).speed(0.5));
+    });
+
+    ui.horizontal(|ui| {
+      ui.label("Segment code blocks at (lines):");
+      ui.add(DragValue::new(&mut self.segmentation_admission).range(0..=100_000).speed(1.0));
     });
 
     ui.separator();
@@ -643,5 +677,24 @@ mod serde_tests {
     let round: MarkdownStyle =
       serde_json::from_str(&serde_json::to_string(&tuned).expect("serialize tuned")).expect("round trip");
     assert_eq!(round.heading_space_above, 9.5);
+  }
+
+  #[test]
+  fn segmentation_admission_defaults_when_missing_and_keeps_explicit_values() {
+    // Old theme files predate the field; they must deserialize with the default.
+    let legacy = style_without_field("segmentation_admission");
+    assert_eq!(legacy.segmentation_admission, 500);
+
+    // An explicit zero is a real preference ("every fence is a segment"), not a
+    // missing value, and must survive a round trip.
+    let mut value = serde_json::to_value(MarkdownStyle::default()).expect("serialize");
+    value["segmentation_admission"] = serde_json::Value::from(0_u64);
+    let explicit_zero: MarkdownStyle = serde_json::from_value(value).expect("deserialize explicit zero");
+    assert_eq!(explicit_zero.segmentation_admission, 0);
+
+    let tuned = MarkdownStyle { segmentation_admission: 120, ..Default::default() };
+    let round: MarkdownStyle =
+      serde_json::from_str(&serde_json::to_string(&tuned).expect("serialize tuned")).expect("round trip");
+    assert_eq!(round.segmentation_admission, 120);
   }
 }
