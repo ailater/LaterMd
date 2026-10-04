@@ -9,27 +9,34 @@
 //! 不引入 tokio:100ms/chunk 的节奏下 `std::sync::mpsc` + 每帧
 //! `request_repaint` 足够(roadmap 阶段 1 附加验证 6 的既定结论)。
 //!
-//! **provider 可切换**(docs/ui-polish.md §6):[`AiRuntime`] 在 Mock 与
-//! OpenAI 兼容端点之间二选一,由 [`AiConfig`] + API key 现场装配,保存配置
-//! 即时生效、无需重启。
+//! **provider 可切换**(docs/ui-polish.md §6):[`AiRuntime`] 在 Mock /
+//! OpenAI 兼容 / Anthropic / Ollama 四者中按 [`AiConfig`] 现场装配,
+//! 保存配置即时生效、无需重启。
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use latermd_ai::{AiProvider, Chunk, MockProvider, OpenAiProvider, OpenAiSettings};
+use latermd_ai::{
+    AiProvider, AnthropicProvider, AnthropicSettings, Chunk, MockProvider, OllamaProvider,
+    OllamaSettings, OpenAiProvider, OpenAiSettings,
+};
 
-use crate::ai_config::AiConfig;
+use crate::ai_config::{AiConfig, ProviderKind};
 use crate::state::Message;
 
 /// 生效的 provider 运行时。
 ///
-/// 枚举而非 trait 对象:只有两种实现,编译期穷尽匹配比动态分发更省事,
+/// 枚举而非 trait 对象:只有四种实现,编译期穷尽匹配比动态分发更省事,
 /// 也让「Mock 的同步合成」这类独有方法不必塞进公共 trait。
 pub enum AiRuntime {
     /// 内置演示 provider:不联网。
     Mock(MockProvider),
     /// OpenAI 兼容端点(参数见 [`OpenAiSettings`])。
     OpenAi(OpenAiProvider),
+    /// Anthropic messages API(参数见 [`AnthropicSettings`])。
+    Anthropic(AnthropicProvider),
+    /// Ollama 本地 `/api/chat`(参数见 [`OllamaSettings`],无鉴权)。
+    Ollama(OllamaProvider),
 }
 
 impl AiRuntime {
@@ -38,6 +45,8 @@ impl AiRuntime {
         match self {
             Self::Mock(_) => "Mock",
             Self::OpenAi(_) => "OpenAI 兼容",
+            Self::Anthropic(_) => "Anthropic",
+            Self::Ollama(_) => "Ollama 本地",
         }
     }
 
@@ -45,22 +54,30 @@ impl AiRuntime {
         match self {
             Self::Mock(provider) => provider.stream_complete(prompt, tx),
             Self::OpenAi(provider) => provider.stream_complete(prompt, tx),
+            Self::Anthropic(provider) => provider.stream_complete(prompt, tx),
+            Self::Ollama(provider) => provider.stream_complete(prompt, tx),
         }
     }
 
     /// 同步生成 commit subject(commit 建议是「一行结果」,流式对它无意义)。
     ///
-    /// Mock 走关键词合成;真实端点走一次非流式请求并取首行(模型偶尔会
-    /// 带解释性前缀行,首行即 subject 的约定在 prompt 里已写明)。
+    /// Mock 走关键词合成;三家真实 provider 走一次非流式请求并取首行
+    /// (模型偶尔会带解释性前缀行,首行即 subject 的约定在 prompt 里已写明)。
     pub fn commit_subject(&self, prompt: &str) -> Result<String, String> {
         match self {
             Self::Mock(provider) => Ok(provider.mock_commit_subject(prompt)),
-            Self::OpenAi(provider) => provider
-                .complete_sync(prompt)
-                .map(|text| first_line(&text).to_owned())
-                .map_err(|error| format!("AI 请求失败:{error}")),
+            Self::OpenAi(provider) => sync_subject(provider.complete_sync(prompt)),
+            Self::Anthropic(provider) => sync_subject(provider.complete_sync(prompt)),
+            Self::Ollama(provider) => sync_subject(provider.complete_sync(prompt)),
         }
     }
+}
+
+/// 非流式补全 → 首行 subject(三家真实 provider 共用一条通路)。
+fn sync_subject(result: Result<String, latermd_ai::AiError>) -> Result<String, String> {
+    result
+        .map(|text| first_line(&text).to_owned())
+        .map_err(|error| format!("AI 请求失败:{error}"))
 }
 
 /// 正文首行(去空白;空正文给空串)。
@@ -106,27 +123,55 @@ impl Default for AiState {
 }
 
 impl AiState {
-    /// 按配置 + key 装配运行时。无 key 的 OpenAI 兼容端点照样装配(请求会
-    /// 失败并由命令闸门拦在前面 —— `requires_key` 为真而凭据为空时,四条
-    /// AI 命令入口先落「未配置 key」提示,见 `State::ai_key_gate`)。
+    /// 按配置 + key 装配运行时。provider 是唯一开关,接口方式随 provider
+    /// 派生(`api_style` 已删,decisions-pending #94)。需要 key 的 provider
+    /// (OpenAI 兼容/Anthropic,共用同一凭据通道)在 key 缺失时照样装配
+    /// —— 请求会被命令闸门拦在前面(`requires_key` 为真而凭据为空时,
+    /// 四条 AI 命令入口先落「未配置 key」提示,见 `State::ai_key_gate`);
+    /// Ollama 本地无鉴权,无 key 照常工作。调用方负责先 `normalize`
+    /// (两个调用点 `load_preferences`/`apply_ai_config` 都已做)。
     pub fn set_provider(&mut self, config: AiConfig, api_key: Option<&str>) {
-        self.runtime = if config.provider.requires_key() {
-            let settings = OpenAiSettings {
-                base_url: config.base_url.clone(),
-                model: config.model.clone(),
-                temperature: Some(config.temperature),
-                top_p: Some(config.top_p),
-                max_tokens: Some(config.max_tokens),
-                system_prompt: config.system_prompt.clone(),
-                stream: config.stream,
-                timeout_secs: config.timeout_secs,
-            };
-            AiRuntime::OpenAi(OpenAiProvider::with_settings(
-                api_key.unwrap_or_default(),
-                settings,
-            ))
-        } else {
-            AiRuntime::Mock(MockProvider::new())
+        let key = api_key.unwrap_or_default();
+        self.runtime = match config.provider {
+            ProviderKind::Mock => AiRuntime::Mock(MockProvider::new()),
+            ProviderKind::OpenAiCompatible => AiRuntime::OpenAi(OpenAiProvider::with_settings(
+                key,
+                OpenAiSettings {
+                    base_url: config.base_url.clone(),
+                    model: config.model.clone(),
+                    temperature: Some(config.temperature),
+                    top_p: Some(config.top_p),
+                    max_tokens: Some(config.max_tokens),
+                    system_prompt: config.system_prompt.clone(),
+                    stream: config.stream,
+                    timeout_secs: config.timeout_secs,
+                },
+            )),
+            ProviderKind::Anthropic => AiRuntime::Anthropic(AnthropicProvider::with_settings(
+                key,
+                AnthropicSettings {
+                    base_url: config.base_url.clone(),
+                    model: config.model.clone(),
+                    temperature: Some(config.temperature),
+                    top_p: Some(config.top_p),
+                    max_tokens: config.max_tokens,
+                    system_prompt: config.system_prompt.clone(),
+                    stream: config.stream,
+                    timeout_secs: config.timeout_secs,
+                },
+            )),
+            ProviderKind::Ollama => {
+                AiRuntime::Ollama(OllamaProvider::with_settings(OllamaSettings {
+                    base_url: config.base_url.clone(),
+                    model: config.model.clone(),
+                    temperature: Some(config.temperature),
+                    top_p: Some(config.top_p),
+                    num_predict: Some(config.max_tokens as i32),
+                    system_prompt: config.system_prompt.clone(),
+                    stream: config.stream,
+                    timeout_secs: config.timeout_secs,
+                }))
+            }
         };
         self.config = config;
     }
@@ -140,7 +185,7 @@ impl AiState {
         self.config.provider.requires_key()
     }
 
-    /// 状态栏显示名(Mock / OpenAI 兼容)。
+    /// 状态栏显示名(Mock / OpenAI 兼容 / Anthropic / Ollama 本地)。
     pub fn provider_label(&self) -> &'static str {
         self.runtime.label()
     }
@@ -225,7 +270,6 @@ impl AiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_config::ProviderKind;
     use std::time::Duration;
 
     /// 把消息序列里的正文块拼起来,便于断言。
@@ -384,6 +428,55 @@ mod tests {
         // 切回 Mock:闸门随之打开
         ai.set_provider(AiConfig::default(), None);
         assert!(!ai.requires_key());
+    }
+
+    /// 分派断言:Anthropic/Ollama 配置装配出对应运行时,参数逐项进入
+    /// adapter settings;Ollama 无 key 也照常装配。
+    #[test]
+    fn set_provider_dispatches_anthropic_and_ollama() {
+        let mut ai = AiState::default();
+
+        let anthropic = AiConfig {
+            provider: ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com".to_owned(),
+            model: "claude-sonnet-4-5".to_owned(),
+            timeout_secs: 90,
+            max_tokens: 1024,
+            ..AiConfig::default()
+        };
+        ai.set_provider(anthropic, Some("placeholder-key"));
+        assert!(ai.requires_key(), "Anthropic 需要 key");
+        assert_eq!(ai.provider_label(), "Anthropic");
+        let AiRuntime::Anthropic(provider) = &ai.runtime else {
+            panic!("应装配 Anthropic 运行时");
+        };
+        let settings = provider.settings();
+        assert_eq!(settings.base_url, "https://api.anthropic.com");
+        assert_eq!(settings.max_tokens, 1024, "max_tokens 是协议必填字段");
+        assert_eq!(settings.timeout_secs, 90);
+        assert_eq!(settings.temperature, Some(AiConfig::default().temperature));
+
+        let ollama = AiConfig {
+            provider: ProviderKind::Ollama,
+            base_url: "http://127.0.0.1:11434".to_owned(),
+            model: "llama3.1".to_owned(),
+            timeout_secs: 180,
+            ..AiConfig::default()
+        };
+        ai.set_provider(ollama, None);
+        assert!(!ai.requires_key(), "Ollama 无 key 照常工作");
+        assert_eq!(ai.provider_label(), "Ollama 本地");
+        let AiRuntime::Ollama(provider) = &ai.runtime else {
+            panic!("应装配 Ollama 运行时");
+        };
+        let settings = provider.settings();
+        assert_eq!(settings.base_url, "http://127.0.0.1:11434");
+        assert_eq!(
+            settings.num_predict,
+            Some(AiConfig::default().max_tokens as i32),
+            "max_tokens 映射为 num_predict"
+        );
+        assert_eq!(settings.timeout_secs, 180);
     }
 
     /// 首行提取:commit subject 只取第一行(模型常带解释性后续行)。

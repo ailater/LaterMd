@@ -3,7 +3,39 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #91 为当前最新条目。
+> 编号 #95 为当前最新条目。
+
+## #95 M3 设置页三选一的四处落地口径:切 provider 出厂值跟随(手改不动)、空端点按当前 provider 回落、connects_network 与 requires_key 解耦、旧拼法 openai_compatible 加 alias(2026-10-04,#20 ai-adapters M3·自动拍板)
+
+- **岔路**:①设置页把 provider 从 OpenAI 兼容切到 Anthropic/Ollama 后,表单里的端点/模型/超时怎么办——原样保留(切完保存即坏配置:provider=Ollama 端点还是 api.openai.com)、无条件重置为新家出厂值(用户为前一家手改的网关地址被静默冲掉)、还是仅当当前值仍是「任一 provider 出厂值」(即用户从未手改)时才跟随;②`normalize()` 的空端点/模型回落——旧版回落全局默认(OpenAI 出厂值),对 provider=Ollama 的手改 JSON 回落 api.openai.com 是错的;③`connects_network()` 旧实现 = `requires_key()`,Ollama 无 key 也连本机 11434,两维是否解耦;④旧 `ai.json` 的 provider 字段:serde snake_case 把 `OpenAiCompatible` 落成 `open_ai_compatible`,而任务书写的是 `openai_compatible`(无下划线),按哪种拼法保兼容。
+- **备选**:①a 原样保留;①b 无条件重置;①c 出厂值跟随(手改不动)。②a 全局默认;②b 当前 provider 出厂值。③a 维持 =requires_key;③b 解耦为 =uses_settings()(唯 Mock 不联网)。④a 只认旧落盘名 `open_ai_compatible`;④b 再加 `#[serde(alias = "openai_compatible")]` 两种拼法都收。
+- **自动选择**:①c + ②b + ③b + ④b。`AiConfig::adopt_provider_defaults(new)`:端点/模型/超时若等于任一 provider 的出厂值则换成 new 的出厂值(含 Ollama 超时 120 本地推理档),手改过的字段原样保留,绝不静默覆盖;`normalize()` 空端点/模型回落**当前 provider** 的出厂值;`connects_network()` 改为 `provider.uses_settings()`(Mock 唯一 false,设置页端点行对 Ollama 也显示);`OpenAiCompatible` 变体加 alias,`open_ai_compatible`(旧版真实落盘名)与 `openai_compatible`(任务书拼法)都能读,落盘仍写 `open_ai_compatible`。出厂值单一事实源:`ProviderKind::factory()` 直接取 latermd-ai 各 adapter 的 `Default` 实现,app 侧不另抄常数。
+- **理由**:①c 是「不丢用户输入」与「不产出坏配置」的交集:出厂值跟随覆盖了全新安装与从未手改的主流路径,手改值可见可改,静默覆盖是配置页最伤信任的行为;②provider 换了,「空值该回到哪」的语义自然跟着换,回落 OpenAI 地址对新 provider 是二次伤害;③Ollama 的端点是真实配置项(默认 http://127.0.0.1:11434),端点行不显示会让用户以为没生效;requires_key 驱动命令闸门、connects_network 驱动端点显示,本就是两个问题;④alias 只影响反序列化,零成本兜住两种拼法,向后兼容对实际旧文件(`open_ai_compatible`)与任务书口径(`openai_compatible`)同时成立。
+- **如何改**:①要无条件重置,把 `adopt_provider_defaults` 里三段 `factories.iter().any(...)` 判断删掉直接赋值(接受手改值被冲掉);②把 `normalize()` 里两处 `factory.base_url`/`factory.model` 换回 `Self::default().base_url`/`model`;③把 `connects_network()` 改回 `self.provider.requires_key()`(Ollama 端点行随之不显示);④删变体上的 `#[serde(alias = "openai_compatible")]` 并同步删 `legacy_ai_json_with_api_style_loads` 里无下划线拼法的断言分支。
+
+## #94 M3 provider 与 ApiStyle 的关系收敛:删除 ApiStyle 字段,ProviderKind 成为唯一开关(2026-10-04,#20 ai-adapters M3·自动拍板)
+
+- **岔路**:任务书要求「优先让 ProviderKind 成为唯一开关、api_style 随 provider 派生」,并授权按小表面积原则取舍「保留或删除 ApiStyle 字段」。三条路:①保留 `AiConfig.api_style` 字段 + `normalize()` 派生覆盖(每次读写都把派生值写回去);②保留字段但只作展示、保存时强制对齐;③整字段删除,协议形态信息移进 provider 的 label/description,UI 的「接口方式」下拉随之退役。
+- **备选**:①字段 + 派生回写;②字段仅展示;③删除字段。
+- **自动选择**:③。`ApiStyle` 枚举、`AiConfig.api_style` 字段、`normalize()` 的「未实现回落 ChatCompletions」段、设置页「接口方式」下拉与「尚未实现」警示行全部删除;provider 下拉显示名改为带协议形态(「OpenAI 兼容(/chat/completions)」「Anthropic(/v1/messages)」「Ollama 本地(/api/chat)」,Ollama 从任务书点名的错误标签 `/api/generate(未实现)` 更正为实际实现的 `/api/chat`),新增 `ProviderKind::description()` 说明行承担 key 需求与端点性质提示。旧 `ai.json` 里遗留的 `api_style` 键读取时被 serde 忽略(结构体未开 `deny_unknown_fields`),向后兼容不受影响。
+- **理由**:四种 provider 各自钉死一种协议后,`api_style` 是 100% 可从 `provider` 派生的冗余状态——保留它,手改 JSON 就能造出「provider=anthropic + api_style=chat_completions」的矛盾组合,归一化与 UI 都要为「对齐派生值」写防御代码,表面积不减反增;它还是「未实现」误导文案(Anthropic /v1/messages 未实现、Ollama /api/generate 未实现)的载体,M1/M2 落地后这些状态已不存在,连字段一起删才删得干净。删除后配置文件少一个字段、UI 少一个下拉、normalize 少一条回落规则,符合任务的小表面积授权。
+- **如何改**:要恢复「同一 provider 多协议」的将来形态(如 OpenAI 兼容端点同时支持 Responses API),把 `ApiStyle` 枚举与字段加回 `ai_config.rs`(serde snake_case),`set_provider` 分派处按 (provider, api_style) 二元组 match,设置页恢复第二下拉;git 历史里本条目的删除 commit 即完整反参照。
+
+## #93 M2 Ollama 适配器的四处口径:超时默认 120(非范本的 60)、num_predict 取 i32(负值合法)、error 行文案带「Ollama 流失败」前缀、complete_sync 恒非流式照 anthropic 口径(2026-10-04,#20 ai-adapters M2·自动拍板)
+
+- **岔路**:①`timeout_secs` 默认值任务未规定,openai/anthropic 范本共用 60,但 Ollama 是本地推理——冷启动先要把几 GB 模型载入内存(CPU 机器数十秒);②`num_predict`(= 各家 max_tokens)类型未规定:openai 的 max_tokens 是 `Option<u32>`,而 Ollama 的 num_predict 负值是协议合法取值(-1 不限、-2 填满上下文窗口);③NDJSON 顶层 error 行的失败块 delta 文案:裸服务端字符串还是带前缀(M1 #92 ③b 同款问题);④`complete_sync` 的请求体:照 openai.rs 原样塞设置里的 stream(流式配置下会拿到 NDJSON 却按单 JSON 解析),还是照 anthropic.rs 恒按 stream=false 请求。
+- **备选**:①a 60(与范本一致);①b 120(本地推理加倍)。②a `Option<u32>`(与 openai max_tokens 同型);②b `Option<i32>`。③a 裸字符串;③b 前缀+字符串。④a 照 openai(设置原样透传);④b 照 anthropic(恒非流式)。
+- **自动选择**:①b + ②b + ③b + ④b。timeout 默认 120;num_predict 为 `Option<i32>`(负值原样透传,单测钉了 -1);error 块 delta 为 `Ollama 流失败:{error}`(error 为 null 的行不当错误、非字符串退「未知错误」);`request_body(prompt, stream)` 带 stream 参数,complete_sync 恒传 false。
+- **理由**:①60s 对本地冷启动是误伤,用户首次点「续写」大概率撞超时报「AI 请求失败」,不是用户可修的问题;本地慢是常态而非异常,加倍是最小偏离。②u32 表达不了 Ollama 老手常用的 -1;serde 对 i32 透传无成本,配置页将来加下界校验即可。③Chunk 失败约定要求 delta 面向用户,裸 "model 'x' not found, try pulling it first" 在 UI 上无来源上下文;前缀还与 #92 ③b、openai 的「AI 请求失败:{err}」同构,用户能区分错误来自哪家。④openai.rs 那套是被 anthropic.rs 注释点名过的既有瑕疵(流式配置下 complete_sync 必炸),M1 已改对,Ollama 跟随。
+- **如何改**:①改 `crates/latermd-ai/src/ollama.rs` `OllamaSettings::default()` 的 timeout_secs(单测 `default_settings_match_documented_defaults` 同步);②类型改 `Option<u32>` 并删「负值透传」单测断言;③改 `error_chunk` 的 format 前缀(单测 `ndjson_error_line_yields_failed_chunk_and_stops` 同步);④把 `request_body` 的 stream 参数删掉改读 `self.settings.stream`(不建议,见 openai.rs 同问题的既有行为)。
+
+## #92 M1 Anthropic 适配器的三处口径:默认型号取 Sonnet 系别名、采样参数默认 None 不发、错误事件文案带「Anthropic 流失败」前缀(2026-10-04,#20 ai-adapters M1·自动拍板)
+
+- **岔路**:①任务要求「model 默认取 Anthropic 当前主力型号,注释说明来源」,但官方 docs.anthropic.com 对本地区域封锁(实测返回 supported-countries 拦截页),取不到官方 model 表;第三方信息混乱(2026-02 有 Claude Opus 4.6 发布报道但均非官方来源,另有未证实的「Claude Mythos」泄露帖),且「主力」有两解——能力旗舰(Opus 级)还是多数任务的默认推荐(Sonnet 级);②temperature/top_p 的默认值未规定:镜像 openai.rs 的 Some(0.7)/Some(1.0),还是 None 不发;③SSE error 事件的失败块 delta 文案格式未规定:裸服务端 message 还是带前缀。
+- **备选**:①a `claude-sonnet-4-5`(Sonnet 系 alias);①b `claude-opus-4-6`(能力旗舰,存在性仅非官方报道);②a 默认 None/None;②b 镜像 openai 默认 0.7/1.0;③a 裸 message;③b 前缀+message。
+- **自动选择**:①a + ②a + ③b。model 默认 `claude-sonnet-4-5`(alias 自动跟随官方最新快照,不钉日期版本,来源与查证受限事实已写进 anthropic.rs 的字段注释);temperature/top_p 默认 None(不发字段=用官方默认 temperature=1.0);error 块 delta 为 `Anthropic 流失败:{message}`(message 缺失退 error.type,再退「未知错误」)。
+- **理由**:①Anthropic 文档口径是 Sonnet 级为多数任务的默认推荐、Opus 留给最难任务;openai.rs 范本默认同为入门级(gpt-4o-mini),「主力」按默认推荐取;Opus 单价比 Sonnet 高数倍,LaterMD 的续写/commit/摘要场景不是 Opus 级任务;alias 形式不受快照迭代失效影响。②官方端点默认值明确,「不发」语义最干净;openai.rs 硬塞 0.7 的理由是「各家兼容端点默认值不一致」,对官方 Anthropic 端点不成立。③Chunk 失败约定要求 delta 是面向用户的错误描述,裸「Overloaded」在 UI 上无上下文,前缀还让用户能区分错误来源(与 openai.rs 的「AI 请求失败:{err}」同构)。
+- **如何改**:①改 `crates/latermd-ai/src/anthropic.rs` 里 `AnthropicSettings::default()` 的 model 字段(单测 `default_settings_match_documented_defaults`、`request_body_is_anthropic_messages_stream` 的断言同步改);②同文件 default 的 temperature/top_p 改 `Some(0.7)`/`Some(1.0)` 并同步上述单测;③改 `error_chunk` 的 format 前缀(单测 `sse_error_event_yields_failed_chunk_and_stops` 同步)。
 
 ## #91 #48 B2 emoji inline widget 的两处口径:标题里的 emoji 不随标题字号缩放(沿用 vendored 链接基础字体)、手型抑制在 app 侧渲染后压回(不改 vendor)(2026-10-04,#48 emoji-color B2·自动拍板)
 
