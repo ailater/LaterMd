@@ -140,10 +140,11 @@ pub(crate) fn nav_row_center_y(top: f32, tab: SidebarTab) -> f32 {
 /// 是文件动作的**唯一常驻按钮入口** —— 编辑器区顶部的文件工具栏退役,
 /// actions 收口到本栏,decisions-pending #32)。
 ///
-/// 全集 = [`Command::FILE`] + `ExportHtml`;AI 与视图开关不在此列
-/// (AI 在菜单栏「AI」,视图开关在标题栏按钮)。菜单栏的菜单项一个不删
-/// —— 这里是快捷入口,不是唯一入口(ui-polish §1.2「菜单栏负责全部」)。
-/// `horizontal_wrapped`:左栏拖到 180px 下限时换行而不是溢出裁切(R4)。
+/// 全集 = [`Command::FILE`] + 导出两项(HTML / PDF);AI 与视图开关不在
+/// 此列(AI 在菜单栏「AI」,视图开关在标题栏按钮)。菜单栏的菜单项一个
+/// 不删 —— 这里是快捷入口,不是唯一入口(ui-polish §1.2「菜单栏负责
+/// 全部」)。`horizontal_wrapped`:左栏拖到 180px 下限时换行而不是溢出
+/// 裁切(R4)。
 fn top_actions(panel: &mut egui::Ui, outbox: &mut Vec<Message>) {
     top_actions_with_probe(panel, outbox, None);
 }
@@ -159,7 +160,11 @@ fn top_actions_with_probe(
 ) {
     let mut probe = probe;
     panel.horizontal_wrapped(|ui| {
-        for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
+        for cmd in Command::FILE
+            .iter()
+            .copied()
+            .chain([Command::ExportHtml, Command::ExportPdf])
+        {
             let response =
                 crate::ui::icons::icon_button(ui, cmd.icon(), &tooltip_of(cmd, &Keymap::builtin()));
             if let Some(probe) = probe.as_deref_mut() {
@@ -2043,7 +2048,11 @@ mod tests {
     #[test]
     fn top_actions_tooltip_carries_label_and_builtin_shortcut() {
         let keymap = Keymap::builtin();
-        for cmd in Command::FILE.iter().copied().chain([Command::ExportHtml]) {
+        for cmd in Command::FILE
+            .iter()
+            .copied()
+            .chain([Command::ExportHtml, Command::ExportPdf])
+        {
             let tooltip = tooltip_of(cmd, &keymap);
             assert!(
                 tooltip.starts_with(cmd.label()),
@@ -2070,7 +2079,7 @@ mod tests {
         let commands: Vec<Command> = Command::FILE
             .iter()
             .copied()
-            .chain([Command::ExportHtml])
+            .chain([Command::ExportHtml, Command::ExportPdf])
             .collect();
         let ctx = egui::Context::default();
         let rects = Rc::new(RefCell::new(Vec::<(Command, Rect)>::new()));
@@ -2093,7 +2102,7 @@ mod tests {
         assert_eq!(
             rects.iter().map(|(cmd, _)| *cmd).collect::<Vec<_>>(),
             commands,
-            "按钮全集 = Command::FILE + ExportHtml,不多不少"
+            "按钮全集 = Command::FILE + 导出两项(HTML/PDF),不多不少"
         );
 
         // 每按钮三帧(moved / press / release):点击发出对应消息

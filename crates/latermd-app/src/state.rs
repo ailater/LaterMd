@@ -461,6 +461,9 @@ pub enum Message {
     NoticeDismissed,
     /// 导出当前文档为 HTML(弹保存对话框,不触碰文档落盘身份)。
     ExportHtml,
+    /// 导出当前文档为 PDF(弹保存对话框,经 headless 管线渲染并嵌入系统
+    /// CJK 字体;同样不触碰文档落盘身份)。字体全失配或编码失败落提示行。
+    ExportPdf,
     /// 切换明暗主题(设置菜单产出);归约里改状态并即时落盘。
     ThemeChanged(ThemeMode),
     /// 明暗主题互换(命令层「切换主题」的快捷键/菜单入口;定向选择走
@@ -776,6 +779,7 @@ impl State {
             Message::FileCommand(cmd) => self.run_file_cmd(cmd),
             Message::NoticeDismissed => self.tabs.current_mut().document.notice = None,
             Message::ExportHtml => self.run_export_html(),
+            Message::ExportPdf => self.run_export_pdf(),
             Message::ThemeChanged(mode) => self.change_theme(mode),
             Message::ToggleTheme => self.change_theme(self.theme.mode.opposite()),
             Message::SidebarToggled => self.toggle_left_panel(),
@@ -2772,6 +2776,44 @@ impl State {
             Err(error) => self.tabs.current_mut().document.notice = Some(error.to_string()),
         }
     }
+
+    /// 导出 PDF(消息归约):弹保存对话框,把当前缓冲经 headless 渲染管线
+    /// (`latermd_render` IR → krilla)渲染成 A4 PDF 落盘。与 HTML 同语义:
+    /// 派生物,文档路径与 dirty 均不动。
+    fn run_export_pdf(&mut self) {
+        let start = file::start_dir(self.tabs.current().document.path.as_deref());
+        let default = export::default_pdf_name(self.tabs.current().document.path.as_deref());
+        if let Some(path) = export::pdf_save_dialog(&start, &default) {
+            self.export_pdf_to(&path);
+        }
+    }
+
+    /// 渲染并写出 PDF;字体全失配、编码失败或落盘失败都只落提示行,不
+    /// panic、不产出残缺文件(落盘走原子写)。绕开对话框直测,与
+    /// `export_html_to` 同构。
+    fn export_pdf_to(&mut self, path: &Path) {
+        // 字体发现与界面侧同一张候选表(latermd-export 单一来源):预览
+        // 与导出命中同一个 CJK face。读文件是注入的,生产传 fs::read。
+        let notice = match latermd_export::discover_cjk_fonts(
+            latermd_export::CJK_SYSTEM_CANDIDATES,
+            &|font_path| std::fs::read(font_path),
+        ) {
+            Err(error) => Some(error.to_string()),
+            Ok(fonts) => {
+                match latermd_export::export_pdf(
+                    self.tabs.current().editor.text(),
+                    &latermd_export::PdfExportOptions::new(fonts),
+                ) {
+                    Ok(bytes) => match file::write_bytes_as("导出", path, &bytes) {
+                        Ok(()) => None,
+                        Err(error) => Some(error.to_string()),
+                    },
+                    Err(error) => Some(error.to_string()),
+                }
+            }
+        };
+        self.tabs.current_mut().document.notice = notice;
+    }
 }
 
 #[cfg(test)]
@@ -4418,6 +4460,66 @@ mod tests {
         let notice = state.tabs.current().document.notice.as_deref().unwrap();
         assert!(notice.contains("导出失败"), "{notice}");
         assert!(notice.contains("dir.html"), "{notice}");
+    }
+
+    /// 导出 PDF:写出的字节是合法 PDF(%PDF 头 / %%EOF 尾)且嵌入了字体
+    /// 程序;派生物语义与 HTML 一致(路径不认领、dirty 不清、成功清提示)。
+    /// 本机无 CJK 候选时改为断言「明确的字体错误」分支:不 panic、不落
+    /// 残缺文件(发现层的注入式命中/降级断言在 latermd-export 侧)。
+    #[test]
+    fn export_pdf_writes_bytes_or_reports_missing_cjk() {
+        let path = temp_path("export.pdf");
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .insert_chars(0, "# 导出标题\n\n中文正文 English 混排。\n");
+        assert!(state.tabs.current_mut().editor.is_dirty());
+
+        state.export_pdf_to(&path);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                assert!(
+                    bytes.starts_with(b"%PDF-"),
+                    "PDF 头缺失:{:?}",
+                    &bytes[..bytes.len().min(8)]
+                );
+                let mut end = bytes.len();
+                while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+                    end -= 1;
+                }
+                assert!(bytes[..end].ends_with(b"%%EOF"));
+                assert!(
+                    bytes.windows(9).any(|w| w == b"/FontFile"),
+                    "嵌入字体程序缺失 —— 中文将在缺字体的机器上变方框"
+                );
+                assert!(
+                    state.tabs.current_mut().editor.is_dirty(),
+                    "派生物不清 dirty"
+                );
+                assert_eq!(state.tabs.current().document.path, None, "不认领路径");
+                assert_eq!(
+                    state.tabs.current().document.notice,
+                    None,
+                    "成功路径应清提示行"
+                );
+            }
+            Err(_) => {
+                let notice = state
+                    .tabs
+                    .current()
+                    .document
+                    .notice
+                    .as_deref()
+                    .unwrap_or("");
+                assert!(
+                    notice.contains("中文字体"),
+                    "无 CJK 候选应落「未找到中文字体」提示,实为:{notice}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 搜索点击归约:换文件 + 跳到命中行行首。行号 1 起 → rope 行 0 起,

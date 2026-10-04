@@ -31,6 +31,7 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
         });
         ui.menu_button("导出", |ui| {
             item(ui, Command::ExportHtml, keymap, outbox);
+            item(ui, Command::ExportPdf, keymap, outbox);
         });
         // 编辑:文档内动作(坤哥 2026-09-29 指令的 Ctrl+D/Ctrl+Shift+D/
         // Ctrl+F/Ctrl+H 可发现性入口;undo/redo 是 TextEdit 内建,不列)

@@ -11,6 +11,7 @@
 //!
 //! 页码画在底边距内(`n / 总页数`),经 [`PdfExportOptions::page_numbers`] 开关。
 
+pub(crate) mod cjk;
 mod layout;
 mod shaping;
 
@@ -543,6 +544,37 @@ fn main() {
         );
     }
 
+    /// M3 验收线「中文导出不是方框」的结构侧证据(不依赖 PATH 上的工具):
+    /// 走生产发现链(`cjk::discover_cjk_fonts` + `CJK_SYSTEM_CANDIDATES`)
+    /// 嵌入 CJK 字体后,PDF 内存在**嵌入字体程序**(`/FontFile2` 或
+    /// `/FontFile3` 键名)与**文本提取映射**(`/ToUnicode`)——前者说明
+    /// 字形随文件走(阅读器无需本机装字体),后者是 pdftotext 逐字回读
+    /// 的前提。本机无 CJK 候选时如实跳过(全失配的错误路径由 cjk 模块
+    /// 测试钉住)。
+    #[test]
+    fn cjk_pdf_embeds_font_program_and_unicode_map() {
+        let Ok(fonts) =
+            cjk::discover_cjk_fonts(cjk::CJK_SYSTEM_CANDIDATES, &|path| std::fs::read(path))
+        else {
+            eprintln!("跳过:本机无 CJK 候选字体");
+            return;
+        };
+        let bytes = export_pdf(
+            "# 中文标题\n\nEnglish 混排正文,标点一致。",
+            &PdfExportOptions::new(fonts),
+        )
+        .expect("导出成功");
+        assert_pdf_shape(&bytes);
+        assert!(
+            bytes.windows(9).any(|w| w == b"/FontFile"),
+            "嵌入字体程序键(/FontFile2 或 /FontFile3)缺失 —— 字形未随文件走"
+        );
+        assert!(
+            bytes.windows(10).any(|w| w == b"/ToUnicode"),
+            "文本提取映射(/ToUnicode)缺失 —— pdftotext 无法逐字回读"
+        );
+    }
+
     /// 块级不可分割:放不下但块高 ≤ 整页内容高的块整体移到下一页——即使
     /// 当页残高还塞得下块的前几行(表格形态,切点只有块尾)。
     #[test]
@@ -702,28 +734,20 @@ fn main() {
 
     /// 取证专用(默认 `--ignored`,不进常规门禁):生成中英混排样例 PDF
     /// 落盘 `/tmp/latermd-pdf-evidence.pdf`,若 PATH 上有 pdftotext 则回读
-    /// 断言中文句子逐字完整。需要本机 Noto Sans CJK 与 poppler-utils;缺任一
-    /// 即如实跳过——常规单测不依赖它们(与 #39 取证测试同口径)。
+    /// 断言中文句子逐字完整。字体走 [`super::cjk::discover_cjk_fonts`] 的
+    /// 生产发现链(与命令行导出同一入口);需要本机 CJK 候选与
+    /// poppler-utils,缺任一即如实跳过——常规单测不依赖它们(与 #39 取证
+    /// 测试同口径)。
     #[test]
     #[ignore = "取证项:需系统 CJK 字体与 pdftotext,常规门禁不跑"]
     fn pdftotext_roundtrip_evidence() {
-        let candidates = [
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        ];
-        let Some(cjk_font) = candidates.iter().find_map(|path| {
-            std::fs::read(path)
-                .ok()
-                .map(|data| PdfFont { data, index: 0 })
-        }) else {
+        let Ok(fonts) =
+            cjk::discover_cjk_fonts(cjk::CJK_SYSTEM_CANDIDATES, &|path| std::fs::read(path))
+        else {
             eprintln!("跳过:本机无 CJK 候选字体");
             return;
         };
-        let options = PdfExportOptions::new(PdfFonts {
-            regular: cjk_font,
-            bold: None,
-            mono: None,
-        });
+        let options = PdfExportOptions::new(fonts);
         let markdown = "# 中文标题\n\n一段中文正文,English words 混排,标点、顿号一致。";
         let bytes = export_pdf(markdown, &options).expect("导出成功");
         assert_pdf_shape(&bytes);

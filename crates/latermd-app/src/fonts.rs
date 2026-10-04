@@ -317,29 +317,12 @@ pub(crate) fn override_vertical_metrics(
 const CJK_PROPORTIONAL: &str = "latermd-cjk-proportional";
 const CJK_MONOSPACE: &str = "latermd-cjk-monospace";
 
-/// 候选 (字体文件, 比例字体 face index, 等宽字体 face index),按序取第一个存在的文件。
-/// face index 是 .ttc 字体集合内的第 N 个字型,Linux 两条由 `fc-query` 枚举得出;
-/// Windows/macOS 条目为资料建议值,待真机核验(见 docs/m0-report.md 附加验证 5)。
-/// 三平台路径前缀互斥,`is_file` 探测天然分流,不需要 #[cfg] 分表。
-const CANDIDATES: &[(&str, u32, u32)] = &[
-    // Linux(Deepin / 常见发行版的 noto 包):同一 .ttc 内含比例与等宽两套 SC 字型
-    (
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        2,
-        7,
-    ),
-    // Linux 兜底:文泉驿微米黑,单字型集合,两个族共用 index 0
-    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0, 0),
-    // Windows 11:msyh.ttc 的 face 0 = 微软雅黑(face 1 为 UI 变体);simhei 单字型;
-    // msyhbd 为粗体集合,仅作最末兜底
-    ("C:\\Windows\\Fonts\\msyh.ttc", 0, 0),
-    ("C:\\Windows\\Fonts\\simhei.ttf", 0, 0),
-    ("C:\\Windows\\Fonts\\msyhbd.ttc", 0, 0),
-    // macOS 14:PingFang 的 index 0 为占位(任一 face 均含 CJK 可消除方块,
-    // SC Regular 确切 index 待真机枚举后修正);Hiragino Sans GB 为简体兜底
-    ("/System/Library/Fonts/PingFang.ttc", 0, 0),
-    ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0, 0),
-];
+/// 系统 CJK 候选表(路径 + `.ttc` 的比例/等宽 face 序号,按序取第一个可读
+/// 文件):单一来源在 [`latermd_export::CJK_SYSTEM_CANDIDATES`],PDF 导出
+/// 与本界面侧共用同一张表 —— 预览与导出命中同一个 face,中文观感一致。
+/// face 序号的来历(Linux 两条经 `fc-query` 枚举,Windows/macOS 为资料
+/// 建议值待真机核验)与逐条注释见 latermd-export 的 `pdf::cjk` 模块。
+const CANDIDATES: &[latermd_export::CjkFontCandidate] = latermd_export::CJK_SYSTEM_CANDIDATES;
 
 /// 注入字体,返回 CJK 回退的加载来源(用户可见);`None` = 候选全失配,
 /// 中文将显示为方块 —— 但 Inter 三字重照常生效(嵌入资源,与系统无关)。
@@ -348,7 +331,12 @@ const CANDIDATES: &[(&str, u32, u32)] = &[
 /// 非预期/表残缺 —— 此时 CJK 照挂、预览副本与行高下限均不生效,回退到
 /// 修复前行为,基线偏差与行盒缺口保留,但不影响中文可显示)。
 pub fn install(ctx: &egui::Context) -> Option<String> {
-    for &(path, prop_idx, mono_idx) in CANDIDATES {
+    for candidate in CANDIDATES {
+        let (path, prop_idx, mono_idx) = (
+            candidate.path,
+            candidate.proportional_index,
+            candidate.monospace_index,
+        );
         if !Path::new(path).is_file() {
             continue;
         }
@@ -602,8 +590,14 @@ fn mark_installed(ctx: &egui::Context, cjk_metrics: Option<VerticalMetricsEm>, e
 pub(crate) fn cjk_source_for_test() -> Option<(&'static str, u32, u32)> {
     CANDIDATES
         .iter()
-        .copied()
-        .find(|(path, _, _)| Path::new(path).is_file())
+        .find(|candidate| Path::new(candidate.path).is_file())
+        .map(|candidate| {
+            (
+                candidate.path,
+                candidate.proportional_index,
+                candidate.monospace_index,
+            )
+        })
 }
 
 #[cfg(test)]
@@ -622,15 +616,15 @@ mod tests {
     fn all_three_platforms_have_candidates() {
         let windows = CANDIDATES
             .iter()
-            .filter(|(p, _, _)| p.starts_with("C:"))
+            .filter(|c| c.path.starts_with("C:"))
             .count();
         let macos = CANDIDATES
             .iter()
-            .filter(|(p, _, _)| p.starts_with("/System/"))
+            .filter(|c| c.path.starts_with("/System/"))
             .count();
         let linux = CANDIDATES
             .iter()
-            .filter(|(p, _, _)| p.starts_with('/') && !p.starts_with("/System/"))
+            .filter(|c| c.path.starts_with('/') && !c.path.starts_with("/System/"))
             .count();
         assert!(windows > 0, "Windows 候选为空");
         assert!(macos > 0, "macOS 候选为空");
@@ -639,10 +633,14 @@ mod tests {
 
     #[test]
     fn candidate_paths_are_absolute_and_unique() {
-        for (path, _, _) in CANDIDATES {
-            assert!(is_absolute_on_target_platform(path), "非绝对路径: {path}");
+        for candidate in CANDIDATES {
+            assert!(
+                is_absolute_on_target_platform(candidate.path),
+                "非绝对路径: {}",
+                candidate.path
+            );
         }
-        let uniq: HashSet<&str> = CANDIDATES.iter().map(|(p, _, _)| *p).collect();
+        let uniq: HashSet<&str> = CANDIDATES.iter().map(|c| c.path).collect();
         assert_eq!(uniq.len(), CANDIDATES.len(), "候选路径存在重复");
     }
 
@@ -650,9 +648,14 @@ mod tests {
     fn windows_candidates_use_regular_face_zero() {
         // msyh / simhei / msyhbd 的 face 0 都是常规字型(1 为 UI/粗体变体);
         // 与 noto 不同,换 Windows 候选文件时沿用 0 前先重查
-        for (path, prop, mono) in CANDIDATES {
-            if path.starts_with("C:") {
-                assert_eq!((*prop, *mono), (0, 0), "{} 偏离 face 0 约定", path);
+        for candidate in CANDIDATES {
+            if candidate.path.starts_with("C:") {
+                assert_eq!(
+                    (candidate.proportional_index, candidate.monospace_index),
+                    (0, 0),
+                    "{} 偏离 face 0 约定",
+                    candidate.path
+                );
             }
         }
     }

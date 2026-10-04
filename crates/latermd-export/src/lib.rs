@@ -15,6 +15,7 @@
 
 mod pdf;
 
+pub use pdf::cjk::{discover_cjk_fonts, CjkFontCandidate, CjkFontError, CJK_SYSTEM_CANDIDATES};
 pub use pdf::{
     export_document, export_pdf, PdfError, PdfExportOptions, PdfFont, PdfFonts, A4_HEIGHT, A4_WIDTH,
 };

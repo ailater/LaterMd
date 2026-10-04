@@ -89,7 +89,7 @@ impl Fonts {
 }
 
 impl Face {
-    fn new(pdf_font: &PdfFont) -> Option<Self> {
+    pub(super) fn new(pdf_font: &PdfFont) -> Option<Self> {
         let data = Arc::new(pdf_font.data.clone());
         let font = KrillaFont::new(Data::from(data.clone()), pdf_font.index)?;
         let upem = font.units_per_em();
