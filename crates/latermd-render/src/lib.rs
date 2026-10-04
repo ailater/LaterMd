@@ -13,8 +13,15 @@
 //! 有意不进 IR 的东西:HTML 块/内联 HTML 事件被丢弃(PDF 无法承载原始
 //! HTML,方言一致性由解析开关保证,不由 HTML 渲染保证);脚注定义单独
 //! 收在 [`Document::footnotes`],由后端决定排成尾注还是页注。
+//!
+//! [`mermaid`] 模块另走一条侧链:```` ```mermaid ```` 围栏内容按纯文本
+//! 交给它自行解析(flowchart v1 子集,DSL 不是 Markdown,铁律 1 不破),
+//! 产出同风格的几何绘制指令(铁律 2 同样成立)。
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+/// mermaid flowchart 子集:解析 + Sugiyama-lite 布局 → 纯几何绘制指令。
+pub mod mermaid;
 
 /// 扩展开关,与预览(vendored `egui_markdown::parser::parse`)逐项一致。
 ///
