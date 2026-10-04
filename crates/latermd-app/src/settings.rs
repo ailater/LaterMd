@@ -12,7 +12,7 @@
 //! 「正在捕获哪个命令的键位」,同侧边栏把手与 `SearchState` 输入的口径。
 
 use crate::ai::AiState;
-use crate::ai_config::{AiConfig, ApiStyle, ProviderKind};
+use crate::ai_config::{AiConfig, ProviderKind};
 use crate::ai_key::{self, AiKeyState};
 use crate::command::Command;
 use crate::keymap::Keymap;
@@ -444,7 +444,10 @@ fn keymap_page(
     }
 }
 
-/// AI 页:provider / 接口方式 / 端点 / 模型 / 采样参数 / key。
+/// AI 页:provider / 端点 / 模型 / 采样参数 / key。
+///
+/// provider 是唯一开关(接口方式随 provider 派生,decisions-pending #94),
+/// 下拉四选一;「未实现」类禁用项与提示已随三选一落地清除。
 fn ai_page(
     ui: &mut egui::Ui,
     settings: &mut SettingsState,
@@ -454,48 +457,38 @@ fn ai_page(
 ) {
     ui.heading("AI");
     let draft = &mut settings.ai_draft;
-    // Mock 不联网也不读参数:参数区整块灰显,避免「配了半天没生效」
-    let editable = draft.provider.requires_key();
+    // Mock 不联网也不读参数:参数区整块灰显,避免「配了半天没生效」;
+    // Ollama 参数照常参与(连的是本机服务)
+    let editable = draft.provider.uses_settings();
 
     ui.add_space(crate::ui::tokens::SPACE_SM);
+    let mut provider = draft.provider;
     egui::ComboBox::from_label("Provider")
-        .selected_text(draft.provider.label())
+        .selected_text(provider.label())
         .show_ui(ui, |ui| {
             for kind in ProviderKind::ALL {
-                ui.selectable_value(&mut draft.provider, kind, kind.label());
+                ui.selectable_value(&mut provider, kind, kind.label());
             }
         });
-    egui::ComboBox::from_label("接口方式")
-        .selected_text(draft.api_style.label())
-        .show_ui(ui, |ui| {
-            for style in ApiStyle::ALL {
-                if style.implemented() {
-                    ui.selectable_value(&mut draft.api_style, style, style.label());
-                } else {
-                    // 未实现的接口方式显式禁用,不伪装可用
-                    ui.add_enabled(false, egui::Button::new(style.label()));
-                }
-            }
-        });
-    if !draft.api_style.implemented() {
-        ui.colored_label(
-            crate::ui::tokens::WARN,
-            "该接口方式尚未实现,保存时会回落到 OpenAI 兼容 SSE。",
-        );
+    if provider != draft.provider {
+        // 切换时端点/模型/超时的出厂值跟随;手改过的字段不动
+        draft.adopt_provider_defaults(provider);
     }
+    ui.weak(draft.provider.description());
 
     ui.add_space(crate::ui::tokens::SPACE_SM);
+    let factory = draft.provider.factory();
     ui.add_enabled_ui(editable, |ui| {
         ui.label("Base URL");
         ui.add(
             egui::TextEdit::singleline(&mut draft.base_url)
-                .hint_text("https://api.openai.com/v1")
+                .hint_text(factory.base_url.as_str())
                 .desired_width(f32::INFINITY),
         );
         ui.label("模型");
         ui.add(
             egui::TextEdit::singleline(&mut draft.model)
-                .hint_text("gpt-4o-mini")
+                .hint_text(factory.model.as_str())
                 .desired_width(f32::INFINITY),
         );
         ui.add(
@@ -510,7 +503,8 @@ fn ai_page(
         );
         ui.add(egui::Slider::new(&mut draft.max_tokens, 256..=32768).text("Max tokens"));
         ui.add(egui::Slider::new(&mut draft.timeout_secs, 10..=300).text("超时(秒)"));
-        ui.checkbox(&mut draft.stream, "流式接收(SSE)");
+        // 流式传输的形态随 provider(SSE 或 NDJSON),文案不钉死协议名
+        ui.checkbox(&mut draft.stream, "流式接收");
         ui.label("System prompt(留空则不发送 system 消息)");
         ui.add(
             egui::TextEdit::multiline(&mut draft.system_prompt)
@@ -537,7 +531,8 @@ fn ai_page(
         ai.config.model,
         if ai.config.stream { "流式" } else { "整段" }
     ));
-    // 端点只在联网型 provider 下有意义(Mock 不联网,不显示以免误导)
+    // 端点只在联网型 provider 下有意义(Mock 不联网,不显示以免误导;
+    // Ollama 连本机服务,算联网型)
     if ai.config.connects_network() {
         ui.weak(ai.config.base_url_trimmed());
     }
@@ -944,6 +939,16 @@ mod tests {
             state.settings.bed_draft = None;
             render(&mut state);
         }
+        // AI 页四个 provider 各再渲一帧:说明文案/出厂值提示/参数区显隐
+        // 随 provider 变化,都要走一遍真实绘制路径
+        state.settings.tab = SettingsTab::Ai;
+        for provider in ProviderKind::ALL {
+            state.settings.ai_draft = AiConfig {
+                provider,
+                ..AiConfig::default()
+            };
+            render(&mut state);
+        }
         // 图片页带草稿与已存 profile 的形态也渲一帧
         state.settings.tab = SettingsTab::Image;
         state.bed.profiles = vec![latermd_bed::BedProfile::preset_smms()];
@@ -1270,15 +1275,21 @@ mod tests {
         }
     }
 
-    /// AI 页草稿:默认等于出厂配置;改成 OpenAI 兼容后「需要 key」为真
-    /// (驱动参数区可用与命令闸门)。
+    /// AI 页草稿:默认等于出厂配置;OpenAI 兼容/Anthropic「需要 key」为真
+    /// (驱动参数区可用与命令闸门);Ollama 不要 key 但参数照常参与。
     #[test]
     fn ai_draft_defaults_and_provider_switch() {
         let mut settings = SettingsState::default();
         assert_eq!(settings.ai_draft, AiConfig::default());
         assert!(!settings.ai_draft.provider.requires_key());
-        settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
-        assert!(settings.ai_draft.provider.requires_key());
+        for kind in [ProviderKind::OpenAiCompatible, ProviderKind::Anthropic] {
+            settings.ai_draft.provider = kind;
+            assert!(kind.requires_key());
+            assert!(kind.uses_settings());
+        }
+        settings.ai_draft.provider = ProviderKind::Ollama;
+        assert!(!settings.ai_draft.provider.requires_key());
+        assert!(settings.ai_draft.provider.uses_settings());
     }
 
     /// MCP 页草稿:默认与 `McpConfig::default` 一致(关闭 + 默认端口 + 五
