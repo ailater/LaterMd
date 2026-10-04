@@ -62,6 +62,9 @@ latermd-git = { path = "../latermd-git" }
 # 文档库检索核心(P1 搜索已下沉至此,docs/mcp-plan.md §3 方案 A):侧边栏
 # 只留状态机,MCP 的 search_docs/list_files 复用同一实现
 latermd-search = { path = "../latermd-search" }
+# mermaid flowchart 解析+布局绘制指令(#51;铁律 2:纯 Rust 不依赖 egui,
+# app 侧翻译为 painter 调用;workspace 内部 crate,非 crates.io 新依赖)
+latermd-render = { path = "../latermd-render" }
 # 本地 MCP server(docs/mcp-plan.md):进程内后台线程暴露五个只读工具,
 # 让外部 AI 检索本机文档库
 latermd-mcp = { path = "../latermd-mcp" }

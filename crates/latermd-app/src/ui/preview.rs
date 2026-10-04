@@ -266,6 +266,9 @@ struct AiLinkHandler {
     /// 本帧已渲染的指令卡数:卡片序号 = 文档序,是 widget id 的稳定成分
     /// (AGENTS.md §6.7:绝不含内容长度 —— 编辑指令文本不改序号,id 不变)。
     card_count: Cell<usize>,
+    /// 本帧已渲染的 mermaid 块数(#51 M3):块序号同为文档序稳定 id 成分,
+    /// 与 `card_count` 分开计数 —— 两种块可交错出现,各自序号互不牵连。
+    mermaid_count: Cell<usize>,
     /// 本帧各卡片的 widget id(渲染序);测试借它断言 id 稳定性。
     card_ids: RefCell<Vec<egui::Id>>,
     /// 本帧画过的 `emoji://` inline widget 区块(屏幕坐标,含纹理缺失只留
@@ -283,6 +286,7 @@ impl AiLinkHandler {
             streaming: ai.is_streaming(),
             last_prompt: ai.last_prompt.clone(),
             card_count: Cell::new(0),
+            mermaid_count: Cell::new(0),
             card_ids: RefCell::new(Vec::new()),
             emoji_rects: RefCell::new(Vec::new()),
         }
@@ -445,7 +449,10 @@ impl LinkHandler for AiLinkHandler {
     }
 
     fn is_block_code_widget(&self, language: Option<&str>) -> bool {
-        is_instruction_info(language)
+        // mermaid(#51 M3)与 ai 指令卡共用 block_code_widget 扩展点;
+        // 两个判定互斥(info string 首词不同),非 mermaid/ai 围栏不受
+        // 影响(否决线:普通代码块照走 vendored 原路径)。
+        is_instruction_info(language) || crate::ui::mermaid::is_mermaid_info(language)
     }
 
     fn block_code_widget(
@@ -454,6 +461,11 @@ impl LinkHandler for AiLinkHandler {
         text: &str,
         language: Option<&str>,
     ) -> Option<egui::Response> {
+        if crate::ui::mermaid::is_mermaid_info(language) {
+            let index = self.mermaid_count.get();
+            self.mermaid_count.set(index + 1);
+            return Some(crate::ui::mermaid::block_widget(ui, index, text));
+        }
         debug_assert!(
             is_instruction_info(language),
             "分段侧已按 info string 过滤,两侧条件不同步是 vendor 回归"
@@ -2173,6 +2185,57 @@ mod tests {
         let ids_c = render(doc_c);
         assert_eq!(ids_c.len(), 2);
         assert_ne!(ids_c[0], ids_c[1]);
+    }
+
+    /// #51 M3:mermaid 块经预览 handler(`AiLinkHandler` 扩展)分派到
+    /// mermaid widget 出图;与 ```ai 卡混排时两套块序号各自独立计数
+    /// (交错出现不牵连),回落块照常走源码路径。
+    #[test]
+    fn mermaid_blocks_dispatch_via_preview_handler_with_independent_indexing() {
+        let ctx = egui::Context::default();
+        let render = |doc: &str| {
+            let handler = AiLinkHandler::new(
+                ai_link_color(true),
+                true,
+                egui::Color32::WHITE,
+                &AiState::default(),
+            );
+            ctx.run_ui(RawInput::default(), |ui| {
+                MarkdownLabel::new(egui::Id::new("preview-md"), doc)
+                    .wrap()
+                    .link_handler(&handler)
+                    .show(ui);
+            })
+            .drop_without_applying_deltas();
+            let captured = (
+                handler.card_ids.borrow().clone(),
+                crate::ui::mermaid::read_probe(&ctx),
+            );
+            captured
+        };
+
+        // 合法图 + 卡混排:卡 2 张按文档序取 id;mermaid 探针 2 块出图,
+        // widget id(块序号成分)互异且与卡片 id 无关。
+        let mixed = concat!(
+            "```ai\nfirst\n```\n\n",
+            "```mermaid\nflowchart TD\nA --> B\n```\n\n",
+            "```mermaid\nflowchart TD\nC --> D\n```\n\n",
+            "```ai\nsecond\n```\n",
+        );
+        let (card_ids, probe) = render(mixed);
+        assert_eq!(card_ids.len(), 2, "两张指令卡");
+        assert_eq!(probe.len(), 2, "两个 mermaid 块探针");
+        assert!(probe.iter().all(|b| b.rendered), "两个合法图都应出图");
+        assert_ne!(probe[0].widget_id, probe[1].widget_id, "块序号互异 id");
+        assert_eq!(probe[0].nodes.len(), 2);
+
+        // 不支持类型(sequenceDiagram):同一 handler 下走回落,不出节点。
+        let (card_ids, probe) =
+            render("```mermaid\nsequenceDiagram\nA->>B: hi\n```\n\n```ai\nonly\n```\n");
+        assert_eq!(card_ids.len(), 1, "指令卡照常渲染");
+        assert_eq!(probe.len(), 1);
+        assert!(!probe[0].rendered, "sequenceDiagram 应回落源码");
+        assert!(probe[0].nodes.is_empty(), "回落态不出节点盒");
     }
 
     /// #39 M2 缓存正确性(编辑后缓存失效):同一 tab 的缓存槽位按文本 hash
