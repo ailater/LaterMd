@@ -732,6 +732,42 @@ fn main() {
         assert_eq!(document_title(&doc, &options), "自定义");
     }
 
+    /// 脚注定义体首块不是段落(列表/代码块/引用等)时,首块内容不得
+    /// 整块丢失——此前 `skip(1)` 无条件跳过首块,而首块只有段落形态才
+    /// 被并入 `[label]` 前缀段,其余形态在 PDF 里只渲染「[1] 」前缀,
+    /// 内容无声消失(HTML 导出链路不丢,两链路对同一 IR 的表现不一致)。
+    /// 断言落在布局层(聚合全部 Glyphs 原文的文本),不依赖 pdftotext。
+    #[test]
+    fn footnote_with_leading_list_block_keeps_all_content() {
+        let Some(options) = test_options() else {
+            eprintln!("跳过:本机无可用系统字体");
+            return;
+        };
+        let doc = latermd_render::parse("正文[^1]。\n\n[^1]: - 列表项甲\n    - 列表项乙\n");
+        let fonts = shaping::Fonts::new(&options.fonts).expect("测试字体可解析");
+        let ctx = LayoutContext {
+            fonts: &fonts,
+            opts: &options,
+            width: A4_WIDTH - 2.0 * options.margin,
+        };
+        let blocks = layout::layout_document(&doc, &ctx);
+        let all_text: String = blocks
+            .iter()
+            .flat_map(|block| block.lines.iter())
+            .flat_map(|line| line.prims.iter())
+            .filter_map(|prim| match prim {
+                Prim::Glyphs { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["正文", "[1]", "列表项甲", "列表项乙"] {
+            assert!(
+                all_text.contains(expected),
+                "布局文本缺 {expected:?}(脚注首块整块丢失):\n{all_text}"
+            );
+        }
+    }
+
     /// 取证专用(默认 `--ignored`,不进常规门禁):生成中英混排样例 PDF
     /// 落盘 `/tmp/latermd-pdf-evidence.pdf`,若 PATH 上有 pdftotext 则回读
     /// 断言中文句子逐字完整。字体走 [`super::cjk::discover_cjk_fonts`] 的
@@ -748,7 +784,7 @@ fn main() {
             return;
         };
         let options = PdfExportOptions::new(fonts);
-        let markdown = "# 中文标题\n\n一段中文正文,English words 混排,标点、顿号一致。";
+        let markdown = "# 中文标题\n\n一段中文正文,English words 混排,标点、顿号一致。脚注[^1]。\n\n[^1]: - 列表项甲\n    - 列表项乙\n";
         let bytes = export_pdf(markdown, &options).expect("导出成功");
         assert_pdf_shape(&bytes);
         let path = "/tmp/latermd-pdf-evidence.pdf";
@@ -769,8 +805,14 @@ fn main() {
         };
         // 两侧都剥空白再比(pdftotext 会在断行/词间补换行与空格)
         let normalized = extracted.replace([' ', '\n'], "");
-        for expected in ["中文标题", "一段中文正文", "Englishwords", "标点、顿号一致"]
-        {
+        for expected in [
+            "中文标题",
+            "一段中文正文",
+            "Englishwords",
+            "标点、顿号一致",
+            "列表项甲",
+            "列表项乙",
+        ] {
             assert!(
                 normalized.contains(expected),
                 "pdftotext 回读缺 {expected:?}:\n{extracted}"

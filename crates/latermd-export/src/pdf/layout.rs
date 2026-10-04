@@ -1153,10 +1153,16 @@ fn layout_footnotes(out: &mut Vec<PlacedBlock>, footnotes: &[FootnoteDef], ctx: 
             text: format!("[{}] ", footnote.label),
             style: latermd_render::Style::default(),
         })];
-        let rest: Vec<Block> = footnote.blocks.iter().skip(1).cloned().collect();
-        if let Some(Block::Paragraph { inlines: first }) = footnote.blocks.first() {
-            inlines.extend(first.iter().cloned());
-        }
+        let rest: Vec<Block> = match footnote.blocks.first() {
+            // 首块是段落:并入 [label] 前缀段,其余块照常排
+            Some(Block::Paragraph { inlines: first }) => {
+                inlines.extend(first.iter().cloned());
+                footnote.blocks.iter().skip(1).cloned().collect()
+            }
+            // 首块不是段落(列表/代码块/引用/表格/标题):不并入前缀段,
+            // 全部块照常排——不能无条件 skip(1),否则这类首块整块丢失
+            _ => footnote.blocks.to_vec(),
+        };
         let (runs, items) = build_runs(&inlines, ctx.opts.body_font_size, false, ctx);
         let lines = layout_runs(&runs, &items, 8.0, (ctx.width - 8.0).max(0.0), false, ctx);
         if !lines.is_empty() {
