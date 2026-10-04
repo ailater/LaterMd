@@ -3,7 +3,23 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #96 为当前最新条目。
+> 编号 #98 为当前最新条目。
+
+## #98 #51 M3 app 侧 mermaid widget 四处口径:超宽图整图等比缩进面板而非横向留白、Live 列用只拦 mermaid 的独立 handler 而非复用 AiLinkHandler、块序号取本帧文档序计数、回落用「嵌套无 handler 的 MarkdownLabel」而非手写代码块(2026-10-04,#51 mermaid-render M3·自动拍板)
+
+- **岔路**:①任务书「widget 高度=布局高度,宽度超面板时按比例缩小或水平留白,取舍写 notes」二选一留给实现;②Live 富渲染块接 mermaid 的方式:复用右栏预览的 `AiLinkHandler`(一并带上 ai 卡/emoji/wikilink 行为)还是新造只拦 mermaid 的 handler;③任务书「用块序号+内容哈希等稳定键」——vendored `block_code_widget` 回调不带 token 序号,块序号从哪来;④回落态源码代码块的画法:vendor 的 `render_code_block` 是私有函数,app 侧手写近似代码块还是嵌套 `MarkdownLabel`。
+- **备选**:①a 等比缩放(字号随之缩小) ①b 原尺寸+水平溢出留白/裁切;②a 复用 AiLinkHandler ②b 独立 LiveMermaidHandler;③a vendor ①类补丁透传块序号 ③b app 侧 handler 帧内计数(照 ```ai 卡 `card_count` 模式);④a 手写代码块(背景+高亮+按钮) ④b 嵌套 MarkdownLabel 渲染原围栏文本。
+- **自动选择**:①等比缩放,`scale = min(1, 面板宽/图宽)`,缩放同步作用于全部坐标与文字字号,窄于面板时水平居中留白;②独立 `LiveMermaidHandler`(只实现 `is_block_code_widget`/`block_code_widget` 对 mermaid 命中,其余全走 vendored 默认);③handler 帧内计数器(preview 侧进 `AiLinkHandler::mermaid_count`,与 `card_count` 分开计数;widget/缓存键 = 外层 label id + 块序号,内容只进缓存条目的 content_hash);④嵌套 `MarkdownLabel::new(稳定id, "```mermaid\n{源}\n```")`,**不传 link_handler**。
+- **理由**:①流程图超宽时留白等于右侧内容永远不可见,缩放保完整性;布局缓存不含面板宽,拖窗宽不重排只重缩放,流式期间也不因面板抖动清缓存;字号同比缩小使「文字在盒内」的几何关系在任意 scale 下近似保持;②Live 列此前不接任何 handler,复用 AiLinkHandler 会顺带改变 ai 卡/emoji/wikilink 在 Live 的渲染行为,越出 #51 的改动边界(否决线:非 mermaid 块路径不变);③vendor 补丁透传序号要动 ①类补丁+登记,而帧内计数在「文档结构不变时每帧序号稳定」上与 token 序号等价,流式追加只动最后一块,上游插入 mermaid 块才平移下游序号(且只清 mermaid 自己的缓存);④手写代码块要么放弃 syntect 高亮要么给 app 新增 syntect 直接依赖,嵌套 label 零 vendor 改动复用 vendored 高亮+复制按钮全链路,不传 handler 即 `is_block_code_widget` 恒 false,天然不可能递归回 mermaid widget。
+- **如何改**:①要改为留白:`ui/mermaid.rs` `paint_diagram` 的 `scale` 固定 1.0、水平居中改左对齐,超宽部分交给面板横向滚动(需另开横向 ScrollArea);②要让 Live 也渲染 ai 卡/emoji:Live 列改为构造 `AiLinkHandler`(需传 `AiState`,live.rs 现无此参数,要改 `live::ui` 签名并从 App 层传入);③要 token 序号:vendor label.rs `block_code_widget` 调用点(约 951 行)加 `push_id(i)` 包裹或改 trait 签名透传(①类补丁,vendor/README 登记);④要手写:在 `paint_fallback` 里用 `ui.visuals().code_bg_color` 画底+`highlight_code` 同款逻辑(app 需直接依赖 syntect,先在 ADR-004 登记依赖再动)。
+
+## #97 #51 M1 mermaid 解析与布局的六处口径:渲染路线取纯 Rust、方向仅收 TD|LR 不收 TB 别名、`---` 按书写方向参与分层、孤立单节点 Ok 不 Err、跨层长边拆虚拟节点走正交肘形、链式边/引号标签收编而更长横线与 `&` 并列显式 Err(2026-10-04,#51 mermaid-render M1·自动拍板)
+
+- **岔路**:①渲染路线(auto-plan #51 已拍板「纯 Rust 内嵌 vs 外部 mmdc(node)/远程 kroki——取纯 Rust」,五要素需在本表在册);②方向别名:任务书钉死「flowchart/graph TD|LR」,但 mermaid 另有 TB(TD 的别名)/BT/RL 与小写写法;③`---` 无向边在分层布局里的方向语义;④任务书「空图/孤立单节点/环(a-->b-->a)不 panic 且 Err 有可读信息」一句中,孤立单节点到底是 Ok 渲染还是 Err;⑤连线形态:任务书允许「折线或正交连线」二选一,跨层长边(A→C 中间隔着 B 层)是否上 Sugiyama 虚拟节点;⑥标签边界:双引号标签、链式 `A --> B --> C`、更长横线 `---->`、`-- 文字 -->`、`A & B` 并列是否算 v1 子集。
+- **备选**:①外部 mmdc / 远程 kroki;②a 顺手收 TB 等别名 ②b 严格只收 TD|LR;③a 无向边双向等价 ③b 按书写方向定向参与分层;④a 孤立单节点 Err ④b Ok 渲染一个盒;⑤a 直线折线 ⑤b 正交肘形+跨层长边拆虚拟节点 ⑤c 正交肘形不拆虚拟节点(垂直段可能穿中间层盒子,靠「宽松断言」兜);⑥a 严格最小集(链式/引号也 Err)⑥b 收编链式与引号、其余 Err。
+- **自动选择**:①纯 Rust 内嵌(latermd-render `mermaid` 模块,零新增 crates.io 依赖);②严格 TD|LR,TB/BT/RL/小写一律 Err(错误信息写明「仅支持 TD|LR」);③`---` 按书写方向参与分层与消交叉,绘制时不带箭头;④孤立单节点 Ok 渲染一个盒,空图(0 节点)与环 Err 且消息可读(环给出 `a → b → a` 全路径);⑤**b**:正交肘形折线 + 跨层长边拆零尺寸虚拟节点(参与 barycenter 排序与列槽占位),因此全部边只走相邻层,折线不穿任何盒——任务书的「宽松断言」被升级成严格断言(样本图含跨层长边也零穿越);⑥b:链式边拆成多条边、双引号标签收编(容纳 `)`/`<` 等特殊字符),`---->`/`-- 文字 -->`/`A & B`/`A((x))` 复合形状等显式 Err。
+- **理由**:①离线+隐私+铁律 2(auto-plan 已拍板,此处落档五要素);②别名集没有任务书背书,「不猜测不吞错」宁可 Err 回落为源码代码块也不静默猜方向,TB 是高频写法但收编它是扩子集的决定,应显式做;③无向边若按双向等价处理,任何 `A --- B` 都成环、分层不变式被破坏,按书写方向定向是 dagre 系通行做法,视觉上无箭头仍忠实「无向」原义;④mermaid 本身渲染孤立节点,Err 会把合法输入错打成回落代码块;任务书该句的可辨认意图是鲁棒性(不 panic),空图与环才真正无法产出图;⑤首版实现先走了 c,样本图(判断分支 B→D 跨层)立刻暴露垂直段穿中间层盒——分支汇合是 flowchart 最常见形态,靠挑样本图绕过等于把缺陷留给用户文档,虚拟节点是 Sugiyama 标准第二步、约 40 行,换来「任意图零穿盒」的强保证;⑥链式与引号是 flowchart 核心语法、真实文档高频,收编成本十数行;更长横线/并列/复合形状超出任务书枚举,显式 Err 保持子集可审计(v1 子集边界由测试逐条钉住)。
+- **如何改**:①要切外部引擎(mmdc/kroki)——推翻 auto-plan #51 的拍板本身:删 latermd-render 的 mermaid 模块与 app 侧 `ui/mermaid.rs`,`block_code_widget` 分支改为起外部进程/发远程请求取图;须先接受 mmdc 依赖 node 运行时、kroki 需联网(离线+隐私两条理由失守),且铁律 2 的 headless 渲染场随之外包给外部工具链;②要收 TB:改 `crates/latermd-render/src/mermaid/parser.rs` 方向 match,加 `"TB" => Direction::TopDown` 分支(小写别名同理);③要无向语义:`layout` 的环检测与分层前把 `---` 边从邻接表剔除(分层不再受它约束,绘制仍画线);④要 Err:在 `parse` 收尾处对 `nodes.len()==1 && edges.is_empty()` 加错误分支;⑤要退回直线折线:删 `layout.rs` 的虚拟节点拆链段(`chains`/`ext_layers`),`elbow` 换成两点直连,并把 mod.rs 的 `edge_polylines_avoid_boxes` 断言降回「相邻层边」子集;⑥要放行 `---->`:在 `parse_statement` 的箭头 token match 加更长横线模式;要收 `A & B`:在 `node_ref` 前加 `&` 分隔的多节点展开。M2/M3 若发现回落率过高,优先按本条扩子集而不是放宽「不吞错」纪律。
 
 ## #96 #25 PDF 导出技术路线:A 纯 Rust 直绘(krilla 后端)而非 B HTML→PDF,printpdf 被实测否决(2026-10-04,#25 export-pdf M1·自动拍板)
 
