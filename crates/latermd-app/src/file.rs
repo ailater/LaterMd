@@ -136,11 +136,17 @@ pub fn write(path: &Path, text: &str) -> Result<(), FileError> {
 
 /// [`fn@write`] 的动作名可指定版本,失败提示形如「导出失败 路径: 原因」。
 ///
-/// 原子落盘:先写目标同目录的临时文件并 fsync,再 rename 顶替。直接的
+/// 原子落盘语义见 [`write_bytes_as`]。
+pub fn write_as(op: &'static str, path: &Path, text: &str) -> Result<(), FileError> {
+    write_bytes_as(op, path, text.as_bytes())
+}
+
+/// [`write_as`] 的二进制版本(PDF 等非 UTF-8 载荷),同一套原子落盘:
+/// 先写目标同目录的临时文件并 fsync,再 rename 顶替。直接的
 /// `std::fs::write` 是先截断再写,写入中途 ENOSPC 或进程被杀时磁盘上的
 /// 原版本已毁,正文文档不可承受;同目录保证 rename 不跨文件系统,POSIX
 /// 与 Windows(标准库内部 `MOVEFILE_REPLACE_EXISTING`)都是原子替换。
-pub fn write_as(op: &'static str, path: &Path, text: &str) -> Result<(), FileError> {
+pub fn write_bytes_as(op: &'static str, path: &Path, bytes: &[u8]) -> Result<(), FileError> {
     let dir = path
         .parent()
         // 相对文件名 "note.md" 的 parent 是 "",临时文件落到当前目录
@@ -160,7 +166,7 @@ pub fn write_as(op: &'static str, path: &Path, text: &str) -> Result<(), FileErr
 
     let result = (|| -> io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         // 目标已存在时保留其权限位(如 0600 的私有笔记);失败不阻断保存
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -194,6 +200,23 @@ mod tests {
         // 再对一次字节,确认没经过任何换行规范化
         assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 二进制写路径(PDF 等非 UTF-8 载荷):字节流逐个原样落盘,不经任何
+    /// 文本规范化;失败提示与文本路径同格式(动作名 + 路径)。
+    #[test]
+    fn write_bytes_as_is_byte_exact_for_binary_payload() {
+        let path = temp_path("bytes.bin");
+        let payload: &[u8] = &[0x25, 0x50, 0x44, 0x46, 0x2D, 0x00, 0xFF, 0xFE, 0x0A];
+        write_bytes_as("导出", &path, payload).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        let _ = std::fs::remove_file(&path);
+
+        let error =
+            write_bytes_as("导出", Path::new("/latermd/no/such/dir.bin"), payload).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("导出失败"), "{message}");
+        assert!(message.contains("dir.bin"), "{message}");
     }
 
     /// 非 UTF-8 文件报错并把路径带进提示,而不是静默替换成 U+FFFD。

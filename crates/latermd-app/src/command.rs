@@ -31,6 +31,10 @@ pub enum Command {
     SaveAs,
     /// 导出当前文档为 HTML(派生物,不触碰文档落盘身份)。
     ExportHtml,
+    /// 导出当前文档为 PDF(A4,嵌入系统 CJK 字体;派生物,不触碰文档
+    /// 落盘身份)。不绑默认快捷键(Ctrl/Cmd+E 已被导出 HTML 占用),只从
+    /// 菜单「导出」与侧边栏按钮触发。
+    ExportPdf,
     /// 明暗主题互换;定向选择仍走工具栏「设置」菜单。
     ToggleTheme,
     /// 侧边栏展开/折叠。
@@ -124,13 +128,14 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 38] = [
+    pub const ALL: [Command; 39] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
         Self::Save,
         Self::SaveAs,
         Self::ExportHtml,
+        Self::ExportPdf,
         Self::ToggleTheme,
         Self::ToggleSidebar,
         Self::AiMockStream,
@@ -199,6 +204,7 @@ impl Command {
             Self::Save => "save",
             Self::SaveAs => "save_as",
             Self::ExportHtml => "export_html",
+            Self::ExportPdf => "export_pdf",
             Self::ToggleTheme => "toggle_theme",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::AiMockStream => "ai_mock_stream",
@@ -243,6 +249,7 @@ impl Command {
             Self::Save => "保存",
             Self::SaveAs => "另存为",
             Self::ExportHtml => "导出 HTML",
+            Self::ExportPdf => "导出 PDF",
             Self::ToggleTheme => "切换主题",
             Self::ToggleSidebar => "切换侧边栏",
             Self::AiMockStream => "AI: Mock 流式续写",
@@ -378,13 +385,16 @@ impl Command {
             }
             Self::ToggleZen => egui::KeyboardShortcut::new(Modifiers::NONE, egui::Key::F11),
             // 无快捷键。前三条是 AI 联调入口:不抢键位,等 provider 选型
-            // 定案再定;后两条只从工具条按钮触发(插画布性质的动作,不像
-            // 加粗那样高频到需要键位)。
+            // 定案再定;FormatDivider/FormatTable 只从工具条按钮触发
+            // (插画布性质的动作,不像加粗那样高频到需要键位);ExportPdf
+            // 不强求键位 —— Ctrl/Cmd+E 已被导出 HTML 占用,强凑一对键的
+            // 收益盖不过撞键风险,只挂菜单与侧边栏按钮。
             Self::AiMockStream
             | Self::AiCommitMessage
             | Self::AiSummary
             | Self::FormatDivider
-            | Self::FormatTable => return None,
+            | Self::FormatTable
+            | Self::ExportPdf => return None,
         };
         Some(shortcut)
     }
@@ -399,7 +409,7 @@ impl Command {
             Self::QuickOpen => Icon::Search,
             Self::Save => Icon::Save,
             Self::SaveAs => Icon::SaveAs,
-            Self::ExportHtml => Icon::Export,
+            Self::ExportHtml | Self::ExportPdf => Icon::Export,
             Self::ToggleTheme => Icon::Theme,
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
@@ -440,6 +450,7 @@ impl Command {
             Self::Save => Message::FileCommand(FileCmd::Save),
             Self::SaveAs => Message::FileCommand(FileCmd::SaveAs),
             Self::ExportHtml => Message::ExportHtml,
+            Self::ExportPdf => Message::ExportPdf,
             Self::ToggleTheme => Message::ToggleTheme,
             Self::ToggleSidebar => Message::SidebarToggled,
             Self::AiMockStream => Message::AiStart,
@@ -671,6 +682,7 @@ mod tests {
             Message::FileCommand(FileCmd::SaveAs)
         );
         assert_eq!(Command::ExportHtml.message(), Message::ExportHtml);
+        assert_eq!(Command::ExportPdf.message(), Message::ExportPdf);
         assert_eq!(Command::ToggleTheme.message(), Message::ToggleTheme);
         assert_eq!(Command::ToggleSidebar.message(), Message::SidebarToggled);
         assert_eq!(Command::AiMockStream.message(), Message::AiStart);
@@ -698,6 +710,9 @@ mod tests {
         assert_eq!(Command::AiMockStream.default_shortcut(), None);
         assert_eq!(Command::AiCommitMessage.default_shortcut(), None);
         assert_eq!(Command::AiSummary.default_shortcut(), None);
+        // 导出 PDF 刻意不绑默认键:Ctrl/Cmd+E 归 HTML,不强凑键位;仍可从
+        // 菜单/侧边栏触发,快捷键设置页可自行改绑。
+        assert_eq!(Command::ExportPdf.default_shortcut(), None);
     }
 
     /// 改绑生效:把「保存」改到 Ctrl+K 后,原 Ctrl+S 不再触发任何命令,
@@ -915,7 +930,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 38);
+        assert_eq!(Command::ALL.len(), 39);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();

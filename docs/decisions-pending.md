@@ -3,7 +3,15 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #95 为当前最新条目。
+> 编号 #96 为当前最新条目。
+
+## #96 #25 PDF 导出技术路线:A 纯 Rust 直绘(krilla 后端)而非 B HTML→PDF,printpdf 被实测否决(2026-10-04,#25 export-pdf M1·自动拍板)
+
+- **岔路**:PDF 导出只有两族技术路线——A「纯 Rust 直绘」(Markdown token → 自建布局引擎 → PDF 编码后端,后端候选 printpdf / genpdf / krilla)与 B「HTML→PDF」(复用 latermd-export 的 HTML 产物,引擎候选纯 Rust 的 fullbleed、Rust CDP 的 headless_chrome、外部的 wkhtmltopdf/weasyprint)。这也是 roadmap「crate 增量创建表」里 `latermd-render`(「出现第二个消费者时」创建)是否随 PDF 落地的岔路:走 A 则 latermd-render 本次创建并成为铁律 2 验证场,走 B 则 HTML 直达引擎、latermd-render 依旧不创建。选型证据全文见 [adr-006-export-pdf-route.md](adr-006-export-pdf-route.md)(草案,待追认)。
+- **备选**:A1 printpdf 0.12.8;A2 krilla 0.8.2;A3 genpdf(printpdf 系布局层);B1 fullbleed 2.5.6(纯 Rust HTML/CSS→PDF);B2 headless_chrome(用户机浏览器);B3 wkhtmltopdf/weasyprint(外部引擎)。
+- **自动选择**:**A2 = krilla 0.8.2**。新建 `latermd-render`(token→布局指令 IR,不 import egui)承担 CJK 断行/段落流/表格/代码块/分页/页码的全部布局,`latermd-export` 依赖 krilla 0.8.2 做编码后端;后续模块(编排驱动)按 [adr-006-export-pdf-route.md](adr-006-export-pdf-route.md) §6 锁定实现。
+- **理由**:①离线约束先砍人——无签名分发(ADR-004 §3)的对价是装完即用,headless_chrome 要求用户装 Chrome(README 明示驱动本机 Chrome/Chromium)、wkhtmltopdf 仓库已归档(gh api 实测 archived:true、2022-11-22 停推),B 只剩 fullbleed;②fullbleed 不够格押注——crate 2026-02-11 才创建(8 个月)、总下载 2,519、47 stars、docs.rs 文档率 9.18%,且**随包字体零 CJK(实测:不注册字体时中文全部渲染为 `?`,pdftotext 输出 `??,LaterMD ??`)**,必须运行时注册系统字体才行;③A 路线后端里 printpdf 有实测致命伤——同一张 19.5MB 系统 TTC、同一段中英混排、`subset_fonts: true`,printpdf 输出 13,190,466 B(子集化失效,debug/release 同值)而 krilla 6,293 B,差 2099 倍,「能邮件发出去的 PDF」场景直接不可用;genpdf(printpdf 系现成布局层)最后发版停在 2021-06-17 且钉 printpdf ^0.3.4 旧线,不可用;④krilla 其余维度全面占优或持平——70 个外部 crates(探针实测;printpdf default-features=false 也有 105)/release 全新编译 15.8s/维护极活跃(0.8.2 于 2026-06-04,150 万下载/90d,作者 typst 生态 LaurenzV,90+ 快照测试+6 款阅读器视觉回归)/MIT OR Apache-2.0/MSRV 1.92≤钉死的 1.98.0/TTC face index 与 CJK 落字探针实跑通过(pdftotext 回读逐字一致)/cargo tree 实测树内无 egui;⑤铁律 2 的验证场是本功能的使命——roadmap 写明 latermd-render「出现第二个消费者时」创建,PDF 就是第二消费者,走 B 则铁律 2 永远停留在纸面。**A 路线的代价如实承认:布局全部自建(B 路线的 fullbleed 引擎内建 @page/页眉页脚,布局工作量近乎为零),这是本选择最大的成本项,ADR §5 已设「CJK 断行+段落流+表格任一里程碑两工作日不可演示即回看」的检查点。**
+- **如何改**:要切到 B 路线(fullbleed)——用户在本文档或 adr-006 上批注追认 B,按 adr-006 §5 复活条件核对(fullbleed 成熟度/CJK 一等公民/CSS 覆盖对齐),把 adr-006 改版为 B 决议(后端 fullbleed 2.5.6、运行时注册 fonts.rs 候选表字体、CSS 写 print 变体),latermd-render 创建推迟;要留 A 但换 printpdf 后端——需先解决其 TTC 子集化 13MB 实测问题(上游 issue 跟踪或改嵌独立 TTF),否则维持 krilla;要改 krilla 版本/特性——改 adr-006 §6 表(实现模块落地时按 #4 口径同步登记 ADR-004 §2 与 docs/README.md 索引,本草案未动这两个文件)。
 
 ## #95 M3 设置页三选一的四处落地口径:切 provider 出厂值跟随(手改不动)、空端点按当前 provider 回落、connects_network 与 requires_key 解耦、旧拼法 openai_compatible 加 alias(2026-10-04,#20 ai-adapters M3·自动拍板)
 

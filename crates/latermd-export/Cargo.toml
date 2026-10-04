@@ -3,9 +3,21 @@ name = "latermd-export"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Standalone document exporters (HTML via pulldown-cmark, no UI deps)"
+description = "Standalone document exporters (HTML/PDF via pulldown-cmark, no UI deps)"
 
 [dependencies]
 # 单一解析器铁律(AGENTS.md §3):HTML 导出与预览共用 pulldown-cmark,
 # 版本与 workspace 其余 crate 一致。
 pulldown-cmark = "0.13.4"
+# 绘制指令 IR(铁律 2 的验证场:该 crate 零 UI 依赖,本 crate 把 IR
+# 翻译为 PDF)。扩展开关的唯一持有点也在那里(同方言铁律)。
+latermd-render = { path = "../latermd-render" }
+# PDF 编码后端(ADR-006 §6 锁定 0.8.2;0.x 的 minor 即破坏性版本,
+# 升级须过 PDF 快照回归)。默认 features 含 simple-text(其内部即
+# rustybuzz)与 raster-images。
+krilla = "0.8.2"
+# 与 krilla 0.8.2 内部同版本的 rustybuzz/skrifa,提升为直接依赖用于
+# 文本整形与字体垂直度量——布局测宽与绘制用同一组字形,宽度天然一致;
+# 不引入依赖树里没有的 crate。
+rustybuzz = "0.20.1"
+skrifa = "0.42.0"
