@@ -12,6 +12,7 @@ members = [
   "crates/latermd-git",
   "crates/latermd-md",
   "crates/latermd-mcp",
+  "crates/latermd-render",
   "crates/latermd-search",
 ]
 

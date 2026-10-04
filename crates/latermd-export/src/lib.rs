@@ -1,13 +1,23 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! HTML 导出(docs/roadmap.md P0「导出」)。
+//! HTML/PDF 导出(docs/roadmap.md「导出」线)。
 //!
-//! 纯逻辑 crate:输入 Markdown 源文本,输出可直接落盘的完整 HTML 文档。
-//! 解析与渲染都走 pulldown-cmark(单一解析器铁律,AGENTS.md §3),扩展
-//! 开关与 vendored `egui_markdown::parser::parse` 逐项一致(见私有
-//! `parser_options`)—— 预览与导出必须同方言,否则同一篇文档两边
-//! 看到两种结果。
+//! 纯逻辑 crate:输入 Markdown 源文本,输出可直接落盘的完整 HTML 文档
+//! 或 PDF 字节。解析与渲染都走 pulldown-cmark(单一解析器铁律,AGENTS.md
+//! §3),扩展开关与 vendored `egui_markdown::parser::parse` 逐项一致——
+//! 开关的唯一持有点在 [`latermd_render::parser_options`](HTML 与 PDF
+//! 两条链路都委托它),预览/HTML/PDF 三方同方言。
+//!
+//! PDF 链路(ADR-006 路线 A):`latermd-render` 产绘制指令 IR(铁律 2,
+//! 零 UI 依赖),本 crate 的 pdf 模块把 IR 布局到 A4 页面并经 krilla
+//! 编码为字节(见 [`export_pdf`] / [`export_document`])。
+
+mod pdf;
+
+pub use pdf::{
+    export_document, export_pdf, PdfError, PdfExportOptions, PdfFont, PdfFonts, A4_HEIGHT, A4_WIDTH,
+};
 
 use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
 
@@ -90,15 +100,10 @@ pub fn export_html(text: &str) -> String {
 }
 
 /// 与 vendored `egui_markdown::parser::parse`(egui_markdown/src/parser.rs
-/// `parse` 内的 options 组装)逐项一致的扩展开关。上游改动方言时同步这里,
-/// 单测覆盖四个扩展各自的输出形态以钉住一致性。
+/// `parse` 内的 options 组装)逐项一致的扩展开关,委托 [`latermd_render`]
+/// 的唯一持有点——HTML 与 PDF 两条链路同方言由构造保证。
 fn parser_options() -> Options {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options
+    latermd_render::parser_options()
 }
 
 /// 取文档标题:第一个标题(任意层级)的纯文本,无标题回退 [`FALLBACK_TITLE`]。
@@ -225,5 +230,21 @@ mod tests {
         let html = export_html("");
         assert!(html.starts_with("<!DOCTYPE html>"), "{html}");
         assert!(html.ends_with("</html>\n"), "{html}");
+    }
+
+    /// 同方言铁律(铁律 1):HTML 与 PDF 共用 `latermd_render::parser_options`
+    /// 这一个持有点,本 crate 的 `parser_options` 只是委托——一致性由构造
+    /// 保证,此处钉住四个扩展开关确实全部在位。
+    #[test]
+    fn pdf_dialect_matches_html_dialect() {
+        assert_eq!(parser_options(), latermd_render::parser_options());
+        for flag in [
+            Options::ENABLE_STRIKETHROUGH,
+            Options::ENABLE_TABLES,
+            Options::ENABLE_FOOTNOTES,
+            Options::ENABLE_TASKLISTS,
+        ] {
+            assert!(parser_options().contains(flag));
+        }
     }
 }
