@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MarkdownStyle::segmentation_admission`. Whole-document callers pass `true` to stay in
   sync with `needs_segmentation`; a caller laying out a single admitted fence as its own
   flushed range passes `false` so the fence renders inline within that range.
+- The height caches behind off-screen culling of block widgets (tables, scrolling code
+  blocks, images) are now keyed by each block's own token — plus the style and link-handler
+  id the previous whole-document key covered — instead of by the hash of the whole document
+  text. Appending at the end of a document (streaming output) now re-measures only the
+  edited block; every other off-screen block culls from its cached height. The entry stays
+  keyed by token index, so an edit that changes the token count earlier in the document
+  shifts later blocks to fresh (never stale) entries. Rendering output is unchanged: cache
+  keys only decide when a block is re-laid-out, and a second frame on a hot context paints
+  the same shapes as a cold one.
 
 ### Fixed
 

@@ -69,6 +69,30 @@ fn hash_text(text: &str, style: &MarkdownStyle, handler: Option<&dyn LinkHandler
   hasher.finish()
 }
 
+/// Identity of one block widget's own content: its token, plus the same context a
+/// whole-document [`hash_text`] key covers (style, handler id).
+///
+/// The height cache under `("block_sz", index)` keys its entry by token index and
+/// verifies it with this hash, so the hash range must be exactly the block: the
+/// whole-document hash would invalidate every block on any edit. The block's
+/// *source span* looks like a cheaper range (one contiguous `&str` hash), but spans
+/// tile the source contiguously: a block's span absorbs the blank separators before
+/// it and stops at the end of the block body (the closing fence line is not part of
+/// it), so the same construct at a different position hashes differently. The token
+/// is exact — an identical token renders an identical widget at the same height,
+/// including nested table cells. Keeping style and handler id in the key preserves
+/// the old invalidation: a style change still re-measures every block.
+#[inline]
+fn hash_block_content(token: &Token<'_>, style: &MarkdownStyle, handler: Option<&dyn LinkHandler>) -> u64 {
+  let mut hasher = std::collections::hash_map::DefaultHasher::new();
+  token.hash(&mut hasher);
+  style.hash(&mut hasher);
+  if let Some(h) = handler {
+    h.id().hash(&mut hasher);
+  }
+  hasher.finish()
+}
+
 /// Identity of everything a [`LayoutResult`] depends on.
 ///
 /// Deliberately excludes the wrap width and break flag: `build_layout` only seeds
@@ -150,12 +174,18 @@ fn record_widget_block(ui: &egui::Ui, id: Id, span: std::ops::Range<usize>, befo
 
 /// Cull an off-screen block widget using its cached height.
 ///
+/// The entry is keyed by the block's token index and verified by the block's
+/// content hash ([`hash_block_content`]): the index is stable while edits append
+/// at the end of the document, and an edit that changes the token count earlier
+/// shifts later indices to fresh — never stale — entries. A hash match therefore
+/// means the cached height was measured for this exact block.
+///
 /// Returns `Some(rect)` when the block was culled — the rect it would have
 /// occupied, so callers can still record its geometry — and `None` when the
 /// block must be rendered normally.
-fn try_cull_block(ui: &mut Ui, block_sz_id: Id, text_hash: u64) -> Option<Rect> {
+fn try_cull_block(ui: &mut Ui, block_sz_id: Id, content_hash: u64) -> Option<Rect> {
   let (cached_hash, cached_height) = ui.data(|d| d.get_temp::<(u64, f32)>(block_sz_id))?;
-  if cached_hash != text_hash {
+  if cached_hash != content_hash {
     return None;
   }
   let size = Vec2::new(ui.available_width(), cached_height);
@@ -167,9 +197,9 @@ fn try_cull_block(ui: &mut Ui, block_sz_id: Id, text_hash: u64) -> Option<Rect> 
   Some(est_rect)
 }
 
-fn cache_block_height(ui: &mut Ui, block_sz_id: Id, text_hash: u64, before_y: f32) {
+fn cache_block_height(ui: &mut Ui, block_sz_id: Id, content_hash: u64, before_y: f32) {
   let height = ui.min_rect().bottom() - before_y;
-  ui.data_mut(|d| d.insert_temp(block_sz_id, (text_hash, height)));
+  ui.data_mut(|d| d.insert_temp(block_sz_id, (content_hash, height)));
 }
 
 /// Convert borrowed tokens to owned ('static) by converting CowStr::Borrowed to Boxed.
@@ -778,7 +808,7 @@ impl<'a> MarkdownLabel<'a> {
         let Some(layout) = cached.layout.clone() else {
           // 布局缺失(分段渲染路径):缓存里留有 spans,块表记录照常可用。
           let md = Markdown { s: text, tokens: (*tokens).clone(), spans: (*spans).clone() };
-          self.render_segmented(ui, &md, &font, color, style, text_hash);
+          self.render_segmented(ui, &md, &font, color, style);
           return;
         };
 
@@ -801,7 +831,10 @@ impl<'a> MarkdownLabel<'a> {
       }
     }
 
-    // Cache miss - parse and build layout.
+    // Cache miss - parse and build layout. The full-text parse and the owned-token copy
+    // are a small fraction of what re-rendering costs (layout dominates), so this
+    // whole-document gate keeps the full-text hash; per-block keying is a segmented-path
+    // concern and lives in its own caches (per-range flushes, per-block heights).
     let md = parser::parse(text);
     let owned_tokens = Arc::new(tokens_to_owned(&md.tokens));
 
@@ -815,7 +848,7 @@ impl<'a> MarkdownLabel<'a> {
           CachedMarkdownLayout { text_hash, layout: None, tokens: owned_tokens, spans: owned_spans },
         );
       });
-      self.render_segmented(ui, &md, &font, color, style, text_hash);
+      self.render_segmented(ui, &md, &font, color, style);
       return;
     }
 
@@ -867,16 +900,8 @@ impl<'a> MarkdownLabel<'a> {
     );
   }
 
-  fn render_segmented(
-    &self,
-    ui: &mut Ui,
-    md: &Markdown<'_>,
-    font: &FontId,
-    color: Color32,
-    style: &MarkdownStyle,
-    text_hash: u64,
-  ) {
-    self.render_token_range(ui, md, font, color, 0, md.tokens.len(), style, text_hash);
+  fn render_segmented(&self, ui: &mut Ui, md: &Markdown<'_>, font: &FontId, color: Color32, style: &MarkdownStyle) {
+    self.render_token_range(ui, md, font, color, 0, md.tokens.len(), style);
   }
 
   /// Recursively render a range of tokens, handling blockquotes and tables as sub-regions.
@@ -890,10 +915,14 @@ impl<'a> MarkdownLabel<'a> {
     start: usize,
     end: usize,
     style: &MarkdownStyle,
-    text_hash: u64,
   ) {
     let mut text_start = start;
     let mut i = start;
+
+    // Block-widget height caches are keyed by the block's own token, not by the
+    // document hash: appending at the end of the document leaves every earlier block's
+    // cached height valid, so only the edited block re-measures.
+    let block_key = |index: usize| hash_block_content(&md.tokens[index], style, self.link_handler);
 
     let block_spacing = style.block_spacing;
     // Before rendering a block element, add spacing if there was preceding content.
@@ -923,7 +952,7 @@ impl<'a> MarkdownLabel<'a> {
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -942,7 +971,7 @@ impl<'a> MarkdownLabel<'a> {
             self.link_handler,
           );
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -964,7 +993,7 @@ impl<'a> MarkdownLabel<'a> {
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -984,7 +1013,7 @@ impl<'a> MarkdownLabel<'a> {
             self.code_theme_arg(),
           );
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -1013,7 +1042,7 @@ impl<'a> MarkdownLabel<'a> {
           before_block(had_content, ui);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -1024,7 +1053,7 @@ impl<'a> MarkdownLabel<'a> {
           let image = egui::Image::new(url.as_ref()).max_width(ui.available_width()).show_loading_spinner(true);
           ui.add(image);
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -1034,7 +1063,7 @@ impl<'a> MarkdownLabel<'a> {
           self.flush_text_range(ui, md, font, color, text_start, i, style, true);
           let block_sz_id = self.id.with(("block_sz", i));
           let before_rect = ui.available_rect_before_wrap();
-          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, text_hash) {
+          if let Some(cull_rect) = try_cull_block(ui, block_sz_id, block_key(i)) {
             record_block_rect(ui, self.id, md.spans[i].clone(), cull_rect);
             i += 1;
             text_start = i;
@@ -1047,7 +1076,7 @@ impl<'a> MarkdownLabel<'a> {
             ui.ctx().open_url(OpenUrl::new_tab(url.to_string()));
           }
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
-          cache_block_height(ui, block_sz_id, text_hash, before_y);
+          cache_block_height(ui, block_sz_id, block_key(i), before_y);
           i += 1;
           text_start = i;
           after_block(&mut i, &mut text_start, end, ui);
@@ -1091,7 +1120,7 @@ impl<'a> MarkdownLabel<'a> {
           child_rect.min.x += indent;
 
           let mut child_ui = ui.new_child(UiBuilder::new().id_salt(self.id.with(("bq", i))).max_rect(child_rect));
-          self.render_token_range(&mut child_ui, md, font, color, bq_content_start, bq_end, style, text_hash);
+          self.render_token_range(&mut child_ui, md, font, color, bq_content_start, bq_end, style);
 
           let bq_stroke =
             Stroke::new(style.blockquote.stroke_width, ui.visuals().widgets.noninteractive.bg_stroke.color);
