@@ -220,6 +220,11 @@ pub fn ui(
     let mut activate: Option<usize> = None;
     let mut route: Option<(usize, usize)> = None;
     let block_count = live.blocks.len();
+    // mermaid 块出图(#51 M3):富渲染块经只拦 mermaid 的 handler 接入
+    // block_code_widget 扩展点。专用 handler(而非复用 AiLinkHandler):
+    // Live 列此前不接任何 handler,不能借 mermaid 顺手改变 ai 卡/emoji/
+    // wikilink 的渲染行为(否决线);其余块照走 vendored 默认。
+    let mermaid_handler = crate::ui::mermaid::LiveMermaidHandler::new();
 
     egui::ScrollArea::vertical()
         .id_salt("live-preview")
@@ -463,6 +468,8 @@ pub fn ui(
                         // 代码块复制头(#38)与右栏预览同一份:Live 模式的
                         // 富渲染块也是「code 预览的地方」。
                         .code_block_buttons(&crate::ui::preview::code_copy_buttons)
+                        // mermaid 块出图(#51 M3),与右栏预览同一渲染入口。
+                        .link_handler(&mermaid_handler)
                         .show(ui);
                     let bottom = ui.cursor().top();
                     let rect = egui::Rect::from_min_max(
@@ -956,6 +963,48 @@ mod tests {
         }
         assert!(copied.is_empty(), "点正文不触发复制:{copied:?}");
         assert_eq!(live.active, Some(2), "点块内正文应切入编辑态:{live:?}");
+    }
+
+    /// #51 M3:Live 富渲染块里的 ```mermaid 围栏出图(生产入口 `ui` 经
+    /// `LiveMermaidHandler` 接入);解析失败的围栏回落源码(探针不出节点),
+    /// 其余块(代码块复制按钮等)不受牵连。
+    #[test]
+    fn live_rich_block_renders_mermaid_and_falls_back() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(concat!(
+            "# 标题\n\n",
+            "```mermaid\nflowchart TD\nA --> B\n```\n\n",
+            "正文段落。\n\n",
+            "```mermaid\nsequenceDiagram\nA->>B\n```\n",
+        ));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let probe = crate::ui::mermaid::read_probe(&ctx);
+        assert_eq!(
+            probe.len(),
+            2,
+            "两个 mermaid 块都进 widget:{:?}",
+            probe.len()
+        );
+        assert!(probe[0].rendered, "合法图应出图");
+        assert_eq!(probe[0].nodes.len(), 2, "A/B 两节点");
+        assert!(!probe[1].rendered, "sequenceDiagram 应回落源码");
+        assert!(probe[1].nodes.is_empty());
+        // 回落块的复制按钮照常挂出(嵌套 label 的代码块增强仍可用)。
+        assert!(
+            !frame.button_rects.is_empty(),
+            "回落块应保留复制按钮:{:?}",
+            frame.button_rects
+        );
     }
 
     /// 链接点击归属富渲染层:打开 URL,不连带把块切进编辑(修复后富渲染
