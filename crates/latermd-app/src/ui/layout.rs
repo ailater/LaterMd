@@ -91,6 +91,19 @@ impl LaterMdApp {
         for message in std::mem::take(outbox) {
             state.apply(message);
         }
+        // 长按修饰键检测(#54 M1):与命令快捷键同层的顶层输入处理,但
+        // 扫描必须排在 poll_shortcuts / poll_capture 之前——快捷键消费会
+        // 从事件流删掉 Key 事件,后扫会把「按过 Ctrl+S」看成「只在按
+        // Ctrl」。只读不消费,既有快捷键行为分毫不变(否决线)。触发事件
+        // M2 渲染层消费(Visible 态即蒙层可见位);Holding 帧按剩余时长
+        // 自驱要帧——按住修饰键此后不再产生事件,不排程 3s 到点就无帧可
+        // 跑归约(#18 帧饥饿的同型教训)。
+        let hold_input = crate::shortcut_overlay::frame_input(ctx);
+        let now = std::time::Instant::now();
+        state.shortcut_overlay.step(hold_input, now);
+        if let Some(wait) = state.shortcut_overlay.repaint_wait(now) {
+            ctx.request_repaint_after(wait);
+        }
         // 命令快捷键(键位来自 `keymap`,用户可改;统一清单见 `crate::command`)。
         // eframe 在 begin_pass 之后调 logic,本帧按键事件此刻可见;消费即从
         // 输入流移除,TextEdit 即使聚焦也收不到;无 COMMAND 修饰的普通字符
