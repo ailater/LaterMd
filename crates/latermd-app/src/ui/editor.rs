@@ -319,37 +319,99 @@ pub fn ui(
                 );
             }
 
-            // minimap 点击/拖动跳转(#55 M2):经本 ScrollArea 的既有滚动
-            // 通道落地,动画关闭(拖动逐帧即时跟随,不留弹性滞后)。意图
-            // 来自**上一帧**闭外注册的窄条交互(minimap-jump temp,消费即
+            // minimap 滚动意图落地(#55 M2 跳转 + #105① 悬停滚轮):两者
+            // 共用上一帧度量(metrics temp),度量同用上一帧真值 —— 本帧
+            // 内容高要等排版完成,编辑帧的一帧误差下一帧自愈。跳转意图来
+            // 自**上一帧**闭外注册的窄条交互(minimap-jump temp,消费即
             // 清)—— 本帧注册本帧消费做不到:scroll_to_rect 要在本闭包内
-            // 才被 end 消费,而窄条命中要排在 ScrollArea 之后注册(层级在
-            // 上,否则被背景拖拽抢走)。一帧滞后在 60fps 下无感,拖动每帧
-            // 刷新意图、逐帧跟随。度量同用上一帧真值(metrics temp):本帧
-            // 内容高要等排版完成,编辑帧的一帧误差下一帧自愈。跳转只动
-            // 滚动 offset,不触碰 TextEdit 光标状态;排在 follow 之后,
-            // 键盘导航(当帧动作)覆盖它。
+            // 才被 end 消费,而窄条命中要排在 ScrollArea 之后注册(层级
+            // 在上,否则被背景拖拽抢走);一帧滞后在 60fps 下无感,拖动
+            // 每帧刷新意图、逐帧跟随。滚轮不走 widget 命中、没有这条时序
+            // 约束,在闭包内当帧截获、以相对增量经 scroll_with_delta 同帧
+            // 转发(见下;实际不会与跳转同帧并存 —— 拖拽进行中被
+            // dragged_id 判据关掉滚轮截获)。两者都只动滚动 offset,不触碰
+            // TextEdit 光标状态;排在 follow 之后,键盘导航(当帧动作)
+            // 覆盖它们。
             if let Some(map_rect) = minimap_rect {
-                // 消费即清:一帧意图一帧落地,不留旧值在拖动结束后复读。
+                let metrics: minimap::ScrollMetrics = ui.ctx().data(|d| {
+                    d.get_temp(minimap::metrics_id(editor_id))
+                        .unwrap_or_default()
+                });
+                let travel = (metrics.content_height - metrics.viewport_height).max(0.0);
+                let scroll_ratio = if travel > 0.0 {
+                    (metrics.offset / travel).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let viewport_frac = if metrics.content_height > 0.0 {
+                    (metrics.viewport_height / metrics.content_height).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                // 绝对滚动比例的落地出口:TOP 对齐语义下 ScrollArea::end
+                // 的换算会扣一个 item_spacing,rect 顶补回;单像素 rect 只
+                // 表位置。动画关闭(滚轮/拖动逐帧即时,不留弹性滞后)。
+                let land = |ui: &egui::Ui, target: f32| {
+                    let clip = ui.clip_rect();
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            clip.left() + 1.0,
+                            clip.top() + target * travel + ui.spacing().item_spacing.y,
+                        ),
+                        egui::vec2(1.0, 1.0),
+                    );
+                    ui.scroll_to_rect_animation(
+                        rect,
+                        Some(egui::Align::TOP),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                };
+
+                // 悬停滚轮转发(#105①):指针悬停窄条命中区(与闭外点击/
+                // 拖动交互同一矩形,避让最右滚动条)时截获本帧滚轮,按
+                // minimap/文档高度比放大后以**相对增量**同帧转发
+                // (scroll_with_delta 由本 ScrollArea::end 当帧消费)。必须
+                // 在这里截获:ScrollArea 的内建滚轮消费在 end() 里只按
+                // 「指针在 outer_rect 内」几何判定,窄条让 TextEdit 压窄、
+                // 却仍在 outer_rect 里(实测:不截获则滚轮先按 1:1 原速滚
+                // 一次,与转发叠加成双滚);读走 smooth_scroll_delta 并清
+                // 零是 egui 嵌套滚动同款抑制手法(该字段文档明言 ScrollArea
+                // 读后即清)。dragged_id 判据镜像内建口径:拖窄条/滚动条/
+                // 选区进行中不截获,滚轮归当前拖拽。放大比例与「为何相对
+                // 而非绝对目标」的取舍见 minimap::wheel_editor_delta。
+                {
+                    let scroll = &ui.style().spacing.scroll;
+                    let scrollbar_w = scroll.bar_width + scroll.bar_outer_margin;
+                    let hit_rect = egui::Rect::from_min_max(
+                        map_rect.min,
+                        egui::pos2(map_rect.right() - scrollbar_w, map_rect.bottom()),
+                    );
+                    if ui.ctx().dragged_id().is_none() && ui.rect_contains_pointer(hit_rect) {
+                        let delta_y = ui.input(|i| i.smooth_scroll_delta.y);
+                        if delta_y != 0.0 {
+                            ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+                            if let Some(scaled) = minimap::wheel_editor_delta(minimap::WheelInput {
+                                content_height: metrics.content_height,
+                                viewport_height: metrics.viewport_height,
+                                total_lines,
+                                row_h: minimap::ROW_H,
+                                delta_y,
+                            }) {
+                                ui.scroll_with_delta_animation(
+                                    egui::vec2(0.0, scaled),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 点击/拖动跳转(#55 M2)。消费即清:一帧意图一帧落地,不
+                // 留旧值在拖动结束后复读。
                 let pointer_y = ui
                     .ctx()
                     .data_mut(|d| d.remove_temp::<f32>(minimap::jump_id(editor_id)));
                 if let Some(pointer_y) = pointer_y {
-                    let metrics: minimap::ScrollMetrics = ui.ctx().data(|d| {
-                        d.get_temp(minimap::metrics_id(editor_id))
-                            .unwrap_or_default()
-                    });
-                    let travel = (metrics.content_height - metrics.viewport_height).max(0.0);
-                    let scroll_ratio = if travel > 0.0 {
-                        (metrics.offset / travel).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let viewport_frac = if metrics.content_height > 0.0 {
-                        (metrics.viewport_height / metrics.content_height).clamp(0.0, 1.0)
-                    } else {
-                        1.0
-                    };
                     if let Some(target) = minimap::jump_ratio(minimap::JumpInput {
                         minimap_height: map_rect.height(),
                         total_lines,
@@ -358,21 +420,7 @@ pub fn ui(
                         pointer_y,
                         viewport_frac,
                     }) {
-                        // TOP 对齐语义下 ScrollArea::end 的换算会扣一个
-                        // item_spacing,rect 顶补回;单像素 rect 只表位置。
-                        let clip = ui.clip_rect();
-                        let rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                clip.left() + 1.0,
-                                clip.top() + target * travel + ui.spacing().item_spacing.y,
-                            ),
-                            egui::vec2(1.0, 1.0),
-                        );
-                        ui.scroll_to_rect_animation(
-                            rect,
-                            Some(egui::Align::TOP),
-                            egui::style::ScrollAnimation::none(),
-                        );
+                        land(ui, target);
                     }
                 }
             }

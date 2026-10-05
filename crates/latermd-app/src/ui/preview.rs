@@ -1418,14 +1418,17 @@ mod tests {
         }
     }
 
-    /// 标题覆盖断言(§3.2 第二段):heading 里的 emoji **确实吃到** inline
-    /// widget —— 图片纵向落在「标题」文本的同一行带内。边长与段落档一致:
-    /// vendored 层对链接一律传正文基础字体(`Token::Link` 分支不吃 heading
-    /// 的字号放大,layout.rs),emoji 因此不随标题缩放,与 wiki:// 等既有
-    /// 链接在标题里的行为同源 —— 非 B2 引入的回归,岔路登记 decisions-pending
-    /// #91。断言把这两个事实都钉成**已知的如实行为**,不是缺陷漏网。
+    /// 标题覆盖断言(§3.2 第二段 + #91 vendor ①类收口):heading 里的 emoji
+    /// **确实吃到** inline widget —— 图片纵向落在「标题」文本的同一行带内;
+    /// 边长随标题档放大:#91 的 vendor 补丁让 `Token::Link` 透传所在 heading
+    /// level(parser),vendored `build_layout` 对 inline widget 分支按
+    /// `heading.scales` 档位缩放入参字体(app 生产 style H1 = 2.0×,theme.rs),
+    /// `inline_widget_size`/占位 shaping 都按入参派生,app 生产代码零改动。
+    /// 标题里的**普通链接文本**(wiki:// 等)不吃缩放 —— vendored 改动严格限
+    /// inline widget 字体路径,既有链接文本渲染逐像素不变(否决线在 vendored
+    /// 测试 tests/inline_widget_heading_scale.rs 钉死)。
     #[test]
-    fn emoji_inline_widget_paints_inside_heading_at_link_font_scale() {
+    fn emoji_inline_widget_scales_with_heading_level() {
         let ctx = egui::Context::default();
         let heading = render_emoji_frame(&ctx, "# 标题 😀 落位", Vec::new(), 12);
         assert_eq!(heading.images.len(), 1, "标题里恰一枚 emoji 图");
@@ -1438,9 +1441,16 @@ mod tests {
 
         let para = render_emoji_frame(&ctx, "对照段落 😀", Vec::new(), 13);
         assert_eq!(para.images.len(), 1);
+        let ratio = image.width() / para.images[0].1.width();
         assert!(
-            (image.width() - para.images[0].1.width()).abs() <= 0.51,
-            "标题档与段落档边长一致(链接字体不吃 heading 缩放):{} vs {}",
+            (ratio - 2.0).abs() <= 0.1,
+            "标题档边长 ≈ 段落档 × H1 scale(2.0):{ratio}({} vs {})",
+            image.width(),
+            para.images[0].1.width()
+        );
+        assert!(
+            image.width() > para.images[0].1.width() * 1.5,
+            "emoji 随标题字号放大,不再是段落档:{} vs {}",
             image.width(),
             para.images[0].1.width()
         );

@@ -887,10 +887,16 @@ fn token_to_owned(token: &Token<'_>) -> Token<'static> {
             text: cowstr_to_owned(text),
             language: language.as_ref().map(cowstr_to_owned),
         },
-        Token::Link { text, href, title } => Token::Link {
+        Token::Link {
+            text,
+            href,
+            title,
+            heading,
+        } => Token::Link {
             text: cowstr_to_owned(text),
             href: cowstr_to_owned(href),
             title: title.as_ref().map(cowstr_to_owned),
+            heading: *heading,
         },
         Token::ListMarker {
             marker,
