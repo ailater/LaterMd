@@ -36,6 +36,7 @@ use crate::live::RenderMode;
 use crate::mcp::McpState;
 use crate::search::SearchState;
 use crate::settings::SettingsState;
+use crate::shortcut_overlay::ShortcutOverlayState;
 use crate::tabs::{DraftRecovery, TabState, TabsState};
 use crate::theme::{
     clamp_editor_font_size, clamp_line_height, Density, SkinCatalog, ThemeMode, ThemeSettings,
@@ -315,6 +316,10 @@ pub struct State {
     /// 剪贴板图片读取(docs/image-plan.md D 段):后台线程 + channel 的
     /// 接收端,生命周期与 `BedState` 同构(发起/收流/收尾三原语)。
     pub clipboard: ClipboardState,
+    /// 快捷键蒙层(#54 M1):长按平台主修饰键 3s 的检测状态机。会话级
+    /// 状态,不持久化——挂在 State 上随帧推进,切窗口/切标签不重建,
+    /// 失焦帧由取消判定收口(不存在「失忆后拿残影计时」的面)。
+    pub shortcut_overlay: ShortcutOverlayState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -433,6 +438,7 @@ impl Default for State {
             image_dialog: ImageDialogState::default(),
             emoji: EmojiPanelState::default(),
             clipboard: ClipboardState::default(),
+            shortcut_overlay: ShortcutOverlayState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
             skins: SkinCatalog::default(),

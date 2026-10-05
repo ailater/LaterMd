@@ -3,7 +3,23 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #101 为当前最新条目。
+> 编号 #103 为当前最新条目。
+
+## #103 #54 M2 蒙层渲染与内容源的六处口径:暗底 160/亮底 216(alpha 从 visuals.dark_mode 推导)、无绑定命令照列、分组=Command::group() 注册表新维度(7 组+兜底,无 Git 组)、Esc 归蒙层(reduce 层 retain 移除)、关闭即重起表不设抑制、分组两列 Grid(horizontal_wrapped 无头不收敛的教训)(2026-10-05,#54 shortcut-overlay M2·自动拍板)
+
+- **岔路**:任务书把自由度交给实现者:①全窗半透明底的不透明度与取色(只钉「两主题各取 visuals 推导不硬编码」);②无绑定命令(AI 三条/导出 PDF/分割线/表格)显示与否;③「分组沿用注册表既有分类」——现状是注册表(`command.rs`)**没有**分类字段,既有分类散在 menubar 子菜单(文件/导出/编辑/视图/AI)与 format_bar 工具条(格式组),任务书例举的「Git」组在命令表里无对应物;④Esc 关闭路径与其它 Esc 语义(禅定退出/emoji 关闭/改键捕获取消)的层级;⑤点击/Esc 关闭后修饰键仍按住时要不要再触发;⑥分组卡片的排版(可滚动是钉死的,列形态自选)。
+- **备选**:①a 单一黑底固定 alpha 两主题共用 ①b 两主题各取黑/白且 alpha 分档;②a 照列(标「未绑定」) ②b 隐藏;③a 蒙层自抄一份分组清单 ③b 给 `Command` 加 `group()` 注册表维度(单一事实源);④a Esc 谁都不消费全靠各层自己判断 ④b 蒙层可见帧在归约层把 Esc 从事件流移除;⑤a 关闭后抑制到修饰键松开 ⑤b 关闭即回 Idle 重新起表;⑥a `horizontal_wrapped` 流式换列 ⑥b 两列 Grid。
+- **自动选择**:①b+②a+③b+④b+⑤b+⑥b。蒙层底暗色 `from_black_alpha(160)`(63% 黑)、亮色 `from_white_alpha(216)`(85% 白),按 `visuals().dark_mode` 分档;无绑定命令照列(组内弱化「未绑定」),蒙层命令集==`Command::ALL` 全集;`CommandGroup` 七组(文件/编辑/格式/视图/标签/导出/AI)+`Other` 兜底,归属沿用 menubar 与 format_bar 的既有分类,全部 39 条命令显式归类、`every_command_has_a_group` 钉住兜底组为空;蒙层可见帧在 `reduce` 里 retain 移除 Esc 按下事件(蒙层可见期间修饰键按着,`consume_key(NONE,…)` 的逻辑匹配对带修饰键的 Esc 不成立,故用 poll_capture 同款 retain);`close()` 与 step 的按键/松开关闭同语义——回 Idle,再长按 3s 再触发;分组用 `egui::Grid` 两列摆放、组内命令/键位两列、外层 `ScrollArea::max_height` 限高。
+- **理由**:①亮色下正文是深字,弱化同样内容需要更厚的白,单一黑底在亮色主题下会把底层内容压成泥;两档 alpha 都从 `visuals().dark_mode` 推导,换主题皮肤自动跟随;②蒙层与设置页「快捷键」、快速打开的命令组口径一致(两处都显示无绑定命令),且「命令集==注册表全集」的断言由此字面成立;AI 三条是暂无键位而非无意义,蒙层里可见=可发现「这些还没键位」;③蒙层不抄第二份清单是任务书红线;注册表加维度是「单一事实源」的正解——menubar 将来可迁移消费(本次不动它,避免回归面扩大);Git 在命令表里没有命令(P2 的 Git 是面板不是命令),任务书例举的「Git」组按现状落空,如实不造空组;④浮层层级语义:最顶层浮层先吃 Esc,禅定/emoji/捕获当帧不可达——蒙层关掉后用户再按一次 Esc 即可到达下层语义,一次一键不叠加;⑤M1 测试 `visible_closes_on_release_key_or_unfocus` 已钉死「关闭后仍按住→重新起表」,点击/Esc 关闭跟随同语义不另设抑制期;重新触发需再按满 3s,门槛本身即防抖;⑥实测教训:`horizontal_wrapped` 配 `set_width` 在无头帧里不收敛,分组卡被排成一行直到屏外(x 到 1505),换 `Grid` 两列(设置页 keymap 表同款容器)后布局确定;Grid 列宽由内容收敛,无头/真机一致。
+- **如何改**:①要调观感——改 `shortcut_overlay.rs` 的 `SCRIM_ALPHA_DARK`/`SCRIM_ALPHA_LIGHT` 两个常量;②要隐藏无绑定命令——`grouped_rows` 的行过滤 `shortcut.is_some()`(同步删 `overlay_rows_cover_every_command` 的全集断言改为「绑定命令全集」);③要改分组/加 Git 组——改 `command.rs` 的 `CommandGroup::ALL` 与 `Command::group()`(新命令忘了归类会落 `Other`,测试会红);④要 Esc 穿透蒙层——删 `ui::layout::reduce` 里 `overlay_visible` 的 retain 段(蒙层关闭本身由 step 的「其它按键」规则完成,不动也不影响关闭,只影响下层可见性);⑤要抑制期——`ShortcutOverlayState` 加 `Suppressed` 态,`close()` 落它、`step` 在修饰键松开/失焦时才回 Idle;⑥要换列形态——改 `paint` 里 `shortcut-overlay-groups` Grid 的 `num_columns` 与 `chunks(n)` 步长。
+
+## #102 #54 M1 长按检测状态机的三处口径:IME 组合态进行中不触发(视为打字)、仅「平台主修饰键单独按住」才算长按(叠加 Shift/Alt 是和弦)、设置页改键捕获期间不特殊处理(留给 M2)(2026-10-05,#54 shortcut-overlay M1·自动拍板)
+
+- **岔路**:任务书把三处自由度交给实现者:①IME 组合态进行中(候选框打字中)长按到点是否触发——任务书明示「自选并记录(倾向不触发,防打字误触)」;②「按住平台主修饰键」的判定口径——只要 Ctrl/⌘ 按住就算(叠加 Shift/Alt 也算),还是必须**单独**按住;③设置页「快捷键」正在捕获新键位(用户可能长时间只按着修饰键等灵感)时,检测是否要为该模态让路。
+- **备选**:①a 组合态期间照常触发 ①b 组合态期间不触发(视同打字);②a 宽口径(修饰键按下即可,叠加其它修饰键不取消) ②b 严口径(`Modifiers::command_only`:Win/Linux 只按 Ctrl、mac 只按 ⌘,叠加即取消);③a 捕获期间暂停检测并清零 ③b 不特殊处理(按通用取消规则自然覆盖)。
+- **自动选择**:①b + ②b + ③b。`is_other_key` 把任何 `Event::Ime`(Preedit 组合中 / Commit 上屏 / DeleteSurrounding)都算「其它按键」——组合态的每一帧都在取消长按,3s 自然凑不满;`modifier_held` 取 egui 既有 `Modifiers::command_only()` 平台抽象;改键捕获期间检测照常运行,不另设分支。
+- **理由**:①任务书倾向即是结论:候选框期间用户在打字,长按 ⌘ 的常见来源是输入法切换/选词的残留指法,此刻弹蒙层是典型误触;且组合态每帧都有 Ime 事件流入,「视为打字」实现为零特判(事件归类进 other_key 一条 match 臂);②叠加 Shift/Alt 时用户在和弦(如准备 Ctrl+Shift+K),macOS Cheatsheet 系蒙层也只在 ⌘ 单独按住时出现;`command_only` 是 egui 既有平台抽象,零自研平台判定;③改键捕获对「按住修饰键等 3s」的响应路径已被通用规则覆盖——捕获完成的按键本身即 other_key 取消;真出现「捕获中只按修饰键 3s」的场景,M1 无渲染无感知,M2 画蒙层时若观感冲突再在此条追加「如何改」③分支,不为未发生的场景预写分支。
+- **如何改**:①要组合态期间可触发——`shortcut_overlay.rs::is_other_key` 删 `Event::Ime(_)` 那条臂,并删 `chords_text_clipboard_and_ime_count_as_other_key` 里对应的 Ime 断言;②要宽口径——`frame_input` 的 `modifier_held` 从 `command_only()` 改为 `modifiers.command`,并同步 `chords_text_clipboard_and_ime_count_as_other_key` 的「叠加 Shift 是和弦」断言(该断言同时钉住取消语义:叠加修饰键当帧取消);③要捕获期间暂停——`ui::layout::reduce` 的检测接线外包一层 `state.settings.capture.is_none()` 并在 else 分支调 `state.shortcut_overlay` 的取消入口(需新增,现为纯 `step` 驱动)。
 
 ## #101 #53 M3 行内词级高亮的四处置口径:仅「单删+单增」紧邻块启用(一对多降级回行级)、第二级底色取同公式 35% 占比(不下划线)、整行重写区段铺满两侧、区段计算 char 级(ZWJ 序列不保证 grapheme 边界)(2026-10-05,#53 git 双栏对比 M3·自动拍板)
 

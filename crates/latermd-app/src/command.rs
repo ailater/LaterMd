@@ -14,6 +14,61 @@ use crate::file::FileCmd;
 use crate::state::Message;
 use eframe::egui::{self, Modifiers};
 
+/// 命令分组(#54 快捷键蒙层):命令注册表的既有归属收编成一个维度,
+/// 单一事实源仍是本模块(`Command::group`)——蒙层、设置页「快捷键」与
+/// 快速打开的命令组共用它,不另抄清单。
+///
+/// 口径沿用菜单栏(`ui::menubar` 的子菜单)与格式工具条(`ui::format_bar`)
+/// 的既有归属;「其他」兜底当前无人认领的命令(新命令忘了归类时落这里,
+/// `groups_cover_every_command_exactly_once` 钉住全集不丢)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandGroup {
+    /// 文件(menubar「文件」:新建/打开/快速打开/保存/另存为)。
+    File,
+    /// 编辑(menubar「编辑」:复制行/查找/替换)。
+    Edit,
+    /// 格式(格式工具条的十五条动作 + 插入图片/Emoji 两个对话框类入口)。
+    Format,
+    /// 视图(menubar「视图」的两条 + 预览栏/Live/禅定三个布局开关)。
+    View,
+    /// 标签(menubar 挂在「文件」尾部的三条;蒙层独立成组,容量余裕比菜单宽)。
+    Tab,
+    /// 导出(menubar「导出」)。
+    Export,
+    /// AI(menubar「AI」)。
+    Ai,
+    /// 兜底:未归类的命令。
+    Other,
+}
+
+impl CommandGroup {
+    /// 展示顺序(蒙层从左到右、从上到下)。
+    pub const ALL: [CommandGroup; 8] = [
+        Self::File,
+        Self::Edit,
+        Self::Format,
+        Self::View,
+        Self::Tab,
+        Self::Export,
+        Self::Ai,
+        Self::Other,
+    ];
+
+    /// 分组显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "文件",
+            Self::Edit => "编辑",
+            Self::Format => "格式",
+            Self::View => "视图",
+            Self::Tab => "标签",
+            Self::Export => "导出",
+            Self::Ai => "AI",
+            Self::Other => "其他",
+        }
+    }
+}
+
 /// 用户命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -192,6 +247,45 @@ impl Command {
             Self::DuplicateLine => FormatAction::DuplicateLine,
             _ => return None,
         })
+    }
+
+    /// 命令的分组(蒙层/设置页「快捷键」的展示维度)。全部命令都有归属,
+    /// 漏归类的落 [`CommandGroup::Other`] 兜底。
+    pub fn group(self) -> CommandGroup {
+        match self {
+            Self::New | Self::Open | Self::QuickOpen | Self::Save | Self::SaveAs => {
+                CommandGroup::File
+            }
+            Self::DuplicateSelection
+            | Self::DuplicateLine
+            | Self::FindInDoc
+            | Self::ReplaceInDoc => CommandGroup::Edit,
+            Self::FormatBold
+            | Self::FormatItalic
+            | Self::FormatStrike
+            | Self::FormatInlineCode
+            | Self::FormatLink
+            | Self::FormatH1
+            | Self::FormatH2
+            | Self::FormatH3
+            | Self::FormatQuote
+            | Self::FormatCodeBlock
+            | Self::FormatDivider
+            | Self::FormatTable
+            | Self::FormatBullet
+            | Self::FormatOrdered
+            | Self::FormatTask
+            | Self::ImageInsert
+            | Self::EmojiPicker => CommandGroup::Format,
+            Self::ToggleTheme
+            | Self::ToggleSidebar
+            | Self::ToggleRightPreview
+            | Self::ToggleLivePreview
+            | Self::ToggleZen => CommandGroup::View,
+            Self::TabNext | Self::TabClose | Self::TabRestore => CommandGroup::Tab,
+            Self::ExportHtml | Self::ExportPdf => CommandGroup::Export,
+            Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => CommandGroup::Ai,
+        }
     }
 
     /// 稳定 id:快捷键表 `keymap.json` 的键。命令的显示名会随文案调整,
@@ -935,5 +1029,55 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), Command::ALL.len(), "ALL 里不得有重复命令");
+    }
+
+    /// 分组维度覆盖全集:每条命令恰好归入一个组(#54 M2 蒙层的「单一
+    /// 事实源」断言基础——蒙层不另抄清单,分组从本表派生)。
+    #[test]
+    fn every_command_has_a_group() {
+        for cmd in Command::ALL {
+            let group = cmd.group();
+            assert!(
+                CommandGroup::ALL.contains(&group),
+                "{cmd:?} 的分组 {group:?} 不在展示序里"
+            );
+        }
+        // 兜底组当前无人认领:有命令落进去说明新命令忘了归类(落兜底可以,
+        // 但必须是显式的决定——出现时更新本断言)
+        let others: Vec<_> = Command::ALL
+            .iter()
+            .filter(|cmd| cmd.group() == CommandGroup::Other)
+            .collect();
+        assert!(others.is_empty(), "未归类的命令:{others:?}");
+    }
+
+    /// 否决线自证(#54 M2):出厂表里**每一条**绑定,真按键都只触发它所
+    /// 属的命令一次——蒙层接线前后跑同一测试,逐项不变。无绑定的命令
+    /// (AI 三条 + PDF/分割线/表格)不参与(无键可按)。
+    #[test]
+    fn every_bound_command_fires_from_its_own_binding() {
+        let keymap = Keymap::builtin();
+        for cmd in Command::ALL {
+            let Some(shortcut) = keymap.get(cmd) else {
+                continue;
+            };
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![key_event(shortcut.key, shortcut.modifiers)],
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(
+                        poll_shortcuts(ui.ctx(), &keymap),
+                        vec![cmd],
+                        "{} 的绑定 {} 应只触发它自己",
+                        cmd.id(),
+                        shortcut.platform_text()
+                    );
+                },
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 }

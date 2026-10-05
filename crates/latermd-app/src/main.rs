@@ -42,6 +42,7 @@ mod preview_pixel_acceptance;
 mod preview_typography_acceptance;
 mod search;
 mod settings;
+mod shortcut_overlay;
 mod state;
 mod tabs;
 mod theme;
