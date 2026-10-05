@@ -728,6 +728,8 @@ fn gutter_digits_stay_aligned_under_line_spacing_projection() {
                 &mut live,
                 crate::live::RenderMode::Source,
                 crate::ui::editor::tab_editor_id(1),
+                // 排版验收不涉 minimap:关(#55 前的现状路径)。
+                false,
             );
         },
     );

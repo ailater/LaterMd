@@ -763,6 +763,10 @@ pub enum Message {
     EditorFontSizeChanged(f32),
     /// 正文行距倍率变化(#23 F2):同上,钳进 1.2..=2.0。
     EditorLineHeightChanged(f32),
+    /// 源码 minimap 开关翻转(#55 M2):外观页复选框产出,落
+    /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
+    /// 全局偏好,非每标签)。
+    ShowMinimapToggled(bool),
 }
 
 /// 字符偏移 → 字节偏移(替换命中落 `String` 前的换算;落在多字节字符
@@ -893,6 +897,10 @@ impl State {
             }
             Message::EditorLineHeightChanged(ratio) => {
                 self.theme.line_height = clamp_line_height(ratio);
+                self.persist_theme();
+            }
+            Message::ShowMinimapToggled(show) => {
+                self.theme.show_minimap = show;
                 self.persist_theme();
             }
             Message::ToggleLivePreview => self.toggle_live_preview(),
@@ -4000,6 +4008,31 @@ mod tests {
             state.apply(Message::EditorLineHeightChanged(ratio));
             assert_eq!(state.theme.line_height, want, "{ratio} -> {want}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #55 M2:minimap 开关消息归约落 `theme.show_minimap` 并即时写
+    /// settings.json;重启(load_from)后值仍在。只动该字段,排版偏好与
+    /// 密度不受影响(与 #23 排版偏好同款通路)。
+    #[test]
+    fn show_minimap_toggle_updates_field_and_persists() {
+        let dir = temp_path("show-minimap-toggle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert!(state.theme.show_minimap, "出厂默认开");
+        let font_before = state.theme.editor_font_size;
+
+        state.apply(Message::ShowMinimapToggled(false));
+        assert!(!state.theme.show_minimap);
+        state.apply(Message::ShowMinimapToggled(true));
+        assert!(state.theme.show_minimap, "往返翻回开");
+        state.apply(Message::ShowMinimapToggled(false));
+
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert!(!reloaded.show_minimap, "重启后仍为关");
+        assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

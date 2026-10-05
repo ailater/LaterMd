@@ -9,6 +9,7 @@
 use crate::live::{self, LiveState, RenderMode};
 use crate::state::{OutlineCursor, PreviewState};
 use crate::ui::gutter;
+use crate::ui::minimap;
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
 
@@ -136,6 +137,14 @@ pub struct CursorChannel<'a> {
 
 /// 绘制编辑面板,并在控件返回后维护预览快照与光标协调。返回 TextEdit
 /// 的响应(焦点/交互归因用,测试也用它拿 widget id)。
+///
+/// `show_minimap`(#55 M2):源码模式右缘 minimap 开关(设置页持久化,
+/// ThemeSettings 同路)。关闭时走与从前逐字节相同的路径 —— TextEdit 宽
+/// 度、ScrollArea、gutter 全部不变,minimap 的注册/绘制/行模型缓存一概
+/// 不进。仅源码模式生效:Live 分支在更早处返回。
+// 参数各自属于 State 的不同字段,打包成结构会造出人为聚合;同款豁免
+// 先例见 settings.rs `dialog`。
+#[allow(clippy::too_many_arguments)]
 pub fn ui(
     panel: &mut egui::Ui,
     editor: &mut EditorBuffer,
@@ -144,6 +153,7 @@ pub fn ui(
     live: &mut LiveState,
     mode: RenderMode,
     editor_id: egui::Id,
+    show_minimap: bool,
 ) -> egui::Response {
     let CursorChannel {
         cursor,
@@ -172,6 +182,18 @@ pub fn ui(
     // 没有任何滚动容器,超过一屏的内容既看不见也滚不动)。
     let rows = (panel.available_height() / line_height).floor().max(1.0) as usize;
 
+    // minimap 窄条(#55 M2):先只算矩形让 TextEdit 压窄;交互注册放在
+    // ScrollArea **之后**(见下方闭外)—— egui 同层后注册的 widget 居上,
+    // ScrollArea 的背景拖拽先注册,先注册的 minimap 会被它抢走命中。
+    // 窄条最右 10px 是滚动条避让区。
+    let panel_avail = panel.available_rect_before_wrap();
+    let minimap_rect = show_minimap.then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(panel_avail.right() - minimap::MINIMAP_W, panel_avail.top()),
+            panel_avail.right_bottom(),
+        )
+    });
+
     // 跳转/格式写回挪进 ScrollArea 闭包:与下面的光标跟随同处一个作用域,
     // scroll_to_rect 在闭包内调用才会被本 ScrollArea 的 end 同帧消费(egui
     // 把滚动目标记在帧级 pass state,ScrollArea 结束时取走折算成偏移)。
@@ -183,7 +205,7 @@ pub fn ui(
     // 写回当帧 output.state 还是写回前的旧快照,定位只能用写回目标本身。
     let mut ime_write_back: Option<usize> = None;
 
-    let output = egui::ScrollArea::vertical()
+    let scrolled = egui::ScrollArea::vertical()
         // 每标签一套滚动位置,与 TextEdit 持久状态的口径一致;id 不含内容
         // 长度/hash(AGENTS §6.7)。
         .id_salt(editor_id.with("source-editor-scroll"))
@@ -201,11 +223,19 @@ pub fn ui(
                     // 即自动扣减行号槽与 token 间距。
                     let (slot, _) =
                         row.allocate_exact_size(egui::vec2(gutter_w, 0.0), egui::Sense::hover());
+                    // minimap 开启时显式压窄同一段剩余宽(INFINITY 的"吃满"
+                    // 语义等价替换);关闭保持 INFINITY 原路径,现状零变化。
+                    let desired_width = if minimap_rect.is_some() {
+                        (row.available_width() - minimap::MINIMAP_W - row.spacing().item_spacing.x)
+                            .max(10.0)
+                    } else {
+                        f32::INFINITY
+                    };
                     let output = egui::TextEdit::multiline(&mut buffer)
                         // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
                         .id(editor_id)
                         .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(desired_width)
                         .desired_rows(rows)
                         .lock_focus(true)
                         .show(row);
@@ -288,9 +318,157 @@ pub fn ui(
                     None,
                 );
             }
+
+            // minimap 点击/拖动跳转(#55 M2):经本 ScrollArea 的既有滚动
+            // 通道落地,动画关闭(拖动逐帧即时跟随,不留弹性滞后)。意图
+            // 来自**上一帧**闭外注册的窄条交互(minimap-jump temp,消费即
+            // 清)—— 本帧注册本帧消费做不到:scroll_to_rect 要在本闭包内
+            // 才被 end 消费,而窄条命中要排在 ScrollArea 之后注册(层级在
+            // 上,否则被背景拖拽抢走)。一帧滞后在 60fps 下无感,拖动每帧
+            // 刷新意图、逐帧跟随。度量同用上一帧真值(metrics temp):本帧
+            // 内容高要等排版完成,编辑帧的一帧误差下一帧自愈。跳转只动
+            // 滚动 offset,不触碰 TextEdit 光标状态;排在 follow 之后,
+            // 键盘导航(当帧动作)覆盖它。
+            if let Some(map_rect) = minimap_rect {
+                // 消费即清:一帧意图一帧落地,不留旧值在拖动结束后复读。
+                let pointer_y = ui
+                    .ctx()
+                    .data_mut(|d| d.remove_temp::<f32>(minimap::jump_id(editor_id)));
+                if let Some(pointer_y) = pointer_y {
+                    let metrics: minimap::ScrollMetrics = ui.ctx().data(|d| {
+                        d.get_temp(minimap::metrics_id(editor_id))
+                            .unwrap_or_default()
+                    });
+                    let travel = (metrics.content_height - metrics.viewport_height).max(0.0);
+                    let scroll_ratio = if travel > 0.0 {
+                        (metrics.offset / travel).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let viewport_frac = if metrics.content_height > 0.0 {
+                        (metrics.viewport_height / metrics.content_height).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    if let Some(target) = minimap::jump_ratio(minimap::JumpInput {
+                        minimap_height: map_rect.height(),
+                        total_lines,
+                        scroll_ratio,
+                        row_h: minimap::ROW_H,
+                        pointer_y,
+                        viewport_frac,
+                    }) {
+                        // TOP 对齐语义下 ScrollArea::end 的换算会扣一个
+                        // item_spacing,rect 顶补回;单像素 rect 只表位置。
+                        let clip = ui.clip_rect();
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                clip.left() + 1.0,
+                                clip.top() + target * travel + ui.spacing().item_spacing.y,
+                            ),
+                            egui::vec2(1.0, 1.0),
+                        );
+                        ui.scroll_to_rect_animation(
+                            rect,
+                            Some(egui::Align::TOP),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                    }
+                }
+            }
             output
-        })
-        .inner;
+        });
+    let output = scrolled.inner;
+
+    // minimap 交互注册(#55 M2):排在 ScrollArea 之后注册 → 同层居上,
+    // 点击/拖动不会被 ScrollArea 的背景拖拽抢走。命中即把指针 y(相对
+    // 窄条顶)写进 jump temp,下一帧闭包开头消费落地;拖动每帧覆写,
+    // 滚动逐帧跟随。窄条最右 10px 让给滚动条(它画得更靠右缘)——不光
+    // 绘制避让,**命中也避让**:滚动条 handle 的 interact 在 ScrollArea::
+    // end 内先注册、sense 同为 CLICK|DRAG 且贴视口右缘整条 bar_width 宽,
+    // egui 同层命中 tie 取后注册者,minimap 的 interact 区若不在右缘收回
+    // 这一条,滚动条的 hover/拖拽就永远被压住。避让宽取当帧样式的
+    // bar_width + bar_outer_margin(默认 floating = 10px,与绘制口径一致)。
+    if let Some(map_rect) = minimap_rect {
+        let scroll = &panel.style().spacing.scroll;
+        let scrollbar_w = scroll.bar_width + scroll.bar_outer_margin;
+        let hit_rect = egui::Rect::from_min_max(
+            map_rect.min,
+            egui::pos2(map_rect.right() - scrollbar_w, map_rect.bottom()),
+        );
+        let response = panel.interact(
+            hit_rect,
+            editor_id.with("minimap"),
+            egui::Sense::click_and_drag(),
+        );
+        if response.clicked() || response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                panel.ctx().data_mut(|d| {
+                    d.insert_temp(minimap::jump_id(editor_id), pos.y - map_rect.top())
+                });
+            }
+        }
+    }
+
+    // minimap 绘制(#55 M2):窗口/高亮框用本帧滚动真值换算,行模型走 M1
+    // 的修订号缓存(命中帧零成本);帧末更新 metrics temp 供下一帧跳转。
+    // 上面的跳转意图经 ScrollArea::end 在**上一帧**落账,本帧读到的
+    // offset 已是跳转后的值,高亮框无额外滞后。
+    if let Some(map_rect) = minimap_rect {
+        let viewport_h = scrolled.inner_rect.height();
+        let content_h = scrolled.content_size.y;
+        let travel = (content_h - viewport_h).max(0.0);
+        let offset = scrolled.state.offset.y;
+        let scroll_ratio = if travel > 0.0 {
+            (offset / travel).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let viewport_frac = if content_h > 0.0 {
+            (viewport_h / content_h).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let (shapes, bars, viewport) = minimap::with_lines(
+            panel.ctx(),
+            editor_id,
+            editor,
+            minimap::LineParams::factory(),
+            |lines| {
+                minimap::shapes(
+                    panel.visuals(),
+                    map_rect,
+                    lines,
+                    scroll_ratio,
+                    viewport_frac,
+                )
+            },
+        );
+        // shapes 的上画布与探针写入都在 with_lines 的 data_mut 借用之外:
+        // painter 的 add 会再进同一把 Context 写锁,借用内重入即死锁。
+        panel.painter().extend(shapes);
+        // 测试探针(照 preview.rs `ScrollProbe` 的 data 手法,生产只写
+        // 不读):供无头测试断言「关闭态零 minimap 元素 / 开启态行条数」。
+        panel.ctx().data_mut(|d| {
+            d.insert_temp(
+                minimap::probe_id(editor_id),
+                minimap::MinimapProbe {
+                    bars,
+                    viewport: Some(viewport),
+                },
+            )
+        });
+        panel.ctx().data_mut(|d| {
+            d.insert_temp(
+                minimap::metrics_id(editor_id),
+                minimap::ScrollMetrics {
+                    offset,
+                    content_height: content_h,
+                    viewport_height: viewport_h,
+                },
+            );
+        });
+    }
 
     // 快照只在修订号前进时重建(文本 + 大纲同源);这是"避免每帧重解析"
     // 的第一层,vendored 层的 text hash 缓存是第二层。
@@ -475,6 +653,9 @@ mod tests {
                         &mut live,
                         RenderMode::Source,
                         tab_editor_id(1),
+                        // 本模块的既有测试都验现状路径:minimap 关(其
+                        // 渲染与跳转的验收在 ui::minimap 的 tests 里)。
+                        false,
                     )
                     .id,
                 );
