@@ -405,6 +405,8 @@ fn tokens_to_layout_job(
         job.append(text.as_ref(), 0.0, format);
       }
       Token::Link { text, href, .. } => {
+        // Table cells never sit inside a heading, so there is no widget font
+        // override to apply (None keeps the cell font everywhere).
         let (link_font, link_color) = link_font_and_color(font_id, hyperlink_color, strong_color, has_bold, is_header);
         let base_format = TextFormat::default();
         append_link_to_job(
@@ -413,6 +415,7 @@ fn tokens_to_layout_job(
           text.as_ref(),
           href.as_ref(),
           &link_font,
+          None,
           &base_format,
           link_color,
           link_handler,

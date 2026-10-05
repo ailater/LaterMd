@@ -59,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default is deliberately conservative: a hand-written document almost never carries a
   single 500-line fence, so ordinary documents keep the whole-document galley path — and
   its pixel output — unchanged. `usize::MAX` disables admission entirely.
+- Heading-scaled inline widgets. `Token::Link` now carries the heading level (1–6) of the
+  block it was parsed in, and `build_layout` passes a heading-scaled font to the
+  inline-widget callbacks (`LinkHandler::inline_widget_size` and the placeholder
+  `layout_link` call), so a widget painted over a placeholder — an emoji, an icon — grows
+  with the heading instead of keeping the body size. The scale is the same
+  `MarkdownStyle::heading.scales` entry the heading's own text uses. Plain link text
+  keeps the body font everywhere (including inside headings), and widgets in body
+  paragraphs and table cells are unchanged, so non-heading output is pixel-identical.
+  **Breaking:** `Token::Link` gained a `heading` field and `append_link_to_job` takes an
+  `inline_widget_font: Option<&FontId>` argument after `font_id` (`None` keeps the body
+  font for widgets too).
 
 ### Changed
 

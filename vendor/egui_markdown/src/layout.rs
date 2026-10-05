@@ -118,6 +118,11 @@ pub struct LinkAppend {
 /// Encapsulates the priority order: `is_block_widget` → `inline_widget_size` (with optional
 /// `layout_link` placeholder) → `layout_link` → `link_style` → default hyperlink color.
 ///
+/// `inline_widget_font` overrides the font handed to the inline-widget callbacks
+/// (`inline_widget_size` and the placeholder `layout_link` call), so a link inside a
+/// heading can scale its widget with the heading level while `font_id` — used by every
+/// plain-text path below — stays the body font. `None` keeps the body font everywhere.
+///
 /// The caller is responsible for mapping the appended sections to their token index
 /// (see [`LinkAppend::sections_added`]).
 #[allow(clippy::too_many_arguments)]
@@ -127,6 +132,7 @@ pub fn append_link_to_job(
   text: &str,
   href: &str,
   font_id: &FontId,
+  inline_widget_font: Option<&FontId>,
   base_format: &TextFormat,
   link_color: Color32,
   link_handler: Option<&dyn LinkHandler>,
@@ -135,10 +141,11 @@ pub fn append_link_to_job(
     if handler.is_block_widget(href) {
       return LinkAppend { is_block_widget: true, ..LinkAppend::default() };
     }
-    if let Some(widget_size) = handler.inline_widget_size(href, font_id) {
+    let widget_font = inline_widget_font.unwrap_or(font_id);
+    if let Some(widget_size) = handler.inline_widget_size(href, widget_font) {
       let start_char = job.text.chars().count();
       let before = job.sections.len();
-      let added = if handler.layout_link(ui, text, href, job, font_id, Color32::TRANSPARENT) {
+      let added = if handler.layout_link(ui, text, href, job, widget_font, Color32::TRANSPARENT) {
         let added = job.sections.len() - before;
         for section in &mut job.sections[before..] {
           // section.format.color = Color32::TRANSPARENT;
@@ -147,7 +154,7 @@ pub fn append_link_to_job(
         added
       } else {
         let format = TextFormat {
-          font_id: FontId::monospace(font_id.size),
+          font_id: FontId::monospace(widget_font.size),
           color: Color32::TRANSPARENT,
           line_height: Some(widget_size.y),
           ..base_format.clone()
@@ -204,7 +211,7 @@ pub fn render_link_in_ui(
   }
 
   let mut job = LayoutJob::default();
-  let info = append_link_to_job(ui, &mut job, text, href, font_id, base_format, link_color, link_handler);
+  let info = append_link_to_job(ui, &mut job, text, href, font_id, None, base_format, link_color, link_handler);
 
   let galley = ui.fonts_mut(|f| f.layout_job(job));
   let size = galley.size();
@@ -484,9 +491,31 @@ pub fn build_layout(
           section_to_token.push(token_index);
         }
       }
-      Token::Link { text, href, .. } => {
+      Token::Link { text, href, heading, .. } => {
         let link_base = text_format(font_id.clone(), color, style_ref);
-        let info = append_link_to_job(ui, &mut job, text, href, &font_id, &link_base, hyperlink_color, link_handler);
+        // Inline widgets scale with the enclosing heading (same index math as the
+        // `Token::Text` heading branch above), so e.g. an emoji link painted over a
+        // placeholder grows with H1–H6 instead of keeping the body size. Plain link
+        // text keeps the body font: `font_id` below is what every non-widget path
+        // uses, and passing the scaled font only as the widget override leaves
+        // those paths pixel-identical.
+        let inline_widget_font = heading.map(|level| {
+          let mut font = font_id.clone();
+          let idx = (level as usize).saturating_sub(1).min(5);
+          font.size *= style_ref.heading.scales[idx];
+          font
+        });
+        let info = append_link_to_job(
+          ui,
+          &mut job,
+          text,
+          href,
+          &font_id,
+          inline_widget_font.as_ref(),
+          &link_base,
+          hyperlink_color,
+          link_handler,
+        );
         if info.is_block_widget {
           segment_breaks.push(token_index);
         } else {

@@ -259,10 +259,11 @@ fn token_to_owned(t: &Token<'_>) -> Token<'static> {
     Token::CodeBlock { text, language } => {
       Token::CodeBlock { text: cowstr_to_owned(text), language: language.as_ref().map(|l| cowstr_to_owned(l)) }
     }
-    Token::Link { text, href, title } => Token::Link {
+    Token::Link { text, href, title, heading } => Token::Link {
       text: cowstr_to_owned(text),
       href: cowstr_to_owned(href),
       title: title.as_ref().map(|t| cowstr_to_owned(t)),
+      heading: *heading,
     },
     Token::ListMarker { marker, indent_level } => {
       Token::ListMarker { marker: cowstr_to_owned(marker), indent_level: *indent_level }

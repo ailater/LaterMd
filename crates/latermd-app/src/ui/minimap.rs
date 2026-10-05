@@ -19,10 +19,11 @@
 //!   行模型缓存。
 //!
 //! M2 渲染层(本文件下半段)消费这三个入口:行条只画 [`window`] 的可见
-//! 区间、颜色从当帧 visuals 推导(明暗两套);编辑器视口的高亮框与
-//! 点击/拖动跳转([`jump_ratio`])都按「内容比例」换算,与窗口平移同一
-//! 套几何。比例尺/不满高铺排等自选项登记在 docs/decisions-pending.md
-//! #104,条宽/默认开关等 M2 口径见 #105。
+//! 区间、颜色从当帧 visuals 推导(明暗两套);编辑器视口的高亮框、
+//! 点击/拖动跳转([`jump_ratio`])与悬停滚轮转发([`wheel_editor_delta`])
+//! 都按「内容比例」换算,与窗口平移同一套几何。比例尺/不满高铺排等自
+//! 选项登记在 docs/decisions-pending.md #104,条宽/默认开关等 M2 口径
+//! 见 #105(#105① 滚轮转发销账注记亦在该条)。
 
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
@@ -373,6 +374,50 @@ pub(crate) fn jump_ratio(input: JumpInput) -> Option<f32> {
     let offset = input.scroll_ratio.clamp(0.0, 1.0) * travel;
     let p = ((input.pointer_y + offset) / full).clamp(0.0, 1.0);
     Some(((p - ve * 0.5) / (1.0 - ve)).clamp(0.0, 1.0))
+}
+
+/// 悬停滚轮转发(#105①)的输入:把窄条命中区截获的本帧滚轮换算成编辑器
+/// 滚动增量(纯函数,单测锚点)。几何量与 [`JumpInput`] 同源——metrics
+/// 两项是编辑器 ScrollArea 的上一帧真值,`total_lines`/`row_h` 与行模型
+/// 同一套口径。
+#[derive(Clone, Copy)]
+pub(crate) struct WheelInput {
+    /// 编辑器内容总高(`ScrollMetrics::content_height`)。
+    pub content_height: f32,
+    /// 编辑器视口高(`ScrollMetrics::viewport_height`)。
+    pub viewport_height: f32,
+    /// 文档总行数。
+    pub total_lines: usize,
+    /// 比例尺(minimap 每行条高,px)。
+    pub row_h: f32,
+    /// 本帧截获的滚轮 y 分量(px;egui 口径正值 = 内容下移 = 向上滚,
+    /// 与 ScrollArea 内建消费 `offset -= delta` 同号)。
+    pub delta_y: f32,
+}
+
+/// 悬停滚轮 → 编辑器滚动增量(px,与 `delta_y` 同号):delta × 「文档
+/// 内容高 / 文档的 minimap 全高」——窄条上滚 1px,文档滚
+/// `内容高/(总行数×比例尺)` px。无行程(编辑器滚不动)或无滚轮量返回
+/// `None`,调用方原样不动;越端钳制交给 ScrollArea::end 的 offset 边界
+/// (与内建滚轮同一条钳子)。
+///
+/// 放大系数取舍:VS Code 按「编辑器滚动高 / minimap 视口高」放大(更
+/// 快),这里取与 [`jump_ratio`] 同一几何(full = 总行数 × 比例尺)——
+/// 滚轮与点击/拖动共用一套换算源,滚轮步长与行条自身的像素位移 1:1,
+/// 观感上「窄条被你滚动了」而不是「文档被随机加速」。
+///
+/// 落地走**相对** delta(`Ui::scroll_with_delta_animation`)而非绝对
+/// `scroll_to_rect`:滚轮动量是逐帧尾量(egui 平滑滚轮事件帧交 90%、
+/// 余量随后帧衰减交齐),绝对目标会拿上一帧基数互相覆写(实测振荡);
+/// 相对增量在 end() 里加到**当帧已应用**的 offset 上,天然链接。
+pub(crate) fn wheel_editor_delta(input: WheelInput) -> Option<f32> {
+    let travel = (input.content_height - input.viewport_height).max(0.0);
+    if travel <= 0.0 || input.delta_y == 0.0 {
+        return None;
+    }
+    let total = input.total_lines.max(1) as f32;
+    let map_full = total * input.row_h.max(0.5);
+    Some(input.delta_y * (input.content_height / map_full))
 }
 
 /// 编辑器视口在 minimap 上的高亮框(相对窄条顶的 `top` 与 `height`,
@@ -1359,6 +1404,192 @@ mod tests {
         assert!(
             ctx.data(|d| d.get_temp::<f32>(jump_id(id))).is_none(),
             "避让区内的按下/拖动不写 minimap 跳转意图(命中真让出去了)"
+        );
+    }
+
+    /// #105① 悬停滚轮转发(纯函数):滚轮量按「文档内容高 / minimap 全
+    /// 文档高」放大 —— 窄条上滚 1px = 文档滚 内容高/(总行数×比例尺)
+    /// px;符号与 delta 同向;无行程/无滚轮量返回 None。端点钳制不在此
+    /// 函数(end() 的 offset 边界统一钳)。
+    #[test]
+    fn wheel_delta_scales_by_document_over_minimap_height() {
+        // 1000 行、内容高 10000、视口 600:minimap 全高 3000,放大系数
+        // 10000/3000 = 10/3。
+        let base = WheelInput {
+            content_height: 10000.0,
+            viewport_height: 600.0,
+            total_lines: 1000,
+            row_h: ROW_H,
+            delta_y: 0.0,
+        };
+        // 向下滚一档(egui 口径 delta 为负):文档滚动量 = -120×10/3 = -400px
+        let down = wheel_editor_delta(WheelInput {
+            delta_y: -120.0,
+            ..base
+        })
+        .expect("长文档有行程");
+        assert!(
+            (down - (-400.0)).abs() < 1e-4,
+            "窄条滚 120px = 文档滚 400px(实测 {down})"
+        );
+        // 比例恒等式(任务书「滚轮量与滚动量比例断言」):文档滚动量 /
+        // 滚轮量 == 内容高 / (总行数×ROW_H)。
+        assert!(
+            (down / -120.0 - 10000.0 / 3000.0).abs() < 1e-7,
+            "步长比 == 内容高/minimap 全文档高"
+        );
+        // 向上滚一档:符号随 delta 翻转(对称)
+        let up = wheel_editor_delta(WheelInput {
+            delta_y: 120.0,
+            ..base
+        })
+        .expect("长文档有行程");
+        assert!((up - 400.0).abs() < 1e-4);
+        // 无行程(内容不满一屏)→ None:编辑器滚不动,不转发
+        assert_eq!(
+            wheel_editor_delta(WheelInput {
+                viewport_height: 10000.0,
+                delta_y: -120.0,
+                ..base
+            }),
+            None
+        );
+        // 无滚轮量 → None
+        assert_eq!(wheel_editor_delta(base), None);
+        // 总行数 0 按 1 行计(与 window/jump_ratio 的 .max(1) 同款),
+        // 不 panic、不除零。
+        assert!(wheel_editor_delta(WheelInput {
+            total_lines: 0,
+            delta_y: -120.0,
+            ..base
+        })
+        .is_some());
+    }
+
+    /// #105① 端到端:悬停窄条滚轮 → 编辑器 offset 前进一个**放大**步长
+    /// (同 delta 在正文区只滚 1:1);连续两档 = 2×步长(截获清零生效,
+    /// ScrollArea 内建 1:1 消费不叠加);向上滚退回;高亮框随文档滚动
+    /// 自然下移;滚轮全程不写跳转意图(点击/拖动通道不受影响)。
+    #[test]
+    fn hover_wheel_over_minimap_scrolls_editor_scaled() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let map = viewport_rect(&shapes).expect("高亮框定位窄条");
+        let strip = egui::pos2(map.center().x, 300.0);
+        let read = |ctx: &egui::Context| {
+            ctx.data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .unwrap_or_default()
+        };
+        let wheel = |pos: egui::Pos2, delta: f32| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        // 落地链:截获帧(end 记 target)→ 下一帧 begin 应用 → 帧末
+        // metrics 可读。egui 的滚轮是平滑量(smooth_scroll_delta):事件
+        // 帧只交 90%,尾量随后几帧按 10 倍衰减交齐(内建 1:1 同样如此,
+        // 实测 108→118.8→120)——转发消费同一平滑源,落定节奏一致,每档
+        // 后补 4 帧空转再取证。
+        let settle =
+            |ctx: &egui::Context, editor: &mut EditorBuffer, pos: egui::Pos2, now: &mut f64| {
+                for _ in 0..4 {
+                    *now += 0.1;
+                    frame(
+                        ctx,
+                        editor,
+                        *now,
+                        true,
+                        vec![egui::Event::PointerMoved(pos)],
+                    );
+                }
+            };
+
+        let before = read(&ctx);
+        assert_eq!(before.offset, 0.0, "起滚前在文档顶");
+        let probe_before = ctx
+            .data(|d| d.get_temp::<MinimapProbe>(probe_id(id)))
+            .expect("探针已写");
+        let step = 120.0 * before.content_height / (500.0 * ROW_H);
+        assert!(
+            step > 240.0,
+            "放大系数显著大于 1(实测一档 {step}px,内容高 {})",
+            before.content_height
+        );
+
+        // 向下滚一档:offset 前进一个放大步长
+        frame(&ctx, &mut editor, 0.2, true, wheel(strip, -120.0));
+        let mut now = 0.2_f64;
+        settle(&ctx, &mut editor, strip, &mut now);
+        let after1 = read(&ctx).offset;
+        assert!(
+            (after1 - step).abs() < 8.0,
+            "悬停滚轮滚出一个放大步长(期望 ≈{step},实测 {after1})"
+        );
+        // 高亮框随文档滚动自然下移(转发不改高亮框逻辑,它只读滚动真值)
+        let probe_after = ctx
+            .data(|d| d.get_temp::<MinimapProbe>(probe_id(id)))
+            .expect("探针已写");
+        let (top_before, top_after) = (
+            probe_before.viewport.expect("高亮框").top(),
+            probe_after.viewport.expect("高亮框").top(),
+        );
+        assert!(
+            top_after > top_before,
+            "高亮框随滚动下移({top_before} → {top_after})"
+        );
+
+        // 第二档:两档合计 ≈ 2×步长 —— 截获清零的否决线:若内建 1:1 未
+        // 被抑制,每档会叠加成 step+120,8px 容差必挂。
+        frame(&ctx, &mut editor, now + 0.1, true, wheel(strip, -120.0));
+        now += 0.1;
+        settle(&ctx, &mut editor, strip, &mut now);
+        let after2 = read(&ctx).offset;
+        assert!(
+            (after2 - 2.0 * step).abs() < 8.0,
+            "连续两档 = 2×步长,内建 1:1 不叠加(期望 ≈{},实测 {after2})",
+            2.0 * step
+        );
+
+        // 向上滚一档:退回一个步长(方向与 egui 口径一致)
+        frame(&ctx, &mut editor, now + 0.1, true, wheel(strip, 120.0));
+        now += 0.1;
+        settle(&ctx, &mut editor, strip, &mut now);
+        let after3 = read(&ctx).offset;
+        assert!(
+            (after3 - step).abs() < 8.0,
+            "向上滚退回一个步长(期望 ≈{step},实测 {after3})"
+        );
+
+        // 滚轮转发不写跳转意图:点击/拖动通道原样
+        assert!(
+            ctx.data(|d| d.get_temp::<f32>(jump_id(id))).is_none(),
+            "滚轮帧不写 minimap 跳转意图"
+        );
+
+        // 正文区滚轮保持 1:1 原速:窄条之外的编辑器滚动零变化(否决线)
+        let text_pos = egui::pos2(200.0, 300.0);
+        frame(&ctx, &mut editor, now + 0.1, true, wheel(text_pos, -120.0));
+        now += 0.1;
+        settle(&ctx, &mut editor, text_pos, &mut now);
+        let after4 = read(&ctx).offset;
+        assert!(
+            (after4 - (after3 + 120.0)).abs() < 8.0,
+            "正文区滚轮仍按 1:1 原速(期望 ≈{},实测 {after4})",
+            after3 + 120.0
         );
     }
 
