@@ -1,4 +1,4 @@
-//! 长按修饰键的快捷键蒙层(#54 M1):纯函数检测状态机。
+//! 长按修饰键的快捷键蒙层(#54):检测状态机(M1)+ 渲染与内容源(M2)。
 //!
 //! 检测「按住平台主修饰键(Win/Linux = Ctrl、macOS = ⌘)**连续 3.0 秒**」
 //! 并给出触发事件;期间按下任何其它键、松开修饰键、窗口失焦,任一发生
@@ -63,7 +63,7 @@ enum HoldState {
     Holding {
         start: Instant,
     },
-    /// 已触发,蒙层该可见(M2 渲染层从这里长出来)。
+    /// 已触发,蒙层该可见(`paint` 据此绘制)。
     Visible,
 }
 
@@ -109,9 +109,8 @@ impl ShortcutOverlayState {
         }
     }
 
-    /// 蒙层是否可见(触发后、关闭前)。M2 渲染层将其作为蒙层可见位
-    /// 消费;M1 里只有测试读它,故 cfg(test)(M2 接线时摘掉)。
-    #[cfg(test)]
+    /// 蒙层是否可见(触发后、关闭前)。M2 渲染层将其作为蒙层可见位消费
+    /// (`shortcut_overlay::paint` 每帧读它决定画不画)。
     pub fn is_visible(&self) -> bool {
         matches!(self.state, HoldState::Visible)
     }
@@ -121,6 +120,16 @@ impl ShortcutOverlayState {
     #[cfg(test)]
     pub fn is_holding(&self) -> bool {
         matches!(self.state, HoldState::Holding { .. })
+    }
+
+    /// 显式关闭(点击蒙层底,#54 M2):Visible → Idle。松开修饰键 / 其它
+    /// 按键 / 失焦三条路径仍走 [`Self::step`];点击与它们语义一致——关闭
+    /// 后若修饰键仍按住,重新起表,再长按 3s 才会再触发(用户重新发起查看,
+    /// 与 M1 已钉死的按键关闭同款,不做抑制期)。
+    pub fn close(&mut self) {
+        if matches!(self.state, HoldState::Visible) {
+            self.state = HoldState::Idle;
+        }
     }
 
     /// Holding 帧的重绘排程:距触发到点的剩余时长;`None` = 无事可等
@@ -142,6 +151,193 @@ impl ShortcutOverlayState {
             *start = Instant::now() - elapsed;
         }
     }
+}
+
+// —— M2:内容源(单一事实源)与渲染 ——
+
+/// 蒙层卡片定宽(分组卡片按此宽度流式换列;窗口更窄时被夹到窗内)。
+const CARD_W: f32 = 720.0;
+/// 蒙层卡片高度上限(内容超出的滚动;窗更矮时被夹到窗内)。
+const CARD_H: f32 = 560.0;
+/// 卡片头部(标题 + 提示行 + 间距)的估高,列表限高从它扣减。
+const CARD_HEADER_H: f32 = 58.0;
+/// 暗色主题蒙层底不透明度(黑);亮色主题取 [`SCRIM_ALPHA_LIGHT`]。
+/// 两主题各从 `visuals().dark_mode` 推导,不硬编码单个色值(取舍与
+/// 观感数值见 decisions-pending #103)。
+const SCRIM_ALPHA_DARK: u8 = 160;
+/// 亮色主题蒙层底不透明度(白):亮色下正文是深字,弱化同样内容需要更
+/// 厚的白,否则底层文字透出来与卡片正文抢辨识。
+const SCRIM_ALPHA_LIGHT: u8 = 216;
+
+/// 蒙层一行:命令 + 当前绑定(`None` = 未绑定)。
+pub type OverlayRow = (crate::command::Command, Option<crate::keymap::Shortcut>);
+
+/// 蒙层一个分组的数据。
+pub type OverlayGroup = (crate::command::CommandGroup, Vec<OverlayRow>);
+
+/// 蒙层的展示数据:分组 → 行。清单来自 [`crate::command::Command::ALL`],键位来自
+/// `keymap`(用户可改,`keymap.json` 如实反映)——蒙层不持有第二份命令
+/// 表,改键/加命令自动跟随。无绑定命令保留(`None` 行,渲染时弱化标
+/// 「未绑定」):口径与设置页「快捷键」一致,全集断言
+/// (`overlay_rows_cover_every_command`)也由此成立。
+pub fn grouped_rows(keymap: &crate::keymap::Keymap) -> Vec<OverlayGroup> {
+    crate::command::CommandGroup::ALL
+        .into_iter()
+        .map(|group| {
+            let rows: Vec<_> = crate::command::Command::ALL
+                .iter()
+                .filter(|cmd| cmd.group() == group)
+                .map(|cmd| (*cmd, keymap.get(*cmd)))
+                .collect();
+            (group, rows)
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
+/// 画蒙层(Visible 态才有输出;挂在 `draw_overlay_dialogs` 同层,三栏与
+/// 禅定两条布局路径都会经过——禅定显式放行,#54 任务书 13a 教训)。
+///
+/// 结构:全窗半透明底(scrim,`Area` 手绘 + 点击感知)盖住下层;中央
+/// `Window` 卡片按分组列出全部命令,键位用等宽 `kbd` 小方块,超出高度
+/// 内部滚动。**非焦点层**:整棵蒙层没有任何可聚焦控件,不调
+/// `request_focus`,编辑器的键盘焦点与输入分毫不动(关闭路径里 Esc 在
+/// 归约层消费,点击只作用于 scrim)。
+pub fn paint(ui: &mut egui::Ui, state: &mut ShortcutOverlayState, keymap: &crate::keymap::Keymap) {
+    if !state.is_visible() {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let screen = ctx.viewport_rect();
+
+    // 半透明底:点击任一处关闭。与卡片同在默认 Middle 层、先画,卡片后
+    // 画盖在其上——点卡片(滚动列表)不误关,点卡片外的蒙层底才关。
+    egui::Area::new(egui::Id::new("shortcut-overlay-scrim"))
+        .interactable(true)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(&ctx, |ui| {
+            let dark = ui.visuals().dark_mode;
+            let tint = if dark {
+                egui::Color32::from_black_alpha(SCRIM_ALPHA_DARK)
+            } else {
+                egui::Color32::from_white_alpha(SCRIM_ALPHA_LIGHT)
+            };
+            ui.painter()
+                .rect_filled(screen, egui::CornerRadius::ZERO, tint);
+            let click = ui.allocate_rect(screen, egui::Sense::click());
+            if click.clicked() {
+                state.close();
+            }
+        });
+
+    // 中央卡片:`Area::anchor` 居中(不依赖 Window 的 Resize 状态机,尺寸
+    // 完全由内容与 max_height 决定,无头帧间稳定)。分组用两列 Grid 摆放
+    // (Grid 列宽由内容收敛,设置页快捷键表同款容器——`horizontal_wrapped`
+    // 配 set_width 在无头帧里不收敛,实测会把分组卡排出一行直到屏外)。
+    // 窄窗/矮窗夹进视口。无标题栏——蒙层是瞬时速查浮层,标题自绘。
+    let available = egui::vec2(
+        (screen.width() - 48.0).max(240.0),
+        (screen.height() - 96.0).max(240.0),
+    );
+    let card_w = CARD_W.min(available.x);
+    let list_max_h = (CARD_H - CARD_HEADER_H).min(available.y - CARD_HEADER_H);
+    egui::Area::new(egui::Id::new("shortcut-overlay-card"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(&ctx, |ui| {
+            egui::Frame::default()
+                .fill(ui.visuals().window_fill)
+                .stroke(ui.visuals().window_stroke)
+                .corner_radius(ui.visuals().window_corner_radius)
+                .inner_margin(egui::Margin::symmetric(16, 14))
+                .show(ui, |ui| {
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
+                    ui.strong("快捷键");
+                    ui.weak(format!(
+                        "按住 {} 满 3 秒唤出;松开、Esc 或点击空白处收起",
+                        if cfg!(target_os = "macos") {
+                            "⌘"
+                        } else {
+                            "Ctrl"
+                        }
+                    ));
+                    ui.add_space(crate::ui::tokens::SPACE_SM);
+                    egui::ScrollArea::vertical()
+                        .id_salt("shortcut-overlay-scroll")
+                        .max_height(list_max_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let groups = grouped_rows(keymap);
+                            egui::Grid::new("shortcut-overlay-groups")
+                                .num_columns(2)
+                                .spacing(egui::vec2(
+                                    crate::ui::tokens::SPACE_MD,
+                                    crate::ui::tokens::SPACE_MD,
+                                ))
+                                .show(ui, |ui| {
+                                    for pair in groups.chunks(2) {
+                                        group_card(ui, pair[0].0, &pair[0].1);
+                                        if let Some((group, rows)) = pair.get(1) {
+                                            group_card(ui, *group, rows);
+                                        } else {
+                                            ui.label("");
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+        });
+}
+
+/// 一个分组的卡片:组名 + 命令/键位两列。宽窄交给外层两列 Grid 收敛
+/// (列宽 = 该列最宽卡)。
+fn group_card(
+    ui: &mut egui::Ui,
+    group: crate::command::CommandGroup,
+    rows: &[(crate::command::Command, Option<crate::keymap::Shortcut>)],
+) {
+    egui::Frame::default()
+        .fill(ui.visuals().panel_fill)
+        .stroke(ui.visuals().window_stroke)
+        .corner_radius(ui.visuals().window_corner_radius)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.strong(group.label());
+            ui.add_space(crate::ui::tokens::SPACE_XS);
+            egui::Grid::new(egui::Id::new(("overlay-group", group)))
+                .num_columns(2)
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    for (cmd, shortcut) in rows {
+                        ui.label(cmd.label());
+                        match shortcut {
+                            Some(shortcut) => kbd(ui, &shortcut.platform_text()),
+                            None => {
+                                ui.weak("未绑定");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// 键位的 kbd 小方块:等宽字体 + 键帽底色。底/描边从 visuals 推导,两
+/// 主题各自的对比度成立(亮色下键帽是浅灰底深字,暗色下深灰底浅字)。
+fn kbd(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::default()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().weak_text_color()))
+        .corner_radius(crate::ui::tokens::RADIUS_SM)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .monospace()
+                    .size(crate::ui::tokens::FONT_SM),
+            );
+        });
 }
 
 /// 从 egui 输入汇集一帧的 [`FrameInput`]。只读不消费——蒙层检测绝不改变
@@ -667,5 +863,208 @@ mod tests {
             app.state.shortcut_overlay.is_holding(),
             "指针按下不是按键,长按不误取消"
         );
+    }
+
+    // ---- M2:内容源(单一事实源)与关闭 ----
+
+    /// 蒙层分组非空且命令集 == 注册表全集:展开后与 `Command::ALL` **集合**
+    /// 相等(顺序按组重排,组内保持 ALL 相对序),没有第二份清单可漂移。
+    #[test]
+    fn overlay_rows_cover_every_command() {
+        let rows = super::grouped_rows(&crate::keymap::Keymap::builtin());
+        assert!(!rows.is_empty(), "分组非空");
+        let flat: Vec<_> = rows
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|r| r.0))
+            .collect();
+        // 集合相等:条数相同 + ALL 每条都在(分组按 group() 单值过滤,无重复)
+        assert_eq!(
+            flat.len(),
+            crate::command::Command::ALL.len(),
+            "蒙层条数 = 注册表全集条数"
+        );
+        for cmd in crate::command::Command::ALL {
+            assert!(flat.contains(&cmd), "{cmd:?} 不在蒙层清单里");
+        }
+        for (group, group_rows) in &rows {
+            assert!(!group_rows.is_empty(), "{group:?} 空组不该产出");
+            for (cmd, _) in group_rows {
+                assert_eq!(cmd.group(), *group, "{cmd:?} 归组与分组过滤一致");
+            }
+            // 组内保持 ALL 的相对序(展示稳定,不随枚举值漂移)
+            let in_all: Vec<_> = crate::command::Command::ALL
+                .iter()
+                .filter(|cmd| cmd.group() == *group)
+                .collect();
+            let in_group: Vec<_> = group_rows.iter().map(|(cmd, _)| cmd).collect();
+            assert_eq!(in_group, in_all, "{group:?} 组内序 = ALL 相对序");
+        }
+    }
+
+    /// 用户自定义绑定如实反映:改绑后行里是新键位,清除后是未绑定行;
+    /// 出厂表里 Save 是 Ctrl+S(改绑断言的对照)。
+    #[test]
+    fn overlay_rows_follow_custom_keymap() {
+        let mut keymap = crate::keymap::Keymap::builtin();
+        keymap.set(
+            crate::command::Command::Save,
+            Some(crate::keymap::Shortcut {
+                modifiers: Modifiers::COMMAND,
+                key: Key::K,
+            }),
+        );
+        keymap.set(crate::command::Command::Open, None);
+        let rows = super::grouped_rows(&keymap);
+        let row = |cmd: crate::command::Command| {
+            rows.iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .find(|(c, _)| *c == cmd)
+                .and_then(|(_, shortcut)| *shortcut)
+        };
+        assert_eq!(row(crate::command::Command::Save), {
+            Some(crate::keymap::Shortcut {
+                modifiers: Modifiers::COMMAND,
+                key: Key::K,
+            })
+        });
+        assert_eq!(row(crate::command::Command::Open), None, "清除后未绑定");
+        // 对照:出厂 Save = Ctrl+S(不是 K)
+        assert_eq!(
+            super::grouped_rows(&crate::keymap::Keymap::builtin())
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .find(|(c, _)| *c == crate::command::Command::Save)
+                .and_then(|(_, s)| *s),
+            Some(crate::keymap::Shortcut {
+                modifiers: Modifiers::COMMAND,
+                key: Key::S,
+            })
+        );
+    }
+
+    /// `close()`:Visible 关闭、Idle 无副作用;关闭后重新长按 3s 可再触发
+    /// (与 step 的重起表语义一致)。
+    #[test]
+    fn close_dismisses_and_allows_retrigger() {
+        let mut overlay = ShortcutOverlayState::default();
+        overlay.close();
+        assert_eq!(
+            overlay.step(held(), at(0.0)),
+            Outcome::None,
+            "Idle 下 close 无副作用"
+        );
+
+        overlay.step(held(), at(10.0));
+        overlay.step(held(), at(13.0));
+        assert!(overlay.is_visible());
+        overlay.close();
+        assert!(!overlay.is_visible(), "点击关闭");
+
+        overlay.step(held(), at(14.0));
+        assert_eq!(
+            overlay.step(held(), at(16.9)),
+            Outcome::None,
+            "重起表 2.9s 不触发"
+        );
+        assert_eq!(overlay.step(held(), at(17.0)), Outcome::Triggered);
+    }
+
+    /// Esc 关闭路径(归约层消费):蒙层可见帧的 Esc 被 consume_key 拿走,
+    /// 下层(禅定退出/emoji 关闭/查找条)当帧不可达;蒙层本帧关闭。
+    #[test]
+    fn escape_is_consumed_while_overlay_visible() {
+        let mut app = LaterMdApp::default();
+        let ctx = egui::Context::default();
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![Event::ModifiersChanged(Modifiers::COMMAND)],
+        );
+        app.state
+            .shortcut_overlay
+            .rewind_hold(Duration::from_secs_f64(3.1));
+        frame(&mut app, &ctx, true, Vec::new());
+        assert!(app.state.shortcut_overlay.is_visible());
+
+        let mut escape_gone = None;
+        let output = ctx.run_ui(
+            RawInput {
+                focused: true,
+                events: vec![
+                    key_press(Key::Escape, Modifiers::COMMAND),
+                    Event::ModifiersChanged(Modifiers::COMMAND),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                app.reduce(ui.ctx());
+                // 消费后本帧输入流里不再有 Esc 按下事件
+                escape_gone = Some(!ui.ctx().input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            Event::Key {
+                                key: Key::Escape,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                }));
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert!(escape_gone.unwrap(), "Esc 已被蒙层消费,下层看不见");
+        assert!(!app.state.shortcut_overlay.is_visible(), "蒙层随 Esc 关闭");
+    }
+
+    /// 蒙层存在期间输入不受影响(否决线):Visible 态下按 Ctrl+S,保存
+    /// 照常落盘(蒙层不吞键),蒙层随该按键关闭。文档挂真路径:未命名
+    /// 文档的 Ctrl+S 会弹同步 rfd 对话框,无头环境里永久阻塞(既有测试
+    /// 的同款手法)。
+    #[test]
+    fn overlay_visible_does_not_swallow_shortcuts() {
+        let dir = std::env::temp_dir().join(format!("latermd-overlay-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("doc.md");
+
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().document.path = Some(doc.clone());
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("蒙层存在期间按 Ctrl+S 的正文");
+        let ctx = egui::Context::default();
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![Event::ModifiersChanged(Modifiers::COMMAND)],
+        );
+        app.state
+            .shortcut_overlay
+            .rewind_hold(Duration::from_secs_f64(3.1));
+        frame(&mut app, &ctx, true, Vec::new());
+        assert!(app.state.shortcut_overlay.is_visible(), "先让蒙层出现");
+
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![
+                key_press(Key::S, Modifiers::COMMAND),
+                Event::ModifiersChanged(Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(
+            std::fs::read_to_string(&doc).unwrap(),
+            "蒙层存在期间按 Ctrl+S 的正文",
+            "蒙层不吞按键:命令快捷键照常触发"
+        );
+        assert!(!app.state.shortcut_overlay.is_visible(), "S 按下即关蒙层");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -100,9 +100,33 @@ impl LaterMdApp {
         // 跑归约(#18 帧饥饿的同型教训)。
         let hold_input = crate::shortcut_overlay::frame_input(ctx);
         let now = std::time::Instant::now();
+        // 可见位先读再 step:Esc 帧本帧就会把 Visible 打回 Idle,后判会漏掉
+        // 「该消费 Esc」的那一帧。
+        let overlay_visible = state.shortcut_overlay.is_visible();
         state.shortcut_overlay.step(hold_input, now);
         if let Some(wait) = state.shortcut_overlay.repaint_wait(now) {
             ctx.request_repaint_after(wait);
+        }
+        // 蒙层可见帧的 Esc 归蒙层(#54 M2 关闭路径之一):蒙层的关闭本身
+        // 已由 step 的「其它按键」规则完成,这里只把事件从流里移除——禅定
+        // 退出、emoji/查找条关闭等其它 Esc 语义当帧不可达(最顶层浮层优先,
+        // 与 poll_capture 的 retain 手法同款)。蒙层可见期间修饰键仍按着,
+        // `consume_key(NONE, …)` 的逻辑匹配对带修饰键的 Esc 不成立,故直接
+        // retain。已知边界(decisions-pending #103):设置页改键捕获中蒙层
+        // 若出现,Esc 先关蒙层、捕获的「Esc 取消」当帧不可达,需再按一次。
+        if overlay_visible {
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
         }
         // 命令快捷键(键位来自 `keymap`,用户可改;统一清单见 `crate::command`)。
         // eframe 在 begin_pass 之后调 logic,本帧按键事件此刻可见;消费即从
@@ -470,10 +494,10 @@ impl LaterMdApp {
             }
         }
 
-        // ⑥ 顶层浮层五件套(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
-        // 图片框):浮窗是独立 Area 层,不参与 panel 嵌套,画在 panel 之后
-        // 取语义上的「最上层」。三栏与禅定两条布局路径共用,理由见
-        // [`Self::draw_overlay_dialogs`]。
+        // ⑥ 顶层浮层通道(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
+        // 图片框 / Emoji / 快速打开 / 快捷键蒙层):浮窗是独立 Area 层,
+        // 不参与 panel 嵌套,画在 panel 之后取语义上的「最上层」。三栏与
+        // 禅定两条布局路径共用,理由见 [`Self::draw_overlay_dialogs`]。
         self.draw_overlay_dialogs(ui);
 
         // ⑥ 自绘窗口骨架之二:屏幕四边/四角的透明缩放命令区。**必须在
@@ -485,8 +509,9 @@ impl LaterMdApp {
         }
     }
 
-    /// 顶层浮层五件套,存在才显示:commit message 建议、设置对话框、回滚
-    /// 确认、脏标签关闭确认、图片框。浮窗是独立 Area 层,不参与 panel 嵌套,
+    /// 顶层浮层通道,存在才显示:commit message 建议、设置对话框、回滚
+    /// 确认、脏标签关闭确认、标签重命名、图片框、Emoji 面板、快速打开、
+    /// 快捷键蒙层(#54 M2)。浮窗是独立 Area 层,不参与 panel 嵌套,
     /// 各浮窗的机制说明见其函数文档。
     ///
     /// **三栏与禅定两条布局路径都要调它。** `draw` 在禅定帧整体分叉提前
@@ -634,6 +659,12 @@ impl LaterMdApp {
         if self.state.quick_open.open {
             let _window = crate::ui::quick_open::panel(ui, &mut self.state.quick_open, outbox);
         }
+
+        // 长按修饰键的快捷键蒙层(#54 M2):Visible 态才画。内容源是
+        // Command/keymap 注册表(单一事实源,不抄第二份清单);非焦点层,
+        // 编辑器的键盘焦点与输入不受影响。挂在浮层五件套同层,三栏与禅定
+        // 两条布局路径都会经过这里(禅定显式放行,13a 教训)。
+        crate::shortcut_overlay::paint(ui, &mut self.state.shortcut_overlay, &self.state.keymap);
     }
 
     /// 禅定模式的整套面板组合(§7)。
@@ -3971,6 +4002,188 @@ mod tests {
                 delays.last(),
                 Some(&std::time::Duration::MAX),
                 "{mode:?}: 动画结束后收敛,不产帧"
+            );
+        }
+    }
+
+    // ---- #54 M2:快捷键蒙层的整帧装配 ----
+
+    /// 让长按蒙层进入 Visible(拨表手法,不真等 3 秒;`shortcut_overlay`
+    /// 测试的 `rewind_hold` 同款)。两帧都是完整帧:eframe 每帧先归约后
+    /// 绘制,reduce-only 帧里 TextEdit 不渲染,焦点与命中状态会偏离真实
+    /// 帧序列。
+    fn trigger_overlay(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect) {
+        full_frame(
+            &mut *app,
+            ctx,
+            screen,
+            vec![Event::ModifiersChanged(Modifiers::COMMAND)],
+        );
+        app.state
+            .shortcut_overlay
+            .rewind_hold(std::time::Duration::from_secs_f64(3.1));
+        full_frame(&mut *app, ctx, screen, Vec::new());
+        assert!(
+            app.state.shortcut_overlay.is_visible(),
+            "前置:长按到点,蒙层进入 Visible"
+        );
+    }
+
+    /// 完整帧(先归约后绘制,eframe 顺序)。
+    fn full_frame(app: &mut LaterMdApp, ctx: &egui::Context, screen: Rect, events: Vec<Event>) {
+        ctx.run_ui(
+            RawInput {
+                focused: true,
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.reduce(ui.ctx());
+                app.draw(ui);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    /// 蒙层在三栏帧真的画出来:标题、分组名、键位 kbd 文本、无绑定行都
+    /// 在本帧 shapes 里;两主题各跑一遍不 panic、都成立(底色与键帽色
+    /// 从 visuals 推导,不硬编码)。
+    #[test]
+    fn shortcut_overlay_paints_grouped_rows_in_both_themes() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for theme in ["dark", "light"] {
+            let mut app = LaterMdApp::default();
+            if theme == "light" {
+                app.state.apply(Message::ToggleTheme);
+            }
+            trigger_overlay(&mut app, &ctx, screen);
+            let mode = app.state.resolved_theme();
+            assert_eq!(
+                mode,
+                if theme == "light" {
+                    crate::theme::ThemeMode::Light
+                } else {
+                    crate::theme::ThemeMode::Dark
+                },
+                "{theme}:主题真的生效了(两轮 visuals 必须一明一暗)"
+            );
+            let texts = draw_frame(&mut app, &ctx, screen);
+            assert!(
+                texts.iter().any(|t| t.contains("快捷键")),
+                "{theme}:蒙层标题已渲染:{texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "文件"),
+                "{theme}:分组名已渲染:{texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "Ctrl+S"),
+                "{theme}:键位 kbd 文本已渲染(平台化显示):{texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t.contains("未绑定")),
+                "{theme}:无绑定命令照列:{texts:?}"
+            );
+        }
+    }
+
+    /// 禅定帧同样渲染蒙层(13a 教训:禅定布局分叉要显式放行顶层浮层——
+    /// 蒙层挂在 `draw_overlay_dialogs`,禅定路径共用);且蒙层可见时 Esc
+    /// 只关蒙层、不退出禅定(最顶层浮层优先吃 Esc)。
+    #[test]
+    fn zen_paints_overlay_and_escape_closes_overlay_not_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::ZenToggled);
+        trigger_overlay(&mut app, &ctx, screen);
+
+        let texts = draw_frame(&mut app, &ctx, screen);
+        assert!(
+            texts.iter().any(|t| t.contains("快捷键")),
+            "禅定帧里蒙层已渲染:{texts:?}"
+        );
+
+        // Esc 整帧:蒙层关、禅定不退、不发禅定消息
+        full_frame(
+            &mut app,
+            &ctx,
+            screen,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(!app.state.shortcut_overlay.is_visible(), "Esc 关蒙层");
+        assert!(app.state.layout.zen, "Esc 不误退禅定");
+        assert!(
+            !app.outbox.contains(&Message::ZenToggled),
+            "无禅定消息发出:{:?}",
+            app.outbox
+        );
+    }
+
+    /// 点击蒙层底(卡片外)关闭;关闭不产生任何消息(纯显示关注点)。
+    #[test]
+    fn clicking_overlay_scrim_closes_it_without_side_effects() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        trigger_overlay(&mut app, &ctx, screen);
+
+        // 两空帧让 Area/Window 完成布局演算,再点屏幕左下(中央卡片之外)
+        full_frame(&mut app, &ctx, screen, Vec::new());
+        full_frame(&mut app, &ctx, screen, Vec::new());
+        let corner = Pos2::new(20.0, screen.height() - 20.0);
+        let click = |pressed| Event::PointerButton {
+            pos: corner,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        full_frame(&mut app, &ctx, screen, vec![Event::PointerMoved(corner)]);
+        full_frame(&mut app, &ctx, screen, vec![click(true)]);
+        full_frame(&mut app, &ctx, screen, vec![click(false)]);
+        assert!(!app.state.shortcut_overlay.is_visible(), "点击蒙层底关闭");
+        assert!(app.outbox.is_empty(), "关闭不产生消息:{:?}", app.outbox);
+    }
+
+    /// 蒙层不抢焦点(非焦点层):编辑器持焦时触发蒙层并渲染,键盘焦点
+    /// id 不变——蒙层存在期间文本编辑器的焦点与输入不受影响。按 Esc 与
+    /// 点击 canvas 清焦是 egui 的内建行为(本仓无头对照实测:无蒙层时
+    /// 同样清),不作为蒙层的断言;蒙层自身无任何可聚焦控件、从不
+    /// `request_focus`,出现/存在/消失三段都不动焦点。
+    #[test]
+    fn overlay_never_steals_editor_focus() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut app = LaterMdApp::default();
+        let editor = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+        ctx.memory_mut(|memory| memory.request_focus(editor));
+        full_frame(&mut app, &ctx, screen, Vec::new());
+        assert!(
+            ctx.memory(|memory| memory.has_focus(editor)),
+            "前置:编辑器持有键盘焦点"
+        );
+
+        trigger_overlay(&mut app, &ctx, screen);
+        full_frame(&mut app, &ctx, screen, Vec::new());
+        assert!(
+            ctx.memory(|memory| memory.has_focus(editor)),
+            "蒙层出现帧焦点仍在编辑器"
+        );
+
+        // 存在期间连续空帧:焦点稳定不动
+        for _ in 0..3 {
+            full_frame(&mut app, &ctx, screen, Vec::new());
+            assert!(
+                ctx.memory(|memory| memory.has_focus(editor)),
+                "蒙层在场的每一帧焦点仍在编辑器"
             );
         }
     }
