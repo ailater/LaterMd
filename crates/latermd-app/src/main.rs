@@ -31,6 +31,7 @@ mod fonts;
 mod fuzzy;
 mod git_diff;
 mod git_panel;
+mod git_split_diff;
 mod keymap;
 mod layout;
 mod live;
