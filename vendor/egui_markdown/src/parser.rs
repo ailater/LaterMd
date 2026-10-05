@@ -542,7 +542,12 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
           in_link = false;
           let text = link_text.take().unwrap_or_else(|| CowStr::Boxed("".into()));
           if let Some(url) = link_href.take() {
-            current_cell.push(Token::Link { text, href: url, title: link_title.take() });
+            current_cell.push(Token::Link {
+              text,
+              href: url,
+              title: link_title.take(),
+              heading: current_style.heading,
+            });
           }
           continue;
         }
@@ -792,7 +797,7 @@ pub fn parse<'s>(s: &'s str) -> Markdown<'s> {
               &mut tokens,
               &mut spans,
               &mut span_last_end,
-              Token::Link { text, href: url, title: link_title.take() },
+              Token::Link { text, href: url, title: link_title.take(), heading: current_style.heading },
               &range,
             );
           }
@@ -1494,7 +1499,7 @@ mod tests {
     let md = parse("[click](https://example.com \"Example Title\")");
     let link = md.tokens.iter().find(|t| matches!(t, Token::Link { .. }));
     assert!(link.is_some());
-    if let Some(Token::Link { text, href, title }) = link {
+    if let Some(Token::Link { text, href, title, .. }) = link {
       assert_eq!(text.as_ref(), "click");
       assert_eq!(href.as_ref(), "https://example.com");
       assert_eq!(title.as_deref(), Some("Example Title"));

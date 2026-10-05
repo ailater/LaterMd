@@ -32,6 +32,11 @@ pub enum Token<'s> {
     href: CowStr<'s>,
     /// Optional hover title.
     title: Option<CowStr<'s>>,
+    /// Heading level (1–6) of the enclosing heading block, or `None` outside one.
+    /// Lets layout scale the link with the heading instead of the body font
+    /// (the parser knows the heading context; the token stream alone does not,
+    /// e.g. a heading that contains only a link has no `Text` token to ask).
+    heading: Option<u8>,
   },
   /// List item bullet or number, such as `"• "` or `"1. "`.
   ListMarker {
@@ -143,10 +148,11 @@ impl<'s> Hash for Token<'s> {
         text.as_ref().hash(state);
         language.as_ref().map(|l| l.as_ref()).hash(state);
       }
-      Token::Link { text, href, title } => {
+      Token::Link { text, href, title, heading } => {
         text.as_ref().hash(state);
         href.as_ref().hash(state);
         title.as_ref().map(|t| t.as_ref()).hash(state);
+        heading.hash(state);
       }
       Token::ListMarker { marker, indent_level } => {
         marker.as_ref().hash(state);
