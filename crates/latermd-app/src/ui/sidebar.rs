@@ -19,7 +19,7 @@ use crate::backlink_panel::{jump_target, Backlink, BacklinkState, BacklinkStatus
 use crate::command::Command;
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
 use crate::git_panel::{DiffView, GitPanelState};
-use crate::git_split_diff::{line_no_text, split_rows, SplitRow, MAX_SPLIT_PAIRS};
+use crate::git_split_diff::{inline_segments, line_no_text, split_rows, SplitRow, MAX_SPLIT_PAIRS};
 use crate::keymap::Keymap;
 use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
 use crate::state::{Message, SidebarTab};
@@ -920,10 +920,11 @@ fn diff_view_toggle(
 }
 
 /// 双栏 diff 视图(#53 M2):GitHub 式左右对齐。左右各带行号列(右对齐)
-/// 与 +/− 沟槽标记,整行底色增绿删红([`diff_row_bg`]),hunk 头 `@@`
-/// 跨双栏整行;长行单行截断(…)+ 悬停看全文;行对上限
+/// 与 +/− 沟槽标记,整行底色增绿删红([`diff_row_bg`]),「单删+单增」
+/// 紧邻对再叠行内词级第二级底色(#53 M3,`git_split_diff::inline_change`);
+/// hunk 头 `@@` 跨双栏整行;长行单行截断(…)+ 悬停看全文;行对上限
 /// [`MAX_SPLIT_PAIRS`] 超限截断 + 显式提示,防大 diff 卡帧。行对来自
-/// `git_split_diff` 纯配对层;取舍见 docs/decisions-pending #100。
+/// `git_split_diff` 纯配对层;取舍见 docs/decisions-pending #100/#101。
 fn split_diff_view(panel: &mut egui::Ui, file: &FileDiff) {
     let split = split_rows(file);
     egui::ScrollArea::vertical()
@@ -1018,13 +1019,25 @@ fn digit_count(mut n: u32) -> usize {
 /// 深绿/深红,不是两套硬编码取色。浓淡只由 [`DIFF_ROW_TINT`] 一个常量
 /// 控制。
 fn diff_row_bg(ui: &egui::Ui, tint: egui::Color32) -> egui::Color32 {
-    tint.lerp_to_gamma(ui.visuals().panel_fill, 1.0 - DIFF_ROW_TINT)
+    diff_tint_bg(ui, tint, DIFF_ROW_TINT)
+}
+
+/// 语义色按占比向面板底色插值([`diff_row_bg`] 的参数化本体):整行一档
+/// ([`DIFF_ROW_TINT`]),行内词级区段深一档([`DIFF_INLINE_TINT`])。
+fn diff_tint_bg(ui: &egui::Ui, tint: egui::Color32, ratio: f32) -> egui::Color32 {
+    tint.lerp_to_gamma(ui.visuals().panel_fill, 1.0 - ratio)
 }
 
 /// 行底色的语义色占比(0..1):16% 增/删语义色 + 84% 面板底色,明暗主题
 /// 下都在「可读出着色语义」与「不压正文对比」之间(数值推断,真机目视
 /// 留人工,见 #53 notes)。
 const DIFF_ROW_TINT: f32 = 0.16;
+
+/// 行内词级区段的第二级语义色占比(#53 M3):比整行底色深一档,同一
+/// 公式推导(35% vs 16%),GitHub word-diff 的「整行淡底 + 行内浓底」
+/// 层级;不下划线(与超链接/拼写检查的视觉惯例冲突)。数值推断,真机
+/// 目视留人工(见 #53 notes)。
+const DIFF_INLINE_TINT: f32 = 0.35;
 
 /// 双栏一侧(左 = 旧侧,右 = 新侧)。
 enum DiffSide {
@@ -1057,7 +1070,7 @@ fn paint_split_row(ui: &mut egui::Ui, row: &SplitRow<'_>, geom: &RowGeometry) ->
                 DIFF_HUNK,
             );
         }
-        SplitRow::Pair { old, new } => {
+        SplitRow::Pair { old, new, inline } => {
             let half = rect.width() / 2.0;
             let left = egui::Rect::from_min_max(
                 rect.left_top(),
@@ -1067,8 +1080,14 @@ fn paint_split_row(ui: &mut egui::Ui, row: &SplitRow<'_>, geom: &RowGeometry) ->
                 egui::pos2(rect.left() + half, rect.top()),
                 rect.right_bottom(),
             );
-            let elided_old = paint_split_side(ui, left, *old, DiffSide::Old, geom);
-            let elided_new = paint_split_side(ui, right, *new, DiffSide::New, geom);
+            // 行内词级区段(#53 M3):配对层只对「单删+单增」紧邻对产出,
+            // 两侧各自取本侧区间
+            let (inline_old, inline_new) = match inline {
+                Some(change) => (Some(&change.old), Some(&change.new)),
+                None => (None, None),
+            };
+            let elided_old = paint_split_side(ui, left, *old, DiffSide::Old, inline_old, geom);
+            let elided_new = paint_split_side(ui, right, *new, DiffSide::New, inline_new, geom);
             // 长行被截断的一侧:悬停看全文(整行响应挂 tooltip,两则并排)
             match (elided_old, elided_new) {
                 (None, None) => {}
@@ -1089,37 +1108,38 @@ fn paint_split_row(ui: &mut egui::Ui, row: &SplitRow<'_>, geom: &RowGeometry) ->
 }
 
 /// 画双栏一侧:整侧底色(删除红/新增绿)+ 行号(右对齐弱化)+ 沟槽标记
-/// (+/−)+ 正文(等宽、单行截断)。返回被截断一侧的全文(悬停提示用;
-/// 未截断/空侧返回 `None`)。行内不做 byte 切:截断由 epaint 的 elision
-/// 在字形层完成,char 边界天然安全。
+/// (+/−)+ 正文(等宽、单行截断);本侧有行内词级区段(#53 M3)时,
+/// 区段字符用更深的第二级底色(`TextFormat::background`,epaint 画在
+/// 字形之下的 mesh 里)。返回被截断一侧的全文(悬停提示用;未截断/空侧
+/// 返回 `None`)。行内不做 byte 切:截断由 epaint 的 elision 在字形层
+/// 完成,区段切分由 [`inline_segments`] 在 char 边界完成。
 fn paint_split_side(
     ui: &egui::Ui,
     cell: egui::Rect,
     line: Option<&DiffLine>,
     side: DiffSide,
+    inline: Option<&std::ops::Range<usize>>,
     geom: &RowGeometry,
 ) -> Option<String> {
     let line = line?;
     // 配对层保证:左栏只收上下文/删除行,右栏只收上下文/新增行
-    let (lineno, marker, bg) = match (side, line.kind) {
+    let (lineno, marker, tint) = match (side, line.kind) {
         (DiffSide::Old, DiffLineKind::Context) => (line.old_lineno, None, None),
         (DiffSide::Old, DiffLineKind::Deleted) => (
             line.old_lineno,
             Some(('−', DIFF_REMOVED)),
-            Some(diff_row_bg(ui, tokens::DANGER)),
+            Some(tokens::DANGER),
         ),
         (DiffSide::New, DiffLineKind::Context) => (line.new_lineno, None, None),
-        (DiffSide::New, DiffLineKind::Added) => (
-            line.new_lineno,
-            Some(('+', DIFF_ADDED)),
-            Some(diff_row_bg(ui, tokens::OK)),
-        ),
+        (DiffSide::New, DiffLineKind::Added) => {
+            (line.new_lineno, Some(('+', DIFF_ADDED)), Some(tokens::OK))
+        }
         // 删除行画右栏/新增行画左栏:配对层不产生,防御跳过
         _ => return None,
     };
     let painter = ui.painter();
-    if let Some(bg) = bg {
-        painter.rect_filled(cell, 0.0, bg);
+    if let Some(tint) = tint {
+        painter.rect_filled(cell, 0.0, diff_row_bg(ui, tint));
     }
     // 行号:右对齐贴行号列右缘(空侧 = 空串,不画)
     let lineno_text = line_no_text(lineno);
@@ -1142,16 +1162,40 @@ fn paint_split_side(
             color,
         );
     }
-    // 正文:单行截断(…);悬停全文由调用方挂行响应
+    // 正文:单行截断(…);悬停全文由调用方挂行响应。行内词级区段用带
+    // background 的独立 section(前缀/区段/后缀三段),整行仍是同一
+    // LayoutJob——行盒、elision、字形换行均与 M2 路径同构
     let text_width = (cell.width() - geom.gutter_w - geom.sign_w - SPACE_XS).max(0.0);
-    let mut job = egui::text::LayoutJob::simple(
-        line.text.clone(),
-        geom.font.clone(),
-        ui.visuals().text_color(),
-        text_width,
-    );
-    job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let inline_range = inline.filter(|range| !range.is_empty());
+    let galley = match (tint, inline_range) {
+        (Some(tint), Some(range)) => {
+            let (prefix, mid, suffix) = inline_segments(&line.text, range);
+            let plain =
+                egui::text::TextFormat::simple(geom.font.clone(), ui.visuals().text_color());
+            let mut highlighted = plain.clone();
+            highlighted.background = diff_tint_bg(ui, tint, DIFF_INLINE_TINT);
+            let mut job = egui::text::LayoutJob::default();
+            if !prefix.is_empty() {
+                job.append(prefix, 0.0, plain.clone());
+            }
+            job.append(mid, 0.0, highlighted);
+            if !suffix.is_empty() {
+                job.append(suffix, 0.0, plain);
+            }
+            job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        }
+        _ => {
+            let mut job = egui::text::LayoutJob::simple(
+                line.text.clone(),
+                geom.font.clone(),
+                ui.visuals().text_color(),
+                text_width,
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        }
+    };
     let pos = egui::pos2(
         cell.left() + geom.gutter_w + geom.sign_w,
         cell.center().y - galley.size().y / 2.0,
@@ -2095,6 +2139,210 @@ mod tests {
                 assert!(ink, "{theme}:行号列应有墨(right={right})");
             }
         }
+    }
+
+    /// #53 M3 探针 fixture:上下文对 + 「单删+单增」对(公共前后缀各 4
+    /// 字符,区段 xxxx/yyyy)+ 一对多块(2删1增,按 #101 降级为行级)。
+    /// 两块之间有上下文行分隔(连续非上下文行是同一块)。
+    fn inline_fixture() -> FileDiff {
+        FileDiff {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 6,
+                new_start: 1,
+                new_lines: 5,
+                lines: vec![
+                    DiffLine {
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        kind: DiffLineKind::Context,
+                        text: "ctx".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(2),
+                        new_lineno: None,
+                        kind: DiffLineKind::Deleted,
+                        text: "AAAAxxxxBBBB".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                        kind: DiffLineKind::Added,
+                        text: "AAAAyyyyBBBB".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(3),
+                        new_lineno: Some(3),
+                        kind: DiffLineKind::Context,
+                        text: "mid".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(4),
+                        new_lineno: None,
+                        kind: DiffLineKind::Deleted,
+                        text: "pp".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(5),
+                        new_lineno: None,
+                        kind: DiffLineKind::Deleted,
+                        text: "qq".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: None,
+                        new_lineno: Some(4),
+                        kind: DiffLineKind::Added,
+                        text: "rr".to_owned(),
+                    },
+                ],
+            }],
+            binary: false,
+            truncated: false,
+        }
+    }
+
+    /// #53 M3 行内词级高亮渲染探针(顶点级,非像素采样):第二级底色以
+    /// `TextFormat::background` 直接进 galley mesh,故从 tessellate 后的
+    /// 顶点里按色找——①删/增两侧都出现第二级底色(公式与整行底色同源,
+    /// 占比 [`DIFF_INLINE_TINT`]);②其 x 完全落在对应侧的正文区(前缀
+    /// 字符之后、本侧右缘之前),不遮行号列/沟槽、不越双栏分界;③其 y
+    /// 只出现在「单删+单增」对的行盒内(一对多块按 #101 降级,无第二级);
+    /// ④行对数与行高恒定(区段不改变行对结构)。明暗两主题各跑一轮。
+    #[test]
+    fn split_inline_highlight_paints_second_level_only_on_unambiguous_pairs() {
+        use crate::preview_pixel_acceptance::color_dist;
+        use egui::epaint::Mesh;
+        use egui::UiBuilder;
+
+        let file = inline_fixture();
+        let split = crate::git_split_diff::split_rows(&file);
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            ctx.options_mut(|o| o.tessellation_options.feathering = false);
+            let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 300.0));
+            let mut rects: Vec<Rect> = Vec::new();
+            let mut gutter_w = 0.0;
+            let mut sign_w = 0.0;
+            let mut digit = 0.0;
+            let mut panel_fill = egui::Color32::BLACK;
+            let mut inline_danger = egui::Color32::BLACK;
+            let mut inline_ok = egui::Color32::BLACK;
+            let mut output = ctx.run_ui(RawInput::default(), |panel| {
+                panel_fill = panel.visuals().panel_fill;
+                let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+                let geom = RowGeometry::of(&ui, &file);
+                gutter_w = geom.gutter_w;
+                sign_w = geom.sign_w;
+                digit = ui.fonts_mut(|fonts| fonts.glyph_width(&geom.font, '0'));
+                inline_danger = diff_tint_bg(&ui, tokens::DANGER, DIFF_INLINE_TINT);
+                inline_ok = diff_tint_bg(&ui, tokens::OK, DIFF_INLINE_TINT);
+                for row in &split.rows {
+                    rects.push(paint_split_row(&mut ui, row, &geom).rect);
+                }
+            });
+            let clipped = std::mem::take(&mut output.shapes);
+            let primitives = ctx.tessellate(clipped, 1.0);
+            output.drop_without_applying_deltas();
+            let vertices: Vec<egui::epaint::Vertex> = primitives
+                .iter()
+                .filter_map(|cp| match &cp.primitive {
+                    egui::epaint::Primitive::Mesh(Mesh { vertices, .. }) => {
+                        Some(vertices.iter().copied())
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            let theme = if dark { "暗色" } else { "亮色" };
+
+            // ④ 行对结构:1 hunk 头 + 5 行对,行盒恒定
+            assert_eq!(rects.len(), 6, "{theme}:hunk 头 + 5 行对");
+            let row_h = rects[0].height();
+            assert!(rects.iter().all(|r| r.height() == row_h));
+
+            // 第二级底色顶点(按公式同源色匹配;首尾字形 expand_bg ±1px)
+            let inline_of = |color: egui::Color32| {
+                vertices
+                    .iter()
+                    .filter(|v| color_dist(v.color, color) <= 6)
+                    .collect::<Vec<_>>()
+            };
+            let old_side = inline_of(inline_danger);
+            let new_side = inline_of(inline_ok);
+            // ① 两侧都有第二级底色
+            assert!(!old_side.is_empty(), "{theme}:删除侧应有行内区段底色");
+            assert!(!new_side.is_empty(), "{theme}:新增侧应有行内区段底色");
+            // 第二级必须比整行第一级更深(距面板底色更远),层级可辨
+            let row_danger = diff_row_bg_formula(panel_fill, tokens::DANGER);
+            assert!(
+                color_dist(inline_danger, panel_fill) > color_dist(row_danger, panel_fill) + 8,
+                "{theme}:第二级应明显深于整行底色"
+            );
+
+            // 「单删+单增」对是第 3 行(rects[2]);一对多的两对在
+            // rects[4]/[5](rects[3] 是块间上下文对)
+            let pair = rects[2];
+            let half = pair.width() / 2.0;
+            for (side_name, side_verts, cell_left) in [
+                ("旧", &old_side, pair.left()),
+                ("新", &new_side, pair.left() + half),
+            ] {
+                // ③ y 只在该行盒内(±2px:background 向字形盒四周外扩
+                // expand_bg=1px,贴边即越 1px):一对多块(rects[4]/[5])
+                // 因此不可能混进第二级顶点
+                let ys: Vec<f32> = side_verts.iter().map(|v| v.pos.y).collect();
+                assert!(
+                    ys.iter()
+                        .all(|y| pair.top() - 2.0 <= *y && *y <= pair.bottom() + 2.0),
+                    "{theme}:{side_name}侧第二级底色越出行盒"
+                );
+                // ② x 落在本侧正文区:前缀 AAAA(4 字符)之后、本侧右缘前,
+                // 不遮行号列与沟槽(正文起点 = 行号列 + 沟槽之后)
+                let text_x = cell_left + gutter_w + sign_w;
+                let xs: Vec<f32> = side_verts.iter().map(|v| v.pos.x).collect();
+                let min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    min_x > text_x + 2.0 * digit,
+                    "{theme}:{side_name}侧区段应在前缀字符之后(min_x={min_x}, text_x={text_x})"
+                );
+                assert!(
+                    max_x < text_x + 10.0 * digit,
+                    "{theme}:{side_name}侧区段应不超过 4 字符宽(max_x={max_x})"
+                );
+                assert!(
+                    max_x < cell_left + half,
+                    "{theme}:{side_name}侧区段不得越过双栏分界"
+                );
+                assert!(min_x < max_x, "{theme}:{side_name}侧区段应有宽度");
+            }
+
+            // 一对多块的行(rects[4]/[5])整行第一级底色仍在(降级 = 保持
+            // M2 行级,不是丢失着色):距面板底色足够远的语义色顶点存在
+            let row_danger = diff_row_bg_formula(panel_fill, tokens::DANGER);
+            for degraded in [rects[4], rects[5]] {
+                let has_row_bg = vertices.iter().any(|v| {
+                    color_dist(v.color, row_danger) <= 6
+                        && degraded.top() <= v.pos.y
+                        && v.pos.y <= degraded.bottom()
+                        && v.pos.x < degraded.left() + half
+                });
+                assert!(
+                    has_row_bg,
+                    "{theme}:一对多块的删除侧应保持整行底色(M2 行级不降级丢失)"
+                );
+            }
+        }
+    }
+
+    /// 测试内复算的整行第一级底色([`diff_row_bg`] 的公式镜像,不吃 &Ui)。
+    fn diff_row_bg_formula(panel_fill: egui::Color32, tint: egui::Color32) -> egui::Color32 {
+        tint.lerp_to_gamma(panel_fill, 1.0 - DIFF_ROW_TINT)
     }
 
     /// #53 M2 视图切换:双栏/统一两视图都渲染非空;结构化通道未就位
