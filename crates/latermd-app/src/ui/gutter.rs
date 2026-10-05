@@ -133,6 +133,8 @@ mod tests {
                     &mut live,
                     RenderMode::Source,
                     tab_editor_id(1),
+                    // 行号槽测试不涉 minimap:关(与 #55 前的现状路径一致)。
+                    false,
                 );
             },
         );

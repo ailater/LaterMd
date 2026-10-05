@@ -379,6 +379,19 @@ fn appearance(
     }
 
     ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.label("编辑器:");
+    // #55 M2:minimap 开关与排版滑杆同款「回显副本 + changed() 即时发消息」
+    // 模式(不是 AI/MCP 页的草稿模式:开关拨一下就该看到)。全局偏好,
+    // 所有标签同开同关。
+    let mut show_minimap = theme.show_minimap;
+    if ui
+        .checkbox(&mut show_minimap, "显示源码侧 minimap(编辑区右缘缩略导航)")
+        .changed()
+    {
+        outbox.push(Message::ShowMinimapToggled(show_minimap));
+    }
+
+    ui.add_space(crate::ui::tokens::SPACE_MD);
     // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
     // 决策,这里只显示不切换
     ui.weak(format!(
@@ -1264,6 +1277,70 @@ mod tests {
         assert!(!state.settings.open);
         render(&mut state);
         assert!(!state.settings.open, "渲染不翻转开关");
+    }
+
+    /// #55 M2:外观页「编辑器」分区真实渲出 minimap 复选框的标签文本
+    /// (与 #23 滑杆测试同款:直接渲 `appearance`,避开整窗 440px 视口
+    /// 对 ScrollArea 的裁剪);两轮回显值(开/关)证明复选框绑定在
+    /// theme 字段上,无交互帧不产出消息(翻转只经 changed() 走归约)。
+    #[test]
+    fn appearance_page_renders_minimap_toggle_bound_to_theme() {
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+
+        for show in [true, false] {
+            state.theme.show_minimap = show;
+            let skins = state.skins.clone();
+            let mut last_shapes = Vec::new();
+            let mut last_outbox = Vec::new();
+            let system_theme_ok = state.system_theme_ok;
+            let resolved = resolved_theme_for_test(&state);
+            for _ in 0..3 {
+                let State {
+                    settings, theme, ..
+                } = &mut state;
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            appearance(
+                                ui,
+                                settings,
+                                theme,
+                                &skins,
+                                system_theme_ok,
+                                resolved,
+                                &mut outbox,
+                            );
+                        });
+                    },
+                );
+                let mut output = output;
+                output.textures_delta.clear();
+                last_shapes = output.shapes;
+                last_outbox = outbox;
+            }
+            let texts: Vec<&str> = last_shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().trim()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.iter().any(|t| t.contains("minimap")),
+                "show={show}: 复选框标签未渲出,文本形状:{texts:?}"
+            );
+            assert!(last_outbox.is_empty(), "show={show}: 无交互帧不产出消息");
+        }
     }
 
     /// 页签图标与显示名一一对应,且都有图标(不出现空图标页)。

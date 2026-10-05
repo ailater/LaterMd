@@ -242,6 +242,12 @@ pub struct ThemeSettings {
     /// 转正)经 `apply_font_size` 投影成 `spacing.extra_text_line_spacing`
     /// 的绝对像素加值,调低时被自然行高 clamp 到 0。
     pub line_height: f32,
+    /// 源码模式右缘 minimap 开关(#55 M2):全局偏好,照 #23 排版偏好在
+    /// `ThemeSettings` 落 settings.json 的先例(旧档缺字段由 struct 级
+    /// `#[serde(default)]` 兜底)。默认**开**(与 VS Code 等编辑器出厂
+    /// 一致,取舍登记 decisions-pending #105);关闭时编辑器走与从前
+    /// 逐字节相同的路径(零 minimap 元素,ui::editor 的否决线)。
+    pub show_minimap: bool,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
     /// Emoji 面板「最近使用」(docs/emoji-plan.md §6.3):新的在前、去重、
@@ -270,6 +276,7 @@ impl Default for ThemeSettings {
             tab_title_width: TitleWidthMode::default(),
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             line_height: LINE_HEIGHT_DEFAULT,
+            show_minimap: true,
             overrides: None,
             emoji_recent: Vec::new(),
             skin_style: None,
@@ -1058,6 +1065,29 @@ mod tests {
             EDITOR_FONT_SIZE_DEFAULT
         );
         assert_eq!(ThemeSettings::default().line_height, LINE_HEIGHT_DEFAULT);
+    }
+
+    /// #55 M2:minimap 开关随 settings.json 往返;默认开(与 VS Code 等
+    /// 编辑器出厂一致,取舍见 decisions-pending #105);旧文件缺该项由
+    /// serde(default) 兜底回开。
+    #[test]
+    fn show_minimap_round_trips_and_old_settings_default_on() {
+        assert!(ThemeSettings::default().show_minimap, "出厂默认开");
+
+        let dir = temp_dir("show-minimap");
+        let settings = ThemeSettings {
+            show_minimap: false,
+            ..ThemeSettings::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(json.contains(r#""show_minimap": false"#), "{json}");
+
+        // 旧版 settings.json 没有 show_minimap:serde(default) 兜底回 true
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert!(ThemeSettings::load_from(&dir).unwrap().show_minimap);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #23 排版偏好随 settings.json 往返:界内自定义值逐项一致(在界内,

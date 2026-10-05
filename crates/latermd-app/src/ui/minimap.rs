@@ -18,13 +18,11 @@
 //!   → 应绘制的行区间与每行 y。O(1) 纯函数,滚动帧只平移窗口、不触碰
 //!   行模型缓存。
 //!
-//! M2 渲染层只消费这三个入口;比例尺/不满高铺排等自选项登记在
-//! docs/decisions-pending.md #104。
-
-// M1 是纯数据层,渲染层(M2)落地前生产代码零调用;测试已全量消费本模块
-// 公共面。M2 接线后删除本属性,恢复整模块(非测试构建)的 dead_code 检查
-// (与 preview.rs `ScrollProbe` 同款豁免)。
-#![cfg_attr(not(test), allow(dead_code))]
+//! M2 渲染层(本文件下半段)消费这三个入口:行条只画 [`window`] 的可见
+//! 区间、颜色从当帧 visuals 推导(明暗两套);编辑器视口的高亮框与
+//! 点击/拖动跳转([`jump_ratio`])都按「内容比例」换算,与窗口平移同一
+//! 套几何。比例尺/不满高铺排等自选项登记在 docs/decisions-pending.md
+//! #104,条宽/默认开关等 M2 口径见 #105。
 
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
@@ -255,12 +253,16 @@ pub(crate) struct VisibleWindow {
 }
 
 impl VisibleWindow {
-    /// 应绘制的行区间(0-based,半开)。
+    /// 应绘制的行区间(0-based,半开)。生产消费见 [`Self::iter`] 与
+    /// [`shapes`] 的容量预估;也是 M1 单测的取证面。
     pub(crate) fn range(&self) -> Range<usize> {
         self.range.clone()
     }
 
     /// 行号 → 该行条的 y(相对 minimap 视口顶);区间外返回 `None`。
+    /// M1 单测的取证面,非测试构建豁免 dead_code(与 preview.rs
+    /// `ScrollProbe` 同款口径)。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn y_of(&self, line: usize) -> Option<f32> {
         if !self.range.contains(&line) {
             return None;
@@ -299,6 +301,201 @@ pub(crate) fn window(input: WindowInput) -> VisibleWindow {
         y0: first as f32 * row_h - offset,
         row_h,
     }
+}
+
+// —— M2 渲染层(#55)——
+
+/// 右缘窄条总宽 = 2px 左内边距、96px 行条区(= [`MAX_UNITS`],1px/单元)、
+/// 10px 滚动条避让。egui ScrollArea 的滚动条贴视口右缘、画在后、居上,
+/// 行条最长到 98px 处,最后 10px 留给它;行条有效宽 96 在任务书建议的
+/// 80–100px 区间内。
+pub(crate) const MINIMAP_W: f32 = 108.0;
+
+/// 行条区左内边距:行条 x = 条左缘 + 此值 + 缩进。
+const PAD_X: f32 = 2.0;
+
+/// 行条颜色:正文 fg(noninteractive)按主题压透明度 —— 暗色白压到 ~35%、
+/// 亮色黑压到 ~26%。两套 visuals 同一函数推导,不做每主题手工色表。
+fn bar_color(visuals: &egui::Visuals) -> egui::Color32 {
+    let [r, g, b, _] = visuals.widgets.noninteractive.fg_stroke.color.to_array();
+    let alpha = if visuals.dark_mode { 0x59 } else { 0x42 };
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+/// 视口高亮框的底色与描边:同从当帧 visuals 推导(暗色提白、亮色压黑,
+/// 与行条方向相反,保证在行条之上仍可辨;描边复用 noninteractive 的
+/// bg_stroke,明暗各自协调)。
+fn viewport_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        egui::Color32::from_white_alpha(0x14)
+    } else {
+        egui::Color32::from_black_alpha(0x0F)
+    }
+}
+
+/// 点击/拖动跳转的输入:把 minimap 视口内的指针位置换算成编辑器的目标
+/// 滚动比例(纯函数,单测锚点)。
+pub(crate) struct JumpInput {
+    /// minimap 内容区高(px,即窄条高)。
+    pub minimap_height: f32,
+    /// 文档总行数。
+    pub total_lines: usize,
+    /// 当前滚动比例(与 [`WindowInput::scroll_ratio`] 同口径)。
+    pub scroll_ratio: f32,
+    /// 比例尺(minimap 每行条高,px)。
+    pub row_h: f32,
+    /// 指针 y(相对 minimap 视口顶)。
+    pub pointer_y: f32,
+    /// 编辑器视口高占内容总高的比例(视口高 / 内容高)。
+    pub viewport_frac: f32,
+}
+
+/// 位置 → 目标滚动比例:点击处的内容对准编辑器**视口中心**。
+///
+/// 换算两步:①指针 y 加上 minimap 当前平移(`scroll_ratio × travel`),
+/// 除以全文档高得到内容比例 `p`;②让视口中心落在 `p` →
+/// `target = (p − viewport_frac/2) / (1 − viewport_frac)`。短文档
+/// (minimap 不满一屏 → 编辑器同样滚不动)或内容不满一屏返回 `None`,
+/// 调用方原样不动。输出钳进 0..=1(点顶到顶、点底到底)。
+pub(crate) fn jump_ratio(input: JumpInput) -> Option<f32> {
+    let total = input.total_lines.max(1) as f32;
+    let row_h = input.row_h.max(0.5);
+    let full = total * row_h;
+    let viewport = input.minimap_height.max(0.0);
+    let travel = (full - viewport).max(0.0);
+    if travel <= 0.0 {
+        return None; // minimap 不满一屏:编辑器此时也滚不动
+    }
+    let ve = input.viewport_frac.clamp(0.0, 1.0);
+    if ve >= 1.0 {
+        return None; // 内容不满一屏:编辑器无行程
+    }
+    let offset = input.scroll_ratio.clamp(0.0, 1.0) * travel;
+    let p = ((input.pointer_y + offset) / full).clamp(0.0, 1.0);
+    Some(((p - ve * 0.5) / (1.0 - ve)).clamp(0.0, 1.0))
+}
+
+/// 编辑器视口在 minimap 上的高亮框(相对窄条顶的 `top` 与 `height`,
+/// 已钳进 `[0, minimap_height]`)。与 [`window`] 的平移同一套几何:视口
+/// 占内容的比例区间 `[ratio×(1−ve), ratio×(1−ve)+ve]` 映射到 minimap
+/// 内容坐标再减平移;非折行文档下与行条严格对齐,深度折行时按内容比例
+/// (行条是均匀逻辑行模型,口径见 decisions-pending #105)。
+pub(crate) fn viewport_highlight(input: WindowInput, viewport_frac: f32) -> (f32, f32) {
+    let total = input.total_lines.max(1) as f32;
+    let row_h = input.row_h.max(0.5);
+    let full = total * row_h;
+    let map_h = input.minimap_height.max(0.0);
+    let travel = (full - map_h).max(0.0);
+    let ve = viewport_frac.clamp(0.0, 1.0);
+    let ratio = input.scroll_ratio.clamp(0.0, 1.0);
+    let top = ratio * ((1.0 - ve) * full - travel);
+    let height = (ve * full).clamp(0.0, map_h);
+    let top = top.clamp(0.0, (map_h - height).max(0.0));
+    (top, height)
+}
+
+/// 构造 minimap 的本帧形状:可见窗口内的行条 + 编辑器视口高亮框。返回
+/// (shapes, 非零行条数, 高亮框矩形)。
+///
+/// **只构造、不上画布**:`with_lines` 把本函数持在 `ctx().data_mut` 的
+/// 借用里,而 `painter` 的任何 add 都要再进同一把 Context 写锁 —— 重入
+/// 即死锁(实测踩过)。调用方(editor.rs)在借用之外 `painter().extend(shapes)`
+/// 并写测试探针。只在源码模式、开关开启时被构造(关闭 = 调用方根本不
+/// 进,零形状)。
+///
+/// `scroll_ratio` / `viewport_frac` 由调用方从编辑器 ScrollArea 的当帧
+/// 真值换算(`offset/(content−viewport)`、`viewport/content`)。
+pub(crate) fn shapes(
+    visuals: &egui::Visuals,
+    rect: egui::Rect,
+    lines: &[LineDesc],
+    scroll_ratio: f32,
+    viewport_frac: f32,
+) -> (Vec<egui::Shape>, usize, egui::Rect) {
+    let geometry = WindowInput {
+        minimap_height: rect.height(),
+        total_lines: lines.len(),
+        scroll_ratio,
+        row_h: ROW_H,
+    };
+    let win = window(geometry);
+    let bar = bar_color(visuals);
+    let left = rect.left() + PAD_X;
+    let mut out = Vec::with_capacity(win.range().len() + 2);
+    // 只构造可见窗口:O(视口行数),滚动帧不随文档长度增长(M1 窗口语义)。
+    let mut bars = 0usize;
+    for (line, y) in win.iter() {
+        let desc = lines[line];
+        if desc.width == 0 {
+            continue; // 空行/纯缩进封顶行:零宽条不画
+        }
+        bars += 1;
+        let tl = egui::pos2(left + f32::from(desc.indent), rect.top() + y);
+        out.push(egui::Shape::Rect(egui::epaint::RectShape::filled(
+            egui::Rect::from_min_size(tl, egui::vec2(f32::from(desc.width), ROW_H)),
+            egui::CornerRadius::ZERO,
+            bar,
+        )));
+    }
+    // 视口高亮框:底色 + 1px 描边,横跨整条(缩进信息在行条上,框只表
+    // 「编辑器现在看哪里」)。排在行条之后 → 盖在其上。
+    let (top, height) = viewport_highlight(geometry, viewport_frac);
+    let frame = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.top() + top),
+        egui::vec2(rect.width(), height),
+    );
+    out.push(egui::Shape::Rect(egui::epaint::RectShape::filled(
+        frame,
+        egui::CornerRadius::ZERO,
+        viewport_fill(visuals),
+    )));
+    out.push(egui::Shape::Rect(egui::epaint::RectShape::stroke(
+        frame,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    )));
+    (out, bars, frame)
+}
+
+/// 测试探针的键(与 [`cache_id`] 同源由 editor_id 派生)。
+pub(crate) fn probe_id(editor_id: egui::Id) -> egui::Id {
+    editor_id.with("minimap-probe")
+}
+
+/// 编辑器 ScrollArea 的滚动度量快照(每帧末由 editor.rs 写入,下一帧的
+/// 点击/拖动跳转换算用它:闭包内拿不到本帧排版完成后的内容高,上一帧
+/// 真值足够 —— 编辑帧的一帧误差在下一帧自愈)。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScrollMetrics {
+    /// 视口顶的内容坐标偏移(`ScrollArea::state.offset.y`)。
+    pub offset: f32,
+    /// 内容总高(`ScrollArea::content_size.y`)。
+    pub content_height: f32,
+    /// 视口高(`ScrollArea::inner_rect.height()`)。
+    pub viewport_height: f32,
+}
+
+/// metrics temp 的键(与 [`cache_id`] 同源由 editor_id 派生,每标签一份)。
+pub(crate) fn metrics_id(editor_id: egui::Id) -> egui::Id {
+    editor_id.with("minimap-metrics")
+}
+
+/// 跳转意图 temp 的键:值 = 指针 y(相对窄条顶)。闭外交互命中时写入,
+/// 下一帧 ScrollArea 闭包开头消费即清 —— 一帧滞后的传接(窄条命中必须
+/// 排在 ScrollArea 之后注册才不被背景拖拽抢层级,而 scroll_to_rect 只在
+/// 闭包内才被同帧消费,二者不可兼得;拖动逐帧覆写,跟随无感)。
+pub(crate) fn jump_id(editor_id: egui::Id) -> egui::Id {
+    editor_id.with("minimap-jump")
+}
+
+/// 测试探针载荷(仅测试读;生产每帧写、从不读,字段读取豁免
+/// dead_code —— 与 preview.rs `ScrollProbe` 同款)。
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct MinimapProbe {
+    pub bars: usize,
+    pub viewport: Option<egui::Rect>,
 }
 
 #[cfg(test)]
@@ -696,5 +893,557 @@ mod tests {
                 .all(|d| d.width.saturating_add(d.indent) <= p.max_units),
             "缩进+长度联合封顶"
         );
+    }
+
+    // —— M2 渲染与跳转(#55)——
+
+    use crate::live::{LiveState, RenderMode};
+    use crate::state::{OutlineCursor, PreviewState};
+    use egui::epaint::ClippedShape;
+
+    /// 跑一帧源码模式编辑面板(带 minimap 开关;视口 800×600 与 editor.rs
+    /// 滚动测试同口径),返回 (shapes, 探针)。探针 None = 本帧没进 minimap
+    /// 渲染路径(关闭态的零元素断言就用它)。
+    fn frame(
+        ctx: &egui::Context,
+        editor: &mut EditorBuffer,
+        now: f64,
+        show_minimap: bool,
+        events: Vec<egui::Event>,
+    ) -> (Vec<ClippedShape>, Option<MinimapProbe>) {
+        let mut preview = PreviewState::new(editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = None;
+        let mut live = LiveState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let editor_id = editor::tab_editor_id(1);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                time: Some(now),
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                editor::ui(
+                    ui,
+                    editor,
+                    &mut preview,
+                    editor::CursorChannel {
+                        cursor: &mut cursor,
+                        selection: &mut selection,
+                        pending: &mut pending,
+                    },
+                    &mut live,
+                    RenderMode::Source,
+                    editor_id,
+                    show_minimap,
+                );
+            },
+        );
+        let shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        let probe = ctx.data(|d| d.get_temp::<MinimapProbe>(probe_id(editor_id)));
+        (shapes, probe)
+    }
+
+    /// shapes 里的 minimap 行条:高恰为 [`ROW_H`]、宽 ≤ 条区 96px 的填充
+    /// 矩形(行条是全帧唯一的 3px 高矩形形状)。返回 (矩形, 颜色)。
+    fn bar_rects(shapes: &[ClippedShape]) -> Vec<(egui::Rect, egui::Color32)> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT => {
+                    let rect = r.rect;
+                    (rect.height() == ROW_H && rect.width() <= 96.0).then_some((rect, r.fill))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// shapes 里的视口高亮框:横跨整条、宽 = [`MINIMAP_W`] 的填充矩形。
+    fn viewport_rect(shapes: &[ClippedShape]) -> Option<egui::Rect> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Rect(r) => (r.fill != egui::Color32::TRANSPARENT
+                && (r.rect.width() - MINIMAP_W).abs() < 0.5)
+                .then_some(r.rect),
+            _ => None,
+        })
+    }
+
+    /// ⑤-1 关闭态零渲染(否决线):开关关 → 无探针、无行模型缓存、无行条
+    /// 形状,TextEdit 右缘保持让位前的现状(不因开关存在而变窄)。
+    #[test]
+    fn disabled_minimap_renders_zero_elements() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, false, Vec::new());
+        let (shapes, probe) = frame(&ctx, &mut editor, 0.1, false, Vec::new());
+        assert!(probe.is_none(), "关闭帧不写探针");
+        assert!(
+            ctx.data(|d| d.get_temp::<MinimapCache>(cache_id(id)))
+                .is_none(),
+            "关闭帧不进行模型缓存路径"
+        );
+        assert!(bar_rects(&shapes).is_empty(), "关闭帧零行条形状");
+        assert!(viewport_rect(&shapes).is_none(), "关闭帧零高亮框形状");
+        // 关闭 = TextEdit 吃满剩余宽(与 #55 之前一致):右缘贴近视口右缘
+        let text_rect = ctx.read_response(id).expect("TextEdit 响应已记录").rect;
+        assert!(
+            (800.0 - text_rect.right()).abs() < 12.0,
+            "关闭时 TextEdit 右缘贴面板(实测 {}),不被窄条挤窄",
+            text_rect.right()
+        );
+    }
+
+    /// ⑤-2 开启态可见行条数 = 窗口计算结果:1000 行全非空文档、600px
+    /// minimap、顶部对齐 → 行条数恰为 window() 区间长;行条都落在窄条
+    /// 96px 行条区内,TextEdit 同步让位。
+    #[test]
+    fn enabled_minimap_paints_exactly_the_visible_window() {
+        let ctx = egui::Context::default();
+        let text = (0..1000)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, probe) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let expect = window(WindowInput {
+            minimap_height: 600.0,
+            total_lines: 1000,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+        })
+        .range()
+        .len();
+        // 1000 行全非空:非零行条数 == 窗口区间长
+        let probe = probe.expect("开启帧写探针");
+        assert_eq!(probe.bars, expect);
+        let bars = bar_rects(&shapes);
+        assert_eq!(bars.len(), expect, "行条形状数与探针一致");
+        // 高亮框探针与 shapes 实画一致(取证两面互证)
+        assert_eq!(
+            probe.viewport,
+            Some(viewport_rect(&shapes).expect("高亮框已绘制")),
+            "探针高亮框与实画形状一致"
+        );
+        // 行条几何:都在右缘窄条的行条区(x ∈ [map_left+pad, +96]),y 从 0 递增
+        let map_left = viewport_rect(&shapes).expect("高亮框已绘制").left();
+        for (rect, _) in &bars {
+            assert!(
+                rect.left() >= map_left && rect.right() <= map_left + MINIMAP_W,
+                "行条落在窄条内({rect:?}, map_left={map_left})"
+            );
+        }
+        // TextEdit 让位:右缘离面板右缘 ≈ MINIMAP_W(±16 容差吸收 gutter
+        // 右缘 token 间距与 TextEdit 自身边距)
+        let text_rect = ctx.read_response(id).expect("TextEdit 响应已记录").rect;
+        assert!(
+            (800.0 - text_rect.right() - MINIMAP_W).abs() < 16.0,
+            "开启时 TextEdit 右缘让出窄条(实测右缘 {})",
+            text_rect.right()
+        );
+    }
+
+    /// ⑤-3 跳转映射(纯函数):点击处对准视口中心;点顶/点底钳到端点,
+    /// 短文档与不满屏内容返回 None,位置 → 目标单调。
+    #[test]
+    fn jump_ratio_maps_pointer_to_centered_target() {
+        // 10000 行、600px minimap(200 行窗口)、ve = 600/30000
+        let base = JumpInput {
+            minimap_height: 600.0,
+            total_lines: 10000,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+            pointer_y: 0.0,
+            viewport_frac: 600.0 / 30000.0,
+        };
+        // 点顶:目标钳 0
+        assert_eq!(
+            jump_ratio(JumpInput {
+                pointer_y: 0.0,
+                ..base
+            }),
+            Some(0.0)
+        );
+        // 点底(y=600):p=0.02 > ve/2 → 正向小步
+        let bottom = jump_ratio(JumpInput {
+            pointer_y: 600.0,
+            ..base
+        })
+        .expect("长文档有行程");
+        assert!(bottom > 0.0 && bottom < 0.05, "点底小步正向(实测 {bottom})");
+        // 点中(y=300,此时 p=0.01≈ve/2 略小)…… 用比例推:点在 minimap
+        // 中部、当前也在中部时目标 ≈ 中部。直接构造 p=0.5:pointer_y +
+        // offset = 15000 → offset = 14700 → ratio = 0.5
+        let mid = jump_ratio(JumpInput {
+            scroll_ratio: 0.5,
+            pointer_y: 300.0,
+            ..base
+        })
+        .expect("长文档有行程");
+        assert!((mid - 0.5).abs() < 0.01, "文档中部对准视口中心(实测 {mid})");
+        // 单调:指针下移 → 目标比例不减
+        let mut previous = f32::NEG_INFINITY;
+        for step in 0..=10 {
+            let target = jump_ratio(JumpInput {
+                pointer_y: f32::from(step as u16) * 60.0,
+                ..base
+            })
+            .expect("长文档有行程");
+            assert!(
+                target >= previous,
+                "指针下移目标单调({previous} → {target})"
+            );
+            previous = target;
+        }
+        // 钳制:指针越界(负)仍给端点;滚到底时点视口底 → 文档底(视口
+        // 顶对文末,minimap 平移量此时最大)
+        assert_eq!(
+            jump_ratio(JumpInput {
+                pointer_y: -50.0,
+                ..base
+            }),
+            Some(0.0)
+        );
+        assert_eq!(
+            jump_ratio(JumpInput {
+                scroll_ratio: 1.0,
+                pointer_y: 600.0,
+                ..base
+            }),
+            Some(1.0),
+            "minimap 平移到底 + 点视口底 = 文档底"
+        );
+        // 短文档(minimap 不满一屏)→ 编辑器同样滚不动 → None
+        assert_eq!(
+            jump_ratio(JumpInput {
+                total_lines: 10,
+                viewport_frac: 1.0,
+                ..base
+            }),
+            None
+        );
+        // 内容不满一屏(ve=1)→ None
+        assert_eq!(
+            jump_ratio(JumpInput {
+                viewport_frac: 1.0,
+                ..base
+            }),
+            None
+        );
+    }
+
+    /// ⑤-3 端到端:点击 minimap 中部 → 编辑器滚动前进,光标纹丝不动
+    /// (跳转只动滚动 offset,不触碰 TextEdit 持久光标)。
+    #[test]
+    fn clicking_minimap_scrolls_without_moving_cursor() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        // 高亮框只标编辑器视口对应的短段;点击目标取窄条自身的中下部
+        // (窄条高 = 编辑区高 600,y=400 离当前视口中心够远,滚动量明确)。
+        let map = viewport_rect(&shapes).expect("高亮框定位窄条");
+        let click = egui::pos2(map.center().x, 400.0);
+        let top_before = ctx.read_response(id).expect("TextEdit 已记录").rect.top();
+        let cursor_before = egui::widgets::text_edit::TextEditState::load(&ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.primary.index.0, r.secondary.index.0));
+
+        // 点击:press 与 release 分两帧(clicked = 双帧语义)
+        frame(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(click),
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &ctx,
+            &mut editor,
+            0.3,
+            true,
+            vec![egui::Event::PointerButton {
+                pos: click,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        // 落账链条比滚轮多一环(意图帧→闭包消费帧→offset 生效帧→布局
+        // 反映帧→read_response 可读帧),补四帧再取证。
+        for step in 0..4 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.4 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+
+        let top_after = ctx.read_response(id).expect("TextEdit 已记录").rect.top();
+        assert!(
+            top_after < top_before - 50.0,
+            "点击 minimap 把视口推离文档顶(实测 {top_before} → {top_after})"
+        );
+        let cursor_after = egui::widgets::text_edit::TextEditState::load(&ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.primary.index.0, r.secondary.index.0));
+        assert_eq!(
+            cursor_before, cursor_after,
+            "跳转不动光标(前后持久光标一致)"
+        );
+    }
+
+    /// ⑤-3 端到端:按住拖动逐帧下移 → 滚动逐帧跟随(offset 单调前进)。
+    #[test]
+    fn dragging_minimap_follows_continuously() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let map = viewport_rect(&shapes).expect("高亮框定位窄条");
+        let press = egui::pos2(map.center().x, map.top() + 40.0);
+        frame(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+
+        // 逐帧跟随用 metrics.offset 断言(ScrollArea 帧末真值,无布局与
+        // read_response 各一帧的滞后);屏幕坐标的最终落点在 settle 帧后验。
+        let mut previous = 0.0_f32;
+        let mut moved = 0;
+        for step in 0..6 {
+            let pos = egui::pos2(press.x, press.y + f32::from(step as u16) * 40.0);
+            frame(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(pos)],
+            );
+            let offset: f32 = ctx
+                .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .map_or(0.0, |m| m.offset);
+            assert!(
+                offset >= previous - 0.5,
+                "拖动下移滚动单调不减(第 {step} 步 {previous} → {offset})"
+            );
+            if offset > previous + 1.0 {
+                moved += 1;
+            }
+            previous = offset;
+        }
+        assert!(moved >= 3, "拖动确实连续跟随(6 步中 {moved} 步在滚)");
+        // settle(意图→消费→offset→布局→可读各差一帧)后,屏幕坐标到位
+        for step in 0..4 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.9 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+        let top = ctx.read_response(id).expect("TextEdit 已记录").rect.top();
+        assert!(
+            top < -50.0,
+            "拖到窄条下部后视口深入文档(实测 top {top},offset {previous})"
+        );
+    }
+
+    /// ⑤-4 10000 行档连续滚动若干帧无 panic,行模型缓存命中(存储指针
+    /// 纹丝不动 = 无逐帧全量重建)。
+    #[test]
+    fn ten_k_line_scrolling_keeps_cache_hot_without_panic() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&"行\n".repeat(10000)); // 10001 行
+        let id = editor::tab_editor_id(1);
+        let p = LineParams::factory();
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let model_ptr = with_lines(&ctx, id, &editor, p, |lines| lines.as_ptr());
+
+        for i in 0..10 {
+            let (shapes, probe) = frame(
+                &ctx,
+                &mut editor,
+                0.1 + f64::from(i) * 0.1,
+                true,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(200.0, 300.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -120.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let probe = probe.expect("滚动帧 minimap 照常绘制");
+            assert!(probe.bars > 0, "第 {i} 帧行条在画");
+            assert!(!bar_rects(&shapes).is_empty(), "第 {i} 帧行条形状在");
+            let (ptr, len) =
+                with_lines(&ctx, id, &editor, p, |lines| (lines.as_ptr(), lines.len()));
+            assert_eq!(ptr, model_ptr, "滚动帧命中缓存,零重建(第 {i} 帧)");
+            assert_eq!(len, 10001);
+        }
+    }
+
+    /// ⑤-5 两主题渲染:明暗各三帧不 panic,行条色随主题翻转(暗色偏白、
+    /// 亮色偏黑,且都非透明)。
+    #[test]
+    fn both_themes_paint_distinct_bar_colors() {
+        let mut seen = Vec::new();
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            let mut editor = EditorBuffer::new("明暗各三帧\n不 panic\n");
+            for step in 0..3 {
+                let (shapes, probe) =
+                    frame(&ctx, &mut editor, f64::from(step) * 0.1, true, Vec::new());
+                let bars = bar_rects(&shapes);
+                assert!(
+                    bars.iter().all(|(_, c)| c.a() > 0),
+                    "{} 第 {step} 帧行条非透明",
+                    if dark { "暗色" } else { "亮色" }
+                );
+                if step == 2 {
+                    assert!(probe.expect("开启帧写探针").bars >= 2);
+                    seen.push((dark, bars[0].1));
+                }
+            }
+        }
+        let (dark_color, light_color) = (seen[0].1, seen[1].1);
+        assert_ne!(dark_color, light_color, "两主题行条色不同");
+        assert!(
+            dark_color.r() > light_color.r(),
+            "暗色主题行条偏白、亮色偏黑(实测 {dark_color:?} vs {light_color:?})"
+        );
+    }
+
+    /// 范围:仅源码模式 —— Live 模式整帧不进 minimap 渲染路径(无探针、
+    /// 无行条形状)。
+    #[test]
+    fn live_mode_renders_no_minimap() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("# 标题\n\n正文一段。\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = None;
+        let mut live = LiveState::default();
+        let editor_id = editor::tab_editor_id(1);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                // 开关开着也只该在源码模式生效
+                editor::ui(
+                    ui,
+                    &mut editor,
+                    &mut preview,
+                    editor::CursorChannel {
+                        cursor: &mut cursor,
+                        selection: &mut selection,
+                        pending: &mut pending,
+                    },
+                    &mut live,
+                    RenderMode::Live,
+                    editor_id,
+                    true,
+                );
+            },
+        );
+        let shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        assert!(
+            ctx.data(|d| d.get_temp::<MinimapProbe>(probe_id(editor_id)))
+                .is_none(),
+            "Live 帧不写 minimap 探针"
+        );
+        assert!(bar_rects(&shapes).is_empty(), "Live 帧零行条形状");
+        assert!(viewport_rect(&shapes).is_none(), "Live 帧零高亮框");
+    }
+
+    /// 范围:切 tab 后开关照常渲染(全局开关)+ 各 tab 行模型分槽
+    /// (第二个 tab 首帧用自己的槽重建,不影响第一个 tab 的缓存)。
+    #[test]
+    fn tab_switch_keeps_toggle_and_slot_isolation() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&"行\n".repeat(300));
+        frame(&ctx, &mut editor, 0.0, true, Vec::new()); // tab1 建立
+        let id1 = editor::tab_editor_id(1);
+        let ptr1 = with_lines(&ctx, id1, &editor, LineParams::factory(), |l| l.as_ptr());
+
+        // 第二个标签同开关渲染(生产里 tab2 用 tab_editor_id(2);本测试
+        // 直接验证分槽:tab2 的槽独立建立)
+        let id2 = editor::tab_editor_id(2);
+        with_lines(&ctx, id2, &editor, LineParams::factory(), |lines| {
+            assert_eq!(lines.len(), 301, "tab2 槽独立成表");
+        });
+        // tab1 缓存不受影响
+        assert_eq!(
+            with_lines(&ctx, id1, &editor, LineParams::factory(), |l| l.as_ptr()),
+            ptr1,
+            "tab1 缓存纹丝不动"
+        );
+        // 开关再渲一帧(tab 往返语义):探针仍在
+        let (_, probe) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        assert!(probe.is_some_and(|p| p.bars > 0), "切回照常渲染");
     }
 }
