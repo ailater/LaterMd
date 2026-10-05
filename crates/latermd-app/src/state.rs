@@ -4152,6 +4152,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `[[note.md]]`(目标自带 `.md` 后缀)点击同样打开 note.md —— 正向
+    /// 解析与反向链接扫描的后缀容错对齐(#87):反向早已计入,点击此前
+    /// 未必打得开;找不到仍落提示行,不静默。
+    #[test]
+    fn wikilink_with_md_suffix_still_opens_the_document() {
+        let dir = temp_path("wikilink-suffix");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("架构决策.md"), "# 架构\n").unwrap();
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        state.apply(Message::FileTreeRootSelected(dir.clone()));
+
+        state.apply(Message::WikilinkClicked {
+            target: "架构决策.md".into(),
+        });
+        assert_eq!(
+            state.tabs.current().document.path.as_deref(),
+            Some(dir.join("架构决策.md").as_path()),
+            "目标带 .md 后缀也按 stem 打开"
+        );
+        assert!(state.tabs.current().document.notice.is_none());
+
+        // 剥后缀后仍无命中:提示行带目标原文,不静默无反应
+        state.apply(Message::WikilinkClicked {
+            target: "不存在.md".into(),
+        });
+        assert!(state
+            .tabs
+            .current()
+            .document
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("不存在.md")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 未选文档库根时点 wikilink:提示「先选根目录」,不猜路径。
     #[test]
     fn wikilink_without_root_notices() {

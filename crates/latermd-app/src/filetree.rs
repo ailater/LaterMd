@@ -137,7 +137,10 @@ pub struct TreeEntry {
 /// 在文档库根下按**名称**找文档:`[[wikilink]]` 的解析落点(P3 双向链接)。
 ///
 /// 匹配口径:文件名(去扩展名)与目标**忽略大小写全等**,扩展名须是
-/// `.md` / `.markdown`。目标带 `/` 时按相对路径直取(先原样、再补扩展名)。
+/// `.md` / `.markdown`;目标自带 `.md` / `.markdown` 后缀且无精确命中时,
+/// 剥一个后缀按 stem 再试一轮(与反向链接扫描同口径,#87——`[[note.md]]`
+/// 计入反向,点击同样要能打开)。目标带 `/` 时按相对路径直取(先原样、再
+/// 补扩展名),不吃剥后缀的模糊匹配。
 ///
 /// 遍历复用 `latermd_search`(与侧边栏搜索、MCP `list_files` 同一份实现),
 /// 因此同样尊重 `.gitignore`;超过条目上限的部分找不到 —— 与搜索结果的截断
@@ -159,23 +162,36 @@ pub fn find_by_name(root: &Path, target: &str) -> Option<PathBuf> {
             }
         }
     }
-    // ② 按文件名全库找(忽略大小写)
+    // ② 按文件名全库找(忽略大小写):精确 stem 命中在前,目标带 md 后缀
+    // 时剥后缀的容错命中只补位(#87)——两轮各取列表首个,既有优先级不变
     let outcome =
         latermd_search::list_files(root, None, None, latermd_search::MAX_LIST_ENTRIES).ok()?;
-    let wanted = target.to_lowercase();
-    outcome
-        .entries
-        .iter()
-        .filter(|entry| !entry.is_dir && latermd_search::is_markdown(&entry.path))
-        .find(|entry| {
-            entry
-                .path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().to_lowercase())
-                .as_deref()
-                == Some(wanted.as_str())
-        })
-        .map(|entry| root.join(&entry.path))
+    let stem_hit = |wanted: &str| {
+        outcome
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_dir && latermd_search::is_markdown(&entry.path))
+            .find(|entry| {
+                entry
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_lowercase())
+                    .as_deref()
+                    == Some(wanted)
+            })
+            .map(|entry| root.join(&entry.path))
+    };
+    let stripped = strip_md_suffix(target);
+    stem_hit(&target.to_lowercase()).or_else(|| stem_hit(&stripped?.to_lowercase()))
+}
+
+/// 剥掉目标末尾的一个 `.md` / `.markdown` 后缀(与反向链接扫描的
+/// `strip_md_extension` 同口径,#87);没有后缀或剥完为空返回 `None`。
+fn strip_md_suffix(target: &str) -> Option<&str> {
+    let stem = target
+        .strip_suffix(".markdown")
+        .or_else(|| target.strip_suffix(".md"))?;
+    (!stem.is_empty()).then_some(stem)
 }
 
 pub fn list_children(dir: &Path, cap: usize) -> DirChildren {
@@ -615,6 +631,76 @@ mod wikilink_tests {
         assert_eq!(
             find_by_name(&root, "子目录/Note One"),
             Some(root.join("子目录/Note One.markdown"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #87 后缀容错:目标自带 `.md` / `.markdown` 后缀也按 stem 打开 ——
+    /// 与反向链接扫描口径对齐(`[[note.md]]` 计入反向,点击此前打不开)。
+    #[test]
+    fn find_by_name_strips_md_suffix_for_bare_targets() {
+        let root = vault("suffix");
+        assert_eq!(
+            find_by_name(&root, "架构决策.md"),
+            Some(root.join("架构决策.md")),
+            "`[[note.md]]` 打开 note.md(此前 stem 对不上,返回 None)"
+        );
+        assert_eq!(
+            find_by_name(&root, "Note One.markdown"),
+            Some(root.join("子目录/Note One.markdown")),
+            ".markdown 后缀同剥,忽略大小写与嵌套不变"
+        );
+        assert_eq!(
+            find_by_name(&root, "架构决策"),
+            Some(root.join("架构决策.md")),
+            "`[[note]]` 不带后缀,既有口径不变"
+        );
+        assert_eq!(
+            find_by_name(&root, "ignored.md"),
+            None,
+            "剥后缀后的 stem 命中同样过不了 .gitignore"
+        );
+        assert_eq!(find_by_name(&root, ".md"), None, "剥完为空不参与匹配");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 精确 stem 命中优先于剥后缀命中:两轮各取列表首个,`note.md.md`
+    /// (stem 恰为「note.md」)被精确轮拿走,不因列表序在前的 `a/note.md`
+    /// 剥后缀先命中而错开 —— 既有「列表首个命中」优先级不变。
+    #[test]
+    fn find_by_name_prefers_exact_stem_over_stripped() {
+        let root = vault("priority");
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a/note.md"), "x").unwrap();
+        std::fs::write(root.join("note.md.md"), "x").unwrap();
+        // list_files 按相对路径排序,a/note.md 排在 note.md.md 之前
+        assert_eq!(
+            find_by_name(&root, "note.md"),
+            Some(root.join("note.md.md")),
+            "精确 stem 命中先于剥后缀命中,不被列表顺序抢走"
+        );
+        assert_eq!(
+            find_by_name(&root, "note"),
+            Some(root.join("a/note.md")),
+            "无精确命中时剥后缀轮照旧取列表首个"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 路径式目标口径不动:直取命中照旧;直取不中也不回落到剥后缀的
+    /// 模糊匹配(盘上是 `.markdown` 时,`子目录/Note One.md` 不再被打开)。
+    #[test]
+    fn find_by_name_path_style_targets_do_not_strip_suffix() {
+        let root = vault("path-suffix");
+        assert_eq!(
+            find_by_name(&root, "子目录/Note One.markdown"),
+            Some(root.join("子目录/Note One.markdown")),
+            "原样直取命中(既有行为)"
+        );
+        assert_eq!(
+            find_by_name(&root, "子目录/Note One.md"),
+            None,
+            "路径式不剥后缀:盘上只有 .markdown,直取不中即 None"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
