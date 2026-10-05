@@ -735,6 +735,9 @@ pub enum Message {
     GitCheckoutConfirmed,
     /// 确认模态取消,不触碰工作区。
     GitCheckoutCancelled,
+    /// 切换 Git 页 diff 区视图(#53 M2):双栏/统一。纯显示偏好,不落盘
+    /// (会话内状态,重启回默认双栏),归约只写 `git.diff_view`。
+    GitDiffViewChanged(crate::git_panel::DiffView),
     /// 保存 MCP 配置(设置页 MCP 页「保存」):归一化 → 落 `mcp.json` → 按
     /// 开关起停后台服务(**默认关闭**,开了才监听回环端口)。
     McpConfigSaved(McpConfig),
@@ -971,6 +974,7 @@ impl State {
                 }
             }
             Message::GitCheckoutCancelled => self.git.cancel_checkout(),
+            Message::GitDiffViewChanged(view) => self.git.diff_view = view,
         }
     }
 
@@ -5074,6 +5078,17 @@ mod tests {
         state.apply(Message::GitFileSelected("a.md".to_owned()));
         assert_eq!(state.git.selected.as_deref(), Some("a.md"));
         assert!(state.git.diff.contains("+工作区乱改"), "{}", state.git.diff);
+
+        // #53 M2 视图切换:纯显示偏好,归约只写字段,不动 diff 数据
+        state.apply(Message::GitDiffViewChanged(
+            crate::git_panel::DiffView::Unified,
+        ));
+        assert_eq!(state.git.diff_view, crate::git_panel::DiffView::Unified);
+        assert_eq!(state.git.selected.as_deref(), Some("a.md"), "切换不动选中");
+        state.apply(Message::GitDiffViewChanged(
+            crate::git_panel::DiffView::Split,
+        ));
+        assert_eq!(state.git.diff_view, crate::git_panel::DiffView::Split);
 
         // 过期路径:不顶掉选中
         state.apply(Message::GitFileSelected("stale.md".to_owned()));

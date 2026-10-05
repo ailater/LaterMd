@@ -18,11 +18,13 @@
 use crate::backlink_panel::{jump_target, Backlink, BacklinkState, BacklinkStatus};
 use crate::command::Command;
 use crate::filetree::{DirChildren, FileTreeState, TreeEntry};
-use crate::git_panel::GitPanelState;
+use crate::git_panel::{DiffView, GitPanelState};
+use crate::git_split_diff::{line_no_text, split_rows, SplitRow, MAX_SPLIT_PAIRS};
 use crate::keymap::Keymap;
 use crate::search::{SearchResult, SearchState, SearchStatus, MAX_HITS};
 use crate::state::{Message, SidebarTab};
-use latermd_git::{CommitInfo, FileStatus, StatusKind};
+use crate::ui::tokens::{self, RADIUS_SM, SPACE_XS};
+use latermd_git::{CommitInfo, DiffHunk, DiffLine, DiffLineKind, FileDiff, FileStatus, StatusKind};
 use latermd_md::OutlineItem;
 
 use eframe::egui;
@@ -773,12 +775,15 @@ fn git_panel(panel: &mut egui::Ui, git: &GitPanelState, outbox: &mut Vec<Message
 
     if let Some(selected) = git.selected.as_deref() {
         panel.add_space(4.0);
-        panel.monospace(selected);
-        if git.diff.is_empty() {
-            panel.weak("无文本改动");
-        } else {
-            diff_view(panel, &git.diff);
-        }
+        // 文件名 + 视图切换同一行:文件名等宽,右侧「双栏/统一」两态
+        // 切换(#53 M2),点击发消息、归约写 `git.diff_view`(本层只读)
+        panel.horizontal(|ui| {
+            ui.monospace(selected);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                diff_view_toggle(ui, git.diff_view, outbox);
+            });
+        });
+        diff_area(panel, git);
         if panel.button("回滚此文件…").clicked() {
             outbox.push(Message::GitCheckoutRequested(selected.to_owned()));
         }
@@ -856,6 +861,313 @@ fn diff_view(panel: &mut egui::Ui, diff: &str) {
                 ui.monospace(egui::RichText::new(line).color(color));
             }
         });
+}
+
+/// diff 区(#53 M2):按 `diff_view` 分流。双栏吃结构化 `diff_lines`;
+/// 统一沿用既有 [`diff_view`] 文本路径,行为不变。双栏的兜底口径:结构化
+/// 未就位(选中后取失败)回落统一文本渲染——错误文案、截断提示都在
+/// `diff` 字符串里,可见性不降级(现状口径不破)。
+fn diff_area(panel: &mut egui::Ui, git: &GitPanelState) {
+    match git.diff_view {
+        DiffView::Unified => unified_diff_area(panel, git),
+        DiffView::Split => match &git.diff_lines {
+            Some(file) if file.binary => {
+                panel.weak(latermd_git::DIFF_BINARY_PLACEHOLDER);
+            }
+            // 空 hunks ⇔ 统一侧的空文本(两 API 同源);首行即超 64KB 的
+            // 病态 diff 会空 hunks + truncated,走下面整行渲染 + 提示
+            Some(file) if file.hunks.is_empty() && !file.truncated => {
+                panel.weak("无文本改动");
+            }
+            Some(file) => split_diff_view(panel, file),
+            None => unified_diff_area(panel, git),
+        },
+    }
+}
+
+/// 统一视图的空态判定(既有口径原样):空文本 = 无文本改动。
+fn unified_diff_area(panel: &mut egui::Ui, git: &GitPanelState) {
+    if git.diff.is_empty() {
+        panel.weak("无文本改动");
+    } else {
+        diff_view(panel, &git.diff);
+    }
+}
+
+/// 「双栏/统一」两态切换(#53 M2):当前态高亮,点击发
+/// [`Message::GitDiffViewChanged`]。返回 (双栏, 统一) 的响应矩形供
+/// 测试定位点击(right_to_left 布局里先加的在最右,视觉顺序「双栏 统一」)。
+fn diff_view_toggle(
+    ui: &mut egui::Ui,
+    current: DiffView,
+    outbox: &mut Vec<Message>,
+) -> (egui::Rect, egui::Rect) {
+    let unified = ui.selectable_label(
+        current == DiffView::Unified,
+        egui::RichText::new("统一").small(),
+    );
+    if unified.clicked() {
+        outbox.push(Message::GitDiffViewChanged(DiffView::Unified));
+    }
+    let split = ui.selectable_label(
+        current == DiffView::Split,
+        egui::RichText::new("双栏").small(),
+    );
+    if split.clicked() {
+        outbox.push(Message::GitDiffViewChanged(DiffView::Split));
+    }
+    (split.rect, unified.rect)
+}
+
+/// 双栏 diff 视图(#53 M2):GitHub 式左右对齐。左右各带行号列(右对齐)
+/// 与 +/− 沟槽标记,整行底色增绿删红([`diff_row_bg`]),hunk 头 `@@`
+/// 跨双栏整行;长行单行截断(…)+ 悬停看全文;行对上限
+/// [`MAX_SPLIT_PAIRS`] 超限截断 + 显式提示,防大 diff 卡帧。行对来自
+/// `git_split_diff` 纯配对层;取舍见 docs/decisions-pending #100。
+fn split_diff_view(panel: &mut egui::Ui, file: &FileDiff) {
+    let split = split_rows(file);
+    egui::ScrollArea::vertical()
+        .id_salt("git-diff-split-scroll")
+        .auto_shrink([false, false])
+        .max_height(200.0)
+        .show(panel, |ui| {
+            let geom = RowGeometry::of(ui, file);
+            for row in &split.rows {
+                paint_split_row(ui, row, &geom);
+            }
+        });
+    split_overflow_hints(panel, file, split.dropped_pairs);
+}
+
+/// 双栏视图的截断提示行(M1 的 ~64KB 行级截断 + M2 的行对上限),显式
+/// 告知内容不完整;返回所画提示的合并矩形(无提示返回 `None`,测试断言
+/// 用)。与统一视图「提示在截断文本尾部」同语义,双栏的结构化数据源
+/// 没有尾部可拼,独立成行。
+fn split_overflow_hints(
+    ui: &mut egui::Ui,
+    file: &FileDiff,
+    dropped_pairs: usize,
+) -> Option<egui::Rect> {
+    let mut rect = None;
+    if file.truncated {
+        rect = Some(ui.weak(latermd_git::DIFF_TRUNCATION_PLACEHOLDER).rect);
+    }
+    if dropped_pairs > 0 {
+        let hint = ui.weak(format!(
+            "…还有 {dropped_pairs} 行对未显示(双栏视图上限 {MAX_SPLIT_PAIRS})"
+        ));
+        rect = Some(match rect {
+            Some(previous) => previous.union(hint.rect),
+            None => hint.rect,
+        });
+    }
+    rect
+}
+
+/// 一帧双栏渲染的公共几何(等宽字体、行高、行号列宽、沟槽宽)。行号列
+/// 宽按双侧最大行号的位数 × 数字宽计算(`ui::gutter` 同款,位数跨档才
+/// 变宽,右对齐不抖)。
+struct RowGeometry {
+    /// 等宽字体(Monospace 档,#50 的 editor-mono 族经投影同源)。
+    font: egui::FontId,
+    /// 单行行高(行盒恒定,配对行不因内容折行变高——长行走截断)。
+    row_height: f32,
+    /// 行号列宽(含右侧留白)。
+    gutter_w: f32,
+    /// +/− 沟槽列宽。
+    sign_w: f32,
+    /// 行号前景(弱化)。
+    weak: egui::Color32,
+}
+
+impl RowGeometry {
+    fn of(ui: &egui::Ui, file: &FileDiff) -> Self {
+        let font = egui::FontSelection::Style(egui::TextStyle::Monospace).resolve(ui.style());
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let digit = ui.fonts_mut(|fonts| fonts.glyph_width(&font, '0'));
+        // 双侧最大行号:hunk 头的范围和就是行号覆盖上界
+        let max_lineno = file.hunks.iter().fold(0u32, |acc, hunk| {
+            acc.max(hunk.old_start.saturating_add(hunk.old_lines))
+                .max(hunk.new_start.saturating_add(hunk.new_lines))
+        });
+        let digits = digit_count(max_lineno);
+        Self {
+            gutter_w: digits as f32 * digit + 2.0 * SPACE_XS,
+            sign_w: digit + SPACE_XS,
+            font,
+            row_height,
+            weak: ui.visuals().weak_text_color(),
+        }
+    }
+}
+
+/// 总行号 → 十进制位数(0 至少 1 位;`ui::gutter` 同款算法,双栏行号列
+/// 自用一份——gutter 的是 crate 私有)。
+fn digit_count(mut n: u32) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// 双栏行底色:语义色(增 [`tokens::OK`]/删 [`tokens::DANGER`])向面板
+/// 底色(`visuals().panel_fill`)的伽马插值,**单一公式**明暗两主题各自
+/// 成立——明色下 ≈ GitHub #e6ffec/#ffebe0 的淡着色观感,暗色自然得到
+/// 深绿/深红,不是两套硬编码取色。浓淡只由 [`DIFF_ROW_TINT`] 一个常量
+/// 控制。
+fn diff_row_bg(ui: &egui::Ui, tint: egui::Color32) -> egui::Color32 {
+    tint.lerp_to_gamma(ui.visuals().panel_fill, 1.0 - DIFF_ROW_TINT)
+}
+
+/// 行底色的语义色占比(0..1):16% 增/删语义色 + 84% 面板底色,明暗主题
+/// 下都在「可读出着色语义」与「不压正文对比」之间(数值推断,真机目视
+/// 留人工,见 #53 notes)。
+const DIFF_ROW_TINT: f32 = 0.16;
+
+/// 双栏一侧(左 = 旧侧,右 = 新侧)。
+enum DiffSide {
+    /// 左栏:上下文行与删除行。
+    Old,
+    /// 右栏:上下文行与新增行。
+    New,
+}
+
+/// 画双栏的一行:hunk 头跨整行(淡底 + `@@` 蓝),行对左右各画一侧。
+/// 布局始终推进(行盒恒定),绘制做视口裁剪(`is_rect_visible`,与
+/// `ui::gutter` 同精神)。返回行响应(悬停全文挂在其上,测试用它取行
+/// 矩形)。
+fn paint_split_row(ui: &mut egui::Ui, row: &SplitRow<'_>, geom: &RowGeometry) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, geom.row_height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    match row {
+        SplitRow::Header(hunk) => {
+            ui.painter()
+                .rect_filled(rect.shrink(0.5), RADIUS_SM, ui.visuals().faint_bg_color);
+            ui.painter().text(
+                egui::pos2(rect.left() + SPACE_XS, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                hunk_header_text(hunk),
+                geom.font.clone(),
+                DIFF_HUNK,
+            );
+        }
+        SplitRow::Pair { old, new } => {
+            let half = rect.width() / 2.0;
+            let left = egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + half, rect.bottom()),
+            );
+            let right = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + half, rect.top()),
+                rect.right_bottom(),
+            );
+            let elided_old = paint_split_side(ui, left, *old, DiffSide::Old, geom);
+            let elided_new = paint_split_side(ui, right, *new, DiffSide::New, geom);
+            // 长行被截断的一侧:悬停看全文(整行响应挂 tooltip,两则并排)
+            match (elided_old, elided_new) {
+                (None, None) => {}
+                (old_text, new_text) => {
+                    let mut tooltip = String::new();
+                    if let Some(text) = old_text {
+                        tooltip.push_str(&format!("− {text}\n"));
+                    }
+                    if let Some(text) = new_text {
+                        tooltip.push_str(&format!("+ {text}"));
+                    }
+                    return response.on_hover_text(tooltip.trim_end());
+                }
+            }
+        }
+    }
+    response
+}
+
+/// 画双栏一侧:整侧底色(删除红/新增绿)+ 行号(右对齐弱化)+ 沟槽标记
+/// (+/−)+ 正文(等宽、单行截断)。返回被截断一侧的全文(悬停提示用;
+/// 未截断/空侧返回 `None`)。行内不做 byte 切:截断由 epaint 的 elision
+/// 在字形层完成,char 边界天然安全。
+fn paint_split_side(
+    ui: &egui::Ui,
+    cell: egui::Rect,
+    line: Option<&DiffLine>,
+    side: DiffSide,
+    geom: &RowGeometry,
+) -> Option<String> {
+    let line = line?;
+    // 配对层保证:左栏只收上下文/删除行,右栏只收上下文/新增行
+    let (lineno, marker, bg) = match (side, line.kind) {
+        (DiffSide::Old, DiffLineKind::Context) => (line.old_lineno, None, None),
+        (DiffSide::Old, DiffLineKind::Deleted) => (
+            line.old_lineno,
+            Some(('−', DIFF_REMOVED)),
+            Some(diff_row_bg(ui, tokens::DANGER)),
+        ),
+        (DiffSide::New, DiffLineKind::Context) => (line.new_lineno, None, None),
+        (DiffSide::New, DiffLineKind::Added) => (
+            line.new_lineno,
+            Some(('+', DIFF_ADDED)),
+            Some(diff_row_bg(ui, tokens::OK)),
+        ),
+        // 删除行画右栏/新增行画左栏:配对层不产生,防御跳过
+        _ => return None,
+    };
+    let painter = ui.painter();
+    if let Some(bg) = bg {
+        painter.rect_filled(cell, 0.0, bg);
+    }
+    // 行号:右对齐贴行号列右缘(空侧 = 空串,不画)
+    let lineno_text = line_no_text(lineno);
+    if !lineno_text.is_empty() {
+        painter.text(
+            egui::pos2(cell.left() + geom.gutter_w - SPACE_XS, cell.center().y),
+            egui::Align2::RIGHT_CENTER,
+            lineno_text,
+            geom.font.clone(),
+            geom.weak,
+        );
+    }
+    // 沟槽标记:行号列右侧一格
+    if let Some((marker, color)) = marker {
+        painter.text(
+            egui::pos2(cell.left() + geom.gutter_w, cell.center().y),
+            egui::Align2::LEFT_CENTER,
+            marker.to_string(),
+            geom.font.clone(),
+            color,
+        );
+    }
+    // 正文:单行截断(…);悬停全文由调用方挂行响应
+    let text_width = (cell.width() - geom.gutter_w - geom.sign_w - SPACE_XS).max(0.0);
+    let mut job = egui::text::LayoutJob::simple(
+        line.text.clone(),
+        geom.font.clone(),
+        ui.visuals().text_color(),
+        text_width,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let pos = egui::pos2(
+        cell.left() + geom.gutter_w + geom.sign_w,
+        cell.center().y - galley.size().y / 2.0,
+    );
+    let elided = galley.elided;
+    painter.galley(pos, galley, ui.visuals().text_color());
+    elided.then(|| line.text.clone())
+}
+
+/// hunk 头文本:`@@ -old_start,old_lines +new_start,new_lines @@`(与
+/// unified 输出同格式;单行范围也带计数,不追 git 的省略逗号形态)。
+fn hunk_header_text(hunk: &DiffHunk) -> String {
+    format!(
+        "@@ -{},{} +{},{} @@",
+        hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+    )
 }
 
 /// 状态角标配色:M 黄(改)、A 绿(增)、U/D 红(冲突/删)、? 灰(未跟踪)。
@@ -1631,6 +1943,338 @@ mod tests {
             git_panel(ui, &truncated, &mut Vec::new());
         })
         .drop_without_applying_deltas();
+    }
+
+    /// #53 M2 探针共享 fixture:1 个 hunk(上下文行 + 删除行 + 新增行)。
+    /// 配对层产出 = hunk 头 + 上下文对 + (删除|新增) 同对。
+    fn split_fixture() -> FileDiff {
+        FileDiff {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec![
+                    DiffLine {
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        kind: DiffLineKind::Context,
+                        text: "上下文".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: Some(2),
+                        new_lineno: None,
+                        kind: DiffLineKind::Deleted,
+                        text: "旧".to_owned(),
+                    },
+                    DiffLine {
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                        kind: DiffLineKind::Added,
+                        text: "新".to_owned(),
+                    },
+                ],
+            }],
+            binary: false,
+            truncated: false,
+        }
+    }
+
+    /// #53 M2 双栏渲染探针(像素采样,#38/#50 先例):已知 diff 逐行画进
+    /// 无头帧,帧后 tessellate 取最终覆盖色——(删除|新增) 对左半红系、
+    /// 右半绿系、上下文行两侧无整行底色、行号列有墨;行对数与行高恒定。
+    /// 明暗两主题各跑一轮(不 panic + 语义都成立)。
+    #[test]
+    fn split_diff_rows_paint_semantic_backgrounds_in_both_themes() {
+        use crate::preview_pixel_acceptance::{color_dist, final_covered_color};
+        use egui::epaint::Mesh;
+        use egui::UiBuilder;
+
+        let file = split_fixture();
+        let split = crate::git_split_diff::split_rows(&file);
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            // 关羽化(#41 同款):透明渐变边缘会污染采样读色
+            ctx.options_mut(|o| o.tessellation_options.feathering = false);
+            let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 300.0));
+            let mut rects: Vec<Rect> = Vec::new();
+            let mut gutter_w = 0.0;
+            let mut panel_fill = egui::Color32::BLACK;
+            let mut output = ctx.run_ui(RawInput::default(), |panel| {
+                panel_fill = panel.visuals().panel_fill;
+                let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+                let geom = RowGeometry::of(&ui, &file);
+                gutter_w = geom.gutter_w;
+                for row in &split.rows {
+                    rects.push(paint_split_row(&mut ui, row, &geom).rect);
+                }
+            });
+            let clipped = std::mem::take(&mut output.shapes);
+            let primitives = ctx.tessellate(clipped, 1.0);
+            output.drop_without_applying_deltas();
+            let meshes: Vec<&Mesh> = primitives
+                .iter()
+                .filter_map(|cp| match &cp.primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
+                    _ => None,
+                })
+                .collect();
+            let theme = if dark { "暗色" } else { "亮色" };
+
+            // 行对数与行盒:1 hunk 头 + 上下文对 + (删除|新增) 对,行高恒定
+            assert_eq!(rects.len(), 3, "{theme}:hunk 头 + 2 行对");
+            let row_h = rects[0].height();
+            assert!(row_h > 0.0);
+            assert!(
+                rects.iter().all(|r| r.height() == row_h),
+                "{theme}:行盒恒定(长行走截断,不折行)"
+            );
+
+            // 底色采样:每半的近右缘(远离行号/沟槽/短正文,纯底色区)
+            let sample = |p: egui::Pos2| final_covered_color(&meshes, p);
+            let edge = |row: Rect, half: f32, right: bool| {
+                let x = if right {
+                    row.left() + 2.0 * half - 6.0
+                } else {
+                    row.left() + half - 6.0
+                };
+                sample(egui::pos2(x, row.center().y))
+            };
+            // 上下文对:两侧都不画整行底(露画布或面板底色)
+            let context = rects[1];
+            let half = context.width() / 2.0;
+            for right in [false, true] {
+                assert!(
+                    edge(context, half, right).is_none_or(|c| color_dist(c, panel_fill) <= 12),
+                    "{theme}:上下文行不该有语义底色({right:?})"
+                );
+            }
+            // (删除|新增) 对:左半红系、右半绿系,都区别于面板底色
+            let pair = rects[2];
+            let half = pair.width() / 2.0;
+            let left_bg = edge(pair, half, false).expect("删除侧画了整行底");
+            let right_bg = edge(pair, half, true).expect("新增侧画了整行底");
+            assert!(
+                color_dist(left_bg, panel_fill) > 35,
+                "{theme}:删除侧红系着色 {left_bg:?} vs {panel_fill:?}"
+            );
+            assert!(
+                i32::from(left_bg.r()) - i32::from(left_bg.g()) > 8,
+                "{theme}:删除侧偏红 {left_bg:?}"
+            );
+            assert!(
+                color_dist(right_bg, panel_fill) > 35,
+                "{theme}:新增侧绿系着色 {right_bg:?} vs {panel_fill:?}"
+            );
+            assert!(
+                i32::from(right_bg.g()) - i32::from(right_bg.r()) > 8,
+                "{theme}:新增侧偏绿 {right_bg:?}"
+            );
+
+            // 行号列有墨:(删除|新增) 对两侧行号槽(右对齐数字)至少一个采样
+            // 点被文本覆盖,且颜色可与本侧底色区分
+            for right in [false, true] {
+                let cell_left = pair.left() + if right { half } else { 0.0 };
+                let side_bg = if right { right_bg } else { left_bg };
+                let mut ink = false;
+                let mut x = cell_left + 4.0;
+                while x <= cell_left + gutter_w - 2.0 {
+                    if let Some(color) = sample(egui::pos2(x, pair.center().y)) {
+                        if color_dist(color, side_bg) > 40 {
+                            ink = true;
+                            break;
+                        }
+                    }
+                    x += 2.0;
+                }
+                assert!(ink, "{theme}:行号列应有墨(right={right})");
+            }
+        }
+    }
+
+    /// #53 M2 视图切换:双栏/统一两视图都渲染非空;结构化通道未就位
+    /// (`diff_lines = None`)时双栏回落统一文本,错误文案在 diff 区仍可见
+    /// (现状口径不破);空 hunks 双栏给「无文本改动」。
+    #[test]
+    fn diff_area_renders_nonempty_in_both_views_with_fallback() {
+        use egui::UiBuilder;
+
+        let mut git = GitPanelState::default();
+        git.entries.push(FileStatus {
+            path: "a.md".to_owned(),
+            code: StatusKind::Modified,
+        });
+        git.selected = Some("a.md".to_owned());
+        git.diff = "@@ -1,2 +1,2 @@\n-旧\n+新\n".to_owned();
+        git.diff_lines = Some(split_fixture());
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 600.0));
+        let mut heights = Vec::new();
+        for view in [DiffView::Split, DiffView::Unified] {
+            git.diff_view = view;
+            let mut height = 0.0;
+            ctx.run_ui(RawInput::default(), |panel| {
+                let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+                diff_area(&mut ui, &git);
+                height = ui.min_rect().height();
+            })
+            .drop_without_applying_deltas();
+            heights.push(height);
+        }
+        assert!(heights[0] > 20.0, "双栏渲染非空:{}", heights[0]);
+        assert!(heights[1] > 20.0, "统一渲染非空:{}", heights[1]);
+
+        // 结构化取失败(diff_lines=None)+ diff=错误文案:回落统一文本渲染
+        git.diff_view = DiffView::Split;
+        git.diff_lines = None;
+        git.diff = "生成 diff 失败: 病态仓库".to_owned();
+        let mut height = 0.0;
+        ctx.run_ui(RawInput::default(), |panel| {
+            let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+            diff_area(&mut ui, &git);
+            height = ui.min_rect().height();
+        })
+        .drop_without_applying_deltas();
+        assert!(height > 10.0, "错误文案在双栏视图仍可见:{}", height);
+
+        // 空 hunks(无文本改动):「无文本改动」占位,不 panic
+        git.diff_lines = Some(FileDiff {
+            hunks: Vec::new(),
+            binary: false,
+            truncated: false,
+        });
+        ctx.run_ui(RawInput::default(), |panel| {
+            let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+            diff_area(&mut ui, &git);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    /// #53 M2 切换按钮:点击「双栏/统一」发 [`Message::GitDiffViewChanged`],
+    /// 当前态高亮由 `selectable_label` 自带;仅渲染不产消息。
+    #[test]
+    fn diff_view_toggle_clicks_send_messages() {
+        let ctx = egui::Context::default();
+        let mut outbox = Vec::new();
+        let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+
+        // 帧 1:当前统一(双栏未选中)——仅渲染不产消息,顺带拿按钮矩形
+        ctx.run_ui(RawInput::default(), |ui| {
+            rects.set(diff_view_toggle(ui, DiffView::Unified, &mut outbox));
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+        let (split_rect, unified_rect) = rects.get();
+        assert!(split_rect.width() > 0.0 && unified_rect.width() > 0.0);
+
+        // 帧 2:点「双栏」→ GitDiffViewChanged(Split)
+        let center = split_rect.center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                diff_view_toggle(ui, DiffView::Unified, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::GitDiffViewChanged(DiffView::Split)],
+            "{outbox:?}"
+        );
+
+        // 帧 3:点「统一」(当前已是双栏)→ GitDiffViewChanged(Unified)
+        outbox.clear();
+        let center = unified_rect.center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                diff_view_toggle(ui, DiffView::Split, &mut outbox);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::GitDiffViewChanged(DiffView::Unified)],
+            "{outbox:?}"
+        );
+    }
+
+    /// #53 M2 行对上限:超限的大 diff 双栏渲染不 panic(视口裁剪),显式
+    /// 提示行非空;未超限且 M1 未截断时无提示。
+    #[test]
+    fn split_view_cap_renders_hint_and_big_diff_does_not_panic() {
+        use egui::UiBuilder;
+
+        // MAX+5 行上下文 → 配对层截到 MAX、dropped 5(纯层已钉,此处验渲染)
+        let file = FileDiff {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: (MAX_SPLIT_PAIRS + 5) as u32,
+                new_start: 1,
+                new_lines: (MAX_SPLIT_PAIRS + 5) as u32,
+                lines: (1..=(MAX_SPLIT_PAIRS + 5) as u32)
+                    .map(|n| DiffLine {
+                        old_lineno: Some(n),
+                        new_lineno: Some(n),
+                        kind: DiffLineKind::Context,
+                        text: format!("行{n}"),
+                    })
+                    .collect(),
+            }],
+            binary: false,
+            truncated: false,
+        };
+        let split = crate::git_split_diff::split_rows(&file);
+        assert_eq!(split.dropped_pairs, 5, "纯层口径先验一把");
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 300.0));
+        let mut height = 0.0;
+        let mut hint = None;
+        ctx.run_ui(RawInput::default(), |panel| {
+            let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+            split_diff_view(&mut ui, &file);
+            height = ui.min_rect().height();
+            hint = split_overflow_hints(&mut ui, &file, split.dropped_pairs);
+        })
+        .drop_without_applying_deltas();
+        assert!(height > 100.0, "2000 行对的大 diff 渲染出内容:{}", height);
+        let hint = hint.expect("超限必有提示行");
+        assert!(hint.width() > 0.0 && hint.height() > 0.0);
+
+        // 未超限且 M1 未截断:无提示行
+        let small = split_fixture();
+        let mut none = None;
+        ctx.run_ui(RawInput::default(), |panel| {
+            let mut ui = panel.new_child(UiBuilder::new().max_rect(screen));
+            none = split_overflow_hints(&mut ui, &small, 0);
+        })
+        .drop_without_applying_deltas();
+        assert!(none.is_none(), "未截断不该有提示");
     }
 
     /// #40 单行截断:窄栏(120px)下长中文文件名行不换行——行高与同栏

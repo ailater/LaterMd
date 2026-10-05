@@ -21,11 +21,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use latermd_git::{CommitInfo, FileStatus, StatusKind};
+use latermd_git::{CommitInfo, FileDiff, FileStatus, StatusKind};
 
 /// Git 状态自动刷新间隔。3s 在「角标足够新」与「零感开销」之间取中:
 /// 每次刷新是两次毫秒级本地读(status + log),空闲时每 3s 唤醒一帧。
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Git 页 diff 区的视图模式(#53 M2):双栏对比(默认)或统一文本。
+///
+/// 会话内状态,**不持久化**——重启回默认双栏;取舍见
+/// docs/decisions-pending #100。统一视图沿用既有文本渲染路径,行为不变。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DiffView {
+    /// 双栏对比(默认):GitHub 式左右对齐,左删右增,行对配对见
+    /// `git_split_diff`。
+    #[default]
+    Split,
+    /// 统一文本:既有单栏路径(`Self::diff` 的逐行着色渲染)。
+    Unified,
+}
 
 /// Git 面板状态:一次刷新的快照(status/log/diff 缓存)+ 确认式回滚。
 ///
@@ -56,6 +70,13 @@ pub struct GitPanelState {
     /// 选中文件的 diff 文本(错误文案也进这里,只读区直接可见);
     /// 空串 = 无文本改动。
     pub diff: String,
+    /// 选中文件的结构化行级 diff(`latermd_git::diff_file_lines` 的结果,
+    /// #53 M2 双栏视图的数据源);`None` = 未取到(选中失效或结构化 API
+    /// 失败——后者时双栏回落渲染 `diff` 文本,错误文案仍进 diff 区可见,
+    /// 现状口径不破)。与 `diff` 在 [`Self::reload_diff`] 同步双取。
+    pub diff_lines: Option<FileDiff>,
+    /// diff 区视图模式(#53 M2):双栏(默认)/统一;会话内切换,不持久化。
+    pub diff_view: DiffView,
     /// 待确认回滚的文件(相对仓库根);`Some` = 确认模态可见。
     pub confirm_checkout: Option<String>,
     /// 下次自动刷新时刻;到点由归约侧轮询触发(见模块文档)。
@@ -75,6 +96,8 @@ impl Default for GitPanelState {
             fetched_at: 0,
             selected: None,
             diff: String::new(),
+            diff_lines: None,
+            diff_view: DiffView::Split,
             confirm_checkout: None,
             refresh_due: Instant::now(),
         }
@@ -129,6 +152,7 @@ impl GitPanelState {
             } else {
                 self.selected = None;
                 self.diff.clear();
+                self.diff_lines = None;
             }
         }
         self.entries = snapshot.entries;
@@ -203,18 +227,28 @@ impl GitPanelState {
         self.commits.clear();
         self.selected = None;
         self.diff.clear();
+        self.diff_lines = None;
         self.confirm_checkout = None;
     }
 
-    /// 按当前选中项重读 diff。
+    /// 按当前选中项重读 diff(#53 M2 起双取):`diff_file` 的统一文本维持
+    /// 既有口径(错误文案进 `diff` 只读区可见),`diff_file_lines` 的结构化
+    /// 结果喂双栏视图。两 API 基于同一份 libgit2 diff,毫秒级本地读,
+    /// 双取成本可忽略;结构化侧失败只置 `None`(双栏回落统一文本渲染)。
     fn reload_diff(&mut self) {
-        self.diff = match (&self.repo_root, &self.selected) {
-            (Some(root), Some(path)) => match latermd_git::diff_file(root, path) {
-                Ok(text) => text,
-                Err(error) => error, // 错误文案进只读区,用户可见
-            },
-            _ => String::new(),
-        };
+        match (&self.repo_root, &self.selected) {
+            (Some(root), Some(path)) => {
+                self.diff = match latermd_git::diff_file(root, path) {
+                    Ok(text) => text,
+                    Err(error) => error, // 错误文案进只读区,用户可见
+                };
+                self.diff_lines = latermd_git::diff_file_lines(root, path).ok();
+            }
+            _ => {
+                self.diff.clear();
+                self.diff_lines = None;
+            }
+        }
     }
 }
 
@@ -372,6 +406,40 @@ mod tests {
         );
 
         // 无改动的文件不在列表里,选不中;列表外的干净文件没有 diff 区
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #53 M2 双取通道:选中后 `diff`(统一文本)与 `diff_lines`(结构化)
+    /// 同帧就位且内容一致(同一处改动两套口径都可见);默认视图是双栏;
+    /// 选中项随 clean 失效时两条通道一起清空。
+    #[test]
+    fn select_fills_both_diff_channels_and_split_is_default() {
+        let dir = temp_repo("dual-diff");
+        std::fs::write(dir.join("a.md"), "HEAD 版本\n新行\n").unwrap();
+
+        let mut git = GitPanelState::default();
+        assert_eq!(git.diff_view, DiffView::Split, "默认双栏");
+        assert_eq!(git.diff_lines, None, "未选中无结构化 diff");
+        git.refresh(Some(&dir));
+        git.select("a.md");
+        assert!(git.diff.contains("+新行"), "{}", git.diff);
+        let structured = git.diff_lines.as_ref().expect("结构化通道就位");
+        assert!(!structured.hunks.is_empty(), "同一处改动结构化可见");
+        assert!(
+            structured
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.kind == latermd_git::DiffLineKind::Added && line.text == "新行"),
+            "{structured:?}"
+        );
+
+        // 回滚到 HEAD → 选中项失效,两条通道一起清空
+        git.request_checkout("a.md".to_owned());
+        git.confirm_checkout(Some(&dir));
+        assert_eq!(git.selected, None);
+        assert_eq!(git.diff, "");
+        assert_eq!(git.diff_lines, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
