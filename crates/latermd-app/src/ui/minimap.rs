@@ -1296,6 +1296,72 @@ mod tests {
         );
     }
 
+    /// ⑤-3b 评审修复回归:窄条最右的滚动条避让区**命中也让**。修复前
+    /// minimap 的 interact 区盖满整条 108px 且注册在 ScrollArea 之后,同层
+    /// 命中 tie 恒胜,滚动条 handle 既 hover 不到也拖不动。修复后避让区内
+    /// 的按下/拖动归滚动条:offset 前进,minimap 跳转意图一次都不写。
+    #[test]
+    fn scrollbar_reserve_stays_interactive_over_minimap() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let map = viewport_rect(&shapes).expect("高亮框定位窄条");
+
+        // 避让宽与生产同源(当帧样式的 bar_width + bar_outer_margin;测试
+        // 未改样式,取 Style::default 同值)。取样点在避让区中点:既在
+        // 滚动条 interact 区内,又远离 minimap 命中边界 5px,两侧都不贴边。
+        let scroll = egui::Style::default().spacing.scroll;
+        let reserve = scroll.bar_width + scroll.bar_outer_margin;
+        assert!(
+            (reserve - 10.0).abs() < 0.5,
+            "默认 floating 样式的避让宽 = 10px(实测 {reserve})"
+        );
+        let grab = egui::pos2(map.right() - reserve * 0.5, 300.0);
+
+        // 按下并拖到下方:滚动条 handle 抓住指针逐帧跟(offset 直接重
+        // 映射,无动画),视口应被推下去
+        frame(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(grab),
+                egui::Event::PointerButton {
+                    pos: grab,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &ctx,
+            &mut editor,
+            0.3,
+            true,
+            vec![egui::Event::PointerMoved(egui::pos2(grab.x, 520.0))],
+        );
+        let offset: f32 = ctx
+            .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+            .map_or(0.0, |m| m.offset);
+        assert!(
+            offset > 100.0,
+            "避让区内拖动由滚动条承接,视口前进(实测 offset {offset})"
+        );
+        assert!(
+            ctx.data(|d| d.get_temp::<f32>(jump_id(id))).is_none(),
+            "避让区内的按下/拖动不写 minimap 跳转意图(命中真让出去了)"
+        );
+    }
+
     /// ⑤-4 10000 行档连续滚动若干帧无 panic,行模型缓存命中(存储指针
     /// 纹丝不动 = 无逐帧全量重建)。
     #[test]

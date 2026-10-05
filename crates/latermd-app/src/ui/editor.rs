@@ -383,10 +383,21 @@ pub fn ui(
     // minimap 交互注册(#55 M2):排在 ScrollArea 之后注册 → 同层居上,
     // 点击/拖动不会被 ScrollArea 的背景拖拽抢走。命中即把指针 y(相对
     // 窄条顶)写进 jump temp,下一帧闭包开头消费落地;拖动每帧覆写,
-    // 滚动逐帧跟随。窄条最右 10px 让给滚动条(它画得更靠右缘)。
+    // 滚动逐帧跟随。窄条最右 10px 让给滚动条(它画得更靠右缘)——不光
+    // 绘制避让,**命中也避让**:滚动条 handle 的 interact 在 ScrollArea::
+    // end 内先注册、sense 同为 CLICK|DRAG 且贴视口右缘整条 bar_width 宽,
+    // egui 同层命中 tie 取后注册者,minimap 的 interact 区若不在右缘收回
+    // 这一条,滚动条的 hover/拖拽就永远被压住。避让宽取当帧样式的
+    // bar_width + bar_outer_margin(默认 floating = 10px,与绘制口径一致)。
     if let Some(map_rect) = minimap_rect {
+        let scroll = &panel.style().spacing.scroll;
+        let scrollbar_w = scroll.bar_width + scroll.bar_outer_margin;
+        let hit_rect = egui::Rect::from_min_max(
+            map_rect.min,
+            egui::pos2(map_rect.right() - scrollbar_w, map_rect.bottom()),
+        );
         let response = panel.interact(
-            map_rect,
+            hit_rect,
             editor_id.with("minimap"),
             egui::Sense::click_and_drag(),
         );
