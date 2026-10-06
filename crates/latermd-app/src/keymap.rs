@@ -648,6 +648,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 跳转命令(#60 M1)进出厂默认表;旧 `keymap.json` 的增量迁移只给
+    /// **缺失**的 command id 补默认,用户已有绑定绝不覆盖(与替换命令
+    /// 同一口径,#17)。
+    #[test]
+    fn goto_line_default_and_incremental_migration() {
+        // 出厂默认:Ctrl/Cmd+G
+        assert_eq!(
+            Keymap::builtin().get(Command::GotoLine),
+            Some(shortcut(Key::G))
+        );
+
+        let dir = std::env::temp_dir().join(format!("latermd-keymap-goto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧版 json(跳转命令尚不存在时的形态):无 goto_line 条目
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::GotoLine),
+            Some(shortcut(Key::G)),
+            "缺失 id 补默认,旧配置无需手动重置"
+        );
+        assert_eq!(
+            loaded.get(Command::Save),
+            Some(shortcut(Key::S)),
+            "既有条目原样保留"
+        );
+
+        // 用户已改绑:load_from 不得用默认值覆盖
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"goto_line": "Ctrl+J"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        assert_eq!(
+            loaded.get(Command::GotoLine),
+            Some(shortcut(Key::J)),
+            "用户绑定不被默认覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Alt 的平台显示(#45 K1):Win/Linux = `Alt+T`,mac = `⌥+T`(与 egui
     /// `format_shortcut` 的 mac 符号口径对齐);按编译目标断言,两侧都在
     /// 各自平台的 CI 上跑。

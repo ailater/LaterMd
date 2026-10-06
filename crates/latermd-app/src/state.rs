@@ -255,6 +255,17 @@ pub struct FindBarState {
     pub(crate) scanned_for: Option<(u64, u64)>,
 }
 
+/// 「跳转到行」浮条状态(#60 M1,Ctrl+G):全局一条(与查找条同款,不随
+/// 标签),`input` 是行号草稿(UI 原地持有,与替换词同款分工)。回车经
+/// [`Message::GotoLineRequested`] 在归约里钳制并跳转,跳成后浮条关闭;
+/// 与查找条互斥(decisions-pending #113):一侧打开即收起另一侧。
+#[derive(Debug, Default, PartialEq)]
+pub struct GotoBarState {
+    pub open: bool,
+    /// 行号输入草稿;打开时清空,非数字回车在 UI 侧拦下(不发消息)。
+    pub input: String,
+}
+
 pub struct State {
     /// 外壳布局(左右两栏展开与否 + 左栏视图 + `layout.json` 存档,
     /// docs/ui-shell-redesign.md §10)。`left` / `right` 直接喂给各自
@@ -270,6 +281,8 @@ pub struct State {
     /// 缓存随 query/文档变化重扫;跳转经 `pending_selection`(字符偏移,
     /// 与格式动作同一契约)。
     pub find: FindBarState,
+    /// 「跳转到行」浮条(#60 M1,Ctrl+G):全局一条,与查找条互斥。
+    pub goto: GotoBarState,
     /// 「快速打开」浮层(#24,Cmd/Ctrl+P):open/query/selected 与文件
     /// 候选快照。查询词与选中下标归 UI 原地持有(与 `image_dialog` /
     /// `emoji` 持草稿同款分工),开关与快照在归约([`Message::ToggleQuickOpen`]
@@ -427,6 +440,7 @@ impl Default for State {
             layout_written: LayoutSettings::default(),
             tabs: TabsState::new(SAMPLE_MD),
             find: FindBarState::default(),
+            goto: GotoBarState::default(),
             quick_open: QuickOpenState::default(),
             ai_active_tab: None,
             file_tree: FileTreeState::default(),
@@ -602,6 +616,15 @@ pub enum Message {
     ReplaceCurrent,
     /// 全部替换:按当前命中一次写入(单条 undo),随后重扫。
     ReplaceAllInDoc,
+    /// 「跳转到行」浮条开/关(#60 M1,Ctrl+G):开时清行号草稿并收起查找
+    /// 条(两者互斥,decisions-pending #113);关即关(Esc / ✕)。
+    GotoBarToggled(bool),
+    /// 跳转到行,载荷为 1 起行号(UI 侧已解析,非数字不发):归约里钳制到
+    /// 1..=总行数、光标落该行行首(`cursor.jump_to`),浮条关闭。空文档
+    /// 总行数为 1,任何载荷都跳第 1 行。
+    GotoLineRequested {
+        line: usize,
+    },
     SearchQueryChanged,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
@@ -856,6 +879,8 @@ impl State {
             Message::ReplaceBarToggled(open) => self.toggle_replace(open),
             Message::ReplaceCurrent => self.replace_current(),
             Message::ReplaceAllInDoc => self.replace_all_in_doc(),
+            Message::GotoBarToggled(open) => self.toggle_goto(open),
+            Message::GotoLineRequested { line } => self.goto_line(line),
             Message::ImageDialogOpened => self.open_image_dialog(),
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
@@ -1460,10 +1485,12 @@ impl State {
     }
 
     /// 查找条开/关:开时按当前选区预填查找词(选中即所要找的,编辑器
-    /// 惯例)并重扫;关时清定位。
+    /// 惯例)并重扫;关时清定位。开时收起「跳转到行」浮条(两者互斥,
+    /// decisions-pending #113)。
     fn toggle_find(&mut self, open: bool) {
         self.find.open = open;
         if open {
+            self.goto.open = false;
             let tab = self.tabs.current();
             if let Some((start, stop)) = tab.selection {
                 let (start, stop) = (start.min(stop), start.max(stop));
@@ -1577,6 +1604,36 @@ impl State {
             self.toggle_find(true);
         }
         self.find.replace_open = open;
+    }
+
+    /// 「跳转到行」浮条开/关(#60 M1,Ctrl+G)。开时清行号草稿并收起
+    /// 查找条(含替换行,与 Esc 关整条同款清理;两者互斥,decisions-
+    /// pending #113);关即关,不动其他浮层。
+    fn toggle_goto(&mut self, open: bool) {
+        self.goto.open = open;
+        if open {
+            self.goto.input.clear();
+            self.find.open = false;
+            self.find.replace_open = false;
+            self.find.hit = None;
+        }
+    }
+
+    /// 跳转到行(#60 M1,`Message::GotoLineRequested` 的归约):1 起行号
+    /// 钳制到 1..=总行数(总行数与源码行号槽同一口径:1 + '\n' 数,空
+    /// 文档 = 1),越界钳最近端;光标落该行行首 —— 经
+    /// [`OutlineCursor::jump_to`] 交给 `ui::editor`(源码模式:覆写持久
+    /// 光标 + scroll_to_rect 滚动,大纲/搜索跳转同一通道)或 `live::ui`
+    /// (Live 模式:切块 + `pending_caret` 路由)。本函数不写文本,缓冲
+    /// 与撤销栈分毫不动;跳成后浮条关闭(输入一并清空)。
+    fn goto_line(&mut self, raw: usize) {
+        let tab = self.tabs.current_mut();
+        let total = 1 + tab.editor.text().bytes().filter(|b| *b == b'\n').count();
+        let line = raw.clamp(1, total);
+        let byte = tab.editor.line_to_byte(line - 1);
+        tab.cursor.jump_to = Some(tab.editor.byte_to_char(byte));
+        self.goto.open = false;
+        self.goto.input.clear();
     }
 
     /// 替换前刷新过期的命中缓存(#17 评审修复):`hits`/`hit` 只在查找词
@@ -7574,6 +7631,89 @@ mod tests {
             state.find.open && !state.find.replace_open,
             "Ctrl+F 打开不带替换行"
         );
+    }
+
+    /// 跳转浮条开/关与互斥(#60 M1):Ctrl+G 开浮条清草稿并收查找条;
+    /// Ctrl+F 开查找条收浮条;Esc 关浮条不动查找条(本来就关)。
+    #[test]
+    fn goto_bar_toggle_semantics_and_mutual_exclusion() {
+        let mut state = State::default();
+        assert!(!state.goto.open);
+
+        // 开浮条:草稿清空、查找条收起
+        state.find.open = true;
+        state.find.replace_open = true;
+        state.goto.input.push_str("99");
+        state.apply(Message::GotoBarToggled(true));
+        assert!(state.goto.open, "Ctrl+G 开浮条");
+        assert!(state.goto.input.is_empty(), "打开即清行号草稿");
+        assert!(
+            !state.find.open && !state.find.replace_open && state.find.hit.is_none(),
+            "互斥:开浮条收起查找条(含替换行)"
+        );
+
+        // 反向互斥:开查找条收浮条
+        state.apply(Message::FindBarToggled(true));
+        assert!(state.find.open && !state.goto.open, "Ctrl+F 收浮条");
+
+        // Esc 关浮条:关是普通关闭,不连带翻转查找条
+        state.apply(Message::GotoBarToggled(true));
+        state.apply(Message::GotoBarToggled(false));
+        assert!(!state.goto.open);
+        assert!(!state.find.open, "浮条与查找条仍互斥,关浮条不再开别的");
+    }
+
+    /// 跳转语义(#60 M1):1 起行号钳制(0 → 第 1 行、超尾 → 最后一行)、
+    /// 光标落该行**行首**、空文档跳第 1 行;跳转不写文本(修订号不动),
+    /// 跳成后浮条关闭并清草稿。
+    #[test]
+    fn goto_line_clamps_and_lands_at_line_start() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("alpha\nbeta\ngamma\n");
+        state.tabs.current_mut().editor.clear_dirty();
+        {
+            let editor = &state.tabs.current().editor;
+            assert_eq!(editor.line_to_byte(1), 6, "前置:第 2 行行首字节");
+            assert_eq!(editor.line_to_byte(3), 17, "前置:第 4 行(末尾空行)行首字节");
+        }
+
+        let jump = |state: &mut State, line: usize| -> Option<usize> {
+            state.goto.open = true;
+            state.goto.input = line.to_string();
+            let rev = state.tabs.current().editor.revision();
+            state.apply(Message::GotoLineRequested { line });
+            assert_eq!(state.tabs.current().editor.revision(), rev, "跳转不写文本");
+            assert!(
+                !state.goto.open && state.goto.input.is_empty(),
+                "跳成即关浮条"
+            );
+            state.tabs.current().cursor.jump_to
+        };
+
+        assert_eq!(jump(&mut state, 2), Some(6), "第 2 行 → 行首字符偏移");
+        assert_eq!(jump(&mut state, 0), Some(0), "0 越界钳到第 1 行行首");
+        assert_eq!(jump(&mut state, 99), Some(17), "超尾钳到最后一行行首");
+        assert_eq!(jump(&mut state, 1), Some(0), "第 1 行行首");
+        assert!(
+            state.tabs.current().editor.text().starts_with("alpha"),
+            "文档未动"
+        );
+
+        // 空文档:总行数 1,任何载荷都跳第 1 行(偏移 0)。默认标签带
+        // SAMPLE_MD,先显式清空再验。
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("");
+        state.apply(Message::GotoLineRequested { line: 7 });
+        assert_eq!(
+            state.tabs.current().cursor.jump_to,
+            Some(0),
+            "空文档钳到第 1 行行首"
+        );
+        assert!(!state.goto.open, "空文档跳转同样关闭浮条");
     }
 
     /// 单个替换(#17 M1):定点改写文本、置脏推进修订号、重扫计数回落、

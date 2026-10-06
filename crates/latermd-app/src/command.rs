@@ -169,6 +169,9 @@ pub enum Command {
     FindInDoc,
     /// 打开查找条的替换行(Ctrl+H,查找条同开);已展开时再按收起替换行。
     ReplaceInDoc,
+    /// 「跳转到行」浮条(#60 M1,Ctrl+G):输入行号回车,编辑器光标落该
+    /// 行行首并滚动到可见;源码/Live 两模式同一 `jump_to` 入口。
+    GotoLine,
     /// 右侧只读预览栏展开/折叠(§3.1)。
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
@@ -183,7 +186,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 39] = [
+    pub const ALL: [Command; 40] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
@@ -221,6 +224,7 @@ impl Command {
         Self::DuplicateLine,
         Self::FindInDoc,
         Self::ReplaceInDoc,
+        Self::GotoLine,
         Self::ToggleRightPreview,
         Self::ToggleZen,
     ];
@@ -259,7 +263,8 @@ impl Command {
             Self::DuplicateSelection
             | Self::DuplicateLine
             | Self::FindInDoc
-            | Self::ReplaceInDoc => CommandGroup::Edit,
+            | Self::ReplaceInDoc
+            | Self::GotoLine => CommandGroup::Edit,
             Self::FormatBold
             | Self::FormatItalic
             | Self::FormatStrike
@@ -329,6 +334,7 @@ impl Command {
             Self::DuplicateLine => "duplicate_line",
             Self::FindInDoc => "find_in_doc",
             Self::ReplaceInDoc => "replace_in_doc",
+            Self::GotoLine => "goto_line",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
         }
@@ -377,6 +383,7 @@ impl Command {
             Self::DuplicateLine => "复制当前行",
             Self::FindInDoc => "查找",
             Self::ReplaceInDoc => "替换",
+            Self::GotoLine => "跳转到行",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
         }
@@ -474,6 +481,9 @@ impl Command {
             Self::FindInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F),
             // Ctrl/Cmd+H:主流编辑器的替换键位,出厂表无占用者
             Self::ReplaceInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::H),
+            // Ctrl/Cmd+G(#60 M1):VS Code 的跳转到行键位;出厂表 G 键无占用者
+            // (mac 侧 ⌘G 与系统「查找下一个」惯例的取舍见 decisions-pending #113)
+            Self::GotoLine => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G),
             Self::ToggleRightPreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
@@ -529,7 +539,8 @@ impl Command {
             Self::DuplicateSelection
             | Self::DuplicateLine
             | Self::FindInDoc
-            | Self::ReplaceInDoc => Icon::Search,
+            | Self::ReplaceInDoc
+            | Self::GotoLine => Icon::Search,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
         }
@@ -579,6 +590,7 @@ impl Command {
             | Self::DuplicateLine => Message::FormatRequested(self.format_action().unwrap()),
             Self::FindInDoc => Message::FindBarToggled(true),
             Self::ReplaceInDoc => Message::ReplaceBarToggled(true),
+            Self::GotoLine => Message::GotoBarToggled(true),
         }
     }
 }
@@ -888,6 +900,54 @@ mod tests {
         );
     }
 
+    /// 跳转命令(#60 M1):Ctrl/Cmd+G 出厂即绑、出厂表无 G 键占用者
+    /// (#9 口径的撞键核查)、真按键只触发这一条;命令映射到跳转浮条
+    /// 打开消息,分组归「编辑」(菜单入口与蒙层分组同一事实源)。
+    #[test]
+    fn goto_line_shortcut_fires_goto_command() {
+        let ctrl_g = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND,
+            key: Key::G,
+        };
+        assert_eq!(
+            Command::GotoLine.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(ctrl_g),
+            "GotoLine 出厂默认 = Ctrl/Cmd+G"
+        );
+        assert_eq!(Keymap::builtin().get(Command::GotoLine), Some(ctrl_g));
+        assert_eq!(
+            Keymap::builtin().conflict(Command::GotoLine, ctrl_g),
+            None,
+            "Ctrl/Cmd+G 不该撞任何出厂键位"
+        );
+        assert_eq!(
+            Command::GotoLine.group(),
+            CommandGroup::Edit,
+            "跳转是编辑命令(菜单「编辑」/蒙层同一归属)"
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::G, Modifiers::COMMAND)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::GotoLine]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(Command::GotoLine.message(), Message::GotoBarToggled(true));
+    }
+
     /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T,
     /// 不撞任何出厂键位;Cmd/Ctrl+Shift+T 的占用者 == TabRestore(#45 K2
     /// 落地后的联动断言,浏览器「恢复关闭标签」同款),且不与任何其他
@@ -1024,7 +1084,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 39);
+        assert_eq!(Command::ALL.len(), 40);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();
