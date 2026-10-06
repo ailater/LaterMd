@@ -128,7 +128,13 @@ fn share_widths(full: &[f32], budget: f32) -> Vec<f32> {
 /// 不会在字节中间被切开(输出是 Rust `String`,半字符本就不可表示);
 /// 全名放得下时原样返回(不加省略号)。`budget` 连一个省略号都放不下时
 /// 仍返回单个省略号(`CHIP_MIN_W` 保证实际到不了这一步,纯防御)。
-fn elide_text(ui: &mut egui::Ui, text: &str, font: &egui::FontId, budget: f32) -> String {
+/// 禅定的悬停标签导航列(#57)复用同一截断(同一显示口径)。
+pub(crate) fn elide_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    font: &egui::FontId,
+    budget: f32,
+) -> String {
     if text_width(ui, text, font) <= budget {
         return text.to_owned();
     }

@@ -172,6 +172,37 @@ impl TitleWidthMode {
     }
 }
 
+/// 禅定模式左缘标签导航的显示方式(#57 M2 三态配置):悬停唤出 / 常显 /
+/// 关闭。纯显示偏好,只影响禅定帧(`draw_zen`),非禅定渲染零关联。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZenNavMode {
+    /// 悬停唤出(#57 M1 既有行为):指针移近左缘唤出,离开去抖后隐藏。
+    /// 默认值 —— 升级不改变默认行为,常显/关闭由用户显式开启(取舍登记
+    /// decisions-pending #107)。
+    #[default]
+    Hover,
+    /// 常显:进入禅定即显示导航列,不随指针移动隐藏。与悬停共用同一渲染
+    /// 件,只是显隐条件不同(恒真,无感应区判定、无去抖)。
+    Always,
+    /// 关闭:完全不渲染 —— 零路径早退,不进任何绘制分支(无形状无命中)。
+    Off,
+}
+
+impl ZenNavMode {
+    /// 设置页可选项顺序(悬停 → 常显 → 关闭)。
+    pub const ALL: [ZenNavMode; 3] = [Self::Hover, Self::Always, Self::Off];
+
+    /// 设置页显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hover => "悬停唤出",
+            Self::Always => "常显",
+            Self::Off => "关闭",
+        }
+    }
+}
+
 /// 排版偏好(#23)的字号取值域(pt,闭区间):下限 12 是中文可读性下限
 /// (auto-plan #23),上限 24。默认 15。F2 的滑杆 range 与本常量同源。
 pub const EDITOR_FONT_SIZE_MIN: f32 = 12.0;
@@ -248,6 +279,10 @@ pub struct ThemeSettings {
     /// 一致,取舍登记 decisions-pending #105);关闭时编辑器走与从前
     /// 逐字节相同的路径(零 minimap 元素,ui::editor 的否决线)。
     pub show_minimap: bool,
+    /// 禅定模式左缘标签导航的显示方式(#57 M2):全局偏好,照 #55 minimap
+    /// 开关先例落 settings.json(旧档缺字段由 struct 级 `#[serde(default)]`
+    /// 兜底回悬停)。关闭档在禅定帧走零路径(不进任何绘制分支)。
+    pub zen_nav: ZenNavMode,
     /// 正文样式覆盖;`None` = 出厂默认(见 [`default_markdown_style`])。
     pub overrides: Option<MarkdownStyle>,
     /// Emoji 面板「最近使用」(docs/emoji-plan.md §6.3):新的在前、去重、
@@ -277,6 +312,7 @@ impl Default for ThemeSettings {
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             line_height: LINE_HEIGHT_DEFAULT,
             show_minimap: true,
+            zen_nav: ZenNavMode::default(),
             overrides: None,
             emoji_recent: Vec::new(),
             skin_style: None,
@@ -1087,6 +1123,45 @@ mod tests {
         // 旧版 settings.json 没有 show_minimap:serde(default) 兜底回 true
         std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
         assert!(ThemeSettings::load_from(&dir).unwrap().show_minimap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 M2:禅定导航显示方式随 settings.json 往返(三态逐个,serde 值
+    /// 可读);默认悬停(M1 已交付的既有行为,升级不改变默认,取舍见
+    /// decisions-pending #107);旧文件缺该项由 serde(default) 兜底回悬停。
+    #[test]
+    fn zen_nav_mode_round_trips_and_old_settings_default_hover() {
+        assert_eq!(
+            ThemeSettings::default().zen_nav,
+            ZenNavMode::Hover,
+            "出厂默认悬停"
+        );
+
+        let dir = temp_dir("zen-nav-mode");
+        for (mode, json_value) in [
+            (ZenNavMode::Hover, "hover"),
+            (ZenNavMode::Always, "always"),
+            (ZenNavMode::Off, "off"),
+        ] {
+            let settings = ThemeSettings {
+                zen_nav: mode,
+                ..ThemeSettings::default()
+            };
+            settings.save_to(Some(&dir)).unwrap();
+            assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+            let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+            assert!(
+                json.contains(&format!(r#""zen_nav": "{json_value}""#)),
+                "{json}"
+            );
+        }
+
+        // 旧版 settings.json 没有 zen_nav:serde(default) 兜底回悬停
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert_eq!(
+            ThemeSettings::load_from(&dir).unwrap().zen_nav,
+            ZenNavMode::Hover
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -18,6 +18,7 @@ pub mod sidebar;
 pub mod tabs;
 pub mod titlebar;
 pub mod tokens;
+pub mod zen_nav;
 
 /// #39 M1 切换卡顿取证 harness:纯测试模块,生产构建不编译。
 #[cfg(test)]

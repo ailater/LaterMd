@@ -19,8 +19,8 @@ use crate::keymap::Keymap;
 use crate::mcp::McpState;
 use crate::state::Message;
 use crate::theme::{
-    Density, SkinCatalog, ThemeMode, ThemeSettings, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
+    Density, SkinCatalog, ThemeMode, ThemeSettings, ZenNavMode, EDITOR_FONT_SIZE_MAX,
+    EDITOR_FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
 };
 use crate::ui::icons;
 use eframe::egui;
@@ -390,6 +390,21 @@ fn appearance(
     {
         outbox.push(Message::ShowMinimapToggled(show_minimap));
     }
+
+    ui.add_space(crate::ui::tokens::SPACE_MD);
+    ui.label("禅定模式:");
+    // #57 M2:左缘标签导航三态,与主题/密度选择同款 selectable_label
+    // (即时生效,非草稿模式 —— 显示偏好拨一下就该看到)。默认悬停,
+    // 常显/关闭是显式选择(取舍见 decisions-pending #107)。
+    for mode in ZenNavMode::ALL {
+        if ui
+            .selectable_label(theme.zen_nav == mode, mode.label())
+            .clicked()
+        {
+            outbox.push(Message::ZenNavModeChanged(mode));
+        }
+    }
+    ui.weak("左缘标签导航:悬停=移近左缘唤出;常显=进入禅定即显示;关闭=不渲染。");
 
     ui.add_space(crate::ui::tokens::SPACE_MD);
     // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
@@ -1340,6 +1355,72 @@ mod tests {
                 "show={show}: 复选框标签未渲出,文本形状:{texts:?}"
             );
             assert!(last_outbox.is_empty(), "show={show}: 无交互帧不产出消息");
+        }
+    }
+
+    /// #57 M2:外观页真实渲出禅定导航三态选择(与 minimap 测试同款:直接
+    /// 渲 `appearance`,避开整窗 440px 视口对 ScrollArea 的裁剪)。三轮回显
+    /// (悬停/常显/关)里三态标签**每轮都在场**——选择器不随选中值增删
+    /// 选项,只换高亮;无交互帧不产出消息(切换只经 clicked() 走归约)。
+    #[test]
+    fn appearance_page_renders_zen_nav_selector_bound_to_theme() {
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+
+        for mode in ZenNavMode::ALL {
+            state.theme.zen_nav = mode;
+            let skins = state.skins.clone();
+            let mut last_shapes = Vec::new();
+            let mut last_outbox = Vec::new();
+            let system_theme_ok = state.system_theme_ok;
+            let resolved = resolved_theme_for_test(&state);
+            for _ in 0..3 {
+                let State {
+                    settings, theme, ..
+                } = &mut state;
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            appearance(
+                                ui,
+                                settings,
+                                theme,
+                                &skins,
+                                system_theme_ok,
+                                resolved,
+                                &mut outbox,
+                            );
+                        });
+                    },
+                );
+                let mut output = output;
+                output.textures_delta.clear();
+                last_shapes = output.shapes;
+                last_outbox = outbox;
+            }
+            let texts: Vec<&str> = last_shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().trim()),
+                    _ => None,
+                })
+                .collect();
+            for label in ZenNavMode::ALL.map(|mode| mode.label()) {
+                assert!(
+                    texts.contains(&label),
+                    "{mode:?}: 三态选项「{label}」未渲出,文本形状:{texts:?}"
+                );
+            }
+            assert!(last_outbox.is_empty(), "{mode:?}: 无交互帧不产出消息");
         }
     }
 
