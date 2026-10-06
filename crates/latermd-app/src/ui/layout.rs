@@ -505,6 +505,15 @@ impl LaterMdApp {
             }
         }
 
+        // ⑤「跳转到行」浮条(#60 M1):同一右上锚点、同一浮层语义;与查找
+        // 条互斥(归约保证),源码/Live 两模式都在场 —— Live 侧跳转走块
+        // 路由,不受「查找条只限源码」的限制。
+        if state.goto.open {
+            if let Some(rect) = source_rect {
+                draw_goto_overlay(ui.ctx(), rect, &mut state.goto, outbox);
+            }
+        }
+
         // ⑥ 顶层浮层通道(commit 建议 / 设置 / 回滚确认 / 关标签确认 /
         // 图片框 / Emoji / 快速打开 / 快捷键蒙层):浮窗是独立 Area 层,
         // 不参与 panel 嵌套,画在 panel 之后取语义上的「最上层」。三栏与
@@ -924,6 +933,10 @@ fn replace_input_id() -> egui::Id {
     egui::Id::new("editor-replace-input")
 }
 
+fn goto_input_id() -> egui::Id {
+    egui::Id::new("editor-goto-input")
+}
+
 /// 查找/替换输入框的按键过滤:在 TextEdit 出厂默认(方向键留在框内、
 /// Tab 跳焦)之上打开 `escape` —— egui 0.36 的焦点导航把裸 Esc 当
 /// 「交出焦点」在 `Focus::begin_pass` 清焦,不清则框内 Esc 检测
@@ -1059,6 +1072,90 @@ fn replace_row(
         (replace, all)
     })
     .inner
+}
+
+/// 「跳转到行」浮条(#60 M1)的源码区浮层:#17 查找卡同款 Window(无标题
+/// 栏、不可拖、位置每帧由源码 rect 重算),同一右上锚点 —— 两者互斥
+/// (decisions-pending #113),同帧至多一个在场,锚点复用不冲突。
+/// 源码与 Live 两模式都画:跳转在 Live 侧走块路由(`cursor.jump_to`
+/// 同一入口),不像查找条那样只限源码。
+fn draw_goto_overlay(
+    ctx: &egui::Context,
+    source_rect: egui::Rect,
+    goto: &mut crate::state::GotoBarState,
+    outbox: &mut Vec<Message>,
+) {
+    let margin = 8.0;
+    let anchor =
+        source_rect.right_top() + egui::vec2(-margin, crate::ui::tokens::TOOLBAR_H + margin * 2.0);
+    egui::Window::new("跳转到行")
+        .id(egui::Id::new("editor-goto-overlay"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_pos(anchor)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .order(egui::Order::Foreground)
+        .constrain_to(source_rect.shrink(margin))
+        .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)))
+        .show(ctx, |ui| goto_bar_contents(ui, goto, outbox));
+}
+
+/// 跳转浮条内容:行号输入 + 「跳转」+ ✕。返回(输入框, 跳转钮)响应供
+/// 无头测试定位。**焦点钉**(quick_open 同款):开着就持焦,Ctrl+G 后直接
+/// 打数字回车;非数字(含溢出/空白)回车忽略,浮条保留可改。
+/// 输入不经任何事件过滤拦截 IME —— 数字/中文输入法直通 TextEdit,
+/// 数字直落草稿;编辑器撤销栈与本浮条无交集(独立 widget 独立状态)。
+fn goto_bar_contents(
+    ui: &mut egui::Ui,
+    goto: &mut crate::state::GotoBarState,
+    outbox: &mut Vec<Message>,
+) -> (egui::Response, egui::Response) {
+    // 焦点钉在草稿抄写之前:首帧即请求,下一 pass 生效(quick_open 同款)
+    if !ui.ctx().memory(|memory| memory.has_focus(goto_input_id())) {
+        ui.ctx()
+            .memory_mut(|memory| memory.request_focus(goto_input_id()));
+    }
+    let mut input = goto.input.clone();
+    let (response, jump_button) = ui
+        .horizontal(|ui| {
+            ui.label("行号");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut input)
+                    .id(goto_input_id())
+                    .event_filter(FIND_BAR_EVENT_FILTER)
+                    .return_key(None::<egui::KeyboardShortcut>)
+                    .desired_width(120.0)
+                    .hint_text("1-总行数,Enter 跳转"),
+            );
+            let jump = ui.button("跳转");
+            if crate::ui::icons::icon_button(ui, crate::ui::icons::Icon::Close, "关闭 (Esc)")
+                .clicked()
+            {
+                outbox.push(Message::GotoBarToggled(false));
+            }
+            (response, jump)
+        })
+        .inner;
+    if input != goto.input {
+        goto.input = input.clone();
+    }
+    // 非数字容错(decisions-pending #113):解析不了的输入(空/非数字/
+    // 溢出)回车与「跳转」都忽略,不发消息;合法值交归约钳制。
+    let parsed = input.trim().parse::<usize>().ok();
+    let request_jump = || parsed.map(|line| Message::GotoLineRequested { line });
+    if response.has_focus() {
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            outbox.extend(request_jump());
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            outbox.push(Message::GotoBarToggled(false));
+        }
+    }
+    if jump_button.clicked() {
+        outbox.extend(request_jump());
+    }
+    (response, jump_button)
 }
 
 /// 底部状态栏:路径 · 行列 · 字数 · 主题 · AI · MCP。
@@ -1634,8 +1731,10 @@ mod tests {
         assert!(outbox.is_empty(), "禁用态不产生消息");
     }
 
-    /// Ctrl+H 整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
-    /// 输入只更新状态不改文档;替换框上 Esc 关整条。
+    /// 替换键整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
+    /// 输入只更新状态不改文档;替换框上 Esc 关整条。(#60 M2:按键从出厂
+    /// 键位读——mac 出厂已是 ⌥⌘F(#114),硬编码 COMMAND+H 在 mac 编译
+    /// 目标上不再触发;测试语义「出厂键触发替换条」不变。)
     #[test]
     fn ctrl_h_opens_replace_row_typing_does_not_edit_and_esc_closes() {
         let ctx = egui::Context::default();
@@ -1646,13 +1745,16 @@ mod tests {
             find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
         }
 
-        // Ctrl+H → 命令层消费键位,查找条同开、替换行展开
+        // 出厂替换键 → 命令层消费键位,查找条同开、替换行展开
+        let shortcut = crate::command::Command::ReplaceInDoc
+            .default_shortcut()
+            .expect("替换命令有出厂键位");
         find_test_frame(
             &mut app,
             &ctx,
             screen,
             1.0,
-            find_key(Key::H, Modifiers::COMMAND),
+            find_key(shortcut.logical_key, shortcut.modifiers),
         );
         find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
         assert!(
@@ -1759,6 +1861,430 @@ mod tests {
         assert_eq!(app.outbox, vec![Message::FindBarToggled(false)]);
         find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
         assert!(!app.state.find.open, "Esc 后整条关闭");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 禅定帧的替换键(#17 M2 核验③,#60):`poll_shortcuts` 在 reduce
+    /// 每帧必跑、不看布局分叉,替换条状态照常翻到位;但查找卡浮层只画
+    /// 三栏源码路径,#17 交付时的既有口径 —— 禅定帧浮层 Area 不存在,
+    /// Esc 退出禅定后同一状态立即落回屏上。是「延后」不是「被吞」
+    /// (13a 的 Foreground Area 跨层屏蔽不适用:查找卡是 egui 管理的
+    /// Window,禅定不画任何遮蔽它的层)。与查找条/goto 浮条在禅定的
+    /// 行为三者同口径(decisions-pending #114)。按键从出厂键位读
+    /// (#114:mac = ⌥⌘F,其余 = Ctrl+H;硬编码 Ctrl+H 在 mac 编译
+    /// 目标上不触发,同 [`ctrl_h_opens_replace_row_typing_does_not_edit_and_esc_closes`])。
+    #[test]
+    fn ctrl_h_in_zen_flips_state_and_overlay_waits_for_three_pane() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("zen-ctrl-h");
+        app.state.apply(Message::ZenToggled);
+        find_test_frame(&mut app, &ctx, screen, 0.1, Vec::new());
+        assert!(app.state.layout.zen, "前置:已进禅定");
+
+        // 禅定帧按出厂替换键:命令层消费键位,状态翻进查找条 + 替换行
+        let shortcut = crate::command::Command::ReplaceInDoc
+            .default_shortcut()
+            .expect("替换命令有出厂键位");
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            0.2,
+            find_key(shortcut.logical_key, shortcut.modifiers),
+        );
+        find_test_frame(&mut app, &ctx, screen, 0.3, Vec::new());
+        assert!(app.state.layout.zen, "仍在禅定");
+        assert!(
+            app.state.find.open && app.state.find.replace_open,
+            "禅定帧替换键状态照常翻到位"
+        );
+        let overlay = egui::Id::new("editor-find-overlay");
+        assert!(
+            ctx.memory(|memory| memory.area_rect(overlay)).is_none(),
+            "禅定帧不画查找卡浮层"
+        );
+
+        // Esc 退出禅定(draw_zen 消费,推 outbox),下一帧 reduce 应用后
+        // 回三栏 —— 查找卡同帧落回屏上,不需要再按一次替换键
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            0.4,
+            find_key(Key::Escape, Modifiers::NONE),
+        );
+        find_test_frame(&mut app, &ctx, screen, 0.5, Vec::new());
+        assert!(!app.state.layout.zen, "Esc 退出禅定");
+        assert!(
+            app.state.find.open && app.state.find.replace_open,
+            "退出禅定后状态仍在,不丢"
+        );
+        assert!(
+            ctx.memory(|memory| memory.area_rect(overlay)).is_some(),
+            "三栏源码路径恢复后查找卡立即可见"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// minimap 开启态与查找/替换卡共存(#17 M2 核验⑤,#60):minimap 压窄
+    /// 正文(MINIMAP_W),查找卡浮层锚定 editor 之后的 available rect,
+    /// 两态都照常出现、都不推低正文 —— 「挤压」只发生在正文一侧且是
+    /// 设计内让位(minimap 画在右缘、查找卡浮在其上,Order::Foreground)。
+    /// minimap 出厂默认开(theme.rs),故 on 态是全量查找卡测试一直在跑
+    /// 的形态;这里把 off 态拉进来对齐正文顶,补成显式断言。
+    #[test]
+    fn find_overlay_coexists_with_minimap() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let overlay = egui::Id::new("editor-find-overlay");
+        let mut tops = std::collections::BTreeMap::new();
+        for (name, show) in [("on", true), ("off", false)] {
+            // 每态独立 Context:Area 记忆挂在 ctx 上,共用会让后一态读到
+            // 前一态的浮层残留,断言失真
+            let ctx = egui::Context::default();
+            let (mut app, dir) = find_test_app("minimap-coexist");
+            app.state.theme.show_minimap = show;
+            app.state.apply(Message::ReplaceBarToggled(true));
+            app.state
+                .apply(Message::FindQueryChanged("needle".to_owned()));
+            for step in 0..4 {
+                find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+            }
+            let shapes = find_test_frame(&mut app, &ctx, screen, 0.5, Vec::new());
+            assert!(
+                ctx.memory(|memory| memory.area_rect(overlay)).is_some(),
+                "minimap {name}:查找卡浮层在场"
+            );
+            assert!(
+                app.state.find.open && app.state.find.replace_open,
+                "minimap {name}:替换行展开"
+            );
+            let body_top = topmost_text(&shapes, "needle one").top();
+            tops.insert(name, body_top);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        assert_eq!(
+            tops["on"], tops["off"],
+            "minimap 开关不改变正文顶边(浮层不参与布局,无挤压推低)"
+        );
+    }
+
+    // —— 「跳转到行」浮条(#60 M1)——
+
+    /// Ctrl+G 整链路:命令层开浮条、焦点钉住输入框(quick_open 同款)、
+    /// 数字直落草稿不进文档、查找条互斥(两侧真实键位路径)、Esc 关浮条
+    /// (egui 0.36 裸 Esc 清焦,同 #17 的 `event_filter` 口径)。
+    #[test]
+    fn ctrl_g_opens_goto_bar_pins_focus_and_esc_closes() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("ctrl-g");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+
+        // Ctrl+G → 浮条打开,下一帧焦点钉住行号输入框
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            find_key(Key::G, Modifiers::COMMAND),
+        );
+        find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
+        let input = goto_input_id();
+        assert!(app.state.goto.open, "Ctrl+G 打开跳转浮条");
+        assert!(
+            ctx.memory(|memory| memory.has_focus(input)),
+            "焦点钉:打开即持焦,可直接打数字"
+        );
+
+        // 数字直通草稿;文档与撤销侧的缓冲不受浮条影响
+        for (step, text) in ["1", "2"].into_iter().enumerate() {
+            let now = 2.0 + step as f64;
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Text(text.to_owned())],
+            );
+            find_test_frame(&mut app, &ctx, screen, now + 0.1, Vec::new());
+            assert!(ctx.memory(|memory| memory.has_focus(input)));
+            assert_eq!(
+                app.state.tabs.current().editor.text(),
+                original,
+                "浮条输入不进文档"
+            );
+        }
+        assert_eq!(app.state.goto.input, "12");
+
+        // 互斥走真实键位:Ctrl+F 开查找条收浮条;Ctrl+G 反向
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            3.0,
+            find_key(Key::F, Modifiers::COMMAND),
+        );
+        find_test_frame(&mut app, &ctx, screen, 3.1, Vec::new());
+        assert!(app.state.find.open && !app.state.goto.open, "Ctrl+F 收浮条");
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            4.0,
+            find_key(Key::G, Modifiers::COMMAND),
+        );
+        find_test_frame(&mut app, &ctx, screen, 4.1, Vec::new());
+        assert!(
+            app.state.goto.open && !app.state.find.open,
+            "Ctrl+G 收查找条"
+        );
+
+        // Esc 关浮条(空帧节奏,#17 同款:打字帧后紧跟浮层闭包不执行)
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            5.0,
+            find_key(Key::Escape, Modifiers::NONE),
+        );
+        assert_eq!(app.outbox, vec![Message::GotoBarToggled(false)]);
+        find_test_frame(&mut app, &ctx, screen, 5.1, Vec::new());
+        assert!(!app.state.goto.open, "Esc 后浮条关闭");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 回车跳转(源码模式):行号 200 → 光标落第 200 行**行首**、焦点交还
+    /// 编辑器、该行滚入视口(编辑器内容整体上移,top 变负,#29 黑盒量法),
+    /// 文档一字不动;浮条跳成即关。
+    #[test]
+    fn goto_enter_jumps_to_line_start_and_scrolls_in_source_mode() {
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        });
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("goto-jump");
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("l{i:03}\n"));
+        }
+        app.state.tabs.current_mut().editor.replace_all(&text);
+        app.state.tabs.current_mut().editor.clear_dirty();
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let editor_id = crate::ui::editor::tab_editor_id(app.state.tabs.current().id);
+        assert!(
+            ctx.read_response(editor_id)
+                .expect("编辑器响应可读")
+                .rect
+                .top()
+                >= 0.0,
+            "前置:视口停在文档顶部"
+        );
+
+        // 开浮条、输入 200、回车
+        app.state.apply(Message::GotoBarToggled(true));
+        find_test_frame(&mut app, &ctx, screen, 1.0, Vec::new());
+        for (step, ch) in ["2", "0", "0"].into_iter().enumerate() {
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                2.0 + step as f64 * 0.1,
+                vec![Event::Text(ch.to_owned())],
+            );
+        }
+        assert_eq!(app.state.goto.input, "200");
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            3.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        assert_eq!(
+            app.outbox,
+            vec![Message::GotoLineRequested { line: 200 }],
+            "回车发出跳转消息"
+        );
+
+        // 下一帧归约消费消息 → jump_to → 编辑器同帧写光标 + 请求滚动
+        find_test_frame(&mut app, &ctx, screen, 3.1, Vec::new());
+        assert!(!app.state.goto.open, "跳成即关浮条");
+        let target = text.find("l199").expect("文档含 l199 行"); // 全 ASCII,字节即字符
+        let state =
+            egui::widgets::text_edit::TextEditState::load(&ctx, editor_id).expect("编辑器持久状态");
+        let range = state.cursor.char_range().expect("光标已覆写");
+        assert_eq!(range.primary.index.0, target, "光标落第 200 行行首");
+        assert_eq!(range.secondary.index.0, target, "无选区,两端一致");
+        assert!(
+            ctx.memory(|memory| memory.has_focus(editor_id)),
+            "焦点交还编辑器"
+        );
+        // 滚动经动画管理器落地(#29 同款):结算帧后再量,编辑器内容
+        // 整体上移(top 变负)
+        for step in 0..3 {
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                4.0 + f64::from(step) * 0.1,
+                Vec::new(),
+            );
+        }
+        let top = ctx
+            .read_response(editor_id)
+            .expect("编辑器响应可读")
+            .rect
+            .top();
+        assert!(top < 0.0, "第 200 行滚入视口,内容上移(top {top} < 0)");
+        assert_eq!(app.state.tabs.current().editor.text(), text, "文档未动");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 回车跳转(Live 模式):同一消息经归约 → `cursor.jump_to` →
+    /// `live::ui` 块路由(`pending_caret`),目标行所在块成为活动块、光标
+    /// 落该行行首(块内偏移),文档不动 —— 两条模式共用一个 jump_to 入口,
+    /// 本测试钉住 Live 侧可达(200 行软换行段 = 单块,块内偏移即全文偏移)。
+    #[test]
+    fn goto_jump_in_live_mode_routes_block_caret() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("goto-live");
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("l{i:03}\n"));
+        }
+        app.state.tabs.current_mut().editor.replace_all(&text);
+        app.state.render_mode = crate::live::RenderMode::Live;
+        for step in 0..4 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        // 跳 1 起第 150 行 = 0 起 149 行,文本 "l149"(行号与文本下标差一)
+        let target_byte = text.find("l149").expect("文档含 l149 行");
+        let block = app
+            .state
+            .tabs
+            .current()
+            .live
+            .block_containing(target_byte)
+            .expect("跳转字节必落在某块");
+
+        app.state.apply(Message::GotoBarToggled(true));
+        find_test_frame(&mut app, &ctx, screen, 1.0, Vec::new());
+        for (step, ch) in ["1", "5", "0"].into_iter().enumerate() {
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                2.0 + step as f64 * 0.1,
+                vec![Event::Text(ch.to_owned())],
+            );
+        }
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            3.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        assert_eq!(app.outbox, vec![Message::GotoLineRequested { line: 150 }]);
+        find_test_frame(&mut app, &ctx, screen, 3.1, Vec::new());
+
+        let tab = app.state.tabs.current();
+        assert_eq!(tab.live.active, Some(block), "目标块成为活动块");
+        let local = tab.editor.byte_to_char(target_byte)
+            - tab.editor.byte_to_char(tab.live.blocks[block].start);
+        let block_id = crate::ui::editor::tab_editor_id(tab.id).with(("live-block", block));
+        let caret = egui::widgets::text_edit::TextEditState::load(&ctx, block_id)
+            .and_then(|state| state.cursor.char_range().map(|range| range.primary.index.0));
+        assert_eq!(caret, Some(local), "光标落目标行行首(块内偏移)");
+        assert_eq!(tab.editor.text(), text, "文档未动");
+        assert!(!app.state.goto.open, "浮条跳成即关");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 非数字容错(#60 M1 自选「忽略」,decisions-pending #113):空/非
+    /// 数字/溢出 usize 的输入回车不发消息,浮条保留可改;退格修成数字后
+    /// 回车照常跳转。
+    #[test]
+    fn goto_non_numeric_enter_is_ignored_until_fixed() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("goto-invalid");
+        let original = app.state.tabs.current().editor.text().to_owned();
+        app.state.apply(Message::GotoBarToggled(true));
+        find_test_frame(&mut app, &ctx, screen, 1.0, Vec::new());
+
+        // 非数字回车:忽略,浮条保留
+        find_test_frame(&mut app, &ctx, screen, 2.0, vec![Event::Text("abc".into())]);
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            2.5,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        assert!(app.outbox.is_empty(), "非数字回车不发消息");
+        assert!(app.state.goto.open, "浮条保留可改");
+        assert_eq!(app.state.goto.input, "abc");
+
+        // 退格修成数字:回车照常跳转
+        for step in 0..3 {
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                3.0 + f64::from(step) * 0.1,
+                find_key(Key::Backspace, Modifiers::NONE),
+            );
+        }
+        find_test_frame(&mut app, &ctx, screen, 3.5, vec![Event::Text("2".into())]);
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            4.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        assert_eq!(app.outbox, vec![Message::GotoLineRequested { line: 2 }]);
+        find_test_frame(&mut app, &ctx, screen, 4.1, Vec::new());
+        assert_eq!(
+            app.state.tabs.current().editor.text(),
+            original,
+            "全过程文档未动"
+        );
+
+        // 溢出 usize 的长数字同样忽略(解析不了 = 非数字同分支)
+        app.state.apply(Message::GotoBarToggled(true));
+        find_test_frame(&mut app, &ctx, screen, 5.0, Vec::new());
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            5.5,
+            vec![Event::Text("9".repeat(26))],
+        );
+        app.outbox.clear();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            6.0,
+            find_key(Key::Enter, Modifiers::NONE),
+        );
+        assert!(app.outbox.is_empty(), "溢出数字回车忽略");
+        assert!(app.state.goto.open);
         let _ = std::fs::remove_dir_all(dir);
     }
 

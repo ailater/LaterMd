@@ -11,6 +11,16 @@ use crate::state::Message;
 
 use eframe::egui;
 
+/// 「编辑」菜单的条目序(显示顺序即数组顺序):文档内动作。单一事实源
+/// 收成常量供存在性测试断言(`Command::FILE` 同款手法)。
+const EDIT_MENU: [Command; 5] = [
+    Command::DuplicateSelection,
+    Command::DuplicateLine,
+    Command::FindInDoc,
+    Command::ReplaceInDoc,
+    Command::GotoLine,
+];
+
 /// 绘制菜单栏内容(挂在 top panel 内)。键位文本取自 `keymap`(用户可改),
 /// 与工具栏按钮同一口径 —— 改键后两处同时变。
 pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
@@ -36,10 +46,9 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
         // 编辑:文档内动作(坤哥 2026-09-29 指令的 Ctrl+D/Ctrl+Shift+D/
         // Ctrl+F/Ctrl+H 可发现性入口;undo/redo 是 TextEdit 内建,不列)
         ui.menu_button("编辑", |ui| {
-            item(ui, Command::DuplicateSelection, keymap, outbox);
-            item(ui, Command::DuplicateLine, keymap, outbox);
-            item(ui, Command::FindInDoc, keymap, outbox);
-            item(ui, Command::ReplaceInDoc, keymap, outbox);
+            for cmd in EDIT_MENU {
+                item(ui, cmd, keymap, outbox);
+            }
         });
         ui.menu_button("视图", |ui| {
             item(ui, Command::ToggleSidebar, keymap, outbox);
@@ -156,5 +165,35 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(outbox, vec![Message::AiStart]);
+    }
+
+    /// 「编辑」菜单含全部五条文档内动作,新命令进菜单不许漏登记(#60 M1
+    /// 的「菜单入口存在」断言):EDIT_MENU 覆盖 Duplicate/Find/Replace/
+    /// GotoLine,且其中每条命令的 group() 都是 Edit(菜单归属与命令注册
+    /// 表同一事实源,蒙层/设置页共用)。
+    #[test]
+    fn edit_menu_lists_every_edit_command() {
+        assert!(
+            EDIT_MENU.contains(&Command::GotoLine),
+            "跳转到行进「编辑」菜单"
+        );
+        for cmd in EDIT_MENU {
+            assert_eq!(
+                cmd.group(),
+                crate::command::CommandGroup::Edit,
+                "{cmd:?} 挂在「编辑」菜单就必须是 Edit 组"
+            );
+        }
+        // 反向补漏:注册表里每一条 Edit 组命令都必须在菜单里(新命令忘记
+        // 加菜单时在这里红)
+        let listed: Vec<_> = EDIT_MENU.to_vec();
+        for cmd in Command::ALL {
+            if cmd.group() == crate::command::CommandGroup::Edit {
+                assert!(
+                    listed.contains(&cmd),
+                    "{cmd:?} 是 Edit 组命令却不在「编辑」菜单"
+                );
+            }
+        }
     }
 }
