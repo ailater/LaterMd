@@ -431,6 +431,7 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             model: "deepseek-chat".to_owned(),
             base_url: "https://api.deepseek.com/v1".to_owned(),
+            context_kb: 0,
         };
         ai.set_provider(config.clone(), Some("placeholder-key"));
         assert!(ai.requires_key());
@@ -464,6 +465,7 @@ mod tests {
                 provider: ProviderKind::OpenAiCompatible,
                 base_url: "https://api.deepseek.com/v1".to_owned(),
                 model: "deepseek-chat".to_owned(),
+                context_kb: 0,
             },
             Some("placeholder-key"),
         );
@@ -489,6 +491,7 @@ mod tests {
                 provider: ProviderKind::Anthropic,
                 base_url: "https://api.anthropic.com".to_owned(),
                 model: "claude-sonnet-4-5".to_owned(),
+                context_kb: 0,
             },
             Some("placeholder-key"),
         );
@@ -512,6 +515,7 @@ mod tests {
                 provider: ProviderKind::Ollama,
                 base_url: "http://127.0.0.1:11434".to_owned(),
                 model: "llama3.1".to_owned(),
+                context_kb: 0,
             },
             None,
         );

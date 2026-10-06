@@ -1149,7 +1149,10 @@ impl State {
                 return;
             }
         };
-        let prompt = latermd_ai::commit_message_prompt(&diff);
+        // prompt 预算走「上下文大小」配置(decisions-pending #110):
+        // 未配置(None)在 latermd-ai 落回 16KB 现状默认,行为不变
+        let prompt =
+            latermd_ai::commit_message_prompt_with_budget(&diff, self.ai.config.context_budget());
         // 同步生成:Mock 走关键词合成,真实端点走一次非流式请求取首行
         // (commit 建议是「一行结果」,流式对它没有意义)
         match self.ai.runtime.commit_subject(&prompt) {
@@ -1180,7 +1183,12 @@ impl State {
             let range = tab.editor.byte_to_char(span.start)..tab.editor.byte_to_char(span.end);
             tab.editor.remove_chars(range);
         }
-        let prompt = latermd_ai::summary_prompt(self.tabs.current().editor.text());
+        // prompt 预算走「上下文大小」配置(decisions-pending #110):
+        // 未配置(None)在 latermd-ai 落回 32KB 现状默认,行为不变
+        let prompt = latermd_ai::summary_prompt_with_budget(
+            self.tabs.current().editor.text(),
+            self.ai.config.context_budget(),
+        );
         // 共用流式入口(二次防重入 + 补空行 + 发起);标题在发起后、首个
         // chunk 到达前的同一归约里插入,流式块自然接在标题与空行之后
         self.start_ai_stream_with_prompt(&prompt);
@@ -4950,6 +4958,7 @@ mod tests {
             provider: crate::ai_config::ProviderKind::OpenAiCompatible,
             base_url: "https://api.deepseek.com/v1/".to_owned(),
             model: "deepseek-chat".to_owned(),
+            context_kb: 0,
         };
         assert_eq!(
             models_source_for(&config, Some("placeholder-key".to_owned())),
@@ -4971,6 +4980,7 @@ mod tests {
             provider: crate::ai_config::ProviderKind::Anthropic,
             base_url: "https://api.anthropic.com".to_owned(),
             model: "claude-sonnet-4-5".to_owned(),
+            context_kb: 0,
         };
         assert_eq!(
             models_source_for(&config, Some("placeholder-key".to_owned())),
@@ -4984,6 +4994,7 @@ mod tests {
             provider: crate::ai_config::ProviderKind::Ollama,
             base_url: "http://127.0.0.1:11434".to_owned(),
             model: "llama3.1".to_owned(),
+            context_kb: 0,
         };
         assert_eq!(
             models_source_for(&config, None),
@@ -5817,6 +5828,91 @@ mod tests {
             state.tabs.current().document.notice.as_deref(),
             Some("文档为空,没有可摘要的内容")
         );
+    }
+
+    /// 上下文大小配置驱动摘要截断(#58 M3,decisions-pending #110):显式
+    /// KB 预算下,发起的 prompt 按新预算截断、说明报真实预算、预算外内容
+    /// 不混入(全程 Mock,不出网)。
+    #[test]
+    fn ai_summary_honors_context_kb_budget() {
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        state.ai.config.context_kb = 4;
+        let long_doc = format!("{}\n尾部哨兵", "字".repeat(4000)); // 12KB+
+        state.tabs.current_mut().editor.load(&long_doc);
+
+        state.apply(Message::AiSummaryRequested);
+        assert!(state.ai.is_streaming());
+        let prompt = state.ai.last_prompt.clone().expect("摘要走流式入口");
+        assert!(prompt.contains("已截断至约 4KB"), "{prompt}");
+        assert!(!prompt.contains("尾部哨兵"), "预算外内容不进 prompt");
+        assert!(
+            prompt.len() > 4096 && prompt.len() < 4096 + 1024,
+            "prompt 应按 4KB 预算截断:实际 {} 字节",
+            prompt.len()
+        );
+        drain_ai_stream(&mut state);
+    }
+
+    /// 否决线(decisions-pending #110):上下文大小未配置(默认 0)时,
+    /// 摘要 prompt 仍按现状 32KB 截断并注明 —— 未配置的截断行为不变。
+    #[test]
+    fn ai_summary_default_context_keeps_legacy_truncation() {
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(state.ai.config.context_kb, 0, "前置:未配置");
+        state.tabs.current_mut().editor.load(&"汉".repeat(20000)); // 60KB,超现状 32KB 预算
+
+        state.apply(Message::AiSummaryRequested);
+        assert!(state.ai.is_streaming());
+        let prompt = state.ai.last_prompt.clone().expect("摘要走流式入口");
+        assert!(prompt.contains("已截断至约 32KB"), "{prompt}");
+        assert!(prompt.len() < 32 * 1024 + 1024, "仍按 32KB 预算截断");
+        drain_ai_stream(&mut state);
+    }
+
+    /// 上下文大小配置驱动 commit 截断(#58 M3):两个文件的未提交改动
+    /// (a.md 改写 12KB + zz.md 删除),现状默认(0)下 16KB 预算装得下
+    /// 全 diff → 尾部文件的删除动作行进 prompt(Mock 合成「清理」);显式
+    /// 4KB 预算把尾部文件截掉 → 同一仓库合成「更新」。Mock 关键词规则
+    /// 可观测,git diff 是本地子进程,全程不出网。
+    #[test]
+    fn ai_commit_message_honors_context_kb_budget() {
+        let dir = temp_path("ai-commit-context");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.md"), "初版\n").unwrap();
+        std::fs::write(dir.join("zz.md"), "将被删除\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+        // 未提交改动:改写 a.md(12KB,压预算)+ 删除 zz.md(判别动作行)
+        std::fs::write(dir.join("a.md"), "字".repeat(4000)).unwrap();
+        std::fs::remove_file(dir.join("zz.md")).unwrap();
+
+        // 默认(未配置,0):全 diff ≈ 12.3KB < 16KB,删除动作行进 prompt
+        let mut state = State::default();
+        state.tabs.current_mut().document.path = Some(dir.join("a.md"));
+        state.apply(Message::AiCommitRequested);
+        assert_eq!(
+            state.ai_commit_suggestion.as_deref(),
+            Some("docs: 清理a.md"),
+            "默认 16KB 预算下尾部删除行在场(全 diff 进 prompt)"
+        );
+
+        // 显式 4KB:12KB 的 a.md 内容把 zz.md 的删除行挤出预算
+        state.ai.config.context_kb = 4;
+        state.apply(Message::AiCommitRequested);
+        assert_eq!(
+            state.ai_commit_suggestion.as_deref(),
+            Some("docs: 更新a.md"),
+            "4KB 预算下删除动作行被截掉,只剩 a.md 的更新"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 防重入(双向):续写流在途时摘要请求被静默忽略 —— 连移除旧节/插

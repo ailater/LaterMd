@@ -12,7 +12,7 @@
 //! 「正在捕获哪个命令的键位」,同侧边栏把手与 `SearchState` 输入的口径。
 
 use crate::ai::AiState;
-use crate::ai_config::{AiConfig, ProviderKind};
+use crate::ai_config::{AiConfig, ProviderKind, CONTEXT_KB_MAX};
 use crate::ai_key::{self, AiKeyState};
 use crate::command::Command;
 use crate::keymap::Keymap;
@@ -661,6 +661,17 @@ fn ai_page(
     });
 
     ui.add_space(crate::ui::tokens::SPACE_SM);
+    // 上下文大小(#58 M3,decisions-pending #110):进入 prompt 的文档/
+    // diff 字节上限,0 = 跟随现状默认(摘要 32KB / commit diff 16KB)。
+    // prompt 组装在 provider 之前,Mock 同样生效,不随 provider 灰显。
+    ui.label("上下文大小(KB)");
+    ui.add(egui::Slider::new(&mut draft.context_kb, 0..=CONTEXT_KB_MAX).text("KB"));
+    ui.weak(
+        "0 = 跟随默认(摘要文档 32KB / commit diff 16KB);\
+         超出上限的内容截断后进请求,约 1KB ≈ 250-350 token。",
+    );
+
+    ui.add_space(crate::ui::tokens::SPACE_SM);
     // 「获取模型列表」(#58 M2):Mock 不联网禁用并说明;拉取中禁用防重入,
     // 按钮文字就是拉取中状态(与 bed 测试上传同款禁用 + 悬停说明)
     let fetching = models.is_fetching();
@@ -1136,7 +1147,8 @@ mod tests {
         render(&mut state);
     }
 
-    /// #58 渲染探针:AI 页只剩 provider/Base URL/模型/key,被删参数控件
+    /// #58 渲染探针:AI 页只剩 provider/Base URL/模型/上下文大小(#58 M3
+    /// 新增的请求预算滑杆)/key,被删参数控件
     /// (Temperature/Top-P/Max tokens/超时/流式接收/System prompt)不再
     /// 渲染。无头渲真实 AI 页数帧,收集全部 `TextShape` 的逻辑文本做
     /// 双向断言(保留项在场 + 被删项绝迹 —— 后者同时钉住「当前生效」行
@@ -1207,7 +1219,7 @@ mod tests {
             !all_text.is_empty(),
             "五帧后仍无文本形状:fade-in 时钟或无头管线异常"
         );
-        for kept in ["Provider", "Base URL", "模型", "保存"] {
+        for kept in ["Provider", "Base URL", "模型", "上下文大小", "保存"] {
             assert!(
                 all_text.contains(kept),
                 "AI 页应保留 \"{kept}\":\n{all_text}"

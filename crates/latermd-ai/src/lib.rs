@@ -19,7 +19,7 @@ mod openai;
 mod summary;
 
 pub use anthropic::{parse_anthropic_sse, AnthropicProvider, AnthropicSettings};
-pub use commit::{commit_message_prompt, truncate_diff};
+pub use commit::{commit_message_prompt, commit_message_prompt_with_budget, truncate_diff};
 pub use mock::MockProvider;
 pub use models::{
     fetch_models, parse_anthropic_models, parse_ollama_models, parse_openai_models, ModelsResult,
@@ -27,7 +27,7 @@ pub use models::{
 };
 pub use ollama::{parse_ollama_ndjson, OllamaProvider, OllamaSettings};
 pub use openai::{parse_openai_sse, AiError, OpenAiProvider, OpenAiSettings, API_KEY_ENV};
-pub use summary::{summary_prompt, truncate_document};
+pub use summary::{summary_prompt, summary_prompt_with_budget, truncate_document};
 
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;

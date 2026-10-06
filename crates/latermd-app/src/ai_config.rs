@@ -4,6 +4,8 @@
 //! (经系统凭据的)API key —— 采样参数/system prompt/超时/流式开关已随
 //! 「配置页参数精简」删除(decisions-pending #108),内部按删除前的默认
 //! 值组装请求(见 `crate::ai::set_provider`),不因删 UI 改变默认请求。
+//! 另有一项**请求预算**:「上下文大小」(decisions-pending #110,KB 字节
+//! 口径,0 = 跟随现状默认),驱动摘要/commit 的文档截断。
 //!
 //! **provider 是唯一开关**(decisions-pending #94):接口方式(协议形态)
 //! 随 provider 派生,不再单列字段 —— 四种 provider 各自钉死一种协议,
@@ -19,6 +21,12 @@ use std::path::Path;
 
 /// 落盘文件名(平台配置目录,与 `settings.json` 同级)。
 const AI_FILE: &str = "ai.json";
+
+/// 上下文大小(KB)可设置的上限(= 1MB)。换算依据(decisions-pending
+/// #110):1KB ≈ 250-350 token(英文约 4 字节/token,UTF-8 常用汉字约
+/// 3 字节、1-1.5 字/token),1MB 已是至多 ~50 万 token 的 prompt,远超
+/// 主流模型上下文窗口,再大只会把请求打爆,钳掉。
+pub const CONTEXT_KB_MAX: u32 = 1024;
 
 /// provider 种类(serde snake_case)。旧 `ai.json` 的 `mock` 与
 /// `open_ai_compatible`(旧版落盘名)原样可读;`openai_compatible` 也收
@@ -133,6 +141,12 @@ pub struct AiConfig {
     pub base_url: String,
     /// 模型名。
     pub model: String,
+    /// 上下文大小(KB):进入 prompt 的文档全文 / commit diff 的字节上限,
+    /// 超出部分不进请求(prompt 里注明「已截断」)。0 = 未配置,摘要与
+    /// commit 各自沿用现状默认(32KB / 16KB),截断行为与旧版完全一致
+    /// (decisions-pending #110 的否决线)。对 provider 无关 —— Mock 也走
+    /// 同一 prompt 组装。
+    pub context_kb: u32,
 }
 
 impl Default for AiConfig {
@@ -142,6 +156,7 @@ impl Default for AiConfig {
             provider: ProviderKind::Mock,
             base_url: factory.base_url,
             model: factory.model,
+            context_kb: 0,
         }
     }
 }
@@ -179,12 +194,14 @@ impl AiConfig {
         }
     }
 
-    /// 归一化:端点/模型去空白,空值回落**当前 provider** 的出厂值。
-    /// provider 本体不回落 —— 四种 provider 全部已实现,配置的是什么就是
-    /// 什么。
+    /// 归一化:端点/模型去空白,空值回落**当前 provider** 的出厂值;
+    /// 上下文大小钳到 `[0, CONTEXT_KB_MAX]`(手改 JSON 的越界值在读入时
+    /// 就地收回,滑杆范围之外没有合法取值)。provider 本体不回落 —— 四种
+    /// provider 全部已实现,配置的是什么就是什么。
     pub fn normalize(&mut self) {
         self.base_url = self.base_url.trim().to_owned();
         self.model = self.model.trim().to_owned();
+        self.context_kb = self.context_kb.min(CONTEXT_KB_MAX);
         let factory = self.provider.factory();
         if self.base_url.is_empty() {
             self.base_url = factory.base_url;
@@ -192,6 +209,16 @@ impl AiConfig {
         if self.model.is_empty() {
             self.model = factory.model;
         }
+    }
+
+    /// 上下文字节预算(「上下文大小」配置 → prompt 截断口径的换算,
+    /// decisions-pending #110):0 = 未配置给 `None`,由 latermd-ai 的
+    /// prompt 组装落回各用途现状默认(摘要 32KB / commit diff 16KB);
+    /// 已配置 = KB × 1024 字节,摘要与 commit 共用同一预算。读侧同样钳
+    /// 上限,绕过 `normalize` 构造的值也不会把请求撑爆。
+    pub fn context_budget(&self) -> Option<usize> {
+        let kb = self.context_kb.min(CONTEXT_KB_MAX);
+        (kb != 0).then(|| kb as usize * 1024)
     }
 
     /// 从目录读取;文件缺失或解析失败 = 默认(坏配置不挡启动,与
@@ -231,7 +258,7 @@ mod tests {
         std::env::temp_dir().join(format!("latermd-aicfg-{}-{name}", std::process::id()))
     }
 
-    /// 往返:改过的字段逐项保持(含旧变体的 snake_case 名)。
+    /// 往返:改过的字段逐项保持(含旧变体的 snake_case 名与新上下文大小)。
     #[test]
     fn save_load_round_trip() {
         let dir = temp_dir("roundtrip");
@@ -239,9 +266,10 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             base_url: "https://open.bigmodel.cn/api/paas/v4/".to_owned(),
             model: "glm-4.6".to_owned(),
+            context_kb: 512,
         };
         config.save_to(&dir).unwrap();
-        assert_eq!(AiConfig::load_from(&dir), config);
+        assert_eq!(AiConfig::load_from(&dir), config, "context_kb 应无损往返");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -261,6 +289,7 @@ mod tests {
                 provider,
                 base_url: base_url.to_owned(),
                 model: model.to_owned(),
+                context_kb: 0,
             };
             let dir = temp_dir("roundtrip-new");
             config.save_to(&dir).unwrap();
@@ -350,6 +379,7 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             base_url: "https://api.deepseek.com/v1".to_owned(),
             model: "deepseek-chat".to_owned(),
+            context_kb: 64,
         };
         config.save_to(&dir).unwrap();
         let json = std::fs::read_to_string(dir.join(AI_FILE)).unwrap();
@@ -367,8 +397,8 @@ mod tests {
                 "落盘不应再含被删键 \"{key}\":\n{json}"
             );
         }
-        // 保留项在场:provider/base_url/model 三键齐全
-        for key in ["provider", "base_url", "model"] {
+        // 保留项在场:provider/base_url/model/context_kb 四键齐全
+        for key in ["provider", "base_url", "model", "context_kb"] {
             assert!(
                 json.contains(&format!("\"{key}\"")),
                 "落盘应含保留键 \"{key}\":\n{json}"
@@ -379,6 +409,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 上下文大小(decisions-pending #110)的换算与默认:默认/旧档缺字段
+    /// = 0 = `None`(未配置,latermd-ai 落回现状默认,截断行为不变);
+    /// 显式 KB 值换算为字节,两用途共用同一预算。
+    #[test]
+    fn context_kb_defaults_to_zero_and_maps_to_byte_budget() {
+        assert_eq!(AiConfig::default().context_kb, 0);
+        assert_eq!(AiConfig::default().context_budget(), None, "未配置 = None");
+        assert_eq!(
+            AiConfig {
+                context_kb: 32,
+                ..AiConfig::default()
+            }
+            .context_budget(),
+            Some(32 * 1024),
+            "KB × 1024 = 字节"
+        );
+
+        // 旧档(ai.json 无 context_kb 键)读入 = 0 = 未配置
+        let dir = temp_dir("legacy-no-context");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(AI_FILE),
+            br#"{"provider":"open_ai_compatible","base_url":"https://api.deepseek.com/v1","model":"deepseek-chat"}"#,
+        )
+        .unwrap();
+        let config = AiConfig::load_from(&dir);
+        assert_eq!(config.context_kb, 0, "旧档缺字段回落 0(未配置)");
+        assert_eq!(config.context_budget(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上下文大小钳制(decisions-pending #110,照 #23 滑杆先例的上下限):
+    /// 手改 JSON 的越界值在 normalize(读入路径)就地收回上限;绕过
+    /// normalize 构造的值在 `context_budget` 读侧同样被钳。
+    #[test]
+    fn context_kb_is_clamped_to_configured_range() {
+        let mut config = AiConfig {
+            context_kb: u32::MAX,
+            ..AiConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.context_kb, CONTEXT_KB_MAX, "读入路径钳到上限");
+
+        let beyond = AiConfig {
+            context_kb: 2000,
+            ..AiConfig::default()
+        };
+        assert_eq!(
+            beyond.context_budget(),
+            Some(CONTEXT_KB_MAX as usize * 1024),
+            "读侧同样钳上限,预算不会撑爆"
+        );
+    }
+
     /// 归一化:空白端点/模型回落**当前 provider** 的出厂值;provider 字段
     /// 对新变体原样保留(不再回落到任何默认)。
     #[test]
@@ -387,6 +471,7 @@ mod tests {
             provider: ProviderKind::Ollama,
             base_url: "  ".to_owned(),
             model: String::new(),
+            context_kb: 0,
         };
         config.normalize();
         assert_eq!(config.provider, ProviderKind::Ollama, "provider 不回落");
@@ -397,6 +482,7 @@ mod tests {
             provider: ProviderKind::Anthropic,
             base_url: String::new(),
             model: String::new(),
+            context_kb: 0,
         };
         config.normalize();
         assert_eq!(config.provider, ProviderKind::Anthropic);
