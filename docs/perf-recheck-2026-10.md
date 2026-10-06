@@ -664,3 +664,328 @@ long_doc_100k/steady_state_scroll_middle
 - 变异验证 2 次:row 游标「匹配即前进」→ 等价断言 8≠15 失败;丢弃 shaped galley 宽度 key → 换宽测试失败;还原后全绿(断言非恒真)。
 - 探针载体 `streaming_profile.rs` 测完已删;vendor 内临时插桩(env 门控 eprintln/计时器/关断开关)全部还原,`git diff vendor/` 仅剩本轮正式改动。
 - 六项门禁(fmt/三轮 clippy/test/doc)与 `vendor/egui_markdown/check.sh` 在本模块收尾时实跑,结果见 auto-plan/README 修订记录;真机目视项见 notes(blocked_external)。
+
+---
+
+## 10. M1 全面取证:基准汇总+补剖面+热点排序(2026-10-06,#59 perf-round M1·只测不改)
+
+> **红线**:本模块只取证不改生产代码;新增 harness `crates/latermd-app/src/ui/perf_finding.rs` 为 `cfg(test)` 纯测试模块(照 `tab_switch_perf` 先例,生产构建不编译,分段计时全部公开 API);`vendor/` 的 A/B 归因用 **env 门控临时探针**(OnceLock + 环境变量,见 §10.2),**测后已逐字还原,`git diff vendor/` 为空**(本轮收尾时核实)。后续 M2 的修复沿 #99/#60 既有登记路线,本节只供数字。
+> **执行环境**:与 §1 同机同会话(Deepin 25 / 内核 6.18.48-amd64-desktop-rolling / X11,DISPLAY=:0 / rustc 1.98.0);分支 `feature/perf-round`(head = `122bbc7`,与 origin/main 同步)。本节全部数字为**无头 CPU 路径**(`egui::Context::run_ui`,不涉 GPU/present),llvmpipe 软渲染为既知条件但与本节数字无耦合;真窗口 vsync 口径见 §10.1.4(仍 blocked_external)。
+> **bench 二进制**:M3 vendor 改动落库后重编为 `target/release/deps/longdoc-e0de551c31baa257`(§9 为 `longdoc-b3c9b69313f2cdbc`);载体源码 `benches/longdoc.rs` 零改动(git 核实)。criterion `change:` 行对照的存档基线 = §9 M3 终测(2026-10-04)。
+> **20k 规模的轮间漂移带**:同代码三组独立复跑(§10.3 [SCROLL] 稳态三次:13.8–15.3 / 12.0–13.1 / 11.6–12.5 ms)实证 ±10–15% 机器漂移,**跨轮绝对值对比一律以 criterion 统计检验或同构建 A/B 差值为准**,不拿跨构建绝对值下结论。
+
+### 10.1 既有基准复跑(命令与输出逐字)
+
+#### 10.1.1 流式追加(#46 §2 同命令)
+
+```bash
+cargo bench -p latermd-app --bench longdoc -- streaming_append
+```
+
+逐字输出(2026-10-06,全量):
+
+```
+    Finished `bench` profile [optimized] target(s) in 7.09s
+     Running benches/longdoc.rs (target/release/deps/longdoc-e0de551c31baa257)
+Gnuplot not found, using plotters backend
+long doc: 100251 chars, 3704 lines
+Benchmarking streaming_append_by_lines/append_1_line_at_500
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Collecting 10 samples in estimated 5.0015 s (132k iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_500: Analyzing
+streaming_append_by_lines/append_1_line_at_500
+                        time:   [37.725 µs 38.340 µs 38.855 µs]
+                        change: [+3.8241% +5.8621% +7.8848%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking streaming_append_by_lines/append_1_line_at_2000
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Collecting 10 samples in estimated 5.0036 s (42k iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_2000: Analyzing
+streaming_append_by_lines/append_1_line_at_2000
+                        time:   [111.92 µs 113.36 µs 115.37 µs]
+                        change: [+4.1403% +5.8748% +7.6579%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking streaming_append_by_lines/append_1_line_at_10000
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Warming up for 3.0000 s
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Collecting 10 samples in estimated 5.0023 s (8635 iterations)
+Benchmarking streaming_append_by_lines/append_1_line_at_10000: Analyzing
+streaming_append_by_lines/append_1_line_at_10000
+                        time:   [563.66 µs 571.72 µs 577.22 µs]
+                        change: [+2.1444% +3.7366% +5.1917%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+```
+
+对照(`change:` 基线 = §9.4 M3 终测存档;µs/行口径同 §0):
+
+| 档位 | M3 终测 | 本轮中值 | 本轮 µs/行 | 对 M3 | 对 M0(R1 未修水位) |
+|---|---|---|---|---|---|
+| 500 行 | 35.886 µs | 38.340 µs | 0.0767 µs | +6.9%(p=0.00) | −99.90% |
+| 2,000 行 | 107.29 µs | 113.36 µs | 0.0567 µs | +5.7%(p=0.00) | −99.93% |
+| 10,000 行 | 550.75 µs | 571.72 µs | 0.0572 µs | +3.8%(p=0.00) | −99.93% |
+
+- **增长曲线判定(口径 = §0)**:500→2000 成本 ×**2.96**(规模 ×4);2000→10000 成本 ×**5.04**(规模 ×5);每行成本 0.0767 → 0.0567 → 0.0572 µs,**下降后趋稳**(末两档差 +0.9%,在 ±5% 持平带宽内)。**§9.5 的「趋稳」判定维持,验收曲线无回归**。
+- 绝对值三档 +3.8~6.9%:criterion 判 regressed(p=0.00),但幅度在 §10 头注的轮间漂移带内(同日两组复跑亦有 ±10%),且三档绝对值仍深藏 100ms 吐字预算(10000 行档 571.72 µs = 预算 0.57%)。**判定:达标水位维持,不构成回归证据**;M2 若动 vendor,复跑本命令时以同日基线对照。
+
+#### 10.1.2 滚动稳态(#52 §9.6 同命令,#99 水位复核)
+
+```bash
+cargo bench -p latermd-app --bench longdoc -- long_doc_100k
+```
+
+逐字输出(2026-10-06,全量):
+
+```
+     Running benches/longdoc.rs (target/release/deps/longdoc-e0de551c31baa257)
+Gnuplot not found, using plotters backend
+long doc: 100251 chars, 3704 lines
+Benchmarking long_doc_100k/cold_first_frame
+Benchmarking long_doc_100k/cold_first_frame: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 6.9s or enable flat sampling.
+Benchmarking long_doc_100k/cold_first_frame: Collecting 10 samples in estimated 6.9180 s (55 iterations)
+Benchmarking long_doc_100k/cold_first_frame: Analyzing
+long_doc_100k/cold_first_frame
+                        time:   [122.83 ms 124.60 ms 128.09 ms]
+                        change: [+0.8673% +3.0866% +5.5810%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Benchmarking long_doc_100k/steady_state_top
+Benchmarking long_doc_100k/steady_state_top: Warming up for 3.0000 s
+Benchmarking long_doc_100k/steady_state_top: Collecting 10 samples in estimated 5.0033 s (8965 iterations)
+Benchmarking long_doc_100k/steady_state_top: Analyzing
+long_doc_100k/steady_state_top
+                        time:   [544.41 µs 548.87 µs 551.70 µs]
+                        change: [+2.6561% +4.0006% +5.3035%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking long_doc_100k/steady_state_scroll_middle
+Benchmarking long_doc_100k/steady_state_scroll_middle: Warming up for 3.0000 s
+Benchmarking long_doc_100k/steady_state_scroll_middle: Collecting 10 samples in estimated 5.0246 s (9020 iterations)
+Benchmarking long_doc_100k/steady_state_scroll_middle: Analyzing
+long_doc_100k/steady_state_scroll_middle
+                        time:   [557.19 µs 563.22 µs 569.37 µs]
+                        change: [-0.4363% +2.5036% +5.7625%] (p = 0.15 > 0.05)
+                        No change in performance detected.
+```
+
+| 场景 | R1(未修基线) | §9.6 | 本轮 | 本轮对 R1 |
+|---|---|---|---|---|
+| `cold_first_frame` | 123.49 ms | 123.90 ms | 124.60 ms | +0.9%(持平) |
+| `steady_state_top` | 358.83 µs | 528.05 µs | 548.87 µs | **+52.9%** |
+| `steady_state_scroll_middle` | 371.36 µs | 571.32 µs | 563.22 µs | **+51.6%** |
+
+**#99 的滚动稳态 +47%/+54% 水位本轮维持**(+52.9%/+51.6%,同量级);冷首帧持平佐证环境可比。归因见 §10.2。
+
+#### 10.1.3 tab_switch_perf(#39 口径,`--release --ignored`)
+
+```bash
+cargo test -p latermd-app --release tab_switch -- --test-threads=1 --ignored --nocapture
+```
+
+逐字输出(2026-10-06,全量):
+
+```
+running 1 test
+test ui::tab_switch_perf::tab_switch_finding_report ... ==== M1 切换卡顿取证:样本 2000 行(doc_a 64236 字节 / doc_b 64236 字节,同一 ctx)====
+[A] 归约/快照侧(打开与编辑时付,不在切换帧)
+  expand_wikilinks(全文展开)                                     156.2 µs
+  outline(全文标题扫描)                                            472.2 µs
+[B] 预览渲染侧(每帧);heal 完整文档应为 Cow::Borrowed
+  heal(完整文档) => Cow::Borrowed(恒等零拷贝)
+  heal(完整文档逐行扫描)                                             186.9 µs
+  parse(heal 后全文)                                            388.7 µs
+  resolve_relative_images(有相对图,Some(base))                   96.8 µs
+  resolve_relative_images(无相对图,借回)                           96.7 µs
+[B2] MarkdownLabel 单件(pre-M2 常量 id 口径,id=preview-md,同一 ctx 连续帧)
+  冷首帧 A(parse+layout+高亮全量)                                   110.91 ms
+  稳态帧 A(缓存命中,7 帧中位)                                          573.5 µs
+  切到 B 首帧(同 id 换文本 = miss)                                   7.03 ms
+  稳态帧 B(缓存命中)                                                583.3 µs
+  切回 A 首帧(往返:flush 段缓存残留与否)                                  6.60 ms
+  对照:B 在全新 ctx 的冷首帧                                          88.93 ms
+[C] TextEdit 单件(生产配置,同一 ctx)
+  冷首帧 A(整篇 layout)                                           7.56 ms
+  稳态帧 A(galley 缓存命中)                                         16.3 µs
+  换到 B 首帧(文本变化 = 整篇 layout)                                  2.15 ms
+  换回 A 首帧(往返)                                                1.66 ms
+[D] 整帧(生产路径 LaterMdApp::draw,含全部面板)
+  open_tab A(读文本建预览快照,同步)                                    1.06 ms
+  open_tab B(同上)                                             888.7 µs
+  稳态帧 A(5 帧中位)                                               584.8 µs
+  归约 TabActivate(1)(switch_active 本体)                        0.6 µs
+  切换后首帧                                                      89.21 ms
+  切换后次帧                                                      997.4 µs
+  稳态帧 B(5 帧中位)                                               657.3 µs
+  往返切回 A 首帧                                                  2.45 ms
+[E] 规模放大(切换首帧是否随文档规模线性;用户的「明显卡顿」按此口径外推)
+  20000 行整帧稳态                                                12.52 ms
+  20000 行切换后首帧                                               916.61 ms
+  20000 行切换后次帧                                               18.62 ms
+  20000 行往返切回 A 首帧                                           35.84 ms
+  20000 行 MarkdownLabel 稳态(单件)                               21.40 ms
+  20000 行 MarkdownLabel 换文本首帧(单件)                            89.44 ms
+  20000 行旧路径(常量 id)往返切回 A 首帧(单件)                             92.16 ms
+==== 结论速读(数字解释见报告)====
+  切换首帧 89.21 ms/稳态帧 = 152.5×(A→B);往返首帧 2.45 ms/稳态帧 A = 4.2×
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 750 filtered out; finished in 3.73s
+```
+
+对照既有挂账口径:
+
+| 项 | #39 M2 时代(2026-09-30) | 本轮 | 判定 |
+|---|---|---|---|
+| 2000 行切换后首帧 | ~91.5 ms(同规模非同构对照) | 89.21 ms | 持平 |
+| 2000 行往返切回 A 首帧 | 2.33 ms(整帧) | 2.45 ms | 持平 |
+| **20000 行冷首切** | **847–927 ms(#60 挂账)** | **916.61 ms** | **挂账维持,超 100ms 目标 9.2×** |
+| 20000 行往返切回 A 首帧 | 31.1 ms | 35.84 ms | 同量级 |
+| 20000 行整帧稳态 | (当年未单列) | **12.52 ms** | **新发现热点,见 §10.2** |
+| 20000 行 MarkdownLabel 稳态(单件,heal 开) | (当年未单列) | **21.40 ms** | **同上;归因后 ≈78% 是块表记录** |
+
+#### 10.1.4 真窗口 scrollbench(§3b 口径)—— 仍 blocked_external
+
+```bash
+timeout 30 target/release/examples/scrollbench
+```
+
+逐字输出(2026-10-06):
+
+```
+scrollbench: 文档 100030 字符 / 4384 行
+scrollbench: 没有采到帧
+```
+
+与 §3b/§8.4 逐字相同(20 秒内 ui 帧数 <121),会话级 Vulkan WSI Fifo present 阻塞未恢复,**该项维持 blocked_external**,诊断链沿用 §3b 不重复。
+
+### 10.2 #99 归因复测(块表记录,同构建 env 门控 A/B,测后已还原)
+
+**方法**:在 `vendor/egui_markdown/src/label.rs` 临时加两处 OnceLock+环境变量探针(`PROBE_NO_BLOCK_TABLE` → `record_block_rect` 首行提前返回;`PROBE_NO_ANCHORS` → `record_section_anchors` 首行提前返回),一次构建跑四配置(criterion 落独立 baseline `probe_ab`,不污染默认存档),**测完逐字还原,`git diff vendor/` 为空**。手法沿 §9.2/§9.6 的「临时探针测完删」先例。
+
+四配置矩阵(`cargo bench -p latermd-app --bench longdoc -- long_doc_100k --save-baseline probe_ab`,中值,µs):
+
+| 配置 | steady_top | steady_middle | cold_first |
+|---|---|---|---|
+| A 基线(探针关) | 531.74 | 548.98 | 124.55 ms |
+| B 关块表记录 | 406.48 | 431.49 | 123.74 ms |
+| C 关锚点记录 | 537.90 | 536.55 | 123.22 ms |
+| D 双关 | 407.26 | 416.55 | 125.91 ms |
+
+(criterion change 行:A 之后各轮对上一配置自动比较,B 对 A = −23.8%/−21.2% p=0.00,D 对 C = −23.6%/−24.0% p=0.00,cold 全部 No change。)
+
+同一探针构建下 tab_switch harness 20000 行口径(env off / `PROBE_NO_BLOCK_TABLE=1` / 双开,`cargo test -p latermd-app --release tab_switch -- --test-threads=1 --ignored --nocapture`):
+
+| 行 | 探针关 | 关块表 | 双关 |
+|---|---|---|---|
+| 20000 行整帧稳态 | 12.13 ms | 3.86 ms | 3.63 ms |
+| 20000 行 MarkdownLabel 稳态(单件) | 20.56 ms | 4.49 ms | 4.50 ms |
+| 20000 行切换后首帧(冷) | 933.60 ms | 904.91 ms | 917.03 ms |
+| 20000 行往返切回 A 首帧 | 33.13 ms | 21.73 ms | 23.80 ms |
+
+**归因结论**:
+
+1. **#99 复测确认,主因即块表记录**:100k bench 口径贡献 **+125.3 µs/帧(top)/ +117.5 µs(middle)**(A−B),与 §9.6 的 +136 µs 同量级——#99 归因成立,数字无漂移。B/D 回不到 R1 的 358.83 µs(差 ~+48 µs)= M2 内容哈希 +36 µs(已接受的固有代价)+ 噪声,与 §9.6 的构成表吻合。
+2. **该成本超线性增长,20k 行规模成为一等热点**:单件稳态 20.56→4.49 ms,**块表 = 16.07 ms/帧(78%)**;整帧口径 12.13→3.86(+8.27 ms)。同一条路径在 3.7k 行的 longdoc bench(块表约千条)上只有 ~125 µs,20k 样本实测 4673 条记录要 16.07 ms——**块数约 3–5×、成本约 129×**:机理是「每记录固定开销(读改写 temp memory,线性)」+「每记录克隆整表 Vec(O(N²) memcpy,20k 规模下 4673²/2 × 56B ≈ 0.6 GB/帧)」叠加,大 N 进入二次项主导区。
+3. **机制(本轮实读)**:`record_block_rect`(label.rs:441)每记录一条都 `get_temp`(egui temp memory 读取**克隆整张 Vec**)+ push + `insert_temp`,N 条记录 = O(N²) 拷贝;且 cull 路径(`render_token_range` 四处 + flush cull)对**视口外块也照记**——`block_span_rects` 公开 API 实测 20000 行稳态帧记录 **4673 条**(视口仅 ~40 行;4673 ≈ 667 节 × 7 块)。4673²/2 × 56 字节 ≈ 0.6 GB/帧 memcpy,与 16 ms 实测吻合。
+4. **锚点记录不值得修**:C vs A 差在噪声内(±1%),20k 行帧锚点只记 **61 条**(只对可见 flush 段记录,`record_section_anchors` 在 `render_galley` 内、cull 段不进)——与块表不同源,标「不值得修」。
+5. **块表与冷首切无关**:冷首帧 A/B/D 全部持平(122–126 ms)——miss 帧主导是 layout(§10.4),两热点独立。
+
+### 10.3 补缺失剖面(新增 harness `perf_finding`,cfg(test))
+
+跑法(与 `tab_switch_perf` 同口径,release;样本生成器同构,30 行一节,1280×800 无头帧):
+
+```bash
+cargo test -p latermd-app --release perf_finding -- --test-threads=1 --ignored --nocapture
+```
+
+逐字输出(2026-10-06 最终版;harness 演进说明:首版「换文本首帧」行同 ctx 同文本取中位,被 egui Fonts 层 galley 缓存命中掩盖成假 miss(29.6 µs),已改为逐帧异文真 miss 后定稿,演进口径见 harness 注释):
+
+```
+test ui::perf_finding::perf_finding_report ... ==== #59 M1 全面取证:样本 2000 行(64236 字节)/ 20000 行(645348 字节),1280×800 无头帧 ====
+[EDIT] 大文档编辑帧(生产配置 TextEdit 单件,7 帧中位)
+  -- 5000 行(160848 字节)--
+  稳态帧(galley 缓存命中)                                               26.4 µs
+  键入 1 字符帧(整篇重排)                                                 915.9 µs
+  换文本首帧(逐帧异文 = 真 miss)                                           793.5 µs
+  -- 10000 行(322671 字节)--
+  稳态帧(galley 缓存命中)                                               49.6 µs
+  键入 1 字符帧(整篇重排)                                                 1.57 ms
+  换文本首帧(逐帧异文 = 真 miss)                                           1.71 ms
+  -- 20000 行(645348 字节)--
+  稳态帧(galley 缓存命中)                                               112.2 µs
+  键入 1 字符帧(整篇重排)                                                 3.05 ms
+  换文本首帧(逐帧异文 = 真 miss)                                           3.19 ms
+[SCROLL] 滚动稳态帧(20000 行预览单件,id=perf-scroll-md,7 帧中位)
+  冷首帧(对照,1 帧)                                                    863.85 ms
+  稳态帧 offset=0                                                   12.30 ms
+  稳态帧 offset=100000                                              12.47 ms
+  稳态帧 offset=250000                                              12.28 ms
+  稳态帧 offset=400000                                              11.96 ms
+  稳态帧 offset=4000000                                             11.62 ms
+  连续滚动帧(800px/帧,24 帧中位)                                          11.14 ms
+  稳态帧记录面:块表 4673 条 / 锚点 61 条(视口内可见行 ~40)
+[COLDSWITCH] 冷首切构成分解(2000 行)
+  ① expand_wikilinks(打开时,快照侧)                                    95.4 µs
+  ② heal 全文扫描(流式帧才开)                                             115.2 µs
+  ③ parse 全文(缓存 miss 时)                                          296.6 µs
+  ④ 冷首帧整帧(heal+parse+layout+高亮+记录)                               84.00 ms
+  ⑤ 稳态帧(命中,对照)                                                   451.5 µs
+  ≈差值归因:④−③−② ≈ layout+高亮+缓存构建 ≈ 83.59 ms(近似口径:①在快照侧不进帧,记录/哈希含在差值里)
+  视口外延迟布局的可挽回上界(#60 路线)= ④−⑤ = 83.55 ms
+[COLDSWITCH] 冷首切构成分解(20000 行)
+  ① expand_wikilinks(打开时,快照侧)                                    1.00 ms
+  ② heal 全文扫描(流式帧才开)                                             1.19 ms
+  ③ parse 全文(缓存 miss 时)                                          3.11 ms
+  ④ 冷首帧整帧(heal+parse+layout+高亮+记录)                               835.99 ms
+  ⑤ 稳态帧(命中,对照)                                                   14.23 ms
+  ≈差值归因:④−③−② ≈ layout+高亮+缓存构建 ≈ 831.68 ms(近似口径:①在快照侧不进帧,记录/哈希含在差值里)
+  视口外延迟布局的可挽回上界(#60 路线)= ④−⑤ = 821.76 ms
+[STARTUP] 应用启动(app 侧;eframe/wgpu/窗口创建与 fonts::install 属原生路径,无头不可测)
+  LaterMdApp::default()(状态构造)                                    126.4 µs
+  首帧(冷:字体图集+全部面板)                                                7.01 ms
+  稳态帧(5 帧中位,示例文档)                                                138.2 µs
+  open_tab(20000 行)+TabActivate 归约:8.393641ms(快照同步在建)
+  大文档首帧(缓存全 miss)                                                883.99 ms
+  大文档次帧                                                          12.87 ms
+==== 完 ====
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 751 filtered out; finished in 6.63s
+```
+
+剖面读数:
+
+- **[EDIT] 大文档编辑帧**:键入一字 915.9 µs(5k)→ 1.57 ms(10k)→ 3.05 ms(20k),**线性 O(n)**(每次键入 TextEdit 整篇重排);20k 行的 3.05 ms = 60fps 帧预算的 18%,**现规模在预算内**;稳态帧 26–112 µs 线性小系数,无碍。外推:>10 万行单文件键入才会破 16 ms 预算。
+- **[SCROLL] 滚动稳态帧(20k 行,现行生产稳态口径 heal 关)**:各滚动偏移稳态 **11.6–12.5 ms,与滚动位置无关**(视口剔除位置无关性在 20k 规模维持);连续滚动 11.14 ms/帧。**但 12 ms 已贴 60fps 预算线(16.6 ms)**——构成见 §10.2:块表 ~16 ms(单件宽口径)/+8.3 ms(整帧窄口径)主导,纯滚动剔除本身无问题。注意此口径与 §10.1.3 [B2] 行(heal 开,21.40 ms)同源不同配置,heal 实测仅 +1.2 ms,余差 ~7 ms 在轮间漂移带 + 配置差内,未做插桩归因,如实存疑;归因锚点以 §10.2 同构建 A/B 为准。
+- **[COLDSWITCH]**:构成 = layout+高亮+缓存构建 ~832 ms(20k)/ ~83.6 ms(2k),**占冷首帧 99.5%+**;parse(3.11 ms)/heal(1.19 ms)/expand_wikilinks(1.00 ms,且在快照侧不在帧内)皆是零头。
+- **[STARTUP]**(app 侧可测部分):状态构造 126 µs、首帧 7.0 ms(一次性字体图集+面板)、示例文档稳态 138 µs、open_tab 20k 行 8.4 ms(快照同步建,一次性)——**启动路径无热点**;eframe/wgpu/窗口创建与 `fonts::install` 属原生路径,无头不可测(blocked_external,与 §3b 同因不同层:后者是 present 阻塞,前者是无窗口环境)。
+
+### 10.4 #60 复测与路线评估(20000 行冷首切 847 ms)
+
+三处独立测量同口径互证:tab_switch [E] **916.61 ms**(§10.1.3)、perf_finding [SCROLL] 冷首帧 **863.85 ms**、perf_finding [STARTUP] 大文档首帧 **883.99 ms**(探针构建下 904.91–933.60 ms,§10.2)——**#60 挂账(847–927 ms)维持,超 100ms 目标 8.4–9.3×**;2000 行同源(84.00 ms,超 100ms 线下但贴近)。
+
+**vendor ①类路线评估(按 #60 已写明的「miss 帧视口外延迟布局」)**:
+
+- 可挽回上界 = ④−⑤ = **821.76 ms(20k)/ 83.55 ms(2k)**:miss 帧只布局视口内 flush 段、屏外段沿用块级尺寸缓存/估计高度占位,则冷首切理论上收敛到「稳态帧 + 视口内 layout」≈ 几 ms 级。
+- 可行性旁证:M1/M2/M3 后**热帧已经是分段命中**(⑤ = 14.23 ms,含块表 16ms 宽口径的重叠不可简单相减,量级证据而已),即「只算可见段」的每帧路径存在且被缓存命中路径每天在走;miss 帧缺的只是「屏外段先给占位高度、命中后补真值」。
+- 已知风险(#60 备选 B 原文):估计高度失准 → 布局塌陷/滚动条跳动,需要「首刷占位 + 后帧校正」策略;块序号 widget id 纪律与 debug_assert 一致性(#77 点名连带)必须保持。
+- 结论:**路线可达、收益 ~822 ms(98%),是 M2 两大主修对象之一**;工程量与风险显著高于块表修复(后者语义零变化),M2 若预算只够一项,优先级见 §10.5。
+
+### 10.5 热点排序表(按可挽回成本,20k 行最坏场景口径)
+
+| # | 热点 | 位置 | 实测成本 | 可挽回上限 | 路线 | 判定 |
+|---|---|---|---|---|---|---|
+| 1 | **冷首切全量 layout+高亮**(miss 帧视口外段照排) | vendor flush miss 路径(#60 已写明) | 836–934 ms/次(2k 行 84 ms) | ~822 ms(98%) | vendor ①类:视口外延迟布局 | **修**(超 100ms 预算 8.4×) |
+| 2 | **块表记录 O(N²)**(每记录克隆整表 Vec,视口外块照记) | vendor `record_block_rect`(#42 落地,#99 挂账) | +16.1 ms/帧 @20k 单件稳态(78%);+125 µs @3.7k bench;+8.3 ms 整帧口径 | ≈全部(A/B 实证) | vendor ①类:帧内局部收集一次 insert(语义零变化) | **修**(20k 行稳态帧 12–20 ms 已贴 60fps 预算线;3.7k 行以上随规模二次方恶化) |
+| 3 | 稳态帧 O(doc) 重哈希(flush ctx 哈希 + 块 key 内容哈希 + 整篇 text 哈希) | vendor `hash_flush_context`/`hash_block_content`/`hash_text` | A/B 关断后残差 ~3.5–4.5 ms/帧 @20k(B/D 配置 3.6–4.5 ms) | 部分(需段/块级摘要哈希,动缓存键语义) | vendor ①类 | **备选**(收益中、风险中;1/2 落地后预算富余再评估) |
+| 4 | 编辑键入整篇重排 | egui TextEdit(egui 内建,非本仓非 vendor) | 3.05 ms/键 @20k,线性 | 预算内(18%) | — | **不值得修**(如实标注;>10 万行单文件再议) |
+| 5 | section anchors 记录 | vendor `record_section_anchors` | ≈0(只记可见段,61 条/帧) | — | — | **不值得修**(A/B 实证噪声级) |
+| 6 | 流式追加残余线性项 | 整篇 parse/哈希(§9.5 已记 ~0.05 µs/行) | 571.72 µs @10000 行档(预算 0.57%) | 微 | — | **不值得修**(#52 已销账,曲线趋稳维持) |
+| 7 | 应用启动(app 侧) | 状态构造/首帧/open_tab | 126 µs / 7.0 ms / 8.4 ms,一次性 | 已达标 | — | 无需修 |
+
+### 10.6 对 M2 的交接
+
+1. **主修一(最小改动最大确定性):块表记录一次收集化**。`record_block_rect` 改为帧内局部 Vec 收集、帧末一次 `insert_temp`(或等价 get_mut 原地 push),「帧号键控、首写重置、跨帧读 None」契约(#78)不变;纯性能语义零变化,风险最低。验收 = §10.1.2 同命令稳态回到 #42 前水位(R1 358.83/371.36 µs 的 ±5% 带宽,即去掉 M2 固有 +36 µs 后 ~395–410 µs 一线)、tab_switch 20k 稳态行降到 ~4 ms 级;**#99 凭此销账**。
+2. **主修二(大改,独立拍板):冷首切视口外段延迟布局**(#60 路线)。验收 = 20k 冷首切向 100 ms 逼近(≥8× 改善即 836→<110 ms 量级)、2k 口径 84→<20 ms;像素零变化否决线沿用 #52 M3(渲染结果不变,vendored 152 项测试全绿)。占位高度失准的塌陷/跳屏对策须先设计后动手(§10.4)。
+3. 不承诺项:热点 3(稳态哈希摘要化)只在 1/2 落地后按剩余预算评估,不达标即如实挂账不硬凑。
+4. 修复全部属 vendor ①类:按 AGENTS §6.9 独立 `vendor:` commit + vendor/README 变更表 + vendored CHANGELOG + 可 cherry-pick;M2 复跑验收命令 = §10.1.1/§10.1.2 两条 bench + §10.1.3/§10.3 两条 harness,验收口径 = 每项「前后数字对比」。
