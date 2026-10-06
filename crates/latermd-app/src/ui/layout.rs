@@ -1864,13 +1864,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 禅定帧的 Ctrl+H(#17 M2 核验③,#60):`poll_shortcuts` 在 reduce
+    /// 禅定帧的替换键(#17 M2 核验③,#60):`poll_shortcuts` 在 reduce
     /// 每帧必跑、不看布局分叉,替换条状态照常翻到位;但查找卡浮层只画
     /// 三栏源码路径,#17 交付时的既有口径 —— 禅定帧浮层 Area 不存在,
     /// Esc 退出禅定后同一状态立即落回屏上。是「延后」不是「被吞」
     /// (13a 的 Foreground Area 跨层屏蔽不适用:查找卡是 egui 管理的
     /// Window,禅定不画任何遮蔽它的层)。与查找条/goto 浮条在禅定的
-    /// 行为三者同口径(decisions-pending #114)。
+    /// 行为三者同口径(decisions-pending #114)。按键从出厂键位读
+    /// (#114:mac = ⌥⌘F,其余 = Ctrl+H;硬编码 Ctrl+H 在 mac 编译
+    /// 目标上不触发,同 [`ctrl_h_opens_replace_row_typing_does_not_edit_and_esc_closes`])。
     #[test]
     fn ctrl_h_in_zen_flips_state_and_overlay_waits_for_three_pane() {
         let ctx = egui::Context::default();
@@ -1880,19 +1882,22 @@ mod tests {
         find_test_frame(&mut app, &ctx, screen, 0.1, Vec::new());
         assert!(app.state.layout.zen, "前置:已进禅定");
 
-        // 禅定帧按 Ctrl+H:命令层消费键位,状态翻进查找条 + 替换行
+        // 禅定帧按出厂替换键:命令层消费键位,状态翻进查找条 + 替换行
+        let shortcut = crate::command::Command::ReplaceInDoc
+            .default_shortcut()
+            .expect("替换命令有出厂键位");
         find_test_frame(
             &mut app,
             &ctx,
             screen,
             0.2,
-            find_key(Key::H, Modifiers::COMMAND),
+            find_key(shortcut.logical_key, shortcut.modifiers),
         );
         find_test_frame(&mut app, &ctx, screen, 0.3, Vec::new());
         assert!(app.state.layout.zen, "仍在禅定");
         assert!(
             app.state.find.open && app.state.find.replace_open,
-            "禅定帧 Ctrl+H 状态照常翻到位"
+            "禅定帧替换键状态照常翻到位"
         );
         let overlay = egui::Id::new("editor-find-overlay");
         assert!(
@@ -1901,7 +1906,7 @@ mod tests {
         );
 
         // Esc 退出禅定(draw_zen 消费,推 outbox),下一帧 reduce 应用后
-        // 回三栏 —— 查找卡同帧落回屏上,不需要再按 Ctrl+H
+        // 回三栏 —— 查找卡同帧落回屏上,不需要再按一次替换键
         find_test_frame(
             &mut app,
             &ctx,
