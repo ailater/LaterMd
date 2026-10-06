@@ -16,6 +16,7 @@ mod mock;
 mod models;
 mod ollama;
 mod openai;
+mod polish;
 mod summary;
 
 pub use anthropic::{parse_anthropic_sse, AnthropicProvider, AnthropicSettings};
@@ -27,6 +28,7 @@ pub use models::{
 };
 pub use ollama::{parse_ollama_ndjson, OllamaProvider, OllamaSettings};
 pub use openai::{parse_openai_sse, AiError, OpenAiProvider, OpenAiSettings, API_KEY_ENV};
+pub use polish::{polish_budget, polish_prompt};
 pub use summary::{summary_prompt, summary_prompt_with_budget, truncate_document};
 
 use std::sync::mpsc::Sender;
