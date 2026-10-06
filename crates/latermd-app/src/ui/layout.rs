@@ -110,6 +110,17 @@ impl LaterMdApp {
         if let Some(wait) = state.shortcut_overlay.repaint_wait(now) {
             ctx.request_repaint_after(wait);
         }
+        // 润色确认浮窗在场的 Esc 归浮窗(#61 M3 放弃快捷键):裸 Esc 被
+        // 消费并当场归约为「放弃」(关窗零改动/作废在途流)。排在蒙层的
+        // retain 之前 —— 浮窗是最显式的用户上下文,最顶层浮层优先;浮窗
+        // 在场时按 Esc 先关浮窗,蒙层(长按修饰键的挂起态)本帧收不到,
+        // 再按一次即可,与 #103 的已知边界同型。只吃裸 Esc,带修饰键的
+        // 组合不受影响。
+        if state.ai_polish.is_some()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            state.apply(Message::SelectionAiPolishDismissed);
+        }
         // 蒙层可见帧的 Esc 归蒙层(#54 M2 关闭路径之一):蒙层的关闭本身
         // 已由 step 的「其它按键」规则完成,这里只把事件从流里移除——禅定
         // 退出、emoji/查找条关闭等其它 Esc 语义当帧不可达(最顶层浮层优先,
@@ -549,6 +560,20 @@ impl LaterMdApp {
             let (_, close) = commit_dialog(ui, &subject);
             if close.clicked() {
                 outbox.push(Message::AiCommitDismissed);
+            }
+        }
+
+        // 选区润色确认浮窗(#61 M3):草稿流式逐块增长(实时可见),确认/
+        // 放弃只发消息,替换与作废在归约。Esc 的消费在 `reduce`(浮窗在场
+        // 即归它,先于蒙层/禅定/查找条等其它 Esc 语义)。
+        if let Some(session) = self.state.ai_polish.clone() {
+            let (confirm, dismiss, _copy) =
+                selection_ai_polish_dialog(ui, &session.draft, self.state.ai.is_streaming());
+            if confirm.clicked() {
+                outbox.push(Message::SelectionAiPolishConfirmed);
+            }
+            if dismiss.clicked() {
+                outbox.push(Message::SelectionAiPolishDismissed);
             }
         }
 
@@ -1317,6 +1342,61 @@ fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Res
                     ctx.copy_text(subject.to_owned());
                 }
                 buttons = Some((copy, ui.button("关闭")));
+            });
+        });
+    buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 选区润色确认浮窗(#61 M3);返回(确认替换, 放弃, 复制)按钮的响应,
+/// 测试定位用(与 `commit_dialog` 同款手法;真正的替换/放弃在归约)。
+///
+/// 正文是**只读**多行文本区(`&str` 的不可变 `TextBuffer`),包在
+/// ScrollArea 里可滚动 —— 润色草稿可能比视口长。流式进行中草稿逐块增长
+/// (本函数每帧读最新 draft,零跨帧缓存),确认按钮禁用;结束后确认/
+/// 放弃可用。widget id 全部固定字符串,不含内容长度/hash(AGENTS §6.7)。
+fn selection_ai_polish_dialog(
+    ui: &mut egui::Ui,
+    draft: &str,
+    streaming: bool,
+) -> (egui::Response, egui::Response, egui::Response) {
+    let ctx = ui.ctx().clone();
+    let mut buttons = None;
+    egui::Window::new("AI 润色")
+        // 固定初始位与尺寸:浮窗出现位置可预期(commit_dialog 同款),
+        // resizable 允许用户拉大看长草稿。
+        .default_pos([80.0, 120.0])
+        .default_size([380.0, 240.0])
+        .collapsible(false)
+        .resizable(true)
+        .show(ui.ctx(), |ui| {
+            ui.label(if streaming {
+                "润色中…(完成后可确认整段替换选区)"
+            } else {
+                "润色结果,确认后整段替换选区:"
+            });
+            let mut view: &str = draft;
+            egui::ScrollArea::vertical()
+                .id_salt("selection-ai-polish-body")
+                .auto_shrink([false, true])
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut view)
+                            .id(egui::Id::new("selection-ai-polish-text"))
+                            .desired_rows(6)
+                            // 固定宽:浮窗尺寸不随草稿内容跳动(流式逐块
+                            // 增长时窗口每帧变宽是观感事故)
+                            .desired_width(340.0),
+                    );
+                });
+            ui.horizontal(|ui| {
+                let copy = ui.button("复制");
+                if copy.clicked() {
+                    ctx.copy_text(draft.to_owned());
+                }
+                let confirm = ui.add_enabled(!streaming, egui::Button::new("确认替换"));
+                let dismiss = ui.button(if streaming { "放弃" } else { "放弃(Esc)" });
+                buttons = Some((confirm, dismiss, copy));
             });
         });
     buttons.expect("浮窗必然绘制按钮")
@@ -2957,6 +3037,185 @@ mod tests {
         let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
         output.drop_without_applying_deltas();
         assert_eq!(app.state.ai_commit_suggestion, None);
+    }
+
+    /// 选区润色确认浮窗(#61 M3)端到端:待确认会话挂上后浮窗显示草稿,
+    /// 点「确认替换」→ 归约整段替换选区、浮窗关闭;点「放弃」→ 文档零
+    /// 改动。Window 层按钮的点击归属要求指针先停在目标上(三帧节奏,
+    /// `commit_dialog_copies_and_close_clears_suggestion` 同款)。
+    #[test]
+    fn selection_ai_polish_dialog_confirm_replaces_and_dismiss_keeps() {
+        use crate::state::AiPolishSession;
+
+        let mut app = LaterMdApp::default();
+        // 选区 (4,6) = 「甲乙」:旧0 文1 本2 (3 甲4 乙5 )6 丙7
+        app.state.tabs.current_mut().editor.load("旧文本(甲乙)丙");
+        let tab_id = app.state.tabs.current().id;
+        let rev = app.state.tabs.current().editor.revision();
+
+        // 帧 1:单独渲染浮窗拿按钮位置(Area 按 id 记忆,draw 内位置一致)
+        let ctx = egui::Context::default();
+        let rects = Cell::new((Rect::NOTHING, Rect::NOTHING));
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(test_viewport()),
+                ..Default::default()
+            },
+            |ui| {
+                let (confirm, dismiss, _copy) = selection_ai_polish_dialog(ui, "润色稿", false);
+                rects.set((confirm.rect, dismiss.rect));
+            },
+        );
+        output.drop_without_applying_deltas();
+        let dismiss_center = {
+            let (_confirm, dismiss) = rects.get();
+            dismiss.center()
+        };
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frame = |events: Vec<Event>| RawInput {
+            events,
+            screen_rect: Some(test_viewport()),
+            ..Default::default()
+        };
+
+        // —— 场景一:点「放弃」→ 零改动 ——
+        app.state.ai_polish = Some(AiPolishSession {
+            tab_id,
+            selection: (4, 6),
+            rev,
+            draft: "润色稿".into(),
+        });
+        let before = app.state.tabs.current_mut().editor.text().to_owned();
+        for events in [
+            vec![Event::PointerMoved(dismiss_center)],
+            vec![click(dismiss_center, true)],
+            vec![click(dismiss_center, false)],
+        ] {
+            let output = ctx.run_ui(frame(events), |ui| {
+                app.reduce(ui.ctx());
+                app.draw(ui);
+            });
+            output.drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.ai_polish, None, "放弃关窗");
+        assert_eq!(
+            app.state.tabs.current_mut().editor.text(),
+            before,
+            "放弃零改动"
+        );
+
+        // —— 场景二:重新挂会话,点「确认替换」→ 整段替换。浮窗经历过
+        // 一次关闭→重开,按本场景草稿重新渲染定位按钮(Window 层按钮的
+        // 点击归属要求指针先停在目标上,同帧 1 手法)——
+        app.state.ai_polish = Some(AiPolishSession {
+            tab_id,
+            selection: (4, 6),
+            rev: app.state.tabs.current().editor.revision(),
+            draft: "甲乙 polished".into(),
+        });
+        let rects2 = Cell::new((Rect::NOTHING, Rect::NOTHING));
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            let (confirm, dismiss, _copy) = selection_ai_polish_dialog(ui, "甲乙 polished", false);
+            rects2.set((confirm.rect, dismiss.rect));
+        });
+        output.drop_without_applying_deltas();
+        let (confirm_center, _dismiss_center) = {
+            let (confirm, dismiss) = rects2.get();
+            (confirm.center(), dismiss.center())
+        };
+        for events in [
+            vec![Event::PointerMoved(confirm_center)],
+            vec![click(confirm_center, true)],
+            vec![click(confirm_center, false)],
+        ] {
+            let output = ctx.run_ui(frame(events), |ui| {
+                app.reduce(ui.ctx());
+                app.draw(ui);
+            });
+            output.drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(RawInput::default(), |ui| app.reduce(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.ai_polish, None, "确认关窗");
+        assert_eq!(
+            app.state.tabs.current_mut().editor.text(),
+            "旧文本(甲乙 polished)丙",
+            "整段替换选区"
+        );
+        assert_eq!(
+            app.state.tabs.current().pending_selection,
+            Some((4, 15)),
+            "新选区落润色结果全文(「甲乙 polished」11 字符)"
+        );
+    }
+
+    /// 润色浮窗在场的 Esc 归浮窗(#61 M3):待确认态按 Esc 当帧归约放弃
+    /// (零改动关窗);流式中按 Esc 作废在途流;浮窗不在场时 Esc 不被
+    /// 任何 M3 逻辑拦截。
+    #[test]
+    fn selection_ai_polish_escape_dismisses_and_aborts_stream() {
+        let mut app = LaterMdApp::default();
+        app.state.tabs.current_mut().editor.load("旧文本甲乙丙");
+        let ctx = egui::Context::default();
+        let esc = || {
+            [true, false]
+                .into_iter()
+                .map(|pressed| Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                })
+                .collect::<Vec<_>>()
+        };
+        let run = |app: &mut LaterMdApp, events: Vec<Event>| {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(test_viewport()),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.reduce(ui.ctx());
+                    app.draw(ui);
+                },
+            );
+            output.drop_without_applying_deltas();
+        };
+
+        // 流式中按 Esc:作废在途流,零文档改动
+        app.state.ai_polish = Some(crate::state::AiPolishSession {
+            tab_id: app.state.tabs.current().id,
+            selection: (4, 6),
+            rev: app.state.tabs.current().editor.revision(),
+            draft: String::new(),
+        });
+        let _ = app
+            .state
+            .ai
+            .start("你是文字润色助手。请改写下方选中的文本,要求:保持原意");
+        assert!(app.state.ai.is_streaming());
+        let before = app.state.tabs.current_mut().editor.text().to_owned();
+        run(&mut app, esc());
+        assert!(!app.state.ai.is_streaming(), "流式中 Esc 作废在途流");
+        assert_eq!(app.state.ai_polish, None, "Esc 关窗");
+        assert_eq!(
+            app.state.tabs.current_mut().editor.text(),
+            before,
+            "Esc 放弃零改动"
+        );
+
+        // 浮窗不在场:Esc 事件原样留在流里(不被 M3 消费)
+        run(&mut app, esc());
+        assert_eq!(app.state.ai_polish, None);
     }
 
     /// 在临时目录里装配一次性 git 仓库(一笔提交 + 一个工作区改动)。
