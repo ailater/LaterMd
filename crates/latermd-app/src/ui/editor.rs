@@ -7,7 +7,7 @@
 //! 大纲跳转也在这里应用:覆写 TextEdit 持久光标并交还焦点。
 
 use crate::live::{self, LiveState, RenderMode};
-use crate::state::{OutlineCursor, PreviewState};
+use crate::state::{Message, OutlineCursor, PreviewState};
 use crate::ui::gutter;
 use crate::ui::minimap;
 use latermd_editor::EditorBuffer;
@@ -154,6 +154,7 @@ pub fn ui(
     mode: RenderMode,
     editor_id: egui::Id,
     show_minimap: bool,
+    outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let CursorChannel {
         cursor,
@@ -169,7 +170,7 @@ pub fn ui(
     // 两种模式共用同一个 rope buffer 与同一套撤销语义(roadmap 铁律):这里
     // 只是分派,没有任何「把光标/文本从一种模式搬到另一种」的恢复逻辑。
     if is_live {
-        return live::ui(panel, editor, preview, cursor, live, editor_id);
+        return live::ui(panel, editor, preview, cursor, live, editor_id, outbox);
     }
 
     let line_height = {
@@ -560,6 +561,19 @@ pub fn ui(
     let mut tracking: ImeCaretTracking = panel
         .ctx()
         .data_mut(|data| data.get_temp(tracking_id).unwrap_or_default());
+    // 选区 AI 浮标(#61)的焦点还回:按在浮标/菜单上的帧,egui 内建清焦
+    // (widget 创建段,`surrender_focus_on: Presses`)已把编辑器焦点吃掉
+    // —— 以上一帧的浮标矩形为准先把焦点还给编辑器,再判焦点(IME 与浮标
+    // 可见性同用);`request_focus` 即刻生效,同帧 `has_focus` 为真。
+    {
+        let prev_floater = crate::ui::selection_ai::hit_rects(panel.ctx(), editor_id);
+        let pointer = panel.ctx().input(|input| input.pointer.interact_pos());
+        if pointer.is_some_and(|pos| prev_floater.iter().any(|rect| rect.contains(pos))) {
+            panel
+                .ctx()
+                .memory_mut(|mem| mem.request_focus(output.response.response.id));
+        }
+    }
     let focused = panel
         .ctx()
         .memory(|mem| mem.has_focus(output.response.response.id));
@@ -605,6 +619,39 @@ pub fn ui(
     panel
         .ctx()
         .data_mut(|data| data.insert_temp(tracking_id, tracking));
+
+    // 选区 AI 浮标(#61 M1):持久选区(#38 同源读法)+ 编辑器持焦 + 无拖拽
+    // 进行中才弹;尾端光标条经 galley pos_from_cursor 换算屏幕矩形(IME 同
+    // 先例),每帧重算无陈旧偏移。命中区注册在本 ScrollArea 之后(同层末尾,
+    // 13a 纪律),clip 取编辑视口 —— 尾端随滚动出视口即隐。
+    let sel_range = output
+        .state
+        .cursor
+        .char_range()
+        .map(|range| (range.primary.index.0, range.secondary.index.0));
+    let sel_tail_anchor = sel_range.map(|(a, b)| {
+        let rect = output
+            .galley
+            .pos_from_cursor(egui::text::CCursor::new(a.max(b)));
+        egui::Rect::from_min_max(
+            output.galley_pos + rect.min.to_vec2(),
+            output.galley_pos + rect.max.to_vec2(),
+        )
+    });
+    let sel_anchor = if crate::ui::selection_ai::badge_visible(
+        sel_range,
+        focused,
+        // 拖选进行中不弹;按在浮标自己上(dragged_id = 浮标)不算拖选。
+        panel
+            .ctx()
+            .dragged_id()
+            .is_some_and(|id| !crate::ui::selection_ai::is_floater_id(editor_id, id)),
+    ) {
+        sel_tail_anchor
+    } else {
+        None
+    };
+    crate::ui::selection_ai::show(panel, editor_id, sel_anchor, scrolled.inner_rect, outbox);
 
     output.response.response
 }
@@ -675,8 +722,94 @@ mod tests {
         pending: &mut Option<(usize, usize)>,
         cursor: &mut OutlineCursor,
     ) -> (egui::Id, Vec<egui::Rect>) {
-        // 真实窗口尺度的视口:滚不滚得动取决于「内容是否高过一屏」,
-        // 默认 10000×10000 的测试视口永远装得下,滚动路径测不到。
+        let mut outbox = Vec::new();
+        frame_core(
+            ctx,
+            events,
+            now,
+            editor,
+            preview,
+            selection,
+            pending,
+            cursor,
+            tab_editor_id(1),
+            &mut outbox,
+        )
+    }
+
+    /// [`frame`] 之外再交出浮标菜单点选产出的消息(#61 浮标测试用)。
+    fn frame_with_messages(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        now: f64,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+    ) -> (egui::Id, Vec<Message>) {
+        let mut selection = None;
+        let mut pending = None;
+        let mut outbox = Vec::new();
+        let (id, ime) = frame_core(
+            ctx,
+            events,
+            now,
+            editor,
+            preview,
+            &mut selection,
+            &mut pending,
+            cursor,
+            tab_editor_id(1),
+            &mut outbox,
+        );
+        let _ = ime;
+        (id, outbox)
+    }
+
+    /// 指定标签稳定 id 跑一帧(浮标「切标签即隐」测试用:探针与菜单状态
+    /// 都挂 editor_id,标签各有各的一份)。
+    fn frame_for_tab(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        now: f64,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        tab_id: u64,
+    ) -> egui::Id {
+        let mut selection = None;
+        let mut pending = None;
+        let mut outbox = Vec::new();
+        frame_core(
+            ctx,
+            events,
+            now,
+            editor,
+            preview,
+            &mut selection,
+            &mut pending,
+            cursor,
+            tab_editor_id(tab_id),
+            &mut outbox,
+        )
+        .0
+    }
+
+    /// 帧驱动核心:真实窗口尺度的视口(滚不滚得动取决于「内容是否高过
+    /// 一屏」,默认 10000×10000 的测试视口永远装得下,滚动路径测不到)。
+    /// 返回 TextEdit widget id 与本帧 `IMERect` 矩形。
+    #[allow(clippy::too_many_arguments)]
+    fn frame_core(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        now: f64,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        selection: &mut Option<(usize, usize)>,
+        pending: &mut Option<(usize, usize)>,
+        cursor: &mut OutlineCursor,
+        editor_id: egui::Id,
+        outbox: &mut Vec<Message>,
+    ) -> (egui::Id, Vec<egui::Rect>) {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut live = LiveState::default();
         let id = std::cell::Cell::new(egui::Id::NULL);
@@ -700,10 +833,11 @@ mod tests {
                         },
                         &mut live,
                         RenderMode::Source,
-                        tab_editor_id(1),
+                        editor_id,
                         // 本模块的既有测试都验现状路径:minimap 关(其
                         // 渲染与跳转的验收在 ui::minimap 的 tests 里)。
                         false,
+                        outbox,
                     )
                     .id,
                 );
@@ -727,6 +861,14 @@ mod tests {
             .unwrap_or_default();
         output.drop_without_applying_deltas();
         (id.get(), ime_rects)
+    }
+
+    /// 读浮标探针(#61):本帧浮标/菜单矩形,未画为 `None`。
+    fn sel_ai_probe(ctx: &egui::Context, editor_id: egui::Id) -> crate::ui::selection_ai::Probe {
+        ctx.data(|d| {
+            d.get_temp(crate::ui::selection_ai::probe_id(editor_id))
+                .unwrap_or_default()
+        })
     }
 
     /// §6.4 通道的**回来那一半**:归约把新选区挂到 `pending`,本模块把它写
@@ -2174,5 +2316,538 @@ mod tests {
             replaced,
             "一步重做恢复全部替换结果(整次操作 = 单个撤销组)"
         );
+    }
+
+    // —— 选区 AI 浮标(#61 M1)——
+
+    use crate::state::SelectionAiAction;
+
+    /// 指针主键按下/抬起事件(pos 处)。
+    fn click_at(pos: egui::Pos2, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// 选区 AI 浮标:选区 + 焦点在场,塌缩后消失。写回当帧 `output.state`
+    /// 还是旧快照(选区下一帧才可见),与光标跟随同口径。
+    #[test]
+    fn selection_badge_appears_with_selection_and_hides_on_collapse() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁戊己庚辛壬癸");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let mut pending = Some((1, 4));
+        let (id, _) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let probe = sel_ai_probe(&ctx, id);
+        assert!(probe.badge.is_some(), "选区 + 焦点 → 浮标在场");
+        assert!(probe.menu.is_none(), "菜单默认合拢");
+
+        // 选区塌缩 → 浮标即隐
+        let mut pending = Some((2, 2));
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.4,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "选区清空 → 零浮标元素"
+        );
+    }
+
+    /// 拖拽三帧指针序列:按下帧/拖动帧(选区已在长、但拖拽进行中)浮标
+    /// 不弹,释放帧(dragged_id 已清空)当帧即出 —— 「以指针释放帧起算」。
+    #[test]
+    fn selection_badge_hidden_while_dragging_and_appears_on_release_frame() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁戊己庚辛壬癸");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let rect = editor_rect(&ctx, id);
+        let from = egui::pos2(rect.left() + 30.0, rect.top() + 12.0);
+        let to = egui::pos2(rect.left() + 150.0, rect.top() + 12.0);
+
+        // 帧①按下
+        frame(
+            &ctx,
+            vec![Event::PointerMoved(from), click_at(from, true)],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "按下帧无选区无浮标"
+        );
+
+        // 帧②拖动:选区已成形,但拖拽进行中不弹
+        frame(
+            &ctx,
+            vec![Event::PointerMoved(to)],
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let span = TextEditState::load(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| {
+                let (a, b) = (range.primary.index.0, range.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+            .expect("拖动帧选区已存在");
+        assert!(span.0 < span.1, "前置:拖选出了非塌缩选区({span:?})");
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "拖拽进行中不弹"
+        );
+
+        // 帧③释放:dragged_id 已清空,当帧即出
+        frame(
+            &ctx,
+            vec![click_at(to, false)],
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let probe = sel_ai_probe(&ctx, id);
+        assert!(probe.badge.is_some(), "释放帧浮标出现");
+    }
+
+    /// 点击浮标开菜单、点菜单行发动作消息、期间打字照常进编辑器(不吞
+    /// 输入、焦点不丢)、动作后菜单合拢。
+    #[test]
+    fn badge_menu_click_emits_action_and_typing_reaches_editor() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁戊己庚辛壬癸");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let mut pending = Some((1, 4));
+        let (id, _) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let badge = sel_ai_probe(&ctx, id).badge.expect("浮标在场");
+
+        // 点击浮标(按下帧 + 释放帧),菜单打开
+        frame(
+            &ctx,
+            vec![
+                Event::PointerMoved(badge.center()),
+                click_at(badge.center(), true),
+            ],
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            vec![click_at(badge.center(), false)],
+            0.4,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(sel_ai_probe(&ctx, id).menu.is_some(), "点击浮标后菜单在场");
+        assert!(
+            ctx.memory(|mem| mem.has_focus(id)),
+            "点浮标不吃编辑器焦点(浮标把焦点还回)"
+        );
+
+        // 打字照常进编辑器:光标处的插入落在缓冲里(不吞文本输入)
+        frame(
+            &ctx,
+            vec![Event::Text("✎".into())],
+            0.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(
+            editor.text().contains("✎"),
+            "浮标在场期间打字不受影响(实测 {:?})",
+            editor.text()
+        );
+        assert!(ctx.memory(|mem| mem.has_focus(id)), "焦点仍在编辑器");
+
+        // 重新灌选区(打字塌缩了它),点菜单第一行 → 发动作消息
+        let mut pending = Some((1, 4));
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.6,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.7,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            vec![
+                Event::PointerMoved(badge.center()),
+                click_at(badge.center(), true),
+            ],
+            0.8,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            vec![click_at(badge.center(), false)],
+            0.9,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let menu = sel_ai_probe(&ctx, id).menu.expect("菜单再次在场");
+        let row = egui::pos2(menu.center().x, menu.top() + 3.0 + 11.0);
+        frame(
+            &ctx,
+            vec![Event::PointerMoved(row), click_at(row, true)],
+            1.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let (_, messages) = frame_with_messages(
+            &ctx,
+            vec![click_at(row, false)],
+            1.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            messages,
+            vec![Message::SelectionAiActionRequested(
+                SelectionAiAction::Continue
+            )],
+            "菜单第一行(续写)点击发动作消息"
+        );
+        assert_eq!(sel_ai_probe(&ctx, id).menu, None, "动作触发后菜单合拢");
+    }
+
+    /// 失焦即隐;浮标状态按标签隔离 —— 另一个标签(不同 editor_id)的
+    /// 探针自成一份,新标签无选区即零浮标;失焦后 egui 把持久选区塌缩回
+    /// 光标(builder.rs `!owns_ime_events` 分支),重聚焦不凭空恢复浮标,
+    /// 重新选中后照常回来。
+    #[test]
+    fn badge_hides_on_blur_and_state_is_per_tab() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁戊");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        let mut pending = Some((1, 4));
+        let (id, _) = frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.2,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(sel_ai_probe(&ctx, id).badge.is_some());
+
+        // 失焦(等价点进侧栏):浮标即隐
+        ctx.memory_mut(|mem| mem.surrender_focus(id));
+        frame(
+            &ctx,
+            Vec::new(),
+            0.3,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "失焦即隐"
+        );
+
+        // 切到另一个标签(另一份缓冲 + 另一个 editor_id):它无选区,
+        // 探针自成一份、零浮标
+        let mut editor2 = EditorBuffer::new("第二篇文档");
+        let mut preview2 = PreviewState::new(&editor2);
+        let mut cursor2 = OutlineCursor::default();
+        let id2 = frame_for_tab(
+            &ctx,
+            Vec::new(),
+            0.4,
+            &mut editor2,
+            &mut preview2,
+            &mut cursor2,
+            2,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id2),
+            crate::ui::selection_ai::Probe::default(),
+            "切标签后新标签无选区零浮标"
+        );
+
+        // 切回原标签:egui 0.36 对失焦的 TextEdit 会把持久选区塌缩回光标
+        // (builder.rs:`!owns_ime_events` 分支,owns_ime_events == has_focus),
+        // 所以「失焦/切标签即隐」是结构性的 —— 重聚焦也不会凭空恢复浮标,
+        // 需要用户重新选出选区。这里钉住该语义:重聚焦后仍是零浮标。
+        ctx.memory_mut(|mem| mem.request_focus(id));
+        frame(
+            &ctx,
+            Vec::new(),
+            0.5,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "egui 在失焦帧塌缩了持久选区,重聚焦不凭空恢复浮标"
+        );
+        let span = TextEditState::load(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| (range.primary.index.0, range.secondary.index.0));
+        assert_eq!(span, Some((4, 4)), "选区已塌缩为光标(egui 失焦语义)");
+
+        // 重新选出选区:浮标照常回到场(失焦不损坏浮标机制本身)
+        let mut pending = Some((1, 4));
+        frame_with_channel(
+            &ctx,
+            Vec::new(),
+            0.6,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+        );
+        frame(
+            &ctx,
+            Vec::new(),
+            0.7,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert!(sel_ai_probe(&ctx, id).badge.is_some(), "新选区浮标恢复");
+    }
+
+    /// 否决线探针:从未选中/仅有塌缩光标的帧,零浮标元素(不画形状、
+    /// 不注册命中)。
+    #[test]
+    fn no_selection_renders_zero_badge_elements() {
+        let ctx = test_ctx();
+        let mut editor = EditorBuffer::new("甲乙丙丁戊");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+
+        let id = frame(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "无选区无浮标"
+        );
+
+        // 有焦点但只有塌缩光标:同样零浮标
+        ctx.memory_mut(|mem| mem.request_focus(id));
+        frame(
+            &ctx,
+            Vec::new(),
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+        );
+        assert_eq!(
+            sel_ai_probe(&ctx, id),
+            crate::ui::selection_ai::Probe::default(),
+            "塌缩光标不算选中,零浮标"
+        );
+    }
+
+    /// 明暗两主题下浮标与菜单渲染均不 panic,探针在两主题同样成立。
+    #[test]
+    fn badge_renders_in_both_themes_without_panic() {
+        for (dark, visuals) in [
+            (true, egui::Visuals::dark()),
+            (false, egui::Visuals::light()),
+        ] {
+            let ctx = test_ctx();
+            ctx.set_visuals(visuals);
+            let mut editor = EditorBuffer::new("甲乙丙丁戊");
+            let mut preview = PreviewState::new(&editor);
+            let mut cursor = OutlineCursor::default();
+            let mut selection = None;
+
+            frame(
+                &ctx,
+                Vec::new(),
+                0.0,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+            let mut pending = Some((1, 4));
+            let (id, _) = frame_with_channel(
+                &ctx,
+                Vec::new(),
+                0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+            );
+            frame(
+                &ctx,
+                Vec::new(),
+                0.2,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+            let badge = sel_ai_probe(&ctx, id).badge.expect("浮标在场");
+            frame(
+                &ctx,
+                vec![
+                    Event::PointerMoved(badge.center()),
+                    click_at(badge.center(), true),
+                ],
+                0.3,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+            frame(
+                &ctx,
+                vec![click_at(badge.center(), false)],
+                0.4,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+            );
+            assert!(
+                sel_ai_probe(&ctx, id).menu.is_some(),
+                "{dark} 主题菜单打开不 panic"
+            );
+        }
     }
 }

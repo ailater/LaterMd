@@ -364,6 +364,10 @@ pub struct State {
     /// 会使索引漂移,id 不会。同帧二次切换只记最后一位切出者,更早的
     /// 由停顿路径兜底。消费即清。
     autosave_switch_out: Option<u64>,
+    /// 选区 AI 浮标最近点选的动作(#61 M1,会话级):M1 只交付浮标入口,
+    /// 文本语义在 M2(续写接选区尾)/M3(润色确认浮窗)接线;归约先记账,
+    /// 链路测试据此断言浮标 → 消息通路。不是持久化偏好,不落盘。
+    pub selection_ai_last: Option<SelectionAiAction>,
 }
 
 /// 文档落盘身份 + 未保存镜像。
@@ -467,8 +471,32 @@ impl Default for State {
             system_theme_due: None,
             settings_dir: None,
             autosave_switch_out: None,
+            selection_ai_last: None,
         }
     }
+}
+
+/// 选区 AI 浮标的两动作(#61 M1):TextEdit 选中内容后浮标点开的菜单项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionAiAction {
+    /// 续写:从选区尾继续写(M2 接线既有 AI 流通道)。
+    Continue,
+    /// 润色:改写选中内容,确认后整段替换选区(M3 接线确认浮窗)。
+    Polish,
+}
+
+impl SelectionAiAction {
+    /// 浮标菜单文案。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "AI 续写",
+            Self::Polish => "AI 润色",
+        }
+    }
+
+    /// 全部动作:菜单渲染与测试穷举共用,出现顺序即菜单行序。
+    pub const ALL: [SelectionAiAction; 2] =
+        [SelectionAiAction::Continue, SelectionAiAction::Polish];
 }
 
 /// UI 事件消息:`ui` 产出、`logic` 消费(docs/adr-005 §5.1/§5.2)。
@@ -666,6 +694,10 @@ pub enum Message {
     /// 用 working tree diff,喂 provider 合成单行 subject。流式进行中在
     /// 归约里被忽略(防重入,与 [`Message::AiStart`] 同一道闸)。
     AiCommitRequested,
+    /// 选区 AI 浮标菜单点选(#61 M1),载荷为所选动作。M1 交付浮标入口,
+    /// 文本语义在 M2(续写)/M3(润色确认浮窗)接线;归约先把动作记入
+    /// [`State::selection_ai_last`],不触碰文档。
+    SelectionAiActionRequested(SelectionAiAction),
     /// 请求生成摘要(命令层入口):文档全文喂 provider,移除旧「AI 摘要」
     /// 节后在文档末尾以引用块形式流式追加新要点。流式进行中在归约里被
     /// 忽略(防重入,同一道闸)。
@@ -944,6 +976,7 @@ impl State {
                 Err(reason) => self.tabs.current_mut().document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
+            Message::SelectionAiActionRequested(action) => self.selection_ai_last = Some(action),
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
@@ -5424,6 +5457,36 @@ mod tests {
             idle.tabs.current().document.notice.as_deref(),
             Some("未实现的 AI 动作:summarize")
         );
+    }
+
+    /// 选区 AI 浮标菜单点选(#61 M1)的归约:动作记入
+    /// `selection_ai_last`,文档与选区分毫不动 —— M1 只交付浮标入口,
+    /// 文本语义在 M2/M3 接线。
+    #[test]
+    fn selection_ai_action_message_records_action_without_touching_document() {
+        let mut state = State::default();
+        assert_eq!(state.selection_ai_last, None);
+        let (text, rev) = {
+            let tab = state.tabs.current();
+            (tab.editor.text().to_owned(), tab.editor.revision())
+        };
+
+        state.apply(Message::SelectionAiActionRequested(
+            SelectionAiAction::Continue,
+        ));
+        assert_eq!(state.selection_ai_last, Some(SelectionAiAction::Continue));
+        state.apply(Message::SelectionAiActionRequested(
+            SelectionAiAction::Polish,
+        ));
+        assert_eq!(
+            state.selection_ai_last,
+            Some(SelectionAiAction::Polish),
+            "后点覆盖前点(最近一次为准)"
+        );
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), text, "文档一字未动");
+        assert_eq!(tab.editor.revision(), rev, "修订号不前进");
+        assert_eq!(tab.selection, None, "选区不动");
     }
 
     /// 在临时目录里跑 git(测试数据装配);失败即 panic。

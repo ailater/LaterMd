@@ -32,7 +32,7 @@ use eframe::egui;
 use egui_markdown::MarkdownLabel;
 use latermd_editor::EditorBuffer;
 
-use crate::state::{OutlineCursor, PreviewState};
+use crate::state::{Message, OutlineCursor, PreviewState};
 
 /// 编辑器的渲染模式(P3 的那**一个标志**)。
 ///
@@ -189,6 +189,7 @@ impl egui::TextBuffer for BlockBuffer<'_> {
 /// 绘制 Live Preview:非活动块富渲染(点击即进入编辑),活动块源码编辑。
 ///
 /// 返回活动块 TextEdit 的响应(没有活动块时返回一块占位区域,便于测试定位)。
+#[allow(clippy::too_many_arguments)]
 pub fn ui(
     panel: &mut egui::Ui,
     editor: &mut EditorBuffer,
@@ -196,6 +197,7 @@ pub fn ui(
     cursor: &mut OutlineCursor,
     live: &mut LiveState,
     editor_id: egui::Id,
+    outbox: &mut Vec<Message>,
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
 
@@ -219,6 +221,12 @@ pub fn ui(
     let mut active_response: Option<egui::Response> = None;
     let mut activate: Option<usize> = None;
     let mut route: Option<(usize, usize)> = None;
+    // 选区 AI 浮标(#61 M1)的锚点素材:活动块持久选区(块内字符偏移对)
+    // 与尾端光标条屏幕矩形,活动块分支内捕获、ScrollArea 之后消费(命中
+    // 区同层末尾注册,与源码模式同一纪律)。
+    let mut sel_ai_selection: Option<(usize, usize)> = None;
+    let mut sel_ai_anchor: Option<egui::Rect> = None;
+    let mut sel_ai_response_id = egui::Id::NULL;
     let block_count = live.blocks.len();
     // mermaid 块出图(#51 M3):富渲染块经只拦 mermaid 的 handler 接入
     // block_code_widget 扩展点。专用 handler(而非复用 AiLinkHandler):
@@ -226,7 +234,7 @@ pub fn ui(
     // wikilink 的渲染行为(否决线);其余块照走 vendored 默认。
     let mermaid_handler = crate::ui::mermaid::LiveMermaidHandler::new();
 
-    egui::ScrollArea::vertical()
+    let scrolled = egui::ScrollArea::vertical()
         .id_salt("live-preview")
         .auto_shrink([false, false])
         .show(panel, |ui| {
@@ -284,6 +292,21 @@ pub fn ui(
                             editor.byte_to_char(live.blocks[index].start) + range.primary.index.0,
                         )
                     });
+                    // 选区 AI 浮标(#61 M1)素材:块内持久选区(#38 同源读法)
+                    // + 尾端光标条屏幕矩形(galley pos_from_cursor,IME 同先例),
+                    // ScrollArea 之后消费。
+                    if let Some(range) = output.state.cursor.char_range() {
+                        sel_ai_selection = Some((range.primary.index.0, range.secondary.index.0));
+                        let tail = range.primary.index.0.max(range.secondary.index.0);
+                        let rect = output
+                            .galley
+                            .pos_from_cursor(egui::text::CCursor::new(tail));
+                        sel_ai_anchor = Some(egui::Rect::from_min_max(
+                            output.galley_pos + rect.min.to_vec2(),
+                            output.galley_pos + rect.max.to_vec2(),
+                        ));
+                    }
+                    sel_ai_response_id = response_id;
                     // LP2-1 内联标记半隐藏 + LP2-2 选区扩展。显形集合与扩
                     // 展选区都是纯函数(`latermd_md::mark_interaction`),绘
                     // 制仍是纯叠加 —— 不挂 widget(不参与命中测试)。交互
@@ -476,7 +499,7 @@ pub fn ui(
                         egui::pos2(ui.min_rect().left(), top),
                         egui::pos2(ui.min_rect().right(), bottom.max(top + 1.0)),
                     );
-                    if clicked_for_edit(ui, rect) {
+                    if clicked_for_edit(ui, rect, editor_id) {
                         activate = Some(index);
                     }
                 }
@@ -497,6 +520,38 @@ pub fn ui(
         live.caret_follow = true;
         live.drag_anchor = None;
     }
+
+    // 选区 AI 浮标(#61 M1):活动块持久选区 + 持焦 + 无拖拽进行中才弹,
+    // 判定与命中区注册与源码模式同一套(`selection_ai`);命中区在 ScrollArea
+    // 之后同层注册(13a 纪律),尾端随滚动出视口即隐。按在浮标/菜单上的
+    // 帧,egui 内建清焦(widget 创建段)已把活动块焦点吃掉 —— 以上一帧
+    // 浮标矩形为准先还焦再判可见性(与源码模式同一手法)。
+    {
+        let prev_floater = crate::ui::selection_ai::hit_rects(panel.ctx(), editor_id);
+        let pointer = panel.ctx().input(|input| input.pointer.interact_pos());
+        if sel_ai_response_id != egui::Id::NULL
+            && pointer.is_some_and(|pos| prev_floater.iter().any(|rect| rect.contains(pos)))
+        {
+            panel
+                .ctx()
+                .memory_mut(|mem| mem.request_focus(sel_ai_response_id));
+        }
+    }
+    let sel_focused = panel.ctx().memory(|mem| mem.has_focus(sel_ai_response_id));
+    let sel_anchor = if crate::ui::selection_ai::badge_visible(
+        sel_ai_selection,
+        sel_focused,
+        // 拖选进行中不弹;按在浮标自己上(dragged_id = 浮标)不算拖选。
+        panel
+            .ctx()
+            .dragged_id()
+            .is_some_and(|id| !crate::ui::selection_ai::is_floater_id(editor_id, id)),
+    ) {
+        sel_ai_anchor
+    } else {
+        None
+    };
+    crate::ui::selection_ai::show(panel, editor_id, sel_anchor, scrolled.inner_rect, outbox);
 
     // 快照同步(与源码模式同一条规则:仅修订号前进时重建)
     if preview.synced_rev != editor.revision() {
@@ -521,7 +576,7 @@ pub fn ui(
 /// 抬起点核对而按不下起点核对:`press_origin` 在抬起帧已被 egui 清空
 /// (input_state 释放即置 None);好在 `primary_clicked` 本身就含「未超出
 /// 点击距离」判定,残余歧义最多块边界 max_click_dist 一线。
-fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect) -> bool {
+fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> bool {
     if !ui.input(|input| input.pointer.primary_clicked()) {
         return false;
     }
@@ -534,6 +589,14 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect) -> bool {
     if crate::ui::preview::copy_button_rects(ui.ctx())
         .iter()
         .any(|button| button.contains(pos))
+    {
+        return false;
+    }
+    // 选区 AI 浮标/菜单(#61)压在本块上时,点击归浮标(探针是上一帧的
+    // 几何 —— 浮标本帧在场,下一帧才有点击可落,一帧滞后无影响)。
+    if crate::ui::selection_ai::hit_rects(ui.ctx(), editor_id)
+        .iter()
+        .any(|hit| hit.contains(pos))
     {
         return false;
     }
@@ -742,6 +805,7 @@ mod tests {
             ..LiveState::default()
         };
         let before = editor.text().to_owned();
+        let mut outbox = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             super::ui(
                 ui,
@@ -750,6 +814,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 egui::Id::new("live-test"),
+                &mut outbox,
             );
         });
         output.drop_without_applying_deltas();
@@ -868,12 +933,14 @@ mod tests {
     }
 
     /// 一帧 Live 列渲染的取证:复制按钮 rect 探针、CopyText 载荷、OpenUrl
-    /// 目标、画出的文本 rect(正文/链接点击定位用)。
+    /// 目标、画出的文本 rect(正文/链接点击定位用)、浮标菜单点选的消息
+    /// (#61)。
     struct LiveFrame {
         button_rects: Vec<egui::Rect>,
         copied: Vec<String>,
         opened: Vec<String>,
         texts: Vec<(String, egui::Rect)>,
+        messages: Vec<Message>,
     }
 
     /// 跑一帧 Live 面板(生产入口 `super::ui`)并收集取证。
@@ -885,6 +952,7 @@ mod tests {
         cursor: &mut OutlineCursor,
         live: &mut LiveState,
     ) -> LiveFrame {
+        let mut outbox = Vec::new();
         let output = ctx.run_ui(
             egui::RawInput {
                 events,
@@ -898,9 +966,11 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new("live-copy-test"),
+                    &mut outbox,
                 );
             },
         );
+        let messages = outbox;
         let mut texts = Vec::new();
         for clipped in &output.shapes {
             if let egui::epaint::Shape::Text(t) = &clipped.shape {
@@ -927,6 +997,7 @@ mod tests {
             copied,
             opened,
             texts,
+            messages,
         }
     }
 
@@ -1170,6 +1241,7 @@ mod tests {
         live: &mut LiveState,
     ) -> Vec<egui::Rect> {
         let mut fade = egui::Color32::TRANSPARENT;
+        let mut outbox = Vec::new();
         let output = ctx.run_ui(
             egui::RawInput {
                 time: Some(time),
@@ -1184,6 +1256,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new(FADE_EDITOR_ID),
+                    &mut outbox,
                 );
                 let bg = ui.visuals().text_edit_bg_color();
                 fade = egui::Color32::from_rgba_unmultiplied(
@@ -1832,6 +1905,7 @@ mod tests {
     ) -> Option<egui::Rect> {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut id = egui::Id::NULL;
+        let mut outbox = Vec::new();
         let output = ctx.run_ui(
             egui::RawInput {
                 time: Some(time),
@@ -1847,6 +1921,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new(SCROLL_EDITOR_ID),
+                    &mut outbox,
                 )
                 .id;
             },
@@ -2335,6 +2410,231 @@ mod tests {
             cursor.byte,
             Some(heading_byte),
             "光标回填随跳转落位(标题行首字节)"
+        );
+    }
+
+    // —— 选区 AI 浮标(#61 M1,Live 活动块)——
+
+    use crate::state::SelectionAiAction;
+
+    /// 指针主键按下/抬起事件(pos 处)。
+    fn pointer_click(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// 读浮标探针(#61):本帧浮标/菜单矩形,未画为 `None`。
+    fn sel_ai_probe(ctx: &egui::Context, editor_id: egui::Id) -> crate::ui::selection_ai::Probe {
+        ctx.data(|d| {
+            d.get_temp(crate::ui::selection_ai::probe_id(editor_id))
+                .unwrap_or_default()
+        })
+    }
+
+    /// 激活块 1 并把选区(块内字符 2..6)写进其持久 state:
+    /// pending_caret 落光标 + 要焦点(生产 pending_caret 通道),选区经
+    /// TextEditState 直写(与源码侧 pending 写回通道同一落点)。返回
+    /// (块 widget id, 浮标所在帧之后的探针读取前提)。
+    fn live_selection_fixture(
+        ctx: &egui::Context,
+    ) -> (
+        egui::Id,
+        EditorBuffer,
+        PreviewState,
+        OutlineCursor,
+        LiveState,
+    ) {
+        let mut editor = EditorBuffer::new("# 标题块\n\n选中的正文内容块\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+        let editor_id = egui::Id::new("live-copy-test");
+        let block_id = editor_id.with(("live-block", 1));
+
+        // 帧①:块 1 直接激活,pending_caret 把光标交进去并要焦点
+        // (pending_caret 只在活动块内落地,激活与交棒是两步,与生产
+        // 「点击富块 → activate + pending_caret」同终点)
+        live.active = Some(1);
+        live.pending_caret = Some((1, 0));
+        live_frame(
+            ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(live.active, Some(1), "前置:块 1 已激活");
+
+        // 块内持久 state 直写选区(2..6 =「的正文内」,字符偏移)
+        let mut state = egui::widgets::text_edit::TextEditState::load(ctx, block_id)
+            .expect("块 state 已持久化");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(2),
+                egui::text::CCursor::new(6),
+            )));
+        state.store(ctx, block_id);
+        (block_id, editor, preview, cursor, live)
+    }
+
+    /// Live 活动块选区:浮标在场;打字照常进编辑器(不吞输入、焦点不丢),
+    /// 输入替换选区后浮标即隐(选区塌缩)。
+    #[test]
+    fn live_selection_badge_appears_and_typing_reaches_editor() {
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("live-copy-test");
+        let (block_id, mut editor, mut preview, mut cursor, mut live) =
+            live_selection_fixture(&ctx);
+
+        // 帧②:选区 + 焦点 → 浮标在场
+        live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let probe = sel_ai_probe(&ctx, editor_id);
+        assert!(probe.badge.is_some(), "Live 活动块选区浮标在场");
+        assert!(probe.menu.is_none(), "菜单默认合拢");
+
+        // 帧③:打字不吞 —— 输入替换选区落进同一份缓冲,焦点仍在活动块
+        live_frame(
+            &ctx,
+            vec![egui::Event::Text("添".into())],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            editor.text(),
+            "# 标题块\n\n选中添容块\n",
+            "浮标在场期间打字照常写入(选区被输入替换)"
+        );
+        assert!(ctx.memory(|mem| mem.has_focus(block_id)), "焦点仍在活动块");
+        assert_eq!(
+            sel_ai_probe(&ctx, editor_id),
+            crate::ui::selection_ai::Probe::default(),
+            "选区被输入塌缩 → 浮标即隐"
+        );
+    }
+
+    /// Live 浮标菜单:点浮标开菜单、点「AI 润色」行动作发消息;菜单压在
+    /// 富渲染块上时,点击归菜单、不误进块编辑(clicked_for_edit 的浮标
+    /// 排除);动作后菜单合拢。
+    #[test]
+    fn live_badge_menu_click_emits_action_without_activating_block() {
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("live-copy-test");
+        let (_block_id, mut editor, mut preview, mut cursor, mut live) =
+            live_selection_fixture(&ctx);
+
+        // 帧②:浮标在场
+        live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let badge = sel_ai_probe(&ctx, editor_id).badge.expect("浮标在场");
+
+        // 帧③④:点击浮标 → 菜单打开,活动块不因点击漂移
+        live_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(badge.center()),
+                pointer_click(badge.center(), true),
+            ],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let frame = live_frame(
+            &ctx,
+            vec![pointer_click(badge.center(), false)],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(frame.messages.is_empty(), "开菜单不产消息");
+        let menu = sel_ai_probe(&ctx, editor_id)
+            .menu
+            .expect("点击浮标后菜单在场");
+        assert_eq!(live.active, Some(1), "活动块不漂移");
+
+        // 帧⑤⑥:点菜单第二行(润色)→ 发动作消息;菜单与富渲染块重叠,
+        // 点击不得误进块编辑
+        let row = egui::pos2(menu.center().x, menu.bottom() - 14.0);
+        live_frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(row), pointer_click(row, true)],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let frame = live_frame(
+            &ctx,
+            vec![pointer_click(row, false)],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            frame.messages,
+            vec![Message::SelectionAiActionRequested(
+                SelectionAiAction::Polish
+            )],
+            "菜单第二行(润色)点击发动作消息"
+        );
+        assert_eq!(live.active, Some(1), "菜单压在富渲染块上,点击不误进块编辑");
+        assert_eq!(
+            sel_ai_probe(&ctx, editor_id).menu,
+            None,
+            "动作触发后菜单合拢"
+        );
+    }
+
+    /// 否决线探针(Live):块激活 + 持焦但无选区(塌缩光标),零浮标元素。
+    #[test]
+    fn live_no_selection_renders_zero_badge_elements() {
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("live-copy-test");
+        let mut editor = EditorBuffer::new("# 标题块\n\n正文块\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(1),
+            pending_caret: Some((1, 0)),
+            ..LiveState::default()
+        };
+
+        live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(live.active, Some(1), "前置:块已激活持焦");
+        assert_eq!(
+            sel_ai_probe(&ctx, editor_id),
+            crate::ui::selection_ai::Probe::default(),
+            "无选区零浮标(Live)"
         );
     }
 }

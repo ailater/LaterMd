@@ -18,7 +18,8 @@ use std::ops::Range;
 use std::path::Path;
 
 /// ai:// 链接的样式色(紫罗兰,与默认超链接色区分),按明暗主题取两档。
-fn ai_link_color(dark_mode: bool) -> egui::Color32 {
+/// `pub(crate)`:选区 AI 浮标(#61)同源取色 —— AI 专属色只有一个真源。
+pub(crate) fn ai_link_color(dark_mode: bool) -> egui::Color32 {
     if dark_mode {
         egui::Color32::from_rgb(0xC9, 0x9B, 0xF5)
     } else {

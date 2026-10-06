@@ -984,6 +984,7 @@ mod tests {
                     RenderMode::Source,
                     editor_id,
                     show_minimap,
+                    &mut Vec::new(),
                 );
             },
         );
@@ -1703,6 +1704,7 @@ mod tests {
                     RenderMode::Live,
                     editor_id,
                     true,
+                    &mut Vec::new(),
                 );
             },
         );

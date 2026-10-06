@@ -488,6 +488,7 @@ impl LaterMdApp {
                     // #55 M2:源码 minimap 开关(全局偏好,所有标签同开同关;
                     // 行模型缓存仍是每标签一份,minimap::cache_id 分槽)。
                     state.theme.show_minimap,
+                    outbox,
                 );
                 // 命中回填沿用编辑器的选区/滚动通道,但不能终止查找框的连续输入。
                 if keep_find_focus {
