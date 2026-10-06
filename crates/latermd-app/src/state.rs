@@ -94,6 +94,10 @@ const DRAFTS_DIR: &str = "drafts";
 /// key 闸门拦下时的状态栏文案:指路设置菜单 → AI Provider 浮窗。
 const AI_KEY_MISSING_NOTICE: &str = "未配置 API key(设置 → AI Provider)";
 
+/// 选区续写的插入点陈旧文案(#61 M2):流进行中文档被编辑、偏移见证失配
+/// 时作废流落此提示(落在发起标签,decisions-pending #116)。
+const AI_STALE_INSERT_NOTICE: &str = "文档在续写期间被编辑,插入点已失效,续写已停止";
+
 /// 侧边栏功能页签。
 ///
 /// `Serialize/Deserialize`:外壳布局要记住「上次停在哪个视图」
@@ -292,6 +296,10 @@ pub struct State {
     /// (成功/失败/作废)清除 —— [`Message::AiChunk`] / [`Message::AiDone`]
     /// 的写入目标由它决定,与 `tabs.active` 无关:切标签不中断也不改道。
     pub ai_active_tab: Option<u64>,
+    /// 在途流的插入点(#61 M2,选区续写专用);`None` = chunk 写发起标签
+    /// 文档末尾(既有语义,存量入口不挂它)。与 [`State::ai_active_tab`]
+    /// 同生命周期:发起时置入,成功/失败/作废一并清除。
+    pub ai_insert_at: Option<AiInsertPoint>,
     /// 文件树(Files 页签):根目录、最近列表与懒加载缓存。
     pub file_tree: FileTreeState,
     /// Git 面板(Git 页签 + Files 页角标,P2):状态/历史/diff 快照与
@@ -447,6 +455,7 @@ impl Default for State {
             goto: GotoBarState::default(),
             quick_open: QuickOpenState::default(),
             ai_active_tab: None,
+            ai_insert_at: None,
             file_tree: FileTreeState::default(),
             git: GitPanelState::default(),
             search: SearchState::default(),
@@ -497,6 +506,24 @@ impl SelectionAiAction {
     /// 全部动作:菜单渲染与测试穷举共用,出现顺序即菜单行序。
     pub const ALL: [SelectionAiAction; 2] =
         [SelectionAiAction::Continue, SelectionAiAction::Polish];
+}
+
+/// 选区续写的流内插入点(#61 M2):**随流携带**的目标写入偏移。
+///
+/// 既有 AI 流(AiStart / ai:// 链接 / 摘要)不携带它 —— chunk 照旧写在
+/// 发起标签文档末尾,行为零变化;选区续写发起时捕获选区尾偏移挂进
+/// [`State::ai_insert_at`],此后每个 chunk 落在该偏移处并随写入量推进,
+/// 流内始终锁在同一条缝里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiInsertPoint {
+    /// 下一个 chunk 的落点(字符偏移):发起时的选区尾 + 补段空行数,
+    /// 每写一块推进 delta 的字符数(字符而非字节,CJK 边界安全)。
+    pub offset: usize,
+    /// 修订号见证(#17 口径):发起归约(含补段空行)完成时的缓冲修订号。
+    /// chunk 到达时缓冲修订号与之不符 = 用户在流中编辑过、偏移已漂移
+    /// → 作废流并提示,绝不把内容写进过期的位置;流自身的写入随写随刷
+    /// (AI 写不算陈旧)。
+    pub rev: u64,
 }
 
 /// UI 事件消息:`ui` 产出、`logic` 消费(docs/adr-005 §5.1/§5.2)。
@@ -694,10 +721,16 @@ pub enum Message {
     /// 用 working tree diff,喂 provider 合成单行 subject。流式进行中在
     /// 归约里被忽略(防重入,与 [`Message::AiStart`] 同一道闸)。
     AiCommitRequested,
-    /// 选区 AI 浮标菜单点选(#61 M1),载荷为所选动作。M1 交付浮标入口,
-    /// 文本语义在 M2(续写)/M3(润色确认浮窗)接线;归约先把动作记入
-    /// [`State::selection_ai_last`],不触碰文档。
-    SelectionAiActionRequested(SelectionAiAction),
+    /// 选区 AI 浮标菜单点选(#61 M1),载荷为所选动作与点选帧的选区
+    /// (文档坐标字符区间,源码模式是 TextEdit 持久选区、Live 模式是活动
+    /// 块内选区换算到全文的坐标;`None` = 点选帧没读到选区)。M2 起「续写」
+    /// 在归约里接线流式通道:选区就是捕获素材,随消息走而不读
+    /// `TabState::selection`(该字段只有源码模式回填,Live 下是陈旧值);
+    /// 「润色」仍只记账,M3 接线确认浮窗。
+    SelectionAiActionRequested {
+        action: SelectionAiAction,
+        selection: Option<(usize, usize)>,
+    },
     /// 请求生成摘要(命令层入口):文档全文喂 provider,移除旧「AI 摘要」
     /// 节后在文档末尾以引用块形式流式追加新要点。流式进行中在归约里被
     /// 忽略(防重入,同一道闸)。
@@ -956,6 +989,7 @@ impl State {
             Message::AiDone => {
                 self.ai.finish();
                 self.ai_active_tab = None;
+                self.ai_insert_at = None;
             }
             Message::AiFailed(error) => {
                 self.ai.finish();
@@ -963,6 +997,7 @@ impl State {
                 // active
                 self.ai_origin_tab_mut().document.notice = Some(error);
                 self.ai_active_tab = None;
+                self.ai_insert_at = None;
                 // 失败不算完成:指令卡状态随 last_prompt 清空回到未执行
                 self.ai.forget_last_prompt();
             }
@@ -976,7 +1011,14 @@ impl State {
                 Err(reason) => self.tabs.current_mut().document.notice = Some(reason),
             },
             Message::AiCommitRequested => self.request_commit_message(),
-            Message::SelectionAiActionRequested(action) => self.selection_ai_last = Some(action),
+            Message::SelectionAiActionRequested { action, selection } => {
+                // 记账保留(M1 链路测试的通路断言,润色的 M3 素材);
+                // 续写(M2)在归约里直接接线流式通道。
+                self.selection_ai_last = Some(action);
+                if action == SelectionAiAction::Continue {
+                    self.start_selection_ai_continue(selection);
+                }
+            }
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
@@ -1310,20 +1352,120 @@ impl State {
         }
     }
 
-    /// 追加 AI 增量块到**发起标签**文档末尾(`Message::AiChunk` 的归约)。
-    /// 写入目标按 [`State::ai_active_tab`] 定位而非当前标签 —— 流式期间
-    /// 切标签,块仍长在发起它的文档上(关键回归测试
-    /// `ai_stream_writes_to_origin_tab_not_active`)。发起标签已不存在时
-    /// (理论上 `remove_tab` 已先行作废流)丢弃块并作废,绝不落到别的
-    /// 标签。走 `insert_chars` 的增量 splice 双写,dirty 与修订号照常推进
-    /// —— AI 写进来的是真实内容,保存前与手敲同责;undo 语义见模块文档。
+    /// 选区续写(`SelectionAiActionRequested { Continue }` 的归约,#61 M2):
+    /// 捕获选区尾偏移 + 修订号见证(#17 口径)挂进 [`State::ai_insert_at`],
+    /// 经既有流式通道从选区尾插入点续写;防重入与 key 闸门照旧,被拦的
+    /// 命令连补行都不发生(与其它 AI 入口同一纪律)。
+    ///
+    /// 发起时在选区尾**两侧锚定补段空行**(`ensure_trailing_blank_line`
+    /// 的文档末语义平移到插入点:AI 首行独立成段、末行不与尾后文粘连),
+    /// 见证修订号取补行之后 —— 补行是流的一部分,不算用户编辑。
+    fn start_selection_ai_continue(&mut self, selection: Option<(usize, usize)>) {
+        if self.ai.is_streaming() || !self.ai_key_gate() {
+            return;
+        }
+        // 选区是 #38 同源的字符区间(primary/secondary 无序);塌缩/缺失
+        // (浮标只在有选区时在场,这里是防御)退回文档末续写 —— 动作语义
+        // 仍是「续写」,只是落点回退(decisions-pending #116)。
+        let Some((a, b)) = selection.filter(|(a, b)| a != b) else {
+            self.start_ai_stream();
+            return;
+        };
+        let (start, tail) = (a.min(b), a.max(b));
+        let tab = self.tabs.current_mut();
+        let text = tab.editor.text();
+        // 选中文本进 prompt(截断按字符,CJK 不拆半);偏移经 char_to_byte
+        // 换算,恒落在字符边界。
+        let selected = &text[tab.editor.char_to_byte(start)..tab.editor.char_to_byte(tail)];
+        let skip = selected
+            .chars()
+            .count()
+            .saturating_sub(AI_PROMPT_TAIL_CHARS);
+        let prompt = format!(
+            "请从以下选中文本之后继续写这份文档:\n{}",
+            selected.chars().skip(skip).collect::<String>()
+        );
+        // 锚定补段空行(**前后两侧**,与文档末路径同一矩阵:0 个补二、
+        // 1 个补一、已空行不补):前侧隔开选区前文,后侧隔开尾后文,
+        // chunk 落在两组补行之间,流完即成规范段落,AI 首末行都不与
+        // 既有文本粘连。文末选区无后侧(与文档末路径逐字符等价)。
+        let newlines_before = text[..tab.editor.char_to_byte(tail)]
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\n')
+            .count();
+        let pad = match newlines_before {
+            0 => 2,
+            1 => 1,
+            _ => 0,
+        };
+        let pad_after = if tail == tab.editor.len_chars() {
+            0
+        } else {
+            match text[tab.editor.char_to_byte(tail)..]
+                .chars()
+                .take_while(|&c| c == '\n')
+                .count()
+            {
+                0 => 2,
+                1 => 1,
+                _ => 0,
+            }
+        };
+        tab.editor.insert_chars(tail, &"\n".repeat(pad));
+        // 后侧补行插在前侧之后(尾 + 前侧数),插入点正好落在两组之间
+        tab.editor.insert_chars(tail + pad, &"\n".repeat(pad_after));
+        let insert = AiInsertPoint {
+            offset: tail + pad,
+            rev: tab.editor.revision(),
+        };
+        let tab_id = tab.id;
+        if self.ai.start(&prompt) {
+            self.ai_active_tab = Some(tab_id);
+            self.ai_insert_at = Some(insert);
+        }
+    }
+
+    /// 写入 AI 增量块到**发起标签**(`Message::AiChunk` 的归约)。写入目标
+    /// 按 [`State::ai_active_tab`] 定位而非当前标签 —— 流式期间切标签,块
+    /// 仍长在发起它的文档上(关键回归测试
+    /// `ai_stream_writes_to_origin_tab_not_active`)。落点由
+    /// [`State::ai_insert_at`] 分流:`None`(存量入口)写文档末尾,行为
+    /// 零变化;`Some`(选区续写)写插入点并随写推进,修订号与见证不符
+    /// 即流中编辑 → 作废流并提示(decisions-pending #116),绝不写进过期
+    /// 位置。发起标签已不存在时(理论上 `remove_tab` 已先行作废流)丢弃
+    /// 块并作废,绝不落到别的标签。走 `insert_chars` 的增量 splice 双写,
+    /// dirty 与修订号照常推进 —— AI 写进来的是真实内容,保存前与手敲同
+    /// 责;undo 语义见模块文档。
     fn append_ai_delta(&mut self, delta: &str) {
         let Some(index) = self.ai_stream_tab_index() else {
             self.abort_ai_stream();
             return;
         };
+        let Some((offset, rev)) = self
+            .ai_insert_at
+            .as_ref()
+            .map(|point| (point.offset, point.rev))
+        else {
+            let tab = &mut self.tabs.tabs[index];
+            tab.editor.insert_chars(tab.editor.len_chars(), delta);
+            return;
+        };
+        // 修订号见证:与发起(或上一块写入)时不符 = 用户在流中编辑过,
+        // 偏移已不可信。中止比钳制诚实:钳到文档末是静默写错位置,按编辑
+        // 量平移要 diff 整篇,都不如让用户重来一次(decisions-pending #116)。
+        if self.tabs.tabs[index].editor.revision() != rev {
+            self.abort_ai_stream();
+            self.tabs.tabs[index].document.notice = Some(AI_STALE_INSERT_NOTICE.to_owned());
+            return;
+        }
         let tab = &mut self.tabs.tabs[index];
-        tab.editor.insert_chars(tab.editor.len_chars(), delta);
+        tab.editor
+            .insert_chars(offset.min(tab.editor.len_chars()), delta);
+        if let Some(point) = self.ai_insert_at.as_mut() {
+            point.offset += delta.chars().count();
+            point.rev = tab.editor.revision();
+        }
     }
 
     /// 在途流发起标签的索引;id 失效(标签已被移除)返回 `None`。
@@ -1338,11 +1480,12 @@ impl State {
         &mut self.tabs.tabs[index]
     }
 
-    /// 作废在途流(收尾标志 + 指令卡状态键 + 发起标签绑定一并清)。
+    /// 作废在途流(收尾标志 + 指令卡状态键 + 发起标签绑定 + 插入点一并清)。
     fn abort_ai_stream(&mut self) {
         self.ai.finish();
         self.ai.forget_last_prompt();
         self.ai_active_tab = None;
+        self.ai_insert_at = None;
     }
 
     /// 收流(每帧归约调用一次):把 AI channel 里积压的 chunk 翻成消息,
@@ -5459,11 +5602,430 @@ mod tests {
         );
     }
 
-    /// 选区 AI 浮标菜单点选(#61 M1)的归约:动作记入
-    /// `selection_ai_last`,文档与选区分毫不动 —— M1 只交付浮标入口,
-    /// 文本语义在 M2/M3 接线。
+    /// 收流到结束(自然收尾**或**陈旧中止):流式标志清零即停。与
+    /// [`drain_ai_stream`] 的差别在退出条件 —— 陈旧中止不产 AiDone/
+    /// AiFailed(块被静默丢弃),按标志判停才不会空转到超时。
+    fn drain_ai_until_idle(state: &mut State) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.ai.is_streaming() && std::time::Instant::now() < deadline {
+            for message in state.poll_ai() {
+                state.apply(message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!state.ai.is_streaming(), "流已收尾(自然或中止)");
+    }
+
+    /// 选区续写(M2)Mock 流端到端:点「续写」→ 捕获选区尾插入点(修订
+    /// 号见证)→ 流逐块精确落在插入点 → 收尾清绑定。本例选区在段中
+    /// (「中点」),前后文必须分毫不动;选中文本进 prompt 一并断言。
     #[test]
-    fn selection_ai_action_message_records_action_without_touching_document() {
+    fn selection_ai_continue_streams_at_selection_tail_mid_document() {
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        // 「开头一句。」= 5 字符,选区 (5,11) = 「选中的句子。」,尾 = 11
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .load("开头一句。选中的句子。结尾一句。");
+
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((5, 11)),
+        });
+        assert!(state.ai.is_streaming(), "点续写发起流");
+        assert_eq!(
+            state.selection_ai_last,
+            Some(SelectionAiAction::Continue),
+            "M1 记账保留(链路通路断言)"
+        );
+        let insert = state.ai_insert_at.expect("选区续写挂插入点");
+        assert_eq!(
+            insert.offset, 13,
+            "选区尾 11 + 锚定补段空行 2(尾前字符非换行)"
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "开头一句。选中的句子。\n\n\n\n结尾一句。",
+            "发起时在选区尾两侧补段空行(前二后二),余下文本原样后移"
+        );
+        assert_eq!(
+            insert.rev,
+            state.tabs.current_mut().editor.revision(),
+            "见证修订号 = 补行后的缓冲修订号"
+        );
+        let prompt = state.ai.last_prompt.clone().expect("发起记录 prompt");
+        assert!(
+            prompt.contains("选中的句子。"),
+            "选中文本进 prompt(实测 {prompt:?})"
+        );
+
+        drain_ai_stream(&mut state);
+        assert_eq!(state.ai_active_tab, None, "收尾清标签绑定");
+        assert_eq!(state.ai_insert_at, None, "收尾清插入点");
+        let text = state.tabs.current_mut().editor.text().to_owned();
+        let middle = text
+            .strip_prefix("开头一句。选中的句子。\n\n")
+            .and_then(|rest| rest.strip_suffix("\n\n结尾一句。"))
+            .expect("续写精确落在选区尾,前后文分毫不动");
+        assert!(!middle.is_empty(), "AI 文本已插入缝中");
+        assert!(
+            state.tabs.current_mut().editor.is_dirty(),
+            "AI 写入置 dirty"
+        );
+        assert!(
+            state.tabs.current().document.notice.is_none(),
+            "干净完成无提示"
+        );
+    }
+
+    /// 文末前(尾后仍有正文)与纯 CJK 选区:补行矩阵与字符偏移边界 ——
+    /// CJK 文档按字符计偏移,补行/插入都不截半字符。
+    #[test]
+    fn selection_ai_continue_tail_before_end_and_cjk_offsets() {
+        // 文末前:选区 (0,4) = 「甲乙丙丁」,尾 = 4,尾后还有「\n结尾」
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        state.tabs.current_mut().editor.load("甲乙丙丁\n结尾");
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 4)),
+        });
+        let insert = state.ai_insert_at.expect("挂插入点");
+        assert_eq!(insert.offset, 6, "尾 4 + 前侧补段空行 2");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "甲乙丙丁\n\n\n\n结尾",
+            "尾后单个换行再补 1 凑成空行(后侧共 2),插入点两侧各隔一个空行"
+        );
+        drain_ai_stream(&mut state);
+        let text = state.tabs.current_mut().editor.text().to_owned();
+        let middle = text
+            .strip_prefix("甲乙丙丁\n\n")
+            .and_then(|rest| rest.strip_suffix("\n\n结尾"))
+            .expect("文末前:AI 落选区尾与既有尾段之间,两侧各隔空行");
+        assert!(!middle.is_empty());
+
+        // 纯 CJK:选区 (0,4) = 「你好世界」,尾字符是「,」→ 补 2;
+        // 偏移全按字符(char_to_byte 恒在边界),结果不截半
+        let mut state = State::default();
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        state.tabs.current_mut().editor.load("你好世界,这是尾句");
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 4)),
+        });
+        let insert = state.ai_insert_at.expect("挂插入点");
+        assert_eq!(insert.offset, 6, "尾 4 + 补段空行 2");
+        drain_ai_stream(&mut state);
+        let text = state.tabs.current_mut().editor.text().to_owned();
+        let middle = text
+            .strip_prefix("你好世界\n\n")
+            .and_then(|rest| rest.strip_suffix("\n\n,这是尾句"))
+            .expect("CJK:AI 落在字符边界,两侧补行隔开既有文本,逗号与尾句原样保留");
+        assert!(!middle.is_empty());
+    }
+
+    /// 选区一路选到文档末 = 「文末」:行为与既有文档末续写(AiStart)完全
+    /// 等价 —— 同一补行矩阵、同一落点、同一段 Mock 文本;存量路径自身
+    /// 不挂插入点(否决线:零行为变化)。
+    #[test]
+    fn selection_ai_continue_at_document_end_matches_legacy_path() {
+        let mut selected = State::default();
+        let mut legacy = State::default();
+        for state in [&mut selected, &mut legacy] {
+            state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+                std::time::Duration::ZERO,
+            ));
+            state.tabs.current_mut().editor.load("正文一段");
+        }
+        selected.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 4)),
+        });
+        assert_eq!(
+            selected.ai_insert_at.map(|point| point.offset),
+            Some(6),
+            "尾 4 = 文档末,补段空行 2 后落点 6"
+        );
+        legacy.apply(Message::AiStart);
+        assert_eq!(
+            legacy.ai_insert_at, None,
+            "存量文档末路径不挂插入点(否决线)"
+        );
+
+        drain_ai_stream(&mut selected);
+        drain_ai_stream(&mut legacy);
+        assert_eq!(
+            selected.tabs.current_mut().editor.text(),
+            legacy.tabs.current_mut().editor.text(),
+            "选到文末的续写结果与 AiStart 逐字符一致(两路 prompt 都无脚本关键词,Mock 同文)"
+        );
+    }
+
+    /// 无选区/塌缩选区(防御分支:浮标只在有选区时在场,消息仍可能被
+    /// 直接触发)退回文档末续写:动作语义不变,落点回退,不挂插入点
+    /// (decisions-pending #116)。
+    #[test]
+    fn selection_ai_continue_without_selection_falls_back_to_document_end() {
+        for selection in [None, Some((3, 3))] {
+            let mut state = State::default();
+            state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+                std::time::Duration::ZERO,
+            ));
+            state.tabs.current_mut().editor.load("三字标题");
+            state.apply(Message::SelectionAiActionRequested {
+                action: SelectionAiAction::Continue,
+                selection,
+            });
+            assert!(state.ai.is_streaming(), "selection={selection:?} 仍发起");
+            assert_eq!(
+                state.ai_insert_at, None,
+                "selection={selection:?} 回退文档末,不挂插入点"
+            );
+            assert!(
+                state
+                    .tabs
+                    .current_mut()
+                    .editor
+                    .text()
+                    .starts_with("三字标题\n\n"),
+                "selection={selection:?} 按文档末口径补行"
+            );
+            state.ai.finish();
+        }
+    }
+
+    /// 插入点随流推进:手动喂 AiChunk 走同一归约(不收真实流),逐块断言
+    /// 偏移按 delta 字符数推进、见证修订号随自身写入刷新(否则第二块会被
+    /// 误判陈旧);空 delta 无操作。
+    #[test]
+    fn selection_ai_insert_point_advances_chunk_by_chunk() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.load("ONE\nTWO");
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 3)),
+        });
+        assert_eq!(
+            state.ai_insert_at.unwrap().offset,
+            5,
+            "尾 3 + 前侧补段空行 2"
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "ONE\n\n\n\nTWO",
+            "尾后原有单个换行再补 1 凑成空行:插入点两侧各隔一个空行"
+        );
+
+        state.apply(Message::AiChunk {
+            delta: "甲".into()
+        });
+        assert_eq!(state.tabs.current_mut().editor.text(), "ONE\n\n甲\n\nTWO");
+        assert_eq!(state.ai_insert_at.unwrap().offset, 6, "推进 delta 字符数");
+        assert_eq!(
+            state.ai_insert_at.unwrap().rev,
+            state.tabs.current_mut().editor.revision(),
+            "见证随自身写入刷新"
+        );
+
+        state.apply(Message::AiChunk {
+            delta: "乙丙".into(),
+        });
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "ONE\n\n甲乙丙\n\nTWO"
+        );
+        state.apply(Message::AiChunk {
+            delta: "丁".into()
+        });
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            "ONE\n\n甲乙丙丁\n\nTWO",
+            "第三块照常写入:上一块刷新过的见证有效"
+        );
+
+        let (rev, offset) = {
+            let tab = state.tabs.current_mut();
+            (
+                tab.editor.revision(),
+                state.ai_insert_at.map(|point| point.offset).unwrap(),
+            )
+        };
+        state.apply(Message::AiChunk {
+            delta: String::new(),
+        });
+        assert_eq!(
+            state.tabs.current_mut().editor.revision(),
+            rev,
+            "空 delta 不推进修订号"
+        );
+        assert_eq!(
+            state.ai_insert_at.unwrap().offset,
+            offset,
+            "空 delta 不推进插入点"
+        );
+        state.ai.finish();
+    }
+
+    /// 选区续写期间的 #11 不变量:流式进行中开新标签,chunk 仍按插入点
+    /// 落在发起标签,新标签零污染,插入点绑定不动(与文档末路径的关键
+    /// 回归 `ai_stream_writes_to_origin_tab_not_active` 同型)。
+    #[test]
+    fn selection_ai_stream_writes_to_origin_tab_at_insert_point() {
+        let mut state = State::default();
+        state.tabs.current_mut().editor.load("ONE\nTWO");
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 3)),
+        });
+        let origin_id = state.ai_active_tab.expect("发起锁定标签");
+        let insert_before = state.ai_insert_at;
+
+        state.apply(Message::FileCommand(FileCmd::New));
+        assert_eq!(state.ai_active_tab, Some(origin_id), "切标签不改写入目标");
+        assert_eq!(state.ai_insert_at, insert_before, "切标签不动插入点");
+
+        state.apply(Message::AiChunk {
+            delta: "甲".into()
+        });
+        assert_eq!(
+            state.tabs.tabs[0].editor.text(),
+            "ONE\n\n甲\n\nTWO",
+            "chunk 仍落发起标签的插入点"
+        );
+        assert_eq!(state.tabs.tabs[1].editor.text(), "", "新标签零污染");
+        state.ai.finish();
+    }
+
+    /// 陈旧防御(#61 M2):流进行中用户编辑 → 缓冲修订号偏离见证 → 下一块
+    /// 到达即作废流并落提示,**不写任何内容到漂移后的位置**(钳到文档末是
+    /// 静默写错位置,decisions-pending #116 选了中止)。
+    #[test]
+    fn selection_ai_continue_aborts_when_document_edited_mid_stream() {
+        let mut state = State::default();
+        // 慢 provider:保证编辑发生在任何块被归约之前
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::from_millis(20),
+        ));
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .load("开头一句。选中的句子。结尾一句。");
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((5, 11)),
+        });
+        assert!(state.ai.is_streaming());
+
+        // 用户在流中编辑:文首插入挪动后续一切,插入点偏移全部漂移
+        let edited = {
+            let tab = state.tabs.current_mut();
+            tab.editor.insert_chars(0, "用户新增");
+            tab.editor.text().to_owned()
+        };
+        drain_ai_until_idle(&mut state);
+
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            edited,
+            "陈旧中止:块一个都没落,文档停在用户编辑后的样子"
+        );
+        assert_eq!(
+            state.tabs.current().document.notice.as_deref(),
+            Some("文档在续写期间被编辑,插入点已失效,续写已停止"),
+            "中止提示落发起标签"
+        );
+        assert_eq!(state.ai_active_tab, None, "作废清标签绑定");
+        assert_eq!(state.ai_insert_at, None, "作废清插入点");
+        assert_eq!(state.ai.last_prompt, None, "作废清指令卡状态键");
+    }
+
+    /// 选区续写的闸门矩阵:key 闸门(provider 需 key 且凭据缺失)拦下时
+    /// 零副作用 —— 不发起、不补行、落「未配置 key」提示;流式进行中再点
+    /// 续写被防重入忽略(不二次补行、不顶掉在途流)。
+    #[test]
+    fn selection_ai_continue_respects_key_gate_and_reentry() {
+        std::env::remove_var(latermd_creds::API_KEY_ENV);
+        let mut state = State::default();
+        state.ai_key.creds = latermd_creds::Credentials::in_memory();
+        state.ai.set_provider(
+            AiConfig {
+                provider: crate::ai_config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.deepseek.com/v1".to_owned(),
+                model: "deepseek-chat".to_owned(),
+                context_kb: 0,
+            },
+            None,
+        );
+        assert!(
+            state.ai_key.creds.ai_api_key().is_none(),
+            "前置:内存凭据与环境变量都无 key"
+        );
+        state.tabs.current_mut().editor.load("甲乙");
+        let (text, rev) = {
+            let tab = state.tabs.current();
+            (tab.editor.text().to_owned(), tab.editor.revision())
+        };
+
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 2)),
+        });
+        assert!(!state.ai.is_streaming(), "无 key 不发起");
+        assert_eq!(
+            state.tabs.current().document.notice.as_deref(),
+            Some("未配置 API key(设置 → AI Provider)"),
+            "拦截文案与其它 AI 入口同源"
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            text,
+            "被拦命令零副作用:文档一字未动"
+        );
+        assert_eq!(
+            state.tabs.current_mut().editor.revision(),
+            rev,
+            "补行也未发生"
+        );
+
+        // 换 Mock(无需 key)发起,再点续写:防重入忽略,不二次补行
+        state.ai.set_provider(AiConfig::default(), None);
+        state.ai.runtime = crate::ai::AiRuntime::Mock(latermd_ai::MockProvider::with_interval(
+            std::time::Duration::ZERO,
+        ));
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 2)),
+        });
+        assert!(state.ai.is_streaming());
+        let after_start = state.tabs.current_mut().editor.text().to_owned();
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Continue,
+            selection: Some((0, 2)),
+        });
+        assert!(state.ai.is_streaming(), "在途流不被顶掉");
+        assert_eq!(
+            state.tabs.current_mut().editor.text(),
+            after_start,
+            "流式中再点被忽略:文档(含首次补行)不再变动"
+        );
+        state.ai.finish();
+    }
+
+    /// 选区 AI 浮标菜单点选的归约。M2 起「润色」仍只记账不动文档(M3 接
+    /// 线确认浮窗);「续写」已接线流式通道,其文本语义由下方 M2 专项测试
+    /// 覆盖,这里断言润色路径的 M1 契约原样保留。
+    #[test]
+    fn selection_ai_polish_message_records_action_without_touching_document() {
         let mut state = State::default();
         assert_eq!(state.selection_ai_last, None);
         let (text, rev) = {
@@ -5471,18 +6033,13 @@ mod tests {
             (tab.editor.text().to_owned(), tab.editor.revision())
         };
 
-        state.apply(Message::SelectionAiActionRequested(
-            SelectionAiAction::Continue,
-        ));
-        assert_eq!(state.selection_ai_last, Some(SelectionAiAction::Continue));
-        state.apply(Message::SelectionAiActionRequested(
-            SelectionAiAction::Polish,
-        ));
-        assert_eq!(
-            state.selection_ai_last,
-            Some(SelectionAiAction::Polish),
-            "后点覆盖前点(最近一次为准)"
-        );
+        state.apply(Message::SelectionAiActionRequested {
+            action: SelectionAiAction::Polish,
+            selection: Some((1, 4)),
+        });
+        assert_eq!(state.selection_ai_last, Some(SelectionAiAction::Polish));
+        assert!(!state.ai.is_streaming(), "润色不发流(M3 接线)");
+        assert_eq!(state.ai_insert_at, None, "润色不挂插入点");
         let tab = state.tabs.current();
         assert_eq!(tab.editor.text(), text, "文档一字未动");
         assert_eq!(tab.editor.revision(), rev, "修订号不前进");

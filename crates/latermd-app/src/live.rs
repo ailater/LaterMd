@@ -221,9 +221,9 @@ pub fn ui(
     let mut active_response: Option<egui::Response> = None;
     let mut activate: Option<usize> = None;
     let mut route: Option<(usize, usize)> = None;
-    // 选区 AI 浮标(#61 M1)的锚点素材:活动块持久选区(块内字符偏移对)
-    // 与尾端光标条屏幕矩形,活动块分支内捕获、ScrollArea 之后消费(命中
-    // 区同层末尾注册,与源码模式同一纪律)。
+    // 选区 AI 浮标(#61 M1)的锚点素材:活动块持久选区(**文档坐标**字符
+    // 区对,块内捕获时换算)与尾端光标条屏幕矩形,活动块分支内捕获、
+    // ScrollArea 之后消费(命中区同层末尾注册,与源码模式同一纪律)。
     let mut sel_ai_selection: Option<(usize, usize)> = None;
     let mut sel_ai_anchor: Option<egui::Rect> = None;
     let mut sel_ai_response_id = egui::Id::NULL;
@@ -294,9 +294,17 @@ pub fn ui(
                     });
                     // 选区 AI 浮标(#61 M1)素材:块内持久选区(#38 同源读法)
                     // + 尾端光标条屏幕矩形(galley pos_from_cursor,IME 同先例),
-                    // ScrollArea 之后消费。
+                    // ScrollArea 之后消费。选区当帧换算成**文档坐标**字符区间
+                    // (块基为字节偏移,块内光标是字符偏移,与光标回填同款换算)
+                    // —— M2 起随动作消息带走做插入点捕获,归约不读
+                    // `TabState::selection`(该字段只有源码模式回填)。活动块
+                    // 是唯一可编辑块,块基不受本帧编辑影响,换算恒成立。
                     if let Some(range) = output.state.cursor.char_range() {
-                        sel_ai_selection = Some((range.primary.index.0, range.secondary.index.0));
+                        let block_base = editor.byte_to_char(live.blocks[index].start);
+                        sel_ai_selection = Some((
+                            block_base + range.primary.index.0,
+                            block_base + range.secondary.index.0,
+                        ));
                         let tail = range.primary.index.0.max(range.secondary.index.0);
                         let rect = output
                             .galley
@@ -551,7 +559,14 @@ pub fn ui(
     } else {
         None
     };
-    crate::ui::selection_ai::show(panel, editor_id, sel_anchor, scrolled.inner_rect, outbox);
+    crate::ui::selection_ai::show(
+        panel,
+        editor_id,
+        sel_ai_selection,
+        sel_anchor,
+        scrolled.inner_rect,
+        outbox,
+    );
 
     // 快照同步(与源码模式同一条规则:仅修订号前进时重建)
     if preview.synced_rev != editor.revision() {
@@ -2595,10 +2610,14 @@ mod tests {
         );
         assert_eq!(
             frame.messages,
-            vec![Message::SelectionAiActionRequested(
-                SelectionAiAction::Polish
-            )],
-            "菜单第二行(润色)点击发动作消息"
+            vec![Message::SelectionAiActionRequested {
+                action: SelectionAiAction::Polish,
+                // 活动块内选区换算文档坐标:块 1 基 = "# 标题块\n\n" 的 7 字符,
+                // 块内 (2,6) → (9,13);primary/secondary 无序(与
+                // `TabState::selection` 同约定),归约侧 min/max 归一
+                selection: Some((13, 9)),
+            }],
+            "菜单第二行(润色)点击发动作消息,选区已换算文档坐标"
         );
         assert_eq!(live.active, Some(1), "菜单压在富渲染块上,点击不误进块编辑");
         assert_eq!(

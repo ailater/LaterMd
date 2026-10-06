@@ -651,7 +651,14 @@ pub fn ui(
     } else {
         None
     };
-    crate::ui::selection_ai::show(panel, editor_id, sel_anchor, scrolled.inner_rect, outbox);
+    crate::ui::selection_ai::show(
+        panel,
+        editor_id,
+        sel_range,
+        sel_anchor,
+        scrolled.inner_rect,
+        outbox,
+    );
 
     output.response.response
 }
@@ -2612,10 +2619,14 @@ mod tests {
         );
         assert_eq!(
             messages,
-            vec![Message::SelectionAiActionRequested(
-                SelectionAiAction::Continue
-            )],
-            "菜单第一行(续写)点击发动作消息"
+            vec![Message::SelectionAiActionRequested {
+                action: SelectionAiAction::Continue,
+                // 点选帧的持久选区随消息带走 —— M2 归约凭它捕获插入点;
+                // primary/secondary 无序(灌入 (1,4),读回主光标在尾),
+                // 归约侧 min/max 归一
+                selection: Some((4, 1)),
+            }],
+            "菜单第一行(续写)点击发动作消息,选区随消息携带"
         );
         assert_eq!(sel_ai_probe(&ctx, id).menu, None, "动作触发后菜单合拢");
     }

@@ -117,8 +117,11 @@ fn menu_open_id(editor_id: egui::Id) -> egui::Id {
 
 /// 绘制浮标与(打开时的)两动作菜单。**必须在 ScrollArea 之后的同层
 /// 调用**(13a 纪律);`anchor` = 选区尾端光标条的屏幕矩形(调用点经
-/// [`badge_visible`] 判可见后给出),`clip` = 编辑视口矩形(浮标/菜单
-/// 只在视口内出,随滚动出视口即隐),`None` = 本帧隐藏。
+/// [`badge_visible`] 判可见后给出),`selection` = 点选帧的选区字符区间
+/// (**文档坐标**:源码模式是 TextEdit 持久选区原值,Live 模式是活动块
+/// 内选区加块基换算的全文偏移),随动作消息带走 —— M2 归约凭它捕获插入
+/// 点,不读 `TabState::selection`(Live 不回填该字段)。`clip` = 编辑视口
+/// 矩形(浮标/菜单只在视口内出,随滚动出视口即隐),`None` = 本帧隐藏。
 ///
 /// 焦点契约:egui 0.36 内建清焦(`surrender_focus_on: Presses` —— 按在
 /// 别处且本 widget 未悬停即交出焦点)发生在 widget 创建段,「点浮标」
@@ -128,6 +131,7 @@ fn menu_open_id(editor_id: egui::Id) -> egui::Id {
 pub(crate) fn show(
     ui: &egui::Ui,
     editor_id: egui::Id,
+    selection: Option<(usize, usize)>,
     anchor: Option<egui::Rect>,
     clip: egui::Rect,
     outbox: &mut Vec<Message>,
@@ -245,7 +249,7 @@ pub(crate) fn show(
         menu_open = false;
     }
     if let Some(action) = fired {
-        outbox.push(Message::SelectionAiActionRequested(action));
+        outbox.push(Message::SelectionAiActionRequested { action, selection });
     }
 
     ctx.data_mut(|d| d.insert_temp(menu_key, menu_open));
