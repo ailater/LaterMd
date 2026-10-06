@@ -8,6 +8,7 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::polish::POLISH_INSTRUCTIONS;
 use crate::summary::SUMMARY_INSTRUCTIONS;
 use crate::{AiProvider, Chunk};
 
@@ -20,6 +21,9 @@ const CHUNK_TARGET: usize = 20;
 /// 摘要结果的分块目标字符数(ask 口径 ~60,模拟打字机;尾块并入后仍不破
 /// 单块上限:60 + MIN_CHUNK == MAX_CHUNK)。
 const SUMMARY_CHUNK_TARGET: usize = 60;
+/// 润色结果的分块目标字符数(与摘要同档:结果是与选区同量级的短文,
+/// 打字机节奏靠它;60 + MIN_CHUNK == MAX_CHUNK 不破单块上限)。
+const POLISH_CHUNK_TARGET: usize = 60;
 /// 默认发块间隔。
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -76,10 +80,14 @@ for piece in script {
 剩下的都是体力活：把错误路径补齐，跑通闭环之后再回头看要不要加重试。原则上第一步定的 trait 不再改签名，后面所有 provider 都往这一个方法里装。";
 
 /// 按 prompt 形态选脚本并分块。摘要请求(以 summary 指令头开头)走同步
-/// 合成 + 60 字符分块;含「代码/code/实现」的续写走代码密集脚本。
+/// 合成 + 60 字符分块;润色请求(以 polish 指令头开头)同理;含「代码/
+/// code/实现」的续写走代码密集脚本。
 fn script_for(prompt: &str) -> Vec<String> {
     if prompt.starts_with(SUMMARY_INSTRUCTIONS) {
         return chunk_text(&mock_summary_body(prompt), SUMMARY_CHUNK_TARGET);
+    }
+    if prompt.starts_with(POLISH_INSTRUCTIONS) {
+        return chunk_text(&mock_polish_body(prompt), POLISH_CHUNK_TARGET);
     }
     let lower = prompt.to_lowercase();
     let text = if prompt.contains("代码") || prompt.contains("实现") || lower.contains("code") {
@@ -159,6 +167,16 @@ impl MockProvider {
     pub fn mock_summary(&self, prompt: &str) -> String {
         mock_summary_body(prompt)
     }
+
+    /// 润色场景的同步生成(#61 M3「AI 润色」背后的 Mock 替身)。
+    ///
+    /// 与 [`MockProvider::mock_summary`] 对称,输入是
+    /// [`crate::polish_prompt`] 的产物,同样走流式通道(stream_complete
+    /// 检测到润色指令头时调同一逻辑并按 60 字符分块)。输出是润色后的
+    /// 选区全文,语义与 Markdown 结构保持(见模块内 `mock_polish_body`)。
+    pub fn mock_polish(&self, prompt: &str) -> String {
+        mock_polish_body(prompt)
+    }
 }
 
 /// 摘要要点条数区间(ask 口径:3-5 条)。
@@ -209,6 +227,82 @@ fn mock_summary_body(prompt: &str) -> String {
         out.push_str("> - ");
         out.push_str(&point);
         out.push('\n');
+    }
+    out
+}
+
+/// 重复压一的句读集合(ASCII + 全角)。连续同字符出现在集合内即压成一个
+/// —— 只收「句读」级标点,`-`/`*`/`#`/`~`/`=` 这些 Markdown 结构标记
+/// 绝不进集合(压了就是毁结构)。
+const REPEATABLE_PUNCT: [char; 12] = [
+    '.', '!', '?', ',', ';', ':', '。', '！', '？', '，', '；', '：',
+];
+
+/// 润色的 Mock 行为(#61 M3):剥指令头取选中文本,做**结构安全**的
+/// 清理 —— 围栏代码块内的行原样透传(缩进与空格是代码语义);块外的行
+/// 压掉行尾空白、行内连续空白与重复句读。只动「明确无信息量」的部分,
+/// 词句一概不改写,天然满足「保持语义/Markdown 结构」的输出约束。
+/// 空输入(调用方拦截,防御)返回原样的换行,绝不空串。
+fn mock_polish_body(prompt: &str) -> String {
+    let body = prompt.strip_prefix(POLISH_INSTRUCTIONS).unwrap_or(prompt);
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            lines.push(line.trim_end().to_owned());
+            continue;
+        }
+        if in_code {
+            lines.push(line.to_owned());
+            continue;
+        }
+        let line = collapse_spaces(line.trim_end());
+        if line.is_empty() {
+            // 连续空行压一(首行就是空行则直接丢)
+            if lines.last().is_some_and(|prev: &String| !prev.is_empty()) {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        lines.push(collapse_repeats(&line));
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// 行内连续空白(空格/制表)压成单个空格。
+fn collapse_spaces(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut prev_space = false;
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+/// 行内重复句读压成一个([`REPEATABLE_PUNCT`] 之内才压)。
+fn collapse_repeats(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut prev: Option<char> = None;
+    for ch in line.chars() {
+        if prev == Some(ch) && REPEATABLE_PUNCT.contains(&ch) {
+            continue;
+        }
+        out.push(ch);
+        prev = Some(ch);
     }
     out
 }
@@ -565,5 +659,93 @@ mod tests {
         }
         assert_eq!(got, expected, "流式拼接与同步合成一致");
         assert!(got.chars().count() > SUMMARY_CHUNK_TARGET, "确实分了多块");
+    }
+
+    /// 润色的 Mock 行为:压掉行尾空白、行内连续空白与重复句读;标题/列表
+    /// 等结构标记与词句原样(语义与 Markdown 结构保持);连续空行压一,
+    /// 产出尾带换行。
+    #[test]
+    fn mock_polish_cleans_whitespace_and_repeated_punct_keeps_structure() {
+        let doc =
+            "# 标题\n\n这是一段  拖沓的、  原文。。\n\n\n\n- 列表项!   好多感叹!!\n尾部空格  \n";
+        let polished = MockProvider::new().mock_polish(&crate::polish::polish_prompt(doc));
+        assert_eq!(
+            polished.lines().collect::<Vec<_>>(),
+            vec![
+                "# 标题",
+                "",
+                "这是一段 拖沓的、 原文。",
+                "",
+                "- 列表项! 好多感叹!",
+                "尾部空格",
+            ],
+            "{polished}"
+        );
+        assert!(polished.ends_with('\n'), "行尾换行,替换后成规范段落");
+        // 全角句读同样压一;语义词句(「拖沓的」等)未被改写
+        let cjk =
+            MockProvider::new().mock_polish(&crate::polish::polish_prompt("等一下。。好吧？？"));
+        assert_eq!(cjk, "等一下。好吧？\n", "{cjk}");
+    }
+
+    /// 结构安全红线:围栏代码块内的行原样透传(缩进/双空格/重复分号都是
+    /// 代码语义),围栏行本身只剥行尾空白。
+    #[test]
+    fn mock_polish_passes_code_blocks_through_verbatim() {
+        let doc = "说明:\n\n```rust\nfn main() {\n    let  a = 1;;\n}\n```\n\n收尾。。\n";
+        let polished = MockProvider::new().mock_polish(&crate::polish::polish_prompt(doc));
+        assert_eq!(
+            polished.lines().collect::<Vec<_>>(),
+            vec![
+                "说明:",
+                "",
+                "```rust",
+                "fn main() {",
+                "    let  a = 1;;",
+                "}",
+                "```",
+                "",
+                "收尾。",
+            ],
+            "{polished}"
+        );
+    }
+
+    /// 毫无缺陷的输入润色后原样返回(幂等);空输入(调用方拦截,防御)
+    /// 给换行兜底,绝不空串。
+    #[test]
+    fn mock_polish_is_idempotent_and_never_empty() {
+        let clean = "# 标题\n\n正文干净的一段。\n";
+        let prompt = crate::polish::polish_prompt(clean);
+        assert_eq!(MockProvider::new().mock_polish(&prompt), clean);
+
+        let empty = MockProvider::new().mock_polish(&crate::polish::polish_prompt(""));
+        assert_eq!(empty, "\n", "{empty}");
+    }
+
+    /// 润色走流式通道:润色 prompt 喂 `stream_complete`,块拼起来恰是
+    /// `mock_polish` 的产物,块长落在 20-80 区间(60 目标 + 尾块并入)。
+    #[test]
+    fn polish_prompt_streams_as_chunked_mock_polish() {
+        let doc = "# 选区润色端到端\n\n这一段  有点拖沓。。需要清理空白与重复的句读,顺便验证分块目标足够触发多块输出。\n\n- 列表  项!!\n尾部空格  \n";
+        let prompt = crate::polish::polish_prompt(doc);
+        let expected = MockProvider::new().mock_polish(&prompt);
+
+        let provider = MockProvider::with_interval(Duration::ZERO);
+        let (tx, rx) = mpsc::channel();
+        provider.stream_complete(&prompt, tx);
+
+        let mut got = String::new();
+        for chunk in rx {
+            if chunk.done {
+                assert!(chunk.delta.is_empty(), "成功结束块不得携带正文");
+                break;
+            }
+            let len = chunk.delta.chars().count();
+            assert!((MIN_CHUNK..=MAX_CHUNK).contains(&len), "块长 {len} 越界");
+            got.push_str(&chunk.delta);
+        }
+        assert_eq!(got, expected, "流式拼接与同步合成一致");
+        assert!(got.chars().count() > POLISH_CHUNK_TARGET, "确实分了多块");
     }
 }
