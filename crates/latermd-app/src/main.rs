@@ -235,6 +235,12 @@ struct LaterMdApp {
     /// 要么在测试里重演同一段布局(而后者验证不了 `draw_zen` 有没有真调)。
     #[cfg(test)]
     zen_probe: Option<Box<dyn FnMut(f32)>>,
+    /// 仅供测试的探针:`ui::zen_nav` 画出的悬停标签导航列矩形。
+    ///
+    /// 同上:行是手绘 widget,坐标由动画位移决定,无头测试要点击真行只能
+    /// 让这条路走一遭;全隐帧不调用——测试据此断言「零导航元素」。
+    #[cfg(test)]
+    zen_nav_probe: Option<Box<dyn FnMut(egui::Rect)>>,
 }
 
 impl LaterMdApp {

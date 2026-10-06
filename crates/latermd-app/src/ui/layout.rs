@@ -766,6 +766,28 @@ impl LaterMdApp {
         // `ui::titlebar::edge_resize_zones` 的文档)。
         zen_exit_button(ui, &mut self.outbox);
 
+        // 禅定悬停标签导航(#57 M1):鼠标移近左缘唤出,点击跳转标签,离开
+        // 即隐。与退出钮同一层、其后分配(左缘与右上角不重叠,互不抢命中);
+        // 感应区是纯几何判定、导航列是同层绝对摆放,均不建 Foreground 层
+        // Area——机制与红线见 `ui::zen_nav` 模块文档(13a 教训)。
+        #[cfg(not(test))]
+        crate::ui::zen_nav::ui(
+            ui,
+            self.frameless,
+            &self.state.tabs,
+            &mut self.state.zen_nav,
+            &mut self.outbox,
+        );
+        #[cfg(test)]
+        crate::ui::zen_nav::ui_with_probe(
+            ui,
+            self.frameless,
+            &self.state.tabs,
+            &mut self.state.zen_nav,
+            &mut self.outbox,
+            self.zen_nav_probe.as_deref_mut(),
+        );
+
         // 顶层浮层与三栏路径同一份:禅定保留的标题栏上有设置齿轮、Ctrl+W
         // 是全局命令 —— 入口在禅定里可达,浮窗就必须跟着可达(见
         // [`Self::draw_overlay_dialogs`])。
@@ -3078,6 +3100,630 @@ mod tests {
             zen.iter().any(|t| t.contains("关闭标签")),
             "禅定帧里确认浮窗已渲染:{zen:?}"
         );
+    }
+
+    // ---- 禅定悬停标签导航(#57 M1)----------------------------------------
+
+    /// 悬停导航测试的三标签应用:出厂样例(未命名,索引 0)+ 甲(脏,非
+    /// 当前,索引 1)+ 乙(当前,索引 2),沙盒目录自清理。脏星(非当前行)
+    /// 与当前高亮(乙行)同帧可取证。
+    fn zen_nav_app(name: &str) -> (LaterMdApp, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-zen-nav-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("甲.md"), "# 甲\n").unwrap();
+        std::fs::write(dir.join("乙.md"), "# 乙\n").unwrap();
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state.settings_dir = Some(dir.clone());
+        app.state.apply(Message::FileSelected(dir.join("甲.md")));
+        app.state.apply(Message::FileSelected(dir.join("乙.md")));
+        assert_eq!(app.state.tabs.active, 2, "乙是当前标签");
+        // 甲改脏:dirty 镜像每帧只刷当前标签(end_of_logic),直接置镜像
+        // (state 层测试同款先例)。
+        app.state.tabs.tabs[1].document.dirty = true;
+        (app, dir)
+    }
+
+    /// 悬停导航帧:完整 reduce→draw,导航列探针命中即记 (代数, 矩形),
+    /// 返回本帧 shapes(取证列内文本与高亮)。
+    fn zen_nav_frame(
+        app: &mut LaterMdApp,
+        ctx: &egui::Context,
+        screen: Rect,
+        now: f64,
+        events: Vec<Event>,
+        probe_hit: &Rc<Cell<(u64, Rect)>>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        {
+            let sink = probe_hit.clone();
+            app.zen_nav_probe = Some(Box::new(move |rect| {
+                let (hits, _) = sink.get();
+                sink.set((hits + 1, rect));
+            }));
+        }
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(now),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.reduce(ui.ctx());
+                app.draw(ui);
+            },
+        );
+        let shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        shapes
+    }
+
+    /// `clip` 内画出的全部文本(中心点判定)。导航列文本与标题栏/正文
+    /// 按矩形区分。
+    fn texts_in_rect(shapes: &[egui::epaint::ClippedShape], clip: Rect) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                clip.contains(clipped.shape.visual_bounding_rect().center())
+                    .then(|| text.galley.job.text.clone())
+            })
+            .collect()
+    }
+
+    /// 文本及其颜色(高亮取证:当前行的强调色与左侧竖条同色)。颜色取
+    /// galley 首段的 format 色(`painter::text` 的颜色落在 job 段里)。
+    fn text_colors_in_rect(
+        shapes: &[egui::epaint::ClippedShape],
+        clip: Rect,
+    ) -> Vec<(String, egui::Color32)> {
+        shapes
+            .iter()
+            .filter_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                let color = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|section| section.format.color)?;
+                clip.contains(clipped.shape.visual_bounding_rect().center())
+                    .then(|| (text.galley.job.text.clone(), color))
+            })
+            .collect()
+    }
+
+    /// 生命周期(#57 验收):指针在外零元素(探针不触发)→ 移近左缘唤出
+    /// (列内画出全部标签文本 + 脏星 + 当前行高亮,条数与标签数一致)→
+    /// 移出后去抖到点隐藏、探针随之停。
+    #[test]
+    fn zen_hover_nav_shows_hides_and_lists_tabs() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (mut app, dir) = zen_nav_app("lifecycle");
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        let mut step = |app: &mut LaterMdApp, events: Vec<Event>, probe: &Rc<Cell<(u64, Rect)>>| {
+            now += 0.1;
+            zen_nav_frame(app, &ctx, screen, now, events, probe)
+        };
+
+        // 指针在外:零导航元素(探针零命中 = 绘制路径没走,全隐帧不分配
+        // 任何形状与命中区)。
+        for _ in 0..3 {
+            step(
+                &mut app,
+                vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+                &probe,
+            );
+        }
+        assert_eq!(probe.get().0, 0, "指针在外不该唤出");
+        assert!(!app.state.zen_nav.visible);
+
+        // 移近左缘:唤出。指针随即移进列内(感应区与导航列连续,不断链),
+        // 动画走完(alpha 到 1,位移归零,矩形回到驻位)。
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            &probe,
+        );
+        assert!(app.state.zen_nav.visible, "移近左缘即唤出(无进入去抖)");
+        for _ in 0..4 {
+            step(
+                &mut app,
+                vec![Event::PointerMoved(egui::pos2(100.0, 400.0))],
+                &probe,
+            );
+        }
+        let (hits, nav) = probe.get();
+        assert_eq!(hits, 5, "唤出期间每帧都画:{hits}");
+        assert_eq!(app.state.zen_nav.alpha, 1.0, "指针停在列内,动画收敛在 1");
+        assert_eq!(
+            nav,
+            crate::ui::zen_nav::nav_rect(screen, tokens::TITLEBAR_H),
+            "收敛后导航列回到驻位矩形:{nav:?}"
+        );
+
+        // 列内容:三个标签各一行(条数=标签数),甲带脏星,乙是当前。
+        let shapes = step(&mut app, Vec::new(), &probe);
+        let labels = texts_in_rect(&shapes, nav);
+        assert_eq!(labels.len(), 3, "一标签一行:{labels:?}");
+        assert!(labels.contains(&"未命名".to_owned()), "{labels:?}");
+        assert!(
+            labels.contains(&"甲.md*".to_owned()),
+            "脏星画出来:{labels:?}"
+        );
+        assert!(labels.contains(&"乙.md".to_owned()), "{labels:?}");
+        // 当前行高亮:乙的文字用强调色(甲用正文色,两者必须不同;乙行
+        // 内还有同色竖条 = selected 行的左侧 accent 条)。
+        let colors = text_colors_in_rect(&shapes, nav);
+        let color_of = |needle: &str| {
+            colors
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .unwrap()
+                .1
+        };
+        let (jia, yi) = (color_of("甲.md"), color_of("乙.md"));
+        assert_ne!(jia, yi, "当前标签行文字必须高亮:{colors:?}");
+        let bar = crate::ui::zen_nav::row_rect(nav, 2);
+        assert!(
+            shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.fill == yi && bar.contains_rect(rect.rect)
+                )
+            }),
+            "当前行左侧有与文字同色的强调竖条:{bar:?}"
+        );
+
+        // 移出:去抖窗口内仍显示,连续在外到 HIDE_DEBOUNCE_FRAMES 帧隐藏,
+        // 淡出走完后探针停、列内文本消失。
+        for _ in 0..3 {
+            step(
+                &mut app,
+                vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+                &probe,
+            );
+        }
+        assert!(
+            app.state.zen_nav.visible,
+            "离开不满去抖帧数仍显示(此刻 {} 帧)",
+            app.state.zen_nav.outside_frames
+        );
+        let hits_before = probe.get().0;
+        for _ in app.state.zen_nav.outside_frames..crate::ui::zen_nav::HIDE_DEBOUNCE_FRAMES {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert!(!app.state.zen_nav.visible, "去抖到点隐藏");
+        for _ in 0..4 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert!(
+            probe.get().0 > hits_before,
+            "隐藏动画期间仍在画(淡出有过程)"
+        );
+        let hits_settled = probe.get().0;
+        step(&mut app, Vec::new(), &probe);
+        assert_eq!(probe.get().0, hits_settled, "全隐后探针停");
+        let shapes = step(&mut app, Vec::new(), &probe);
+        assert!(
+            texts_in_rect(&shapes, nav).is_empty(),
+            "隐藏后列内零文本(标题栏除外不在 nav 矩形内)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 点击导航行 → [`Message::TabActivate`] → 既有归约真跳标签。
+    #[test]
+    fn zen_hover_nav_click_jumps_tab_via_tab_activate() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (mut app, dir) = zen_nav_app("click");
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+
+        // 唤出并收敛(指针停在列内)
+        for events in [
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            vec![Event::PointerMoved(egui::pos2(100.0, 400.0))],
+        ] {
+            now += 0.1;
+            zen_nav_frame(&mut app, &ctx, screen, now, events, &probe);
+        }
+        for _ in 0..4 {
+            now += 0.1;
+            zen_nav_frame(&mut app, &ctx, screen, now, Vec::new(), &probe);
+        }
+        let (_, nav) = probe.get();
+
+        // 点击第 1 行(甲,脏但激活不涉及关闭):moved → press → release
+        let center = crate::ui::zen_nav::row_rect(nav, 1).center();
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(center, true)],
+            vec![click(center, false)],
+        ] {
+            now += 0.1;
+            zen_nav_frame(&mut app, &ctx, screen, now, events, &probe);
+        }
+        assert_eq!(app.outbox, vec![Message::TabActivate(1)]);
+
+        // 下一帧归约消费:真跳到甲
+        now += 0.1;
+        zen_nav_frame(&mut app, &ctx, screen, now, Vec::new(), &probe);
+        assert_eq!(app.state.tabs.active, 1, "TabActivate 走既有归约跳标签");
+        assert_eq!(
+            app.state.tabs.current().document.base_name(),
+            "甲.md",
+            "当前标签已切换"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 唤出期间输入不被吞(13a 同层红线的回归):Esc 照常退禅定、F11 命令
+    /// 照常触发、文字输入不改任何状态;右上角「退出禅定」在导航列在场时
+    /// 依然点得动(跨层屏蔽会把它变成哑弹)。
+    #[test]
+    fn zen_hover_nav_keeps_input_and_exit_reachable() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        // 唤出到收敛的公共前奏(每个用例独立 app,同一个 ctx 逐段跑)
+        let warm_up = |name: &str, now: &mut f64| {
+            let (mut app, dir) = zen_nav_app(name);
+            app.state.apply(Message::ZenToggled);
+            for events in [
+                vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+                vec![Event::PointerMoved(egui::pos2(100.0, 400.0))],
+            ] {
+                *now += 0.1;
+                zen_nav_frame(&mut app, &ctx, screen, *now, events, &probe);
+            }
+            for _ in 0..4 {
+                *now += 0.1;
+                zen_nav_frame(&mut app, &ctx, screen, *now, Vec::new(), &probe);
+            }
+            assert!(app.state.zen_nav.visible, "{name}:导航列在场");
+            (app, dir)
+        };
+
+        // Esc:禅定出口当帧可达(导航列不消费键盘)
+        {
+            let (mut app, dir) = warm_up("esc", &mut now);
+            now += 0.1;
+            zen_nav_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                &probe,
+            );
+            assert!(
+                app.outbox.contains(&Message::ZenToggled),
+                "Esc 仍发出禅定退出:{:?}",
+                app.outbox
+            );
+            now += 0.1;
+            zen_nav_frame(&mut app, &ctx, screen, now, Vec::new(), &probe);
+            assert!(!app.state.layout.zen, "Esc 真退出禅定");
+            assert_eq!(
+                app.state.zen_nav,
+                crate::ui::zen_nav::ZenNavState::default(),
+                "退出即复位悬停导航"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // F11 命令快捷键照常触发(reduce 的 poll_shortcuts 不受导航列影响)
+        {
+            let (mut app, dir) = warm_up("f11", &mut now);
+            now += 0.1;
+            zen_nav_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Key {
+                    key: Key::F11,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                &probe,
+            );
+            assert!(!app.state.layout.zen, "F11 照常切换禅定");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // 文字输入:不被吞也不误写(禅定无编辑器焦点,输入落到空处)
+        {
+            let (mut app, dir) = warm_up("text", &mut now);
+            let before = app.state.tabs.current().editor.text().to_owned();
+            now += 0.1;
+            zen_nav_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::Text("字".to_owned())],
+                &probe,
+            );
+            assert_eq!(
+                app.state.tabs.current().editor.text(),
+                before,
+                "文字输入不写进缓冲"
+            );
+            assert!(app.outbox.is_empty(), "无任何消息被触发:{:?}", app.outbox);
+            assert!(
+                app.state.layout.zen && app.state.zen_nav.visible,
+                "状态不动"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // 右上角退出钮:导航列在场时仍点得动(同层摆放不跨层屏蔽,13a)
+        {
+            let (mut app, dir) = warm_up("exit-btn", &mut now);
+            let size = egui::vec2(tokens::ICON + 12.0, tokens::TOOLBAR_H);
+            let button = egui::Rect::from_min_size(
+                screen.right_top()
+                    - egui::vec2(size.x + tokens::ZEN_EXIT_MARGIN, -tokens::ZEN_EXIT_MARGIN),
+                size,
+            );
+            let center = button.center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+            ] {
+                now += 0.1;
+                zen_nav_frame(&mut app, &ctx, screen, now, events, &probe);
+            }
+            assert!(
+                app.outbox.contains(&Message::ZenToggled),
+                "退出钮不是哑弹:{:?}",
+                app.outbox
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 禅定进出后状态正确 + 非禅定模式零导航元素:退出即复位(无残置可见
+    /// 位)、三栏帧(含指针停在感应区位置)探针零命中、重进禅定指针在外
+    /// 时不闪残影(动画残值被全隐帧钉回 0)。
+    #[test]
+    fn zen_nav_state_resets_and_stays_hidden_outside_zen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (mut app, dir) = zen_nav_app("reset");
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        let mut step = |app: &mut LaterMdApp, events: Vec<Event>, probe: &Rc<Cell<(u64, Rect)>>| {
+            now += 0.1;
+            zen_nav_frame(app, &ctx, screen, now, events, probe)
+        };
+
+        // 唤出并收敛
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            &probe,
+        );
+        for _ in 0..5 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert!(app.state.zen_nav.visible);
+        let hits_in_zen = probe.get().0;
+        assert!(hits_in_zen > 0);
+
+        // 退出禅定(归约直接翻转,同 Esc 链路的落点):悬停态复位
+        app.state.apply(Message::ZenToggled);
+        assert_eq!(
+            app.state.zen_nav,
+            crate::ui::zen_nav::ZenNavState::default(),
+            "退出即复位"
+        );
+
+        // 三栏帧,指针特意停在感应区位置:零导航元素(探针零新增;三栏
+        // 渲染路径根本不调 zen_nav)
+        for _ in 0..3 {
+            step(
+                &mut app,
+                vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+                &probe,
+            );
+        }
+        assert_eq!(probe.get().0, hits_in_zen, "非禅定帧零导航元素");
+        assert_eq!(
+            app.state.zen_nav,
+            crate::ui::zen_nav::ZenNavState::default()
+        );
+
+        // 重进禅定,指针先移到远处:首帧即全隐(无残影闪现——上一会话的
+        // 动画残值被全隐帧钉回 0),移近左缘才重新唤出
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+            &probe,
+        );
+        app.state.apply(Message::ZenToggled);
+        for _ in 0..3 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert_eq!(probe.get().0, hits_in_zen, "重进禅定不闪残影");
+        assert!(!app.state.zen_nav.visible);
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            &probe,
+        );
+        assert!(probe.get().0 > hits_in_zen, "移近左缘重新唤出");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 标签多于列高(26 行装 40 标签):ScrollArea 承接,不 panic、画出
+    /// 的行都在列矩形内(视口剔除),点击首行仍走 TabActivate。
+    #[test]
+    fn zen_hover_nav_scrolls_when_tabs_overflow_the_column() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let dir = std::env::temp_dir().join(format!("latermd-zen-nav-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state.settings_dir = Some(dir.clone());
+        for i in 0..40 {
+            let path = dir.join(format!("文{i:02}.md"));
+            std::fs::write(&path, format!("# 文{i:02}\n")).unwrap();
+            app.state.apply(Message::FileSelected(path));
+        }
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        for events in [
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            vec![Event::PointerMoved(egui::pos2(100.0, 400.0))],
+            Vec::new(),
+            Vec::new(),
+        ] {
+            now += 0.1;
+            let shapes = zen_nav_frame(&mut app, &ctx, screen, now, events, &probe);
+            let (_, nav) = probe.get();
+            for (text, rect) in text_colors_in_rect(&shapes, nav)
+                .iter()
+                .map(|(text, _)| {
+                    (
+                        text,
+                        shapes
+                            .iter()
+                            .filter_map(|clipped| {
+                                let egui::epaint::Shape::Text(shape) = &clipped.shape else {
+                                    return None;
+                                };
+                                (shape.galley.job.text == *text)
+                                    .then_some(clipped.shape.visual_bounding_rect())
+                            })
+                            .min_by_key(|rect| rect.top().to_bits())
+                            .unwrap(),
+                    )
+                })
+                .filter(|(text, _)| text.starts_with("文"))
+            {
+                assert!(
+                    nav.contains_rect(rect),
+                    "行 {text} 画在列矩形内(视口剔除):{rect:?} vs {nav:?}"
+                );
+            }
+        }
+        assert!(probe.get().0 > 0, "唤出帧都画了");
+        // 点击首行(未被滚动):TabActivate(0) = 出厂样例标签
+        let (_, nav) = probe.get();
+        let center = crate::ui::zen_nav::row_rect(nav, 0).center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            now += 0.1;
+            zen_nav_frame(&mut app, &ctx, screen, now, events, &probe);
+        }
+        assert_eq!(app.outbox, vec![Message::TabActivate(0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两主题各唤出一遍:不 panic、列内容齐全、visuals 真切换(暗/亮各一)。
+    #[test]
+    fn zen_hover_nav_paints_in_both_themes() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for theme in ["dark", "light"] {
+            // 每轮独立 context:动画管理器的时刻只前进,跨轮回拨会 panic
+            let ctx = egui::Context::default();
+            let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+            let (mut app, dir) = zen_nav_app(theme);
+            if theme == "light" {
+                app.state.apply(Message::ToggleTheme);
+            }
+            assert_eq!(
+                app.state.resolved_theme(),
+                if theme == "light" {
+                    crate::theme::ThemeMode::Light
+                } else {
+                    crate::theme::ThemeMode::Dark
+                },
+                "{theme}:主题真的生效了(两轮 visuals 必须一明一暗)"
+            );
+            app.state.apply(Message::ZenToggled);
+            let mut now = 0.0;
+            now += 0.1;
+            zen_nav_frame(
+                &mut app,
+                &ctx,
+                screen,
+                now,
+                vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+                &probe,
+            );
+            for _ in 0..5 {
+                now += 0.1;
+                let shapes = zen_nav_frame(&mut app, &ctx, screen, now, Vec::new(), &probe);
+                if app.state.zen_nav.alpha == 1.0 {
+                    let (_, nav) = probe.get();
+                    let labels = texts_in_rect(&shapes, nav);
+                    assert_eq!(labels.len(), 3, "{theme}:三行都在:{labels:?}");
+                    assert!(labels.contains(&"甲.md*".to_owned()), "{theme}:{labels:?}");
+                    assert!(labels.contains(&"乙.md".to_owned()), "{theme}:{labels:?}");
+                    break;
+                }
+            }
+            assert_eq!(
+                app.state.zen_nav.alpha, 1.0,
+                "{theme}:动画收敛(指针停在感应区未离开)"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// M5 收口(2026-09-27 修复用户实测回归):非禅定态的 panel 序列恰为

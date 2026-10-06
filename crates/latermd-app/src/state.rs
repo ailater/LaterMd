@@ -44,6 +44,7 @@ use crate::theme::{
 use crate::ui::emoji_panel::EmojiPanelState;
 use crate::ui::image_dialog::ImageDialogState;
 use crate::ui::quick_open::QuickOpenState;
+use crate::ui::zen_nav::ZenNavState;
 use latermd_editor::EditorBuffer;
 use latermd_mcp::McpConfig;
 use latermd_md::OutlineItem;
@@ -320,6 +321,10 @@ pub struct State {
     /// 状态,不持久化——挂在 State 上随帧推进,切窗口/切标签不重建,
     /// 失焦帧由取消判定收口(不存在「失忆后拿残影计时」的面)。
     pub shortcut_overlay: ShortcutOverlayState,
+    /// 禅定悬停标签导航(#57 M1):显隐去抖与动画值。会话级状态,不持久
+    /// 化;由 `ui::zen_nav` 在禅定帧推进(UI 原地持有,与 quick_open 的
+    /// 查询草稿同款分工),退出禅定时在归约复位(悬停态不跨禅定会话)。
+    pub zen_nav: ZenNavState,
     /// 最近一次 AI 生成的 commit message 建议;`Some` = 建议浮窗可见。
     /// 经 [`Message::AiCommitSuggestion`] 置入,浮窗「关闭」或下一次生成
     /// 时替换/清除。
@@ -439,6 +444,7 @@ impl Default for State {
             emoji: EmojiPanelState::default(),
             clipboard: ClipboardState::default(),
             shortcut_overlay: ShortcutOverlayState::default(),
+            zen_nav: ZenNavState::default(),
             ai_commit_suggestion: None,
             theme: ThemeSettings::default(),
             skins: SkinCatalog::default(),
@@ -1359,6 +1365,9 @@ impl State {
     fn toggle_zen(&mut self) {
         if self.layout.zen {
             self.layout.exit_zen();
+            // 退出即复位悬停导航(#57):显隐判定随布局分叉失效,残置的可见位
+            // 会在重进禅定时凭空闪现一列(动画残值由绘制侧的全隐帧钉回 0)。
+            self.zen_nav = ZenNavState::default();
         } else {
             self.layout.enter_zen();
         }
