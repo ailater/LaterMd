@@ -1,5 +1,6 @@
-//! 禅定模式的悬停标签导航(#57 M1):鼠标移近左缘唤出标签列,点击跳转
-//! 标签,离开即隐。
+//! 禅定模式的左缘标签导航(#57 M1 悬停唤出;M2 三态配置:悬停/常显/关闭)。
+//! 点击跳转标签;悬停态下鼠标移近左缘唤出、离开去抖后即隐,常显态进禅定
+//! 即显示,关闭态零路径不渲染。
 //!
 //! 层级纪律(13a 教训,auto-plan #57 写死):感应区与导航列都留在
 //! `draw_zen` 的**同一层**。感应区是纯几何判定(只读指针位置,不注册任何
@@ -11,14 +12,21 @@
 //! 同层则按距离裁决、同距后画者胜:导航列画在 CentralPanel 之后盖住正文,
 //! 边缘缩放区仍最后分配,左缘 6px 缩放手势照常获胜。
 //!
-//! 显隐判定是纯函数(指针位置 × 感应区/导航列矩形 × 去抖计数):指针
-//! 移动本身产生事件帧驱动它,不为此排程 repaint;唤出/隐藏的淡入位移
+//! 三态共用同一渲染件(任务书钉死):分叉只在 [`ui_with_probe`] 开头的
+//! 显隐判定一步——悬停走 [`step`](指针几何 × 去抖),常显恒真(列是常驻
+//! chrome 而非指针的衍生显示态,无感应区、无去抖),关闭首行早退(零路径
+//! = 不读指针、不推进判定、不注册任何形状与命中,与「全隐帧零形状」同一
+//! 条红线)。判定之后的动画与绘制(淡入滑入、行、滚动)三态完全共用。
+//!
+//! 悬停态的显隐判定是纯函数(指针位置 × 感应区/导航列矩形 × 去抖计数):
+//! 指针移动本身产生事件帧驱动它,不为此排程 repaint;唤出/隐藏的淡入位移
 //! 动画由 egui 动画管理器自驱(进行中自动 request_repaint)。唤出期间
 //! 不抢键盘焦点(列内无 TextEdit、不 request_focus),键盘与命令快捷键
 //! 照常到达;只有点击导航行本身发 [`Message::TabActivate`]。
 
 use crate::state::Message;
 use crate::tabs::TabsState;
+use crate::theme::ZenNavMode;
 use crate::ui::{fade, tokens};
 use eframe::egui;
 
@@ -102,12 +110,14 @@ pub fn step(
     }
 }
 
-/// 悬停导航的会话级状态(不持久化;退出禅定即复位,见 `State::toggle_zen`)。
-/// 每帧由 `ui::zen_nav::ui_with_probe` 推进——显隐是指针几何的衍生显示
-/// 态,与 quick_open 的查询草稿同款归 UI 原地持有。
+/// 左缘标签导航的会话级状态(不持久化;退出禅定即复位,见
+/// `State::toggle_zen`;切换三态配置也复位,见 `Message::ZenNavModeChanged`
+/// 的归约)。每帧由 `ui::zen_nav::ui_with_probe` 推进——悬停态的显隐是
+/// 指针几何的衍生显示态(常显态 `visible` 被钉在 true,判定不参与),
+/// 与 quick_open 的查询草稿同款归 UI 原地持有。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZenNavState {
-    /// 去抖后的可见位(显隐判定输出,动画目标)。
+    /// 去抖后的可见位(显隐判定输出,动画目标;常显态恒 true)。
     pub visible: bool,
     /// 连续「指针在感应区与导航列之外」的帧计数。
     pub outside_frames: u32,
@@ -125,9 +135,10 @@ impl Default for ZenNavState {
     }
 }
 
-/// 绘制悬停标签导航(生产入口;探针恒 `None`,零开销)。
+/// 绘制左缘标签导航(生产入口;探针恒 `None`,零开销)。
 pub fn ui(
     panel: &mut egui::Ui,
+    mode: ZenNavMode,
     frameless: bool,
     tabs: &TabsState,
     zen_nav: &mut ZenNavState,
@@ -135,6 +146,7 @@ pub fn ui(
 ) {
     ui_with_probe(
         panel,
+        mode,
         frameless,
         tabs,
         zen_nav,
@@ -144,9 +156,10 @@ pub fn ui(
 }
 
 /// 同 [`ui`],额外把**实际画出来的**导航列矩形交给 `probe`(只供无头
-/// 测试定位;全隐帧不调用——测试据此断言零导航元素)。
+/// 测试定位;全隐帧与关闭档不调用——测试据此断言零导航元素)。
 pub fn ui_with_probe(
     panel: &mut egui::Ui,
+    mode: ZenNavMode,
     frameless: bool,
     tabs: &TabsState,
     zen_nav: &mut ZenNavState,
@@ -155,24 +168,34 @@ pub fn ui_with_probe(
 ) {
     let screen = panel.max_rect();
     let top = if frameless { tokens::TITLEBAR_H } else { 0.0 };
-    let zone = edge_zone(screen, top);
     let rest = nav_rect(screen, top);
 
-    // 显隐判定:导航列「占据屏幕」按上一帧动画值与可见位取(隐藏动画
-    // 进行中它仍在屏幕上,指针回到列内要能留住)。
-    let nav_hit = if zen_nav.visible || zen_nav.alpha > 0.0 {
-        rest
-    } else {
-        egui::Rect::NOTHING
+    // 显隐判定按模式分叉(三态共用其后的一切):悬停 = 指针几何 × 去抖
+    // (M1 判定);常显 = 恒真(列是常驻 chrome,与指针无关);关闭 = 零
+    // 路径早退 —— 不读指针、不推进判定、不注册任何形状与命中区,与
+    // 「全隐帧零形状」同一条红线(否决线:探针零命中)。
+    let (visible, outside_frames) = match mode {
+        ZenNavMode::Off => return,
+        ZenNavMode::Always => (true, 0),
+        ZenNavMode::Hover => {
+            let zone = edge_zone(screen, top);
+            // 显隐判定:导航列「占据屏幕」按上一帧动画值与可见位取(隐藏
+            // 动画进行中它仍在屏幕上,指针回到列内要能留住)。
+            let nav_hit = if zen_nav.visible || zen_nav.alpha > 0.0 {
+                rest
+            } else {
+                egui::Rect::NOTHING
+            };
+            let pointer = panel.ctx().input(|input| input.pointer.latest_pos());
+            step(
+                zen_nav.visible,
+                zen_nav.outside_frames,
+                pointer,
+                zone,
+                nav_hit,
+            )
+        }
     };
-    let pointer = panel.ctx().input(|input| input.pointer.latest_pos());
-    let (visible, outside_frames) = step(
-        zen_nav.visible,
-        zen_nav.outside_frames,
-        pointer,
-        zone,
-        nav_hit,
-    );
     zen_nav.visible = visible;
     zen_nav.outside_frames = outside_frames;
 
@@ -405,7 +428,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| super::ui(ui, true, tabs, zen_nav, outbox),
+                |ui| super::ui(ui, ZenNavMode::Hover, true, tabs, zen_nav, outbox),
             );
             let shapes = output.shapes.clone();
             output.drop_without_applying_deltas();
@@ -512,5 +535,93 @@ mod tests {
             &mut outbox,
         );
         assert_eq!(outbox, vec![Message::TabActivate(0)], "仅点击导航行生效");
+    }
+
+    /// 三态(#57 M2):常显无视指针几何 —— 指针在外、乃至无指针(窗口
+    /// 失焦)都当帧唤出并画出标签行(动画器首调直落端点,无淡入闪烁);
+    /// 关闭零路径 —— 指针贴在感应区也不读不画(零形状、零探针、会话态
+    /// 保持出厂、零消息)。悬停态对同一指针序列的唤出由
+    /// `panel_paints_only_near_left_edge_and_click_activates` 覆盖,三处
+    /// 合起来构成「同一指针输入下三态行为互异」的非恒真矩阵。
+    #[test]
+    fn always_mode_ignores_pointer_and_off_mode_is_zero_path() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let tabs = TabsState::new("# 禅定");
+
+        // 常显:指针在外 → 当帧唤出;无指针 → 同样显示。
+        for events in [
+            vec![egui::Event::PointerMoved(egui::pos2(900.0, 400.0))],
+            Vec::new(),
+        ] {
+            let ctx = egui::Context::default();
+            let mut zen_nav = ZenNavState::default();
+            let mut outbox = Vec::new();
+            let mut hits = 0u32;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    super::ui_with_probe(
+                        ui,
+                        ZenNavMode::Always,
+                        true,
+                        &tabs,
+                        &mut zen_nav,
+                        &mut outbox,
+                        Some(|_| hits += 1),
+                    );
+                },
+            );
+            let shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+            assert_eq!(hits, 1, "常显当帧即画");
+            assert!(zen_nav.visible);
+            assert_eq!(zen_nav.outside_frames, 0, "常显不走去抖路径");
+            let painted: Vec<String> = shapes
+                .iter()
+                .filter_map(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return None;
+                    };
+                    Some(text.galley.job.text.clone())
+                })
+                .collect();
+            assert!(
+                painted.iter().any(|t| t.contains("未命名")),
+                "常显画出标签行:{painted:?}"
+            );
+        }
+
+        // 关闭:指针贴在感应区,零形状零探针零推进。
+        let ctx = egui::Context::default();
+        let mut zen_nav = ZenNavState::default();
+        let mut outbox = Vec::new();
+        let mut hits = 0u32;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(egui::pos2(8.0, 400.0))],
+                ..Default::default()
+            },
+            |ui| {
+                super::ui_with_probe(
+                    ui,
+                    ZenNavMode::Off,
+                    true,
+                    &tabs,
+                    &mut zen_nav,
+                    &mut outbox,
+                    Some(|_| hits += 1),
+                );
+            },
+        );
+        assert!(output.shapes.is_empty(), "关闭档零形状");
+        output.drop_without_applying_deltas();
+        assert_eq!(hits, 0, "零导航元素(否决线)");
+        assert_eq!(zen_nav, ZenNavState::default(), "零路径:不推进任何判定");
+        assert!(outbox.is_empty());
     }
 }

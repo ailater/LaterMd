@@ -773,6 +773,11 @@ pub enum Message {
     /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
     /// 全局偏好,非每标签)。
     ShowMinimapToggled(bool),
+    /// 禅定导航显示方式切换(#57 M2):外观页三态选择产出,落
+    /// `theme.zen_nav` 并即时写 settings.json(与 minimap 开关同款通路)。
+    /// 归约同时复位会话级悬停态:新模式从干净状态起算(常显不继承旧会话
+    /// 的去抖残值,关闭后再开悬停不带着残置可见位)。
+    ZenNavModeChanged(crate::theme::ZenNavMode),
 }
 
 /// 字符偏移 → 字节偏移(替换命中落 `String` 前的换算;落在多字节字符
@@ -907,6 +912,11 @@ impl State {
             }
             Message::ShowMinimapToggled(show) => {
                 self.theme.show_minimap = show;
+                self.persist_theme();
+            }
+            Message::ZenNavModeChanged(mode) => {
+                self.theme.zen_nav = mode;
+                self.zen_nav = ZenNavState::default();
                 self.persist_theme();
             }
             Message::ToggleLivePreview => self.toggle_live_preview(),
@@ -4042,6 +4052,49 @@ mod tests {
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(!reloaded.show_minimap, "重启后仍为关");
         assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 M2:禅定导航方式消息归约落 `theme.zen_nav` 并即时写
+    /// settings.json;重启(load_from)后值仍在。切换同时复位会话级悬停
+    /// 态 —— 残置的去抖计数/可见位不带入新模式(常显→悬停不闪 200ms
+    /// 残显,悬停→常显干净淡入)。只动该字段,排版偏好与 minimap 不受
+    /// 影响(与 #55 同款通路)。
+    #[test]
+    fn zen_nav_mode_change_updates_field_persists_and_resets_session() {
+        let dir = temp_path("zen-nav-mode-change");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert_eq!(
+            state.theme.zen_nav,
+            crate::theme::ZenNavMode::Hover,
+            "出厂默认悬停"
+        );
+        let font_before = state.theme.editor_font_size;
+
+        state.zen_nav.visible = true;
+        state.zen_nav.outside_frames = 7;
+        state.apply(Message::ZenNavModeChanged(crate::theme::ZenNavMode::Always));
+        assert_eq!(state.theme.zen_nav, crate::theme::ZenNavMode::Always);
+        assert_eq!(
+            state.zen_nav,
+            crate::ui::zen_nav::ZenNavState::default(),
+            "切换即复位会话级悬停态"
+        );
+
+        state.apply(Message::ZenNavModeChanged(crate::theme::ZenNavMode::Off));
+        assert_eq!(state.theme.zen_nav, crate::theme::ZenNavMode::Off);
+
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert_eq!(
+            reloaded.zen_nav,
+            crate::theme::ZenNavMode::Off,
+            "重启后仍为关"
+        );
+        assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        assert!(reloaded.show_minimap, "minimap 开关不受影响");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

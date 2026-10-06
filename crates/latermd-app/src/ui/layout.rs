@@ -766,13 +766,15 @@ impl LaterMdApp {
         // `ui::titlebar::edge_resize_zones` 的文档)。
         zen_exit_button(ui, &mut self.outbox);
 
-        // 禅定悬停标签导航(#57 M1):鼠标移近左缘唤出,点击跳转标签,离开
-        // 即隐。与退出钮同一层、其后分配(左缘与右上角不重叠,互不抢命中);
+        // 禅定左缘标签导航(#57 M1 悬停唤出;M2 三态配置):悬停=鼠标移近
+        // 左缘唤出、离开即隐;常显=进禅定即显示;关闭=零路径不渲染。与
+        // 退出钮同一层、其后分配(左缘与右上角不重叠,互不抢命中);
         // 感应区是纯几何判定、导航列是同层绝对摆放,均不建 Foreground 层
         // Area——机制与红线见 `ui::zen_nav` 模块文档(13a 教训)。
         #[cfg(not(test))]
         crate::ui::zen_nav::ui(
             ui,
+            self.state.theme.zen_nav,
             self.frameless,
             &self.state.tabs,
             &mut self.state.zen_nav,
@@ -781,6 +783,7 @@ impl LaterMdApp {
         #[cfg(test)]
         crate::ui::zen_nav::ui_with_probe(
             ui,
+            self.state.theme.zen_nav,
             self.frameless,
             &self.state.tabs,
             &mut self.state.zen_nav,
@@ -3593,6 +3596,217 @@ mod tests {
         );
         assert!(probe.get().0 > hits_in_zen, "移近左缘重新唤出");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 常显(#57 M2):进禅定首帧导航列即在场 —— 指针始终在外也当帧唤出
+    /// (无感应区判定),列内容与悬停态同一渲染件(三行齐全、当前行高亮),
+    /// 指针在外停任意久都不隐藏(无去抖路径),点击行照旧走 TabActivate。
+    #[test]
+    fn zen_nav_always_mode_shows_immediately_and_never_hides() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (mut app, dir) = zen_nav_app("always");
+        app.state.theme.zen_nav = crate::theme::ZenNavMode::Always;
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        let mut step = |app: &mut LaterMdApp, events: Vec<Event>, probe: &Rc<Cell<(u64, Rect)>>| {
+            now += 0.1;
+            zen_nav_frame(app, &ctx, screen, now, events, probe)
+        };
+
+        // 首帧(指针在外):导航列当帧在场,三行齐全。
+        let shapes = step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+            &probe,
+        );
+        assert_eq!(probe.get().0, 1, "常显首帧即画");
+        assert!(app.state.zen_nav.visible);
+        let (_, nav) = probe.get();
+        let labels = texts_in_rect(&shapes, nav);
+        assert_eq!(labels.len(), 3, "与悬停态同一渲染件,三行齐全:{labels:?}");
+        assert!(labels.contains(&"甲.md*".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"乙.md".to_owned()), "{labels:?}");
+
+        // 指针在外停远远超过去抖窗口:仍显示、仍在画、动画收敛在 1。
+        for _ in 0..(crate::ui::zen_nav::HIDE_DEBOUNCE_FRAMES * 2 + 8) {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert!(app.state.zen_nav.visible, "常显不随指针离开隐藏");
+        assert_eq!(app.state.zen_nav.alpha, 1.0);
+        let hits_settled = probe.get().0;
+        step(&mut app, Vec::new(), &probe);
+        assert!(probe.get().0 > hits_settled, "每帧都在画(常驻 chrome)");
+
+        // 点击第 1 行(甲):常显态交互照旧,走既有 TabActivate 归约。
+        let center = crate::ui::zen_nav::row_rect(nav, 1).center();
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(center, true)],
+            vec![click(center, false)],
+        ] {
+            step(&mut app, events, &probe);
+        }
+        assert_eq!(app.outbox, vec![Message::TabActivate(1)]);
+        step(&mut app, Vec::new(), &probe);
+        assert_eq!(app.state.tabs.active, 1, "常显态点击真跳标签");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关闭(#57 M2 否决线):零导航元素 —— 指针贴在感应区、停任意久,
+    /// 探针零命中、列驻位矩形内零文本、会话级状态保持出厂(零路径:连
+    /// 指针都不读)。对照组:同一指针序列在悬停态当帧唤出,证明零命中
+    /// 不是指针事件缺失造成的恒真。
+    #[test]
+    fn zen_nav_off_mode_renders_zero_elements_even_at_the_edge() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let nav = crate::ui::zen_nav::nav_rect(screen, tokens::TITLEBAR_H);
+        let at_edge = || vec![Event::PointerMoved(egui::pos2(8.0, 400.0))];
+
+        // 对照组(悬停):同一序列当帧唤出。
+        {
+            let ctx = egui::Context::default();
+            let (mut app, dir) = zen_nav_app("off-control");
+            app.state.apply(Message::ZenToggled);
+            let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+            zen_nav_frame(&mut app, &ctx, screen, 0.1, at_edge(), &probe);
+            assert!(probe.get().0 > 0, "悬停态同指针序列当帧唤出(非恒真对照)");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // 关闭档:零元素。
+        let ctx = egui::Context::default();
+        let (mut app, dir) = zen_nav_app("off");
+        app.state.theme.zen_nav = crate::theme::ZenNavMode::Off;
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        for _ in 0..6 {
+            now += 0.1;
+            let shapes = zen_nav_frame(&mut app, &ctx, screen, now, at_edge(), &probe);
+            assert!(texts_in_rect(&shapes, nav).is_empty(), "列驻位矩形内零文本");
+        }
+        assert_eq!(probe.get().0, 0, "零导航元素(否决线)");
+        assert_eq!(
+            app.state.zen_nav,
+            crate::ui::zen_nav::ZenNavState::default(),
+            "零路径:不推进任何判定"
+        );
+        assert!(app.outbox.is_empty(), "零交互");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 禅定内切三态(#57 M2):归约即时生效 —— 常显在场切「关闭」,下一帧
+    /// 起探针冻结(零渲染);再切「悬停」,从复位态起算:指针在外不显示,
+    /// 移近左缘才唤出(会话级悬停态在归约里复位,不继承常显期的可见位)。
+    #[test]
+    fn zen_nav_mode_switch_inside_zen_takes_effect_next_frame() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (mut app, dir) = zen_nav_app("switch");
+        app.state.theme.zen_nav = crate::theme::ZenNavMode::Always;
+        app.state.apply(Message::ZenToggled);
+        let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
+        let mut now = 0.0;
+        let mut step = |app: &mut LaterMdApp, events: Vec<Event>, probe: &Rc<Cell<(u64, Rect)>>| {
+            now += 0.1;
+            zen_nav_frame(app, &ctx, screen, now, events, probe)
+        };
+
+        // 常显在场(指针在外)。
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+            &probe,
+        );
+        for _ in 0..4 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert!(app.state.zen_nav.visible);
+        let hits_always = probe.get().0;
+        assert!(hits_always > 0);
+
+        // 切关闭(归约;设置浮窗路径的落点就是这条消息):下一帧零渲染。
+        app.state
+            .apply(Message::ZenNavModeChanged(crate::theme::ZenNavMode::Off));
+        for _ in 0..3 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert_eq!(probe.get().0, hits_always, "关闭档探针冻结");
+        assert_eq!(
+            app.state.zen_nav,
+            crate::ui::zen_nav::ZenNavState::default(),
+            "归约已复位会话级悬停态"
+        );
+
+        // 切悬停:指针在外保持隐藏;移近左缘才唤出。
+        app.state
+            .apply(Message::ZenNavModeChanged(crate::theme::ZenNavMode::Hover));
+        for _ in 0..3 {
+            step(&mut app, Vec::new(), &probe);
+        }
+        assert_eq!(probe.get().0, hits_always, "悬停态指针在外不显示");
+        assert!(!app.state.zen_nav.visible);
+        step(
+            &mut app,
+            vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+            &probe,
+        );
+        assert!(probe.get().0 > hits_always, "移近左缘重新唤出(复位起算)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 M2 否决线:非禅定模式逐像素零变化 —— 三态任何一态配置下,
+    /// 三栏帧(指针特意停在左缘感应区)的完整 shapes 两两完全一致。
+    /// shapes 是本帧全部绘制指令(文本/矩形/线,含颜色与位置),列表
+    /// 相等即逐像素相等;`zen_nav` 只在 `draw_zen` 内被咨询,该断言钉住
+    /// 「三态设置不泄漏进三栏路径」。
+    #[test]
+    fn zen_nav_mode_does_not_leak_into_three_column_frames() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut fingerprints = Vec::new();
+        for mode in [
+            crate::theme::ZenNavMode::Hover,
+            crate::theme::ZenNavMode::Always,
+            crate::theme::ZenNavMode::Off,
+        ] {
+            let ctx = egui::Context::default();
+            let (mut app, dir) = zen_nav_app(&format!("leak-{mode:?}"));
+            app.state.theme.zen_nav = mode;
+            let mut shapes = Vec::new();
+            for i in 0..2 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![Event::PointerMoved(egui::pos2(8.0, 400.0))],
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                );
+                if i == 1 {
+                    shapes = output.shapes.clone();
+                }
+                output.drop_without_applying_deltas();
+            }
+            fingerprints.push(format!("{shapes:?}"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(!fingerprints[0].is_empty(), "三栏帧本身有形状(非空对照)");
+        assert_eq!(
+            fingerprints[0], fingerprints[1],
+            "常显态与悬停态的三栏帧逐像素不一致"
+        );
+        assert_eq!(
+            fingerprints[0], fingerprints[2],
+            "关闭态与悬停态的三栏帧逐像素不一致"
+        );
     }
 
     /// 标签多于列高(26 行装 40 标签):ScrollArea 承接,不 panic、画出
