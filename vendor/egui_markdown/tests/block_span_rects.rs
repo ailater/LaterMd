@@ -271,3 +271,52 @@ fn culled_blocks_stay_in_table() {
 fn block_hit(blocks: &[BlockSpanRect], offset: usize) -> Option<BlockSpanRect> {
   blocks.iter().find(|b| b.span.start <= offset && offset < b.span.end).cloned()
 }
+
+/// The per-frame table lives in one reused slot per id (records mutate it in
+/// place instead of rebuilding the `Vec` per record), so a later frame must
+/// observe exactly that frame's records — not the previous frame's leftover
+/// entries underneath. A block-heavy document rendered in frame 1 and another
+/// one in frame 2 must read back identical to a cold-context render of the
+/// frame-2 document, in the same span order.
+#[test]
+fn reused_table_slot_is_fresh_every_frame() {
+  let id = Id::new("blocks");
+  let text_a = many_blocks_doc(1);
+  let text_b = many_blocks_doc(2);
+  // Cold-context baseline for the frame-2 document.
+  let cold_b = blocks_for(&text_b);
+  assert!(cold_b.len() > 100, "sample must be block-heavy enough to catch duplication");
+
+  let ctx = Context::default();
+  for text in [&text_a, &text_b] {
+    let text = text.clone();
+    let mut read = None;
+    let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen()), ..Default::default() }, |ui| {
+      let mut child = ui.new_child(UiBuilder::new().max_rect(screen()));
+      MarkdownLabel::new(id, &text).wrap().show(&mut child);
+      read = block_span_rects(&child, id);
+    });
+    output.textures_delta.clear();
+    if text == text_b {
+      let warm = read.expect("frame 2 wrote a table");
+      assert_eq!(warm.len(), cold_b.len(), "reused slot holds exactly this frame's records");
+      assert!(
+        warm.iter().map(|b| b.span.clone()).eq(cold_b.iter().map(|b| b.span.clone())),
+        "span sequence must match a fresh-context render"
+      );
+    } else {
+      assert!(read.is_some(), "frame 1 wrote a table");
+    }
+  }
+}
+
+/// A plain-text document with 150 heading+paragraph blocks: exercises the
+/// in-galley block-recording path (no segmentation) at a record count where a
+/// per-record table rebuild would be visible.
+fn many_blocks_doc(seed: u32) -> String {
+  let mut text = String::new();
+  for i in 0..150 {
+    text.push_str(&format!("# 第 {seed}-{i} 节\n\n第 {i} 段正文,内容甲乙丙丁,足够一行以上。\n\n"));
+  }
+  text
+}

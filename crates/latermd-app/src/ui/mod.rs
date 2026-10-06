@@ -23,3 +23,8 @@ pub mod zen_nav;
 /// #39 M1 切换卡顿取证 harness:纯测试模块,生产构建不编译。
 #[cfg(test)]
 mod tab_switch_perf;
+
+/// #59 perf-round M1 全面取证 harness(大文档编辑帧/滚动稳态帧/冷首切分解/
+/// 应用启动):纯测试模块,生产构建不编译。
+#[cfg(test)]
+mod perf_finding;

@@ -198,6 +198,7 @@ fn needs_segmentation_matches_build_layout_across_admission_thresholds() {
           None,
           false,
           true,
+          true,
           &style,
           Default::default(),
         );
@@ -219,6 +220,7 @@ fn needs_segmentation_matches_build_layout_across_admission_thresholds() {
                 None,
                 false,
                 false,
+                true,
                 &style,
                 Default::default(),
               );

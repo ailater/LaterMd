@@ -155,6 +155,7 @@ fn needs_segmentation_matches_build_layout() {
           None,
           scroll_code_blocks,
           true,
+          true,
           &style,
           Default::default(),
         );

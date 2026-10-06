@@ -96,6 +96,7 @@ fn needs_segmentation_matches_build_layout_with_widget_handler() {
         Some(&handler),
         false,
         true,
+        true,
         &style,
         Default::default(),
       );

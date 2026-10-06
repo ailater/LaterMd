@@ -70,6 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking:** `Token::Link` gained a `heading` field and `append_link_to_job` takes an
   `inline_widget_font: Option<&FontId>` argument after `font_id` (`None` keeps the body
   font for widgets too).
+- `MarkdownLabel::defer_offscreen_highlight` (default `false`): lay out flushed ranges that
+  start below the viewport without syntax highlighting, and highlight them the moment they
+  can become visible. The deferral decision reads the exact layout cursor — a range starts
+  below the fold only when its first y lies entirely below the clip rect's bottom edge, and
+  cursor positions are sums of real heights — so no height estimation is involved and
+  nothing to correct. A deferred range is built from the same padded code text in the same
+  monospace metrics (identical geometry, absent colors), remembered in the flush cache, and
+  rebuilt with full highlighting on the first frame where it is no longer below the fold —
+  one syntect run per range, on the frame it scrolls into view. This removes the syntect
+  cost of every below-fold block from cache-miss frames (first paint of a long document)
+  without changing any pixel a user can see. Only the segmented render path defers; the
+  whole-document path and builds without the `syntax_highlighting` feature are unaffected.
 
 ### Changed
 
@@ -89,6 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MarkdownStyle::segmentation_admission`. Whole-document callers pass `true` to stay in
   sync with `needs_segmentation`; a caller laying out a single admitted fence as its own
   flushed range passes `false` so the fence renders inline within that range.
+- **Breaking:** `build_layout` now also takes `highlight_code_blocks: bool` (before
+  `style`). `false` builds code-block sections in a plain monospace format — same padded
+  text, same metrics, absent colors — as the placeholder for
+  [`MarkdownLabel::defer_offscreen_highlight`]; pass `true` for unchanged behavior.
+- The per-frame block table (`block_span_rects`) is now mutated in place through the
+  stored allocation instead of being rebuilt (read + clone + write-back) for every recorded
+  block. Table contents, ordering and frame semantics are unchanged; on a 20k-line document
+  recording 4673 blocks per frame, the per-record clone made the cost quadratic (~16 ms per
+  frame) and the in-place path removes it.
 - The height caches behind off-screen culling of block widgets (tables, scrolling code
   blocks, images) are now keyed by each block's own token — plus the style and link-handler
   id the previous whole-document key covered — instead of by the hash of the whole document
