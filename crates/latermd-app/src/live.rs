@@ -758,6 +758,71 @@ mod tests {
         assert!(live.blocks.len() >= 3, "{live:?}");
     }
 
+    /// 替换(#17)与 Live 块表的联动(#60 M2 核验②):替换走的**整篇 rope**
+    /// (`EditorBuffer::replace_all` / `replace_range`,归约侧
+    /// `replace_all_in_doc` / `replace_current` 的同一对写路径),不是活动
+    /// 块缓冲 —— rev 推进后下一次 `sync` 按新文本重切块,块表重新覆盖全
+    /// 文;替换本身不产 `pending_caret`(那是跳转/路由的通道,替换定位走
+    /// 源码侧 `pending_selection`,Live 下查找卡本就不可达,#17 口径)。
+    /// 换句话说:Live 模式被(程序化或切模式前的)替换改写后,渲染口径与
+    /// 文本永远对得上,不存在「替换词写进活动块、其余块还是旧文本」的
+    /// 第二份缓冲。
+    #[test]
+    fn replace_writes_whole_rope_and_next_sync_rechunks() {
+        // —— 全部替换路径(replace_all):三块文档里的 foo 全变 bar ——
+        let (mut editor, mut live, _) = state_with("foo aa\n\nfoo bb\n\nfoo cc\n");
+        live.sync(&editor, Some(editor.byte_to_char(live.blocks[1].start)));
+        assert_eq!(live.active, Some(1), "前置:活动块在第 2 块");
+        let rev_before = editor.revision();
+
+        // #17 replace_all_in_doc 的同一写:一次整篇写入,undo 栈单快照
+        editor.replace_all("bar aa\n\nbar bb\n\nbar cc\n");
+        assert!(editor.revision() > rev_before, "整篇替换推进修订号");
+        assert_ne!(
+            live.synced_rev,
+            Some(editor.revision()),
+            "块表此刻还是旧文本的,等下一帧 sync"
+        );
+
+        // 渲染帧入口的第一次 sync:重切块 + 活动块按光标字节重定位
+        live.sync(&editor, Some(editor.byte_to_char(live.blocks[1].start)));
+        assert_eq!(live.synced_rev, Some(editor.revision()), "块表已追上");
+        let mut covered = 0;
+        for block in &live.blocks {
+            assert_eq!(block.start, covered, "块表连续覆盖新全文");
+            covered = block.end;
+        }
+        assert_eq!(covered, editor.text().len());
+        assert_eq!(
+            BlockBuffer::slice(editor.text(), &live.blocks[1]),
+            "bar bb\n\n",
+            "块切片渲染的就是替换后的文本"
+        );
+        assert_eq!(
+            live.active,
+            Some(live.block_containing(live.blocks[1].start).unwrap()),
+            "活动块按光标落回新块表"
+        );
+
+        // —— 单个替换路径(replace_range):当前命中定点改写同样整篇生效 ——
+        let (mut editor, mut live, _) = state_with("foo one\n\nfoo two\n");
+        live.sync(&editor, None);
+        let first_foo_end = editor.byte_to_char(3);
+        editor.replace_range(0..first_foo_end, "bar");
+        live.sync(&editor, None);
+        assert_eq!(editor.text(), "bar one\n\nfoo two\n");
+        assert_eq!(
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            "bar one\n\n",
+            "块 0 已是替换后文本,块 1 未受牵连"
+        );
+        assert_eq!(
+            BlockBuffer::slice(editor.text(), &live.blocks[1]),
+            "foo two\n"
+        );
+        assert!(live.pending_caret.is_none(), "替换不产块路由待落地");
+    }
+
     /// 块包含判定:块内 / 文末 / 边界都给出确定的块。
     #[test]
     fn block_containing_resolves_edges() {

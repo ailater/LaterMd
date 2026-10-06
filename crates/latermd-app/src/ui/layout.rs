@@ -1731,8 +1731,10 @@ mod tests {
         assert!(outbox.is_empty(), "禁用态不产生消息");
     }
 
-    /// Ctrl+H 整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
-    /// 输入只更新状态不改文档;替换框上 Esc 关整条。
+    /// 替换键整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
+    /// 输入只更新状态不改文档;替换框上 Esc 关整条。(#60 M2:按键从出厂
+    /// 键位读——mac 出厂已是 ⌥⌘F(#114),硬编码 COMMAND+H 在 mac 编译
+    /// 目标上不再触发;测试语义「出厂键触发替换条」不变。)
     #[test]
     fn ctrl_h_opens_replace_row_typing_does_not_edit_and_esc_closes() {
         let ctx = egui::Context::default();
@@ -1743,13 +1745,16 @@ mod tests {
             find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
         }
 
-        // Ctrl+H → 命令层消费键位,查找条同开、替换行展开
+        // 出厂替换键 → 命令层消费键位,查找条同开、替换行展开
+        let shortcut = crate::command::Command::ReplaceInDoc
+            .default_shortcut()
+            .expect("替换命令有出厂键位");
         find_test_frame(
             &mut app,
             &ctx,
             screen,
             1.0,
-            find_key(Key::H, Modifiers::COMMAND),
+            find_key(shortcut.logical_key, shortcut.modifiers),
         );
         find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
         assert!(
@@ -1857,6 +1862,106 @@ mod tests {
         find_test_frame(&mut app, &ctx, screen, 1.1, Vec::new());
         assert!(!app.state.find.open, "Esc 后整条关闭");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 禅定帧的 Ctrl+H(#17 M2 核验③,#60):`poll_shortcuts` 在 reduce
+    /// 每帧必跑、不看布局分叉,替换条状态照常翻到位;但查找卡浮层只画
+    /// 三栏源码路径,#17 交付时的既有口径 —— 禅定帧浮层 Area 不存在,
+    /// Esc 退出禅定后同一状态立即落回屏上。是「延后」不是「被吞」
+    /// (13a 的 Foreground Area 跨层屏蔽不适用:查找卡是 egui 管理的
+    /// Window,禅定不画任何遮蔽它的层)。与查找条/goto 浮条在禅定的
+    /// 行为三者同口径(decisions-pending #114)。
+    #[test]
+    fn ctrl_h_in_zen_flips_state_and_overlay_waits_for_three_pane() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("zen-ctrl-h");
+        app.state.apply(Message::ZenToggled);
+        find_test_frame(&mut app, &ctx, screen, 0.1, Vec::new());
+        assert!(app.state.layout.zen, "前置:已进禅定");
+
+        // 禅定帧按 Ctrl+H:命令层消费键位,状态翻进查找条 + 替换行
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            0.2,
+            find_key(Key::H, Modifiers::COMMAND),
+        );
+        find_test_frame(&mut app, &ctx, screen, 0.3, Vec::new());
+        assert!(app.state.layout.zen, "仍在禅定");
+        assert!(
+            app.state.find.open && app.state.find.replace_open,
+            "禅定帧 Ctrl+H 状态照常翻到位"
+        );
+        let overlay = egui::Id::new("editor-find-overlay");
+        assert!(
+            ctx.memory(|memory| memory.area_rect(overlay)).is_none(),
+            "禅定帧不画查找卡浮层"
+        );
+
+        // Esc 退出禅定(draw_zen 消费,推 outbox),下一帧 reduce 应用后
+        // 回三栏 —— 查找卡同帧落回屏上,不需要再按 Ctrl+H
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            0.4,
+            find_key(Key::Escape, Modifiers::NONE),
+        );
+        find_test_frame(&mut app, &ctx, screen, 0.5, Vec::new());
+        assert!(!app.state.layout.zen, "Esc 退出禅定");
+        assert!(
+            app.state.find.open && app.state.find.replace_open,
+            "退出禅定后状态仍在,不丢"
+        );
+        assert!(
+            ctx.memory(|memory| memory.area_rect(overlay)).is_some(),
+            "三栏源码路径恢复后查找卡立即可见"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// minimap 开启态与查找/替换卡共存(#17 M2 核验⑤,#60):minimap 压窄
+    /// 正文(MINIMAP_W),查找卡浮层锚定 editor 之后的 available rect,
+    /// 两态都照常出现、都不推低正文 —— 「挤压」只发生在正文一侧且是
+    /// 设计内让位(minimap 画在右缘、查找卡浮在其上,Order::Foreground)。
+    /// minimap 出厂默认开(theme.rs),故 on 态是全量查找卡测试一直在跑
+    /// 的形态;这里把 off 态拉进来对齐正文顶,补成显式断言。
+    #[test]
+    fn find_overlay_coexists_with_minimap() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let overlay = egui::Id::new("editor-find-overlay");
+        let mut tops = std::collections::BTreeMap::new();
+        for (name, show) in [("on", true), ("off", false)] {
+            // 每态独立 Context:Area 记忆挂在 ctx 上,共用会让后一态读到
+            // 前一态的浮层残留,断言失真
+            let ctx = egui::Context::default();
+            let (mut app, dir) = find_test_app("minimap-coexist");
+            app.state.theme.show_minimap = show;
+            app.state.apply(Message::ReplaceBarToggled(true));
+            app.state
+                .apply(Message::FindQueryChanged("needle".to_owned()));
+            for step in 0..4 {
+                find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+            }
+            let shapes = find_test_frame(&mut app, &ctx, screen, 0.5, Vec::new());
+            assert!(
+                ctx.memory(|memory| memory.area_rect(overlay)).is_some(),
+                "minimap {name}:查找卡浮层在场"
+            );
+            assert!(
+                app.state.find.open && app.state.find.replace_open,
+                "minimap {name}:替换行展开"
+            );
+            let body_top = topmost_text(&shapes, "needle one").top();
+            tops.insert(name, body_top);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        assert_eq!(
+            tops["on"], tops["off"],
+            "minimap 开关不改变正文顶边(浮层不参与布局,无挤压推低)"
+        );
     }
 
     // —— 「跳转到行」浮条(#60 M1)——

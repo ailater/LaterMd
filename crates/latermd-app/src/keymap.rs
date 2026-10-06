@@ -425,6 +425,39 @@ impl Keymap {
                         changed = true;
                     }
                 }
+                // M2(#60):mac 替换键改排 ⌘H → ⌥⌘F 的同构迁移(#45 K1
+                // 先例)。⌘H 被 winit 默认菜单的 Hide 项持有(mac 死键,
+                // decisions-pending #114),改排只发生在 mac 出厂表 —— 其余
+                // 平台新默认 == 旧默认,`new != retired` 条件天然不命中,
+                // Win/Linux 老档里的 Ctrl+H(当年落盘的出厂值)分毫不动,
+                // 因此不需要平台 cfg 门,两条 CI 都能实测迁移本体。只迁
+                // 「值 == 旧默认」的条目:用户真自定义与主动清除分毫不动。
+                let retired_replace_default = Shortcut {
+                    modifiers: Modifiers::COMMAND,
+                    key: egui::Key::H,
+                };
+                let new_replace_default =
+                    Command::ReplaceInDoc
+                        .default_shortcut()
+                        .map(|shortcut| Shortcut {
+                            modifiers: shortcut.modifiers,
+                            key: shortcut.logical_key,
+                        });
+                let stored_replace = keymap
+                    .bindings
+                    .get(Command::ReplaceInDoc.id())
+                    .and_then(|text| parse_shortcut(text));
+                if stored_replace == Some(retired_replace_default)
+                    && new_replace_default != Some(retired_replace_default)
+                {
+                    if let Some(shortcut) = new_replace_default {
+                        keymap.bindings.insert(
+                            Command::ReplaceInDoc.id().to_owned(),
+                            shortcut.platform_text(),
+                        );
+                        changed = true;
+                    }
+                }
                 for cmd in Command::ALL {
                     if !keymap.bindings.contains_key(cmd.id()) {
                         if let Some(shortcut) = cmd.default_shortcut() {
@@ -604,12 +637,21 @@ mod tests {
 
     /// 替换命令(#17 M1)进出厂默认表;旧 `keymap.json` 增量迁移只给
     /// **缺失**的 command id 补默认,用户已有绑定绝不覆盖。
+    /// (#60 M2:出厂默认按平台分化——mac = ⌥⌘F,其余 = Ctrl/Cmd+H,
+    /// 按编译目标断言,两侧都在各自平台的 CI 上跑。)
     #[test]
     fn replace_in_doc_default_and_incremental_migration() {
-        // 出厂默认:Ctr/Cmd+H
+        let replace_default = if cfg!(target_os = "macos") {
+            Shortcut {
+                modifiers: Modifiers::ALT | Modifiers::COMMAND,
+                key: Key::F,
+            }
+        } else {
+            shortcut(Key::H)
+        };
         assert_eq!(
             Keymap::builtin().get(Command::ReplaceInDoc),
-            Some(shortcut(Key::H))
+            Some(replace_default)
         );
 
         let dir =
@@ -624,7 +666,7 @@ mod tests {
         let loaded = Keymap::load_from(&dir);
         assert_eq!(
             loaded.get(Command::ReplaceInDoc),
-            Some(shortcut(Key::H)),
+            Some(replace_default),
             "缺失 id 补默认,旧配置无需手动重置"
         );
         assert_eq!(
@@ -645,6 +687,114 @@ mod tests {
             Some(shortcut(Key::R)),
             "用户绑定不被默认覆盖"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mac 替换键改排(⌘H → ⌥⌘F,#60 M2)的旧档迁移回归,照 #45 K1
+    /// 主题迁移的形态分叉:老档躺着旧默认 Cmd+H → 迁 ⌥⌘F 且写回落盘;
+    /// 别名/大小写变体同样按解析值识别;用户自定义与主动清除分毫不动;
+    /// 缺失 id 走既有增量补默认。旧默认只在 mac 出厂表改排——其余平台
+    /// 新默认 == 旧默认,迁移条件天然不命中,「Ctrl+H 出厂值落盘」的老档
+    /// 保持原样(即现行默认,行为不变),该分支按编译目标断言。
+    #[test]
+    fn replace_default_migration_on_load() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-keymap-replace-m2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let retired = Shortcut {
+            modifiers: Modifiers::COMMAND,
+            key: Key::H,
+        };
+        let mac_default = Shortcut {
+            modifiers: Modifiers::ALT | Modifiers::COMMAND,
+            key: Key::F,
+        };
+
+        // 形态 ①:老档躺着旧默认值(当年增量写回落盘的出厂值)。mac:
+        // 迁 ⌥⌘F 且写回;其余平台:新默认 == 旧默认,不迁也不必迁
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S", "replace_in_doc": "Ctrl+H"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        let persisted = std::fs::read_to_string(dir.join(KEYMAP_FILE)).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                loaded.get(Command::ReplaceInDoc),
+                Some(mac_default),
+                "旧默认 Cmd+H 迁到 ⌥⌘F"
+            );
+            let reloaded: Keymap = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(
+                reloaded.get(Command::ReplaceInDoc),
+                Some(mac_default),
+                "迁移结果已写回 keymap.json:{persisted}"
+            );
+        } else {
+            assert_eq!(
+                loaded.get(Command::ReplaceInDoc),
+                Some(retired),
+                "非 mac:Ctrl+H 仍是现行默认,原样保留"
+            );
+        }
+        assert_eq!(loaded.get(Command::Save), Some(shortcut(Key::S)));
+
+        // 形态 ②:别名/大小写变体的旧默认(手改档)同样按解析值识别
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"replace_in_doc": "cmd+h"}}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load_from(&dir);
+        if cfg!(target_os = "macos") {
+            assert_eq!(loaded.get(Command::ReplaceInDoc), Some(mac_default));
+        } else {
+            assert_eq!(loaded.get(Command::ReplaceInDoc), Some(retired));
+        }
+
+        // 形态 ③:用户自定义键位 → 绝不覆盖(两侧平台同口径)
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"replace_in_doc": "Ctrl+R"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ReplaceInDoc),
+            Some(shortcut(Key::R)),
+            "用户自定义不被迁移覆盖"
+        );
+
+        // 形态 ④:主动清除(空串)→ 保持未绑定,不借迁移复活
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"replace_in_doc": ""}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ReplaceInDoc),
+            None,
+            "主动清除的绑定不因默认改排复活"
+        );
+
+        // 形态 ⑤:老档没有该 id → 既有增量补默认直接补上当前默认
+        std::fs::write(
+            dir.join(KEYMAP_FILE),
+            br#"{"bindings": {"save": "Ctrl+S"}}"#,
+        )
+        .unwrap();
+        let current_default = if cfg!(target_os = "macos") {
+            mac_default
+        } else {
+            retired
+        };
+        assert_eq!(
+            Keymap::load_from(&dir).get(Command::ReplaceInDoc),
+            Some(current_default),
+            "缺失 id 补当前默认"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

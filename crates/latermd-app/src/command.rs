@@ -479,8 +479,21 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::D)
             }
             Self::FindInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F),
-            // Ctrl/Cmd+H:主流编辑器的替换键位,出厂表无占用者
-            Self::ReplaceInDoc => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::H),
+            // Ctrl+H:Win/Linux 主流编辑器的替换键位,出厂表无占用者。mac
+            // 例外:⌘H 被 winit 默认应用菜单的「隐藏窗口」(Hide,
+            // `sel!(hide:)`)持有,Cocoa 主菜单按键匹配先于 egui —— 按键
+            // 到不了应用,命令成了死键且副作用是整个窗口消失(winit
+            // `menu.rs` 默认建菜单,eframe 未关闭)。mac 出厂改排 ⌥⌘F
+            // (VS Code / Sublime 的 mac 替换键惯例,与 ⌘F 查找同族);
+            // 老档 Cmd+H 的值感知迁移见 `keymap::load_from`,取舍全文见
+            // decisions-pending #114。
+            Self::ReplaceInDoc => {
+                if cfg!(target_os = "macos") {
+                    egui::KeyboardShortcut::new(Modifiers::ALT | Modifiers::COMMAND, egui::Key::F)
+                } else {
+                    egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::H)
+                }
+            }
             // Ctrl/Cmd+G(#60 M1):VS Code 的跳转到行键位;出厂表 G 键无占用者
             // (mac 侧 ⌘G 与系统「查找下一个」惯例的取舍见 decisions-pending #113)
             Self::GotoLine => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G),
@@ -876,14 +889,42 @@ mod tests {
         output.drop_without_applying_deltas();
     }
 
-    /// 替换命令(#17):Ctrl/Cmd+H 出厂即绑且只触发这一条;命令映射到
-    /// 替换条打开消息(开/关语义在归约侧翻转发)。
+    /// 替换命令(#17;#60 M2 mac 改排):出厂即绑且只触发这一条;命令
+    /// 映射到替换条打开消息(开/关语义在归约侧翻转发)。出厂键位按编译
+    /// 目标断言:mac = ⌥⌘F(⌘H 被 winit 默认菜单 Hide 项持有,#114),
+    /// 其余 = Ctrl/Cmd+H,两形态都在各自平台 CI 上跑(与
+    /// `alt_platform_text_per_target` 同口径)。
     #[test]
     fn replace_shortcut_fires_replace_command() {
+        let shortcut = Command::ReplaceInDoc
+            .default_shortcut()
+            .expect("替换命令有出厂键位");
+        let as_binding = crate::keymap::Shortcut {
+            modifiers: shortcut.modifiers,
+            key: shortcut.logical_key,
+        };
+        if cfg!(target_os = "macos") {
+            assert_eq!(shortcut.modifiers, Modifiers::ALT | Modifiers::COMMAND);
+            assert_eq!(shortcut.logical_key, Key::F, "mac 出厂 = ⌥⌘F");
+        } else {
+            assert_eq!(shortcut.modifiers, Modifiers::COMMAND);
+            assert_eq!(shortcut.logical_key, Key::H, "Win/Linux 出厂 = Ctrl/Cmd+H");
+        }
+        assert_eq!(
+            Keymap::builtin().get(Command::ReplaceInDoc),
+            Some(as_binding),
+            "keymap 出厂表与命令层默认一致"
+        );
+        assert_eq!(
+            Keymap::builtin().conflict(Command::ReplaceInDoc, as_binding),
+            None,
+            "替换出厂键不撞任何其他出厂键位"
+        );
+
         let ctx = egui::Context::default();
         let output = ctx.run_ui(
             RawInput {
-                events: vec![key_event(Key::H, Modifiers::COMMAND)],
+                events: vec![key_event(shortcut.logical_key, shortcut.modifiers)],
                 ..Default::default()
             },
             |ui| {
