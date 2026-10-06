@@ -666,6 +666,19 @@ pub enum Message {
     /// 保存 AI 配置(设置页 AI 区「保存」):归一化 → 落 `ai.json` → 即时
     /// 重装配 provider(无需重启)。失败只落提示行,不改内存配置。
     AiConfigSaved(AiConfig),
+    /// 设置页「获取模型列表」(#58 M2):归约里按草稿装配列表来源并发起
+    /// 后台拉取(std 线程 + mpsc,与 AI 流式同款,零 tokio)。Mock 不联网
+    /// 直接忽略(UI 已禁用按钮,防御);拉取中忽略(防重入)。收尾见
+    /// [`Message::AiModelsFetchFinished`]。
+    AiModelsFetchRequested,
+    /// 模型列表收尾(后台线程经 channel 回传,每帧归约收流翻成此消息):
+    /// `Ok(列表)` 填充下拉候选并清错误行;`Err(文案)` 显示错误行,旧候选
+    /// 保留。消息只可能来自当前在途请求 —— 防重入在 `start` 把关(在途
+    /// 忽略,接收端不中途替换),见 `ModelListState`。
+    AiModelsFetchFinished {
+        /// 成功 = 保序去重后的模型名列表;失败 = 面向用户的错误文案。
+        result: Result<Vec<String>, String>,
+    },
     /// 给某命令绑定新键位(快捷键页捕获到按键后由归约侧产出)。撞键时
     /// **拒绝**并落提示 —— 不静默抢占另一个命令的键位。
     KeymapAssign {
@@ -788,6 +801,32 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
+/// 按配置草稿装配模型列表来源(`request_ai_models` 的纯映射,单测不出网):
+/// Mock 不联网返回 `None`;需要 key 的 provider 带上凭据(缺失给空串,
+/// 由后台线程回「未配置 API key」文案);Ollama 本地无鉴权。base_url
+/// 原样透传 —— 尾斜杠与空白由 latermd-ai 的端点拼装吃掉(与各 adapter
+/// `url()` 同口径)。
+fn models_source_for(
+    config: &AiConfig,
+    api_key: Option<String>,
+) -> Option<latermd_ai::ModelsSource> {
+    use latermd_ai::ModelsSource;
+    match config.provider {
+        crate::ai_config::ProviderKind::Mock => None,
+        crate::ai_config::ProviderKind::OpenAiCompatible => Some(ModelsSource::OpenAiCompatible {
+            base_url: config.base_url.clone(),
+            api_key: api_key.unwrap_or_default(),
+        }),
+        crate::ai_config::ProviderKind::Anthropic => Some(ModelsSource::Anthropic {
+            base_url: config.base_url.clone(),
+            api_key: api_key.unwrap_or_default(),
+        }),
+        crate::ai_config::ProviderKind::Ollama => Some(ModelsSource::Ollama {
+            base_url: config.base_url.clone(),
+        }),
+    }
+}
+
 impl State {
     /// 消费一条消息,变更状态。只允许在 `App::logic` 调用。
     pub fn apply(&mut self, message: Message) {
@@ -895,6 +934,8 @@ impl State {
             }
             Message::AiKeyBackendUnavailable => self.ai_key.backend_ok = false,
             Message::AiConfigSaved(config) => self.apply_ai_config(config),
+            Message::AiModelsFetchRequested => self.request_ai_models(),
+            Message::AiModelsFetchFinished { result } => self.settings.models.finish(result),
             Message::McpConfigSaved(config) => self.apply_mcp_config(config),
             Message::ThemeSkinSelected(name) => self.apply_skin(name),
             Message::ThemeSkinExported { name } => self.export_skin(&name),
@@ -2153,6 +2194,26 @@ impl State {
         }
         let key = self.ai_key.creds.ai_api_key();
         self.ai.set_provider(config, key.as_deref());
+    }
+
+    /// 「获取模型列表」(`Message::AiModelsFetchRequested` 的归约):按
+    /// 草稿装配列表来源并发起后台拉取。Mock 不联网忽略;拉取中忽略
+    /// (UI 已禁用按钮,防御)。key 沿 AI 命令同一通道(latermd-creds →
+    /// 环境变量)读取,缺失不在此拦 —— 让后台线程回「未配置 API key」
+    /// 文案,错误行显示(错误路径是本功能的一等公民,见 #58 M2 任务书)。
+    fn request_ai_models(&mut self) {
+        let draft = self.settings.ai_draft.clone();
+        let key = self.ai_key.creds.ai_api_key();
+        let Some(source) = models_source_for(&draft, key) else {
+            return;
+        };
+        self.settings.models.start(source);
+    }
+
+    /// 模型列表收流(每帧归约调用一次):channel 里的结果翻成消息,由
+    /// 调用方并入本帧归约队列(与 [`Self::poll_ai`] 同分工)。
+    pub fn poll_models(&mut self) -> Vec<Message> {
+        self.settings.models.poll()
     }
 
     /// 切换主题(设置菜单的归约):改状态并即时落盘(重启保持);投影到
@@ -4871,6 +4932,140 @@ mod tests {
         assert!(!state.search.is_running());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&settings_dir);
+    }
+
+    /// 模型列表来源的纯映射(`request_ai_models` 的装配段,单测不出网):
+    /// Mock 不联网返回 None;需要 key 的 provider 带凭据,缺失给空串(由
+    /// 后台线程回「未配置 API key」);Ollama 无 key;端点原样透传。
+    #[test]
+    fn models_source_maps_provider_and_key() {
+        use latermd_ai::ModelsSource;
+        let config = AiConfig {
+            provider: crate::ai_config::ProviderKind::Mock,
+            ..AiConfig::default()
+        };
+        assert!(models_source_for(&config, None).is_none(), "Mock 不拉取");
+
+        let config = AiConfig {
+            provider: crate::ai_config::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1/".to_owned(),
+            model: "deepseek-chat".to_owned(),
+        };
+        assert_eq!(
+            models_source_for(&config, Some("placeholder-key".to_owned())),
+            Some(ModelsSource::OpenAiCompatible {
+                base_url: "https://api.deepseek.com/v1/".to_owned(),
+                api_key: "placeholder-key".to_owned(),
+            })
+        );
+        assert_eq!(
+            models_source_for(&config, None),
+            Some(ModelsSource::OpenAiCompatible {
+                base_url: "https://api.deepseek.com/v1/".to_owned(),
+                api_key: String::new(),
+            }),
+            "key 缺失给空串,不拦发起"
+        );
+
+        let config = AiConfig {
+            provider: crate::ai_config::ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com".to_owned(),
+            model: "claude-sonnet-4-5".to_owned(),
+        };
+        assert_eq!(
+            models_source_for(&config, Some("placeholder-key".to_owned())),
+            Some(ModelsSource::Anthropic {
+                base_url: "https://api.anthropic.com".to_owned(),
+                api_key: "placeholder-key".to_owned(),
+            })
+        );
+
+        let config = AiConfig {
+            provider: crate::ai_config::ProviderKind::Ollama,
+            base_url: "http://127.0.0.1:11434".to_owned(),
+            model: "llama3.1".to_owned(),
+        };
+        assert_eq!(
+            models_source_for(&config, None),
+            Some(ModelsSource::Ollama {
+                base_url: "http://127.0.0.1:11434".to_owned(),
+            }),
+            "Ollama 无鉴权,key 有无都不参与"
+        );
+    }
+
+    /// 「获取模型列表」归约全链路(假装配,零网络):Mock 草稿不发起;
+    /// 联网型草稿发起后收流归约填候选、清错误行;失败文案落错误行。
+    #[test]
+    fn ai_models_fetch_request_gate_and_finish_landing() {
+        let mut state = State::default();
+        state.ai_key.creds = latermd_creds::Credentials::in_memory();
+
+        // Mock 草稿:不发起(UI 已禁用,归约防御)
+        state.apply(Message::AiModelsFetchRequested);
+        assert!(!state.settings.models.is_fetching(), "Mock 不发起拉取");
+
+        // OpenAI 兼容草稿 + 假装配(即时回两个模型):发起 → 收流 → 落地
+        state.settings.ai_draft.provider = crate::ai_config::ProviderKind::OpenAiCompatible;
+        state.settings.models.spawner = std::sync::Arc::new(|_source, tx| {
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let _ = tx.send(Ok(vec!["fake-a".to_owned(), "fake-b".to_owned()]));
+                })
+                .ok()
+        });
+        state.apply(Message::AiModelsFetchRequested);
+        assert!(state.settings.models.is_fetching(), "联网型草稿发起拉取");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut messages = Vec::new();
+        while messages.is_empty() && std::time::Instant::now() < deadline {
+            messages = state.poll_models();
+            if messages.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        for message in messages {
+            state.apply(message);
+        }
+        assert!(!state.settings.models.is_fetching(), "结果落地后回到空闲");
+        assert_eq!(
+            state.settings.models.options,
+            vec!["fake-a".to_owned(), "fake-b".to_owned()],
+            "候选列表填充"
+        );
+        assert!(state.settings.models.error.is_none(), "成功清错误行");
+
+        // 失败结果:文案落错误行,旧候选保留(上次拉到的列表仍可用)
+        state.settings.models.spawner = std::sync::Arc::new(|_source, tx| {
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let _ = tx.send(Err("获取模型列表失败:HTTP 401:bad key".to_owned()));
+                })
+                .ok()
+        });
+        state.apply(Message::AiModelsFetchRequested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut messages = Vec::new();
+        while messages.is_empty() && std::time::Instant::now() < deadline {
+            messages = state.poll_models();
+            if messages.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        for message in messages {
+            state.apply(message);
+        }
+        assert_eq!(
+            state.settings.models.error.as_deref(),
+            Some("获取模型列表失败:HTTP 401:bad key"),
+            "失败文案落错误行"
+        );
+        assert_eq!(
+            state.settings.models.options,
+            vec!["fake-a".to_owned(), "fake-b".to_owned()],
+            "失败不清旧候选"
+        );
     }
 
     /// AI 流式全链路归约:发起(补空行 + 流式标志)、防重入、chunk 追加、

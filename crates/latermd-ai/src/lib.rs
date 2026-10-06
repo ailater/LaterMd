@@ -13,6 +13,7 @@
 mod anthropic;
 mod commit;
 mod mock;
+mod models;
 mod ollama;
 mod openai;
 mod summary;
@@ -20,6 +21,10 @@ mod summary;
 pub use anthropic::{parse_anthropic_sse, AnthropicProvider, AnthropicSettings};
 pub use commit::{commit_message_prompt, truncate_diff};
 pub use mock::MockProvider;
+pub use models::{
+    fetch_models, parse_anthropic_models, parse_ollama_models, parse_openai_models, ModelsResult,
+    ModelsSource,
+};
 pub use ollama::{parse_ollama_ndjson, OllamaProvider, OllamaSettings};
 pub use openai::{parse_openai_sse, AiError, OpenAiProvider, OpenAiSettings, API_KEY_ENV};
 pub use summary::{summary_prompt, truncate_document};
