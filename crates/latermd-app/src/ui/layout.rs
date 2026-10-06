@@ -33,6 +33,9 @@ impl LaterMdApp {
         // 图床上传收流:同一手法(channel → Message → 归约),结果只在归约
         // 落地(插入或回显),后台线程不碰 UI 状态
         outbox.extend(state.poll_bed());
+        // 模型列表拉取收流(#58 M2):同一手法,结果只在归约落地(填下拉
+        // 候选或显示错误行),后台线程不碰 UI 状态
+        outbox.extend(state.poll_models());
         // 剪贴板图片读取收流:同上(D 段,arboard 的阻塞 IO 在后台线程)
         outbox.extend(state.poll_clipboard());
         // 图片拖入落盘(D 段):dropped_files 由 egui-winit 汇进 raw input,
@@ -212,6 +215,11 @@ impl LaterMdApp {
         // 图床上传的重绘驱动同理:结果到达要在下一帧收流归约(空闲不来帧,
         // 不显式要帧结果会悬到下一次无关重绘);收尾清接收端后自然停。
         if state.bed.is_uploading() {
+            ctx.request_repaint();
+        }
+        // 模型列表拉取的重绘驱动同理(#58 M2):结果到达要在下一帧收流
+        // 归约;收尾清接收端后自然停。
+        if state.settings.models.is_fetching() {
             ctx.request_repaint();
         }
         // 剪贴板图片读取的重绘驱动同理(D 段):结果到达要在下一帧收流

@@ -1,24 +1,32 @@
 //! AI provider 配置(docs/ui-polish.md §6「AI」页)。
 //!
-//! P1 把 provider 定死成 MockProvider、端点与模型走环境变量
-//! (decisions-pending #3/#9)。本模块把它们变成**用户可在设置页填写的表单**:
-//! provider 种类、Base URL、模型名、采样参数、system prompt、超时与流式
-//! 开关,落 `ai.json`。
+//! 配置只保留**用户真正要填的四件事**:provider、Base URL、模型名与
+//! (经系统凭据的)API key —— 采样参数/system prompt/超时/流式开关已随
+//! 「配置页参数精简」删除(decisions-pending #108),内部按删除前的默认
+//! 值组装请求(见 `crate::ai::set_provider`),不因删 UI 改变默认请求。
+//! 另有一项**请求预算**:「上下文大小」(decisions-pending #110,KB 字节
+//! 口径,0 = 跟随现状默认),驱动摘要/commit 的文档截断。
 //!
 //! **provider 是唯一开关**(decisions-pending #94):接口方式(协议形态)
 //! 随 provider 派生,不再单列字段 —— 四种 provider 各自钉死一种协议,
 //! 「OpenAI 端点 + Anthropic 协议」这类矛盾组合在配置层就不存在。
 //!
 //! **API key 不在这里**:key 只走系统凭据(`latermd-creds`,见
-//! `crate::ai_key`),与参数分开存 —— 参数可以备份/分享,key 不行。
-//! 四种 provider 全部已实现:OpenAI 兼容/Anthropic 需要 key(共用同一
-//! 凭据通道),Ollama 本地无鉴权,Mock 不联网。
+//! `crate::ai_key`),与参数分开存 —— 参数可以备份/分享,key 不行;旧档
+//! 迁移时凭据通道不受影响。四种 provider 全部已实现:OpenAI 兼容/
+//! Anthropic 需要 key(共用同一凭据通道),Ollama 本地无鉴权,Mock 不联网。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 落盘文件名(平台配置目录,与 `settings.json` 同级)。
 const AI_FILE: &str = "ai.json";
+
+/// 上下文大小(KB)可设置的上限(= 1MB)。换算依据(decisions-pending
+/// #110):1KB ≈ 250-350 token(英文约 4 字节/token,UTF-8 常用汉字约
+/// 3 字节、1-1.5 字/token),1MB 已是至多 ~50 万 token 的 prompt,远超
+/// 主流模型上下文窗口,再大只会把请求打爆,钳掉。
+pub const CONTEXT_KB_MAX: u32 = 1024;
 
 /// provider 种类(serde snake_case)。旧 `ai.json` 的 `mock` 与
 /// `open_ai_compatible`(旧版落盘名)原样可读;`openai_compatible` 也收
@@ -39,14 +47,12 @@ pub enum ProviderKind {
     Ollama,
 }
 
-/// provider 的出厂端点/模型/超时([`ProviderKind::factory`] 的返回)。
+/// provider 的出厂端点/模型([`ProviderKind::factory`] 的返回)。
 pub struct ProviderFactory {
     /// 端点根地址。
     pub base_url: String,
     /// 模型名。
     pub model: String,
-    /// 连接/响应超时(秒)。
-    pub timeout_secs: u64,
 }
 
 impl ProviderKind {
@@ -90,7 +96,7 @@ impl ProviderKind {
         }
     }
 
-    /// 是否消费表单参数(端点/模型/采样):只有 Mock 全不读、参数区灰显;
+    /// 是否消费表单参数(端点/模型):只有 Mock 全不读、参数区灰显;
     /// Ollama 连本机服务,参数照常参与。
     pub fn uses_settings(self) -> bool {
         !matches!(self, Self::Mock)
@@ -100,32 +106,32 @@ impl ProviderKind {
     /// (防两处漂移)。Mock 无 adapter,沿用 OpenAI 兼容的值 —— 参数不
     /// 参与请求,表单只需要一个可显示的缺省。
     pub fn factory(self) -> ProviderFactory {
-        let (base_url, model, timeout_secs) = match self {
+        let (base_url, model) = match self {
             Self::Mock | Self::OpenAiCompatible => {
                 let s = latermd_ai::OpenAiSettings::default();
-                (s.base_url, s.model, s.timeout_secs)
+                (s.base_url, s.model)
             }
             Self::Anthropic => {
                 let s = latermd_ai::AnthropicSettings::default();
-                (s.base_url, s.model, s.timeout_secs)
+                (s.base_url, s.model)
             }
             Self::Ollama => {
                 let s = latermd_ai::OllamaSettings::default();
-                (s.base_url, s.model, s.timeout_secs)
+                (s.base_url, s.model)
             }
         };
-        ProviderFactory {
-            base_url,
-            model,
-            timeout_secs,
-        }
+        ProviderFactory { base_url, model }
     }
 }
 
 /// 模型参数与端点配置。缺省字段回落默认,手改的配置文件缺项不致整体失效。
 ///
-/// 旧版曾有 `api_style` 字段(接口方式);已随「provider 唯一开关」删除,
-/// 旧 `ai.json` 里遗留的该键在读取时被忽略(serde 默认不拒绝未知字段)。
+/// 旧版曾有 `api_style`(接口方式)与 `temperature`/`top_p`/`max_tokens`/
+/// `system_prompt`/`timeout_secs`/`stream` 字段;前者已随「provider 唯一
+/// 开关」删除(decisions-pending #94),后者已随「配置页参数精简」删除
+/// (decisions-pending #108)—— 旧 `ai.json` 里遗留的这些键在读取时被
+/// 忽略(serde 默认不拒绝未知字段),provider/端点/模型名无损读入;
+/// 被删参数的内部取值见 `crate::ai::set_provider`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
@@ -135,18 +141,12 @@ pub struct AiConfig {
     pub base_url: String,
     /// 模型名。
     pub model: String,
-    /// 采样温度 0–2。
-    pub temperature: f32,
-    /// 核采样 0–1。
-    pub top_p: f32,
-    /// 单次回复的 token 上限(Ollama 侧映射为 `num_predict`)。
-    pub max_tokens: u32,
-    /// system prompt;空串 = 不发送 system 消息。
-    pub system_prompt: String,
-    /// 连接/响应超时(秒)。
-    pub timeout_secs: u64,
-    /// 是否流式接收(关闭则一次性拿全文 —— 请求侧仍走同一 provider 通道)。
-    pub stream: bool,
+    /// 上下文大小(KB):进入 prompt 的文档全文 / commit diff 的字节上限,
+    /// 超出部分不进请求(prompt 里注明「已截断」)。0 = 未配置,摘要与
+    /// commit 各自沿用现状默认(32KB / 16KB),截断行为与旧版完全一致
+    /// (decisions-pending #110 的否决线)。对 provider 无关 —— Mock 也走
+    /// 同一 prompt 组装。
+    pub context_kb: u32,
 }
 
 impl Default for AiConfig {
@@ -156,12 +156,7 @@ impl Default for AiConfig {
             provider: ProviderKind::Mock,
             base_url: factory.base_url,
             model: factory.model,
-            temperature: 0.7,
-            top_p: 1.0,
-            max_tokens: 2048,
-            system_prompt: String::new(),
-            timeout_secs: factory.timeout_secs,
-            stream: true,
+            context_kb: 0,
         }
     }
 }
@@ -178,10 +173,9 @@ impl AiConfig {
         self.provider.uses_settings()
     }
 
-    /// 切换 provider 时的出厂值跟随:端点/模型/超时若仍是**任一** provider
-    /// 的出厂值(即用户从未手改),换成新 provider 的出厂值;手改过的字段
-    /// 原样保留,绝不静默覆盖。采样参数/system prompt/流式开关与 provider
-    /// 无关,不动。设置页 provider 下拉切换时调用。
+    /// 切换 provider 时的出厂值跟随:端点/模型若仍是**任一** provider 的
+    /// 出厂值(即用户从未手改),换成新 provider 的出厂值;手改过的字段
+    /// 原样保留,绝不静默覆盖。设置页 provider 下拉切换时调用。
     pub fn adopt_provider_defaults(&mut self, new: ProviderKind) {
         self.provider = new;
         let factory = new.factory();
@@ -198,20 +192,16 @@ impl AiConfig {
         if factories.iter().any(|f| f.model == self.model) {
             self.model = factory.model;
         }
-        if factories
-            .iter()
-            .any(|f| f.timeout_secs == self.timeout_secs)
-        {
-            self.timeout_secs = factory.timeout_secs;
-        }
     }
 
-    /// 归一化:端点/模型去空白,空值回落**当前 provider** 的出厂值;采样
-    /// 参数钳到合法区间(手改 JSON 可能写出 5.0 或 -1)。provider 本体
-    /// 不回落 —— 四种 provider 全部已实现,配置的是什么就是什么。
+    /// 归一化:端点/模型去空白,空值回落**当前 provider** 的出厂值;
+    /// 上下文大小钳到 `[0, CONTEXT_KB_MAX]`(手改 JSON 的越界值在读入时
+    /// 就地收回,滑杆范围之外没有合法取值)。provider 本体不回落 —— 四种
+    /// provider 全部已实现,配置的是什么就是什么。
     pub fn normalize(&mut self) {
         self.base_url = self.base_url.trim().to_owned();
         self.model = self.model.trim().to_owned();
+        self.context_kb = self.context_kb.min(CONTEXT_KB_MAX);
         let factory = self.provider.factory();
         if self.base_url.is_empty() {
             self.base_url = factory.base_url;
@@ -219,10 +209,16 @@ impl AiConfig {
         if self.model.is_empty() {
             self.model = factory.model;
         }
-        self.temperature = self.temperature.clamp(0.0, 2.0);
-        self.top_p = self.top_p.clamp(0.0, 1.0);
-        self.max_tokens = self.max_tokens.clamp(256, 32_768);
-        self.timeout_secs = self.timeout_secs.clamp(10, 300);
+    }
+
+    /// 上下文字节预算(「上下文大小」配置 → prompt 截断口径的换算,
+    /// decisions-pending #110):0 = 未配置给 `None`,由 latermd-ai 的
+    /// prompt 组装落回各用途现状默认(摘要 32KB / commit diff 16KB);
+    /// 已配置 = KB × 1024 字节,摘要与 commit 共用同一预算。读侧同样钳
+    /// 上限,绕过 `normalize` 构造的值也不会把请求撑爆。
+    pub fn context_budget(&self) -> Option<usize> {
+        let kb = self.context_kb.min(CONTEXT_KB_MAX);
+        (kb != 0).then(|| kb as usize * 1024)
     }
 
     /// 从目录读取;文件缺失或解析失败 = 默认(坏配置不挡启动,与
@@ -262,7 +258,7 @@ mod tests {
         std::env::temp_dir().join(format!("latermd-aicfg-{}-{name}", std::process::id()))
     }
 
-    /// 往返:改过的字段逐项保持(含旧变体的 snake_case 名)。
+    /// 往返:改过的字段逐项保持(含旧变体的 snake_case 名与新上下文大小)。
     #[test]
     fn save_load_round_trip() {
         let dir = temp_dir("roundtrip");
@@ -270,15 +266,10 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             base_url: "https://open.bigmodel.cn/api/paas/v4/".to_owned(),
             model: "glm-4.6".to_owned(),
-            temperature: 1.2,
-            top_p: 0.85,
-            max_tokens: 4096,
-            system_prompt: "你是技术文档助手".to_owned(),
-            timeout_secs: 120,
-            stream: false,
+            context_kb: 512,
         };
         config.save_to(&dir).unwrap();
-        assert_eq!(AiConfig::load_from(&dir), config);
+        assert_eq!(AiConfig::load_from(&dir), config, "context_kb 应无损往返");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -298,8 +289,7 @@ mod tests {
                 provider,
                 base_url: base_url.to_owned(),
                 model: model.to_owned(),
-                timeout_secs: 120,
-                ..AiConfig::default()
+                context_kb: 0,
             };
             let dir = temp_dir("roundtrip-new");
             config.save_to(&dir).unwrap();
@@ -315,16 +305,16 @@ mod tests {
         }
     }
 
-    /// 旧版 ai.json 兼容:只含旧变体、还带着已删除的 `api_style` 键
-    /// (含曾经的「未实现」取值)也能原样读回,未知键被忽略不报错。
-    /// 旧版落盘名是 `open_ai_compatible`,`openai_compatible` 拼法走 alias。
+    /// 旧版 ai.json 兼容:含**全部**被删字段(采样三参数/system prompt/
+    /// 超时/流式)与已删除的 `api_style` 键也能读回,未知键被忽略不报错,
+    /// provider/端点/模型名无损;provider 取值走旧落盘名与 alias 拼法。
     #[test]
-    fn legacy_ai_json_with_api_style_loads() {
-        let dir = temp_dir("legacy");
+    fn legacy_ai_json_with_all_removed_fields_loads_losslessly() {
+        let dir = temp_dir("legacy-full");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(AI_FILE),
-            br#"{"provider":"open_ai_compatible","api_style":"chat_completions","base_url":"https://api.deepseek.com/v1","model":"deepseek-chat"}"#,
+            r#"{"provider":"open_ai_compatible","api_style":"chat_completions","base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","temperature":1.2,"top_p":0.85,"max_tokens":4096,"system_prompt":"你是技术文档助手","timeout_secs":90,"stream":false}"#,
         )
         .unwrap();
         let config = AiConfig::load_from(&dir);
@@ -332,6 +322,33 @@ mod tests {
         assert_eq!(config.base_url, "https://api.deepseek.com/v1");
         assert_eq!(config.model, "deepseek-chat");
 
+        // 另两家 provider 同款:被删字段在旧档里同样被忽略
+        std::fs::write(
+            dir.join(AI_FILE),
+            r#"{"provider":"anthropic","base_url":"https://api.anthropic.com","model":"claude-sonnet-4-5","temperature":0.1,"top_p":0.5,"max_tokens":8192,"system_prompt":"x","timeout_secs":30,"stream":false,"api_style":"anthropic_messages"}"#,
+        )
+        .unwrap();
+        let config = AiConfig::load_from(&dir);
+        assert_eq!(config.provider, ProviderKind::Anthropic);
+        assert_eq!(config.base_url, "https://api.anthropic.com");
+        assert_eq!(config.model, "claude-sonnet-4-5");
+
+        std::fs::write(
+            dir.join(AI_FILE),
+            br#"{"provider":"ollama","base_url":"http://127.0.0.1:11434","model":"llama3.1","temperature":0.9,"stream":false}"#,
+        )
+        .unwrap();
+        let config = AiConfig::load_from(&dir);
+        assert_eq!(config.provider, ProviderKind::Ollama);
+        assert_eq!(config.model, "llama3.1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧拼法 `openai_compatible`(无下划线)走 alias;`mock` 原样可读。
+    #[test]
+    fn legacy_provider_spellings_load() {
+        let dir = temp_dir("legacy-spelling");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(AI_FILE),
             br#"{"provider":"openai_compatible","api_style":"anthropic_messages"}"#,
@@ -348,39 +365,124 @@ mod tests {
             br#"{"provider":"mock","api_style":"ollama_generate"}"#,
         )
         .unwrap();
-        let config = AiConfig::load_from(&dir);
-        assert_eq!(config.provider, ProviderKind::Mock);
+        assert_eq!(AiConfig::load_from(&dir).provider, ProviderKind::Mock);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 归一化:空白端点/模型回落**当前 provider** 的出厂值;越界采样参数
-    /// 被钳住;provider 字段对新变体原样保留(不再回落到任何默认)。
+    /// 新配置落盘后,被删字段不复活:ai.json 里不再出现 temperature/top_p/
+    /// max_tokens/system_prompt/timeout_secs/stream/api_style 任何一键
+    /// (字段已从结构体删除,serde 不再序列化它们)。
     #[test]
-    fn normalize_clamps_and_falls_back_to_provider_factory() {
+    fn save_drops_removed_fields_from_disk() {
+        let dir = temp_dir("no-revival");
+        let config = AiConfig {
+            provider: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1".to_owned(),
+            model: "deepseek-chat".to_owned(),
+            context_kb: 64,
+        };
+        config.save_to(&dir).unwrap();
+        let json = std::fs::read_to_string(dir.join(AI_FILE)).unwrap();
+        for key in [
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "system_prompt",
+            "timeout_secs",
+            "stream",
+            "api_style",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "落盘不应再含被删键 \"{key}\":\n{json}"
+            );
+        }
+        // 保留项在场:provider/base_url/model/context_kb 四键齐全
+        for key in ["provider", "base_url", "model", "context_kb"] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "落盘应含保留键 \"{key}\":\n{json}"
+            );
+        }
+        // 落盘 → 重读仍然无损(旧字段消失不影响往返)
+        assert_eq!(AiConfig::load_from(&dir), config);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上下文大小(decisions-pending #110)的换算与默认:默认/旧档缺字段
+    /// = 0 = `None`(未配置,latermd-ai 落回现状默认,截断行为不变);
+    /// 显式 KB 值换算为字节,两用途共用同一预算。
+    #[test]
+    fn context_kb_defaults_to_zero_and_maps_to_byte_budget() {
+        assert_eq!(AiConfig::default().context_kb, 0);
+        assert_eq!(AiConfig::default().context_budget(), None, "未配置 = None");
+        assert_eq!(
+            AiConfig {
+                context_kb: 32,
+                ..AiConfig::default()
+            }
+            .context_budget(),
+            Some(32 * 1024),
+            "KB × 1024 = 字节"
+        );
+
+        // 旧档(ai.json 无 context_kb 键)读入 = 0 = 未配置
+        let dir = temp_dir("legacy-no-context");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(AI_FILE),
+            br#"{"provider":"open_ai_compatible","base_url":"https://api.deepseek.com/v1","model":"deepseek-chat"}"#,
+        )
+        .unwrap();
+        let config = AiConfig::load_from(&dir);
+        assert_eq!(config.context_kb, 0, "旧档缺字段回落 0(未配置)");
+        assert_eq!(config.context_budget(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上下文大小钳制(decisions-pending #110,照 #23 滑杆先例的上下限):
+    /// 手改 JSON 的越界值在 normalize(读入路径)就地收回上限;绕过
+    /// normalize 构造的值在 `context_budget` 读侧同样被钳。
+    #[test]
+    fn context_kb_is_clamped_to_configured_range() {
+        let mut config = AiConfig {
+            context_kb: u32::MAX,
+            ..AiConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.context_kb, CONTEXT_KB_MAX, "读入路径钳到上限");
+
+        let beyond = AiConfig {
+            context_kb: 2000,
+            ..AiConfig::default()
+        };
+        assert_eq!(
+            beyond.context_budget(),
+            Some(CONTEXT_KB_MAX as usize * 1024),
+            "读侧同样钳上限,预算不会撑爆"
+        );
+    }
+
+    /// 归一化:空白端点/模型回落**当前 provider** 的出厂值;provider 字段
+    /// 对新变体原样保留(不再回落到任何默认)。
+    #[test]
+    fn normalize_falls_back_to_provider_factory() {
         let mut config = AiConfig {
             provider: ProviderKind::Ollama,
             base_url: "  ".to_owned(),
             model: String::new(),
-            temperature: 9.9,
-            top_p: -0.5,
-            max_tokens: 0,
-            timeout_secs: 1,
-            ..AiConfig::default()
+            context_kb: 0,
         };
         config.normalize();
         assert_eq!(config.provider, ProviderKind::Ollama, "provider 不回落");
         assert_eq!(config.base_url, "http://127.0.0.1:11434");
         assert_eq!(config.model, "llama3.1");
-        assert_eq!(config.temperature, 2.0);
-        assert_eq!(config.top_p, 0.0);
-        assert_eq!(config.max_tokens, 256);
-        assert_eq!(config.timeout_secs, 10);
 
         let mut config = AiConfig {
             provider: ProviderKind::Anthropic,
             base_url: String::new(),
             model: String::new(),
-            ..AiConfig::default()
+            context_kb: 0,
         };
         config.normalize();
         assert_eq!(config.provider, ProviderKind::Anthropic);
@@ -437,8 +539,8 @@ mod tests {
         );
     }
 
-    /// 切 provider 的出厂值跟随:出厂端点/模型/超时跟着换(含 Ollama 的
-    /// 本地推理超时档);手改过的端点与模型不被静默覆盖。
+    /// 切 provider 的出厂值跟随:出厂端点/模型跟着换;手改过的端点与模型
+    /// 不被静默覆盖。
     #[test]
     fn adopt_provider_defaults_swaps_factory_values_only() {
         let mut config = AiConfig::default(); // 出厂 = OpenAI 兼容端点
@@ -446,7 +548,6 @@ mod tests {
         assert_eq!(config.provider, ProviderKind::Ollama);
         assert_eq!(config.base_url, "http://127.0.0.1:11434");
         assert_eq!(config.model, "llama3.1");
-        assert_eq!(config.timeout_secs, 120, "Ollama 出厂超时是本地推理档");
 
         let mut config = AiConfig {
             base_url: "https://api.deepseek.com/v1".to_owned(),

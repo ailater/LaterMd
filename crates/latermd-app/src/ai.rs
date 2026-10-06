@@ -24,6 +24,20 @@ use latermd_ai::{
 use crate::ai_config::{AiConfig, ProviderKind};
 use crate::state::Message;
 
+/// 配置页被删参数的内部默认(decisions-pending #108)。
+///
+/// 「配置页参数精简」删掉采样参数/system prompt/超时/流式的 UI 与落盘
+/// 字段后,请求装配仍要有值:这里钉住**删除前** `AiConfig::default()`
+/// 的取值,默认请求与删 UI 前逐字段一致(不因删 UI 改变默认请求)。
+/// 注意 Anthropic/Ollama 的 adapter `Default` 是「不发采样参数」
+/// (decisions-pending #92/#93),与删除前 app 装配的现行为不同 ——
+/// 所以这两家不能整体 `..Default::default()` 了事,采样三参数必须
+/// 显式给值。超时/流式/system prompt 的默认与 adapter `Default` 同源,
+/// 不在此重复(装配处走 `..Default::default()`)。
+const INTERNAL_TEMPERATURE: f32 = 0.7;
+const INTERNAL_TOP_P: f32 = 1.0;
+const INTERNAL_MAX_TOKENS: u32 = 2048;
+
 /// 生效的 provider 运行时。
 ///
 /// 枚举而非 trait 对象:只有四种实现,编译期穷尽匹配比动态分发更省事,
@@ -105,7 +119,7 @@ pub struct AiState {
     /// (`State::ai_active_tab`),切标签不作废:别的标签里文本不匹配的
     /// 指令卡自然显示「未执行」,切回发起标签仍能正确显示状态。
     pub(crate) last_prompt: Option<String>,
-    /// 当前生效的 AI 配置(端点/模型/采样参数……)。与 `runtime` 同源:
+    /// 当前生效的 AI 配置(provider/端点/模型)。与 `runtime` 同源:
     /// 保存配置即重新装配 runtime,两者不会各说各话。
     pub(crate) config: AiConfig,
 }
@@ -130,6 +144,11 @@ impl AiState {
     /// 四条 AI 命令入口先落「未配置 key」提示,见 `State::ai_key_gate`);
     /// Ollama 本地无鉴权,无 key 照常工作。调用方负责先 `normalize`
     /// (两个调用点 `load_preferences`/`apply_ai_config` 都已做)。
+    ///
+    /// 采样参数/system prompt/超时/流式已随「配置页参数精简」从配置删除
+    /// (decisions-pending #108):这里按 [`INTERNAL_TEMPERATURE`] 等内部
+    /// 默认装配(= 删除前 `AiConfig::default()`),默认请求不因删 UI 改变;
+    /// 超时/流式/system prompt 走各 adapter `Default`(与删除前出厂一致)。
     pub fn set_provider(&mut self, config: AiConfig, api_key: Option<&str>) {
         let key = api_key.unwrap_or_default();
         self.runtime = match config.provider {
@@ -139,12 +158,10 @@ impl AiState {
                 OpenAiSettings {
                     base_url: config.base_url.clone(),
                     model: config.model.clone(),
-                    temperature: Some(config.temperature),
-                    top_p: Some(config.top_p),
-                    max_tokens: Some(config.max_tokens),
-                    system_prompt: config.system_prompt.clone(),
-                    stream: config.stream,
-                    timeout_secs: config.timeout_secs,
+                    temperature: Some(INTERNAL_TEMPERATURE),
+                    top_p: Some(INTERNAL_TOP_P),
+                    max_tokens: Some(INTERNAL_MAX_TOKENS),
+                    ..OpenAiSettings::default()
                 },
             )),
             ProviderKind::Anthropic => AiRuntime::Anthropic(AnthropicProvider::with_settings(
@@ -152,24 +169,20 @@ impl AiState {
                 AnthropicSettings {
                     base_url: config.base_url.clone(),
                     model: config.model.clone(),
-                    temperature: Some(config.temperature),
-                    top_p: Some(config.top_p),
-                    max_tokens: config.max_tokens,
-                    system_prompt: config.system_prompt.clone(),
-                    stream: config.stream,
-                    timeout_secs: config.timeout_secs,
+                    temperature: Some(INTERNAL_TEMPERATURE),
+                    top_p: Some(INTERNAL_TOP_P),
+                    max_tokens: INTERNAL_MAX_TOKENS,
+                    ..AnthropicSettings::default()
                 },
             )),
             ProviderKind::Ollama => {
                 AiRuntime::Ollama(OllamaProvider::with_settings(OllamaSettings {
                     base_url: config.base_url.clone(),
                     model: config.model.clone(),
-                    temperature: Some(config.temperature),
-                    top_p: Some(config.top_p),
-                    num_predict: Some(config.max_tokens as i32),
-                    system_prompt: config.system_prompt.clone(),
-                    stream: config.stream,
-                    timeout_secs: config.timeout_secs,
+                    temperature: Some(INTERNAL_TEMPERATURE),
+                    top_p: Some(INTERNAL_TOP_P),
+                    num_predict: Some(INTERNAL_MAX_TOKENS as i32),
+                    ..OllamaSettings::default()
                 }))
             }
         };
@@ -418,7 +431,7 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             model: "deepseek-chat".to_owned(),
             base_url: "https://api.deepseek.com/v1".to_owned(),
-            ..AiConfig::default()
+            context_kb: 0,
         };
         ai.set_provider(config.clone(), Some("placeholder-key"));
         assert!(ai.requires_key());
@@ -430,40 +443,82 @@ mod tests {
         assert!(!ai.requires_key());
     }
 
-    /// 分派断言:Anthropic/Ollama 配置装配出对应运行时,参数逐项进入
-    /// adapter settings;Ollama 无 key 也照常装配。
+    /// 四 provider 默认装配回归(#58 配置页参数精简):配置里已无采样
+    /// 参数/system prompt/超时/流式,`set_provider` 用内部默认装配 ——
+    /// 逐字段断言与**删除前** `AiConfig::default()` 装配出的 settings
+    /// 一致,即默认请求体组装输入不因删 UI 改变(请求体本身由
+    /// latermd-ai 各 adapter 的 `request_body_*` 测试钉住)。顺带断言
+    /// 端点/模型照常透传、Ollama 无 key 也装配。
     #[test]
-    fn set_provider_dispatches_anthropic_and_ollama() {
+    fn set_provider_dispatches_all_kinds_with_pre_removal_defaults() {
         let mut ai = AiState::default();
 
-        let anthropic = AiConfig {
-            provider: ProviderKind::Anthropic,
-            base_url: "https://api.anthropic.com".to_owned(),
-            model: "claude-sonnet-4-5".to_owned(),
-            timeout_secs: 90,
-            max_tokens: 1024,
-            ..AiConfig::default()
+        // Mock:不联网不读参数,装配出 Mock 运行时
+        ai.set_provider(AiConfig::default(), None);
+        assert!(!ai.requires_key());
+        assert_eq!(ai.provider_label(), "Mock");
+        assert!(matches!(ai.runtime, AiRuntime::Mock(_)));
+
+        // OpenAI 兼容:0.7/1.0/2048/流式/60s(= adapter 出厂,也是删前默认)
+        ai.set_provider(
+            AiConfig {
+                provider: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.deepseek.com/v1".to_owned(),
+                model: "deepseek-chat".to_owned(),
+                context_kb: 0,
+            },
+            Some("placeholder-key"),
+        );
+        assert!(ai.requires_key());
+        assert_eq!(ai.provider_label(), "OpenAI 兼容");
+        let AiRuntime::OpenAi(provider) = &ai.runtime else {
+            panic!("应装配 OpenAI 兼容运行时");
         };
-        ai.set_provider(anthropic, Some("placeholder-key"));
-        assert!(ai.requires_key(), "Anthropic 需要 key");
+        let settings = provider.settings();
+        assert_eq!(settings.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(settings.model, "deepseek-chat");
+        assert_eq!(settings.temperature, Some(INTERNAL_TEMPERATURE));
+        assert_eq!(settings.top_p, Some(INTERNAL_TOP_P));
+        assert_eq!(settings.max_tokens, Some(INTERNAL_MAX_TOKENS));
+        assert_eq!(settings.system_prompt, "");
+        assert!(settings.stream);
+        assert_eq!(settings.timeout_secs, 60);
+
+        // Anthropic:删前 app 装配是塞 0.7/1.0(不是 adapter 出厂的 None,
+        // 见 INTERNAL_* 常量注释);max_tokens 是协议必填,恒 2048
+        ai.set_provider(
+            AiConfig {
+                provider: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com".to_owned(),
+                model: "claude-sonnet-4-5".to_owned(),
+                context_kb: 0,
+            },
+            Some("placeholder-key"),
+        );
+        assert!(ai.requires_key());
         assert_eq!(ai.provider_label(), "Anthropic");
         let AiRuntime::Anthropic(provider) = &ai.runtime else {
             panic!("应装配 Anthropic 运行时");
         };
         let settings = provider.settings();
         assert_eq!(settings.base_url, "https://api.anthropic.com");
-        assert_eq!(settings.max_tokens, 1024, "max_tokens 是协议必填字段");
-        assert_eq!(settings.timeout_secs, 90);
-        assert_eq!(settings.temperature, Some(AiConfig::default().temperature));
+        assert_eq!(settings.temperature, Some(INTERNAL_TEMPERATURE));
+        assert_eq!(settings.top_p, Some(INTERNAL_TOP_P));
+        assert_eq!(settings.max_tokens, INTERNAL_MAX_TOKENS);
+        assert_eq!(settings.system_prompt, "");
+        assert!(settings.stream);
+        assert_eq!(settings.timeout_secs, 60);
 
-        let ollama = AiConfig {
-            provider: ProviderKind::Ollama,
-            base_url: "http://127.0.0.1:11434".to_owned(),
-            model: "llama3.1".to_owned(),
-            timeout_secs: 180,
-            ..AiConfig::default()
-        };
-        ai.set_provider(ollama, None);
+        // Ollama:删前默认是 Some(0.7)/Some(1.0)/Some(2048),超时本地推理档 120
+        ai.set_provider(
+            AiConfig {
+                provider: ProviderKind::Ollama,
+                base_url: "http://127.0.0.1:11434".to_owned(),
+                model: "llama3.1".to_owned(),
+                context_kb: 0,
+            },
+            None,
+        );
         assert!(!ai.requires_key(), "Ollama 无 key 照常工作");
         assert_eq!(ai.provider_label(), "Ollama 本地");
         let AiRuntime::Ollama(provider) = &ai.runtime else {
@@ -471,12 +526,16 @@ mod tests {
         };
         let settings = provider.settings();
         assert_eq!(settings.base_url, "http://127.0.0.1:11434");
+        assert_eq!(settings.temperature, Some(INTERNAL_TEMPERATURE));
+        assert_eq!(settings.top_p, Some(INTERNAL_TOP_P));
         assert_eq!(
             settings.num_predict,
-            Some(AiConfig::default().max_tokens as i32),
+            Some(INTERNAL_MAX_TOKENS as i32),
             "max_tokens 映射为 num_predict"
         );
-        assert_eq!(settings.timeout_secs, 180);
+        assert_eq!(settings.system_prompt, "");
+        assert!(settings.stream);
+        assert_eq!(settings.timeout_secs, 120);
     }
 
     /// 首行提取:commit subject 只取第一行(模型常带解释性后续行)。

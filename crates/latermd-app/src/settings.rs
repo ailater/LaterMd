@@ -3,7 +3,7 @@
 //! 形态:左侧竖排分页 + 右侧内容区,单个 `egui::Window`。
 //!
 //! **为什么从工具栏的「设置」菜单升级成对话框**:菜单里只能塞几行
-//! (主题列表 + 一个入口),而快捷键页有 10 行、AI 页有 8 个字段 —— 塞进
+//! (主题列表 + 一个入口),而快捷键页有 10 行、AI 页有一串字段 —— 塞进
 //! 菜单既画不下,也违背「菜单是对话框以外的轻量入口」这一通用范式。
 //! 原「AI Provider」浮窗随之退役,其内容(`ai_key::key_editor`)嵌入 AI 页。
 //!
@@ -12,7 +12,7 @@
 //! 「正在捕获哪个命令的键位」,同侧边栏把手与 `SearchState` 输入的口径。
 
 use crate::ai::AiState;
-use crate::ai_config::{AiConfig, ProviderKind};
+use crate::ai_config::{AiConfig, ProviderKind, CONTEXT_KB_MAX};
 use crate::ai_key::{self, AiKeyState};
 use crate::command::Command;
 use crate::keymap::Keymap;
@@ -24,7 +24,11 @@ use crate::theme::{
 };
 use crate::ui::icons;
 use eframe::egui;
+use latermd_ai::{ModelsResult, ModelsSource};
 use latermd_mcp::{McpConfig, ToolKind};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 /// 设置页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,7 +38,7 @@ pub enum SettingsTab {
     Appearance,
     /// 快捷键(可改绑)。
     Keymap,
-    /// AI provider 与模型参数。
+    /// AI provider、端点与模型。
     Ai,
     /// MCP server(规划态)。
     Mcp,
@@ -94,6 +98,8 @@ pub struct SettingsState {
     pub skin_export_name: String,
     /// 图片页的图床编辑草稿;`None` = 不在编辑。保存才发消息落盘。
     pub bed_draft: Option<BedDraft>,
+    /// AI 页「获取模型列表」的状态机(在途接收端 + 候选列表 + 错误行)。
+    pub models: ModelListState,
 }
 
 /// 图床页的编辑草稿:profile 本体 + 两个只属编辑期的字段(`headers` 的
@@ -148,6 +154,114 @@ fn headers_from_text(text: &str) -> Result<Vec<(String, String)>, String> {
     Ok(headers)
 }
 
+/// 模型列表拉取的线程装配点:生产 [`latermd_ai::fetch_models`];测试注入
+/// 假装配(定时回固定结果,零网络),与 `AiKeyState::creds` 同款注入点。
+pub(crate) type ModelsSpawner =
+    Arc<dyn Fn(ModelsSource, mpsc::Sender<ModelsResult>) -> Option<JoinHandle<()>> + Send + Sync>;
+
+/// AI 页「获取模型列表」的状态机(#58 M2):在途接收端 + 候选列表 + 错误行。
+///
+/// 与 `crate::ai`(流式)和 `crate::bed::BedState`(上传)同款「发起 /
+/// 接收 / 收尾」三原语,但只服务设置页,不碰任何文档。防重入口径随
+/// `AiState`(流式):在途时 `start` 被忽略(UI 禁用按钮是第一道防线),
+/// 接收端不中途替换,能到达归约的只有当前在途请求的结果,无需消息层
+/// 序号。「获取中」绝不卡死:线程异常退出(channel 断连且未交出结果)
+/// 由 [`ModelListState::poll`] 补一条失败。
+pub struct ModelListState {
+    /// 在途拉取的接收端;`None` = 空闲。
+    pub(crate) rx: Option<Receiver<ModelsResult>>,
+    /// 本次 channel 是否已交出过结果:断连兜底(线程 panic 没发出结果)
+    /// 的判定依据(与 `BedState::saw_result` 同口径,跨 poll 存续)。
+    pub(crate) saw_result: bool,
+    /// 最近一次成功拉到的候选列表(保序去重);失败保留旧值,成功覆盖。
+    pub options: Vec<String>,
+    /// 最近一次失败的错误行文案;成功与再次发起时清空。
+    pub error: Option<String>,
+    /// 线程装配点(见 [`ModelsSpawner`])。
+    pub(crate) spawner: ModelsSpawner,
+}
+
+impl Default for ModelListState {
+    fn default() -> Self {
+        Self {
+            rx: None,
+            saw_result: false,
+            options: Vec::new(),
+            error: None,
+            spawner: Arc::new(latermd_ai::fetch_models),
+        }
+    }
+}
+
+impl ModelListState {
+    /// 是否有拉取在途(驱动 UI 禁用按钮 + 持续重绘)。
+    pub fn is_fetching(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    /// 发起(归约侧调用):替换接收端并经装配点 spawn。在途时忽略(UI 已
+    /// 禁用按钮,防御);spawn 失败当场按失败收尾,不留卡死的「获取中」。
+    /// 发起即清旧错误行 —— 用户已重新行动,旧行是过期信息。
+    pub(crate) fn start(&mut self, source: ModelsSource) {
+        if self.rx.is_some() {
+            return;
+        }
+        self.error = None;
+        self.saw_result = false;
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        if (self.spawner)(source, tx).is_none() {
+            self.rx = None;
+            self.error = Some("获取模型列表失败:无法启动后台线程".to_owned());
+        }
+    }
+
+    /// 非阻塞收空 channel(每帧归约调用),结果翻成
+    /// [`Message::AiModelsFetchFinished`];生命周期收口在归约侧的
+    /// [`ModelListState::finish`](与 `AiState::poll` 同分工)。断连却没
+    /// 等到结果(线程异常退出)补一条失败:「获取中」标志绝不能卡死,
+    /// 否则按钮永久禁用。
+    pub(crate) fn poll(&mut self) -> Vec<Message> {
+        let Some(rx) = &self.rx else {
+            return Vec::new();
+        };
+        let mut messages = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.saw_result = true;
+                    messages.push(Message::AiModelsFetchFinished { result });
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.saw_result {
+                        messages.push(Message::AiModelsFetchFinished {
+                            result: Err("获取模型列表失败:后台线程意外中断".to_owned()),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        messages
+    }
+
+    /// 收尾(`Message::AiModelsFetchFinished` 的归约):清在途状态并落地
+    /// 结果 —— 成功覆盖候选列表并清错误行;失败只落错误行,旧候选保留
+    /// (上次拉到的列表仍然可用,比清空更友好)。
+    pub(crate) fn finish(&mut self, result: ModelsResult) {
+        self.rx = None;
+        self.saw_result = false;
+        match result {
+            Ok(list) => {
+                self.options = list;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+}
+
 impl Default for SettingsState {
     fn default() -> Self {
         Self {
@@ -159,6 +273,7 @@ impl Default for SettingsState {
             mcp_draft: McpConfig::default(),
             skin_export_name: String::new(),
             bed_draft: None,
+            models: ModelListState::default(),
         }
     }
 }
@@ -472,10 +587,13 @@ fn keymap_page(
     }
 }
 
-/// AI 页:provider / 端点 / 模型 / 采样参数 / key。
+/// AI 页:provider / 端点 / 模型 / key。
 ///
 /// provider 是唯一开关(接口方式随 provider 派生,decisions-pending #94),
-/// 下拉四选一;「未实现」类禁用项与提示已随三选一落地清除。
+/// 下拉四选一;采样参数/system prompt/超时/流式已随「配置页参数精简」
+/// 移除(decisions-pending #108),请求侧按内部默认装配(见
+/// `crate::ai::set_provider`)。「获取模型列表」(#58 M2)按 provider 拉
+/// 取可用模型,成功后模型名下方出现候选下拉(手输框保留,点选才覆盖)。
 fn ai_page(
     ui: &mut egui::Ui,
     settings: &mut SettingsState,
@@ -484,9 +602,11 @@ fn ai_page(
     outbox: &mut Vec<Message>,
 ) {
     ui.heading("AI");
+    // 字段级借用拆分:候选列表只读,草稿可变(下同 key_editor 的 creds)
+    let models = &settings.models;
     let draft = &mut settings.ai_draft;
-    // Mock 不联网也不读参数:参数区整块灰显,避免「配了半天没生效」;
-    // Ollama 参数照常参与(连的是本机服务)
+    // Mock 不联网也不读参数:端点/模型整块灰显,避免「配了半天没生效」;
+    // Ollama 连本机服务,参数照常参与
     let editable = draft.provider.uses_settings();
 
     ui.add_space(crate::ui::tokens::SPACE_SM);
@@ -499,7 +619,7 @@ fn ai_page(
             }
         });
     if provider != draft.provider {
-        // 切换时端点/模型/超时的出厂值跟随;手改过的字段不动
+        // 切换时端点/模型的出厂值跟随;手改过的字段不动
         draft.adopt_provider_defaults(provider);
     }
     ui.weak(draft.provider.description());
@@ -519,27 +639,68 @@ fn ai_page(
                 .hint_text(factory.model.as_str())
                 .desired_width(f32::INFINITY),
         );
-        ui.add(
-            egui::Slider::new(&mut draft.temperature, 0.0..=2.0)
-                .text("Temperature")
-                .step_by(0.05),
-        );
-        ui.add(
-            egui::Slider::new(&mut draft.top_p, 0.0..=1.0)
-                .text("Top-P")
-                .step_by(0.05),
-        );
-        ui.add(egui::Slider::new(&mut draft.max_tokens, 256..=32768).text("Max tokens"));
-        ui.add(egui::Slider::new(&mut draft.timeout_secs, 10..=300).text("超时(秒)"));
-        // 流式传输的形态随 provider(SSE 或 NDJSON),文案不钉死协议名
-        ui.checkbox(&mut draft.stream, "流式接收");
-        ui.label("System prompt(留空则不发送 system 消息)");
-        ui.add(
-            egui::TextEdit::multiline(&mut draft.system_prompt)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+        // 拉取成功后的候选下拉:与手输框并存,点选才覆盖草稿;手输名不
+        // 在列表时回显带「(手输)」标记,不强制改写(decisions-pending #109)
+        if !models.options.is_empty() {
+            let known = models.options.iter().any(|name| name == &draft.model);
+            let selected = if known {
+                draft.model.clone()
+            } else if draft.model.trim().is_empty() {
+                format!("已获取 {} 个模型,点选填入", models.options.len())
+            } else {
+                format!("{}(手输)", draft.model)
+            };
+            egui::ComboBox::from_label("已获取")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for name in &models.options {
+                        ui.selectable_value(&mut draft.model, name.clone(), name);
+                    }
+                });
+        }
     });
+
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    // 上下文大小(#58 M3,decisions-pending #110):进入 prompt 的文档/
+    // diff 字节上限,0 = 跟随现状默认(摘要 32KB / commit diff 16KB)。
+    // prompt 组装在 provider 之前,Mock 同样生效,不随 provider 灰显。
+    ui.label("上下文大小(KB)");
+    ui.add(egui::Slider::new(&mut draft.context_kb, 0..=CONTEXT_KB_MAX).text("KB"));
+    ui.weak(
+        "0 = 跟随默认(摘要文档 32KB / commit diff 16KB);\
+         超出上限的内容截断后进请求,约 1KB ≈ 250-350 token。",
+    );
+
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    // 「获取模型列表」(#58 M2):Mock 不联网禁用并说明;拉取中禁用防重入,
+    // 按钮文字就是拉取中状态(与 bed 测试上传同款禁用 + 悬停说明)
+    let fetching = models.is_fetching();
+    let hover = if fetching {
+        Some("正在拉取模型列表…")
+    } else if !editable {
+        Some("Mock 不联网,无需获取模型列表")
+    } else {
+        None
+    };
+    let fetch = ui.add_enabled(
+        editable && !fetching,
+        egui::Button::new(if fetching {
+            "获取中…"
+        } else {
+            "获取模型列表"
+        }),
+    );
+    // on_disabled_hover_text 消费 Response:先算悬停文案再一次性挂上
+    let fetch = match hover {
+        Some(text) => fetch.on_disabled_hover_text(text),
+        None => fetch,
+    };
+    if editable && !fetching && fetch.clicked() {
+        outbox.push(Message::AiModelsFetchRequested);
+    }
+    if let Some(error) = &models.error {
+        ui.colored_label(crate::ui::tokens::WARN, error);
+    }
 
     ui.add_space(crate::ui::tokens::SPACE_SM);
     ui.horizontal(|ui| {
@@ -554,10 +715,9 @@ fn ai_page(
         }
     });
     ui.weak(format!(
-        "当前生效:{} · {} · {}",
+        "当前生效:{} · {}",
         ai.provider_label(),
-        ai.config.model,
-        if ai.config.stream { "流式" } else { "整段" }
+        ai.config.model
     ));
     // 端点只在联网型 provider 下有意义(Mock 不联网,不显示以免误导;
     // Ollama 连本机服务,算联网型)
@@ -987,193 +1147,371 @@ mod tests {
         render(&mut state);
     }
 
-    /// #35:AI 页滑杆在两档密度下 handle 与 rail 几何对齐(handle 圆心在
-    /// rail 中心线上、x 落在 rail 区间内)。坤哥 2026-09-29 截图报「滑块
-    /// 圆圈脱离轨道悬浮」,此测试把滑杆几何钉进无头矩阵(两档密度)——
-    /// 复现则红,不复现则证明几何层正常(错乱另有环境成因)。
+    /// #58 渲染探针:AI 页只剩 provider/Base URL/模型/上下文大小(#58 M3
+    /// 新增的请求预算滑杆)/key,被删参数控件
+    /// (Temperature/Top-P/Max tokens/超时/流式接收/System prompt)不再
+    /// 渲染。无头渲真实 AI 页数帧,收集全部 `TextShape` 的逻辑文本做
+    /// 双向断言(保留项在场 + 被删项绝迹 —— 后者同时钉住「当前生效」行
+    /// 不再报流式形态)。#35 的 AI 页滑杆几何探针随四根滑杆移除而删除
+    /// (外观页两根排版滑杆的几何探针不受影响)。
     #[test]
-    fn ai_page_slider_geometry_aligned_across_densities() {
-        for density in Density::ALL {
-            let mut state = State::default();
-            state.theme.density = density;
-            state.settings.open = true;
-            state.settings.tab = SettingsTab::Ai;
-            // 滑杆区在 provider.requires_key() 时才可编辑(Mock 档整块灰显
-            // 不渲染交互态),切到 OpenAI 让四根滑杆真实渲出
-            state.settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
-            let ctx = egui::Context::default();
-            // 真机每帧先跑主题投影(apply_shell_to 把 widgets.inactive.bg_fill
-            // 投影成 border 色 —— egui Slider 轨道硬绑该字段),无头此前漏掉
-            // 这步,轨道隐形缺陷因此漏网
-            state.theme.apply(&ctx, state.theme.mode);
-            // 窗口打开有 fade-in,首帧内容整体 noop(无头测试的老坑),渲足
-            // 5 帧取末帧 shapes
-            let mut last_shapes = Vec::new();
-            let system_theme_ok = state.system_theme_ok;
-            let mut now = 0.0_f64;
-            let resolved = resolved_theme_for_test(&state);
-            for _ in 0..5 {
-                now += 0.1; // fade-in 动画时钟:不给 time 则窗口透明度冻结在中途
-                let State {
-                    settings,
-                    ai_key,
-                    ai,
-                    mcp,
-                    bed,
-                    keymap,
-                    theme,
-                    skins,
-                    ..
-                } = &mut state;
-                let mut outbox = Vec::new();
-                let output = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::pos2(0.0, 0.0),
-                            egui::vec2(1200.0, 800.0),
-                        )),
-                        time: Some(now),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        dialog(
-                            ui,
-                            settings,
-                            theme,
-                            skins,
-                            system_theme_ok,
-                            resolved,
-                            keymap,
-                            ai,
-                            ai_key,
-                            mcp,
-                            bed,
-                            &mut outbox,
-                        );
-                    },
-                );
-                // shapes move 出前清 textures delta(直接 drop 带 delta 会 panic)
-                let mut output = output;
-                output.textures_delta.clear();
-                last_shapes = output.shapes;
-            }
-            // egui 0.36 默认 handle_shape = Rect{aspect 0.75}(竖圆角条),
-            // rail 是细长填充矩形;handle 宽高比 ~0.75 且不大于行高
-            use egui::epaint::Shape;
-            let shapes = &last_shapes;
-            let mut rails = Vec::new();
-            let mut handles = Vec::new();
-            for clipped in shapes {
-                let shape = &clipped.shape;
-                match shape {
-                    Shape::Rect(r) => {
-                        let rect = r.rect;
-                        let (w, h) = (rect.width(), rect.height());
-                        if h <= 12.0 && w > 40.0 {
-                            rails.push(rect); // rail:横向细长
-                        } else if (0.4..=1.2).contains(&(w / h)) && h <= 30.0 {
-                            handles.push(rect); // handle:小竖条
-                        }
-                    }
-                    Shape::Circle(c) => handles.push(egui::Rect::from_center_size(
-                        c.center,
-                        egui::vec2(c.radius, c.radius),
+    fn ai_page_renders_kept_fields_without_removed_parameter_widgets() {
+        let mut state = State::default();
+        state.settings.open = true;
+        state.settings.tab = SettingsTab::Ai;
+        // 切到可编辑 provider:Base URL/模型输入框真实渲出(参数区旧位置)
+        state.settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+        let system_theme_ok = state.system_theme_ok;
+        let resolved = resolved_theme_for_test(&state);
+        let mut all_text = String::new();
+        let mut now = 0.0_f64;
+        for _ in 0..5 {
+            now += 0.1; // fade-in 时钟:不给 time 首帧内容整体 noop(无头老坑)
+            let State {
+                settings,
+                ai_key,
+                ai,
+                mcp,
+                bed,
+                keymap,
+                theme,
+                skins,
+                ..
+            } = &mut state;
+            let mut outbox = Vec::new();
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
                     )),
-                    _ => {}
-                }
-            }
-            if handles.len() < 4 || rails.len() < 4 {
-                let mut hist = std::collections::BTreeMap::new();
-                for c in shapes {
-                    let name = match &c.shape {
-                        Shape::Noop => "noop",
-                        Shape::Vec(_) => "vec",
-                        Shape::Circle(_) => "circle",
-                        Shape::Ellipse(_) => "ellipse",
-                        Shape::LineSegment { .. } => "line",
-                        Shape::Path(_) => "path",
-                        Shape::Rect(r) => {
-                            &format!("rect {}x{}", r.rect.width() as i32, r.rect.height() as i32)
-                        }
-                        Shape::Text(_) => "text",
-                        _ => "other",
-                    };
-                    *hist.entry(name.to_string()).or_insert(0) += 1;
-                }
-                panic!(
-                    "{density:?} 档滑杆形状不足 handle {} rail {}: {hist:?}",
-                    handles.len(),
-                    rails.len()
-                );
-            }
-            // handle 只认 rail 横向区间 ±20px 内的(分页列的小矩形不掺和)
-            let rail_x0 = rails.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min) - 20.0;
-            let rail_x1 = rails
-                .iter()
-                .map(|r| r.right())
-                .fold(f32::NEG_INFINITY, f32::max)
-                + 20.0;
-            let rail_yc: Vec<f32> = rails.iter().map(|r| r.center().y).collect();
-            let on_any_rail_y = |y: f32| rail_yc.iter().any(|rc| (y - rc).abs() <= 10.0);
-            let slider_handles: Vec<egui::Rect> = handles
-                .iter()
-                .copied()
-                .filter(|h| {
-                    let c = h.center();
-                    c.x >= rail_x0 && c.x <= rail_x1 && on_any_rail_y(c.y)
-                })
-                .collect();
-            assert!(
-                slider_handles.len() >= 4 && rails.len() >= 4,
-                "{density:?} 档滑杆形状不足: handle {} / rail {}",
-                slider_handles.len(),
-                rails.len()
+                    time: Some(now),
+                    ..Default::default()
+                },
+                |ui| {
+                    dialog(
+                        ui,
+                        settings,
+                        theme,
+                        skins,
+                        system_theme_ok,
+                        resolved,
+                        keymap,
+                        ai,
+                        ai_key,
+                        mcp,
+                        bed,
+                        &mut outbox,
+                    );
+                },
             );
-            // rail 可见性:egui 0.36 滑杆轨道 rect_filled 绑
-            // widgets.inactive.bg_fill;曾投影成 TRANSPARENT 致轨道隐形
-            // (手柄漂浮,坤哥 2026-09-29 截图)。断言每条 rail 的填充色
-            // 非透明、且与窗口 content 底色每通道差 ≥6(可辨下限)。
-            let content =
-                crate::theme::shell_tokens(state.theme.mode == crate::theme::ThemeMode::Dark)
-                    .content;
-            let mut rail_fills = Vec::new();
-            for clipped in shapes {
-                if let Shape::Rect(r) = &clipped.shape {
-                    let rect = r.rect;
-                    if rect.height() <= 12.0 && rect.width() > 40.0 {
-                        let [rr, gg, bb, _] = r.fill.to_array();
-                        assert!(
-                            r.fill != egui::Color32::TRANSPARENT,
-                            "{density:?} 档滑杆轨道填充透明(隐形回归)"
-                        );
-                        let [cr, cg, cb, _] = content.to_array();
-                        let delta = (rr as i32 - cr as i32)
-                            .abs()
-                            .max((gg as i32 - cg as i32).abs())
-                            .max((bb as i32 - cb as i32).abs());
-                        assert!(
-                            delta >= 6,
-                            "{density:?} 档滑杆轨道与窗口底不可辨: fill={:?} content={content:?}",
-                            r.fill
-                        );
-                        rail_fills.push(r.fill);
-                    }
+            output.textures_delta.clear();
+            for clipped in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                    all_text.push_str(text.galley.text());
+                    all_text.push('\n');
                 }
-            }
-            assert_eq!(rail_fills.len(), 4, "四条轨道都取到填充色");
-            for handle in &slider_handles {
-                let center = handle.center();
-                let on_rail = rails.iter().any(|rail| {
-                    (center.y - rail.center().y).abs() <= 8.0
-                        && center.x >= rail.left() - 2.0
-                        && center.x <= rail.right() + 2.0
-                });
-                assert!(
-                    on_rail,
-                    "{density:?} 档滑杆 handle 中心 {center:?} 不在任何 rail 上: rails={rails:?}"
-                );
             }
         }
+        assert!(
+            !all_text.is_empty(),
+            "五帧后仍无文本形状:fade-in 时钟或无头管线异常"
+        );
+        for kept in ["Provider", "Base URL", "模型", "上下文大小", "保存"] {
+            assert!(
+                all_text.contains(kept),
+                "AI 页应保留 \"{kept}\":\n{all_text}"
+            );
+        }
+        for removed in [
+            "Temperature",
+            "Top-P",
+            "Max tokens",
+            "超时",
+            "流式接收",
+            "System prompt",
+        ] {
+            assert!(
+                !all_text.contains(removed),
+                "AI 页不应再渲染 \"{removed}\":\n{all_text}"
+            );
+        }
+    }
+
+    // ---- 「获取模型列表」(#58 M2):状态机 + 渲染探针(全部零网络;
+    // 假装配注入点与 AiKeyState::creds 同理念,真实端点验证留人工) ----
+
+    /// 定时回固定结果的假装配:spawn 真线程(验线程机制)但绝不碰网络。
+    fn fake_spawner(delay: std::time::Duration, result: ModelsResult) -> ModelsSpawner {
+        Arc::new(move |_source, tx| {
+            let result = result.clone();
+            std::thread::Builder::new()
+                .name("fake-models-spawner".into())
+                .spawn(move || {
+                    std::thread::sleep(delay);
+                    let _ = tx.send(result);
+                })
+                .ok()
+        })
+    }
+
+    /// 轮询到第一条结果消息(线程异步,限时 5s)。
+    fn wait_result(models: &mut ModelListState) -> Vec<Message> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut messages = Vec::new();
+        while messages.is_empty() && std::time::Instant::now() < deadline {
+            messages = models.poll();
+            if messages.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        messages
+    }
+
+    /// 状态机生命周期:start 置在途、poll 非阻塞收结果、finish 落地
+    /// (成功覆盖候选清错误行;失败落错误行保旧候选)。
+    #[test]
+    fn model_list_state_lifecycle_start_poll_finish() {
+        let mut models = ModelListState::default();
+        assert!(!models.is_fetching());
+        assert!(models.poll().is_empty(), "空闲 poll 为空");
+
+        let source = ModelsSource::Ollama {
+            base_url: "http://模型列表测试.invalid".to_owned(),
+        };
+        models.spawner = fake_spawner(
+            std::time::Duration::from_millis(20),
+            Ok(vec!["m1".to_owned(), "m2".to_owned()]),
+        );
+        models.start(source.clone());
+        assert!(models.is_fetching(), "发起后置在途");
+
+        let messages = wait_result(&mut models);
+        assert_eq!(
+            messages,
+            vec![Message::AiModelsFetchFinished {
+                result: Ok(vec!["m1".to_owned(), "m2".to_owned()])
+            }]
+        );
+        models.finish(Ok(vec!["m1".to_owned(), "m2".to_owned()]));
+        assert!(!models.is_fetching(), "收尾回空闲");
+        assert_eq!(models.options, vec!["m1".to_owned(), "m2".to_owned()]);
+        assert!(models.error.is_none(), "成功清错误行");
+
+        // 失败:文案落错误行,旧候选保留(上次拉到的列表仍可用)
+        models.spawner = fake_spawner(
+            std::time::Duration::from_millis(20),
+            Err("获取模型列表失败:HTTP 401:bad key".to_owned()),
+        );
+        models.start(source);
+        let messages = wait_result(&mut models);
+        assert_eq!(messages.len(), 1);
+        models.finish(Err("获取模型列表失败:HTTP 401:bad key".to_owned()));
+        assert!(!models.is_fetching());
+        assert_eq!(
+            models.error.as_deref(),
+            Some("获取模型列表失败:HTTP 401:bad key")
+        );
+        assert_eq!(
+            models.options,
+            vec!["m1".to_owned(), "m2".to_owned()],
+            "失败不清旧候选"
+        );
+    }
+
+    /// 防重入:在途时再次发起被忽略(第一次的接收端不被替换,结果照常
+    /// 交付);收尾后可重新发起。UI 禁用按钮是第一道防线,归约侧忽略是
+    /// 同一语义的第二道(与 `AiState` 的 streaming 防重入口径一致)。
+    #[test]
+    fn model_list_state_ignores_start_while_inflight() {
+        let mut models = ModelListState::default();
+        let source = ModelsSource::Ollama {
+            base_url: "http://模型列表测试.invalid".to_owned(),
+        };
+        models.spawner = fake_spawner(
+            std::time::Duration::from_millis(80),
+            Ok(vec!["old".to_owned()]),
+        );
+        models.start(source.clone());
+        models.spawner = fake_spawner(std::time::Duration::ZERO, Ok(vec!["new".to_owned()]));
+        models.start(source.clone());
+        assert!(models.is_fetching());
+
+        let messages = wait_result(&mut models);
+        assert_eq!(
+            messages,
+            vec![Message::AiModelsFetchFinished {
+                result: Ok(vec!["old".to_owned()])
+            }],
+            "在途时第二次发起被忽略,交付的是第一次的结果"
+        );
+        models.finish(Ok(vec!["old".to_owned()]));
+        assert!(!models.is_fetching());
+
+        // 空闲后再发起:新结果照常可达
+        models.spawner = fake_spawner(std::time::Duration::ZERO, Ok(vec!["fresh".to_owned()]));
+        models.start(source);
+        assert_eq!(
+            wait_result(&mut models),
+            vec![Message::AiModelsFetchFinished {
+                result: Ok(vec!["fresh".to_owned()])
+            }]
+        );
+    }
+
+    /// 断连兜底:发送端没发出结果就退出(线程异常/panic 的可观察形态就是
+    /// channel 断连)→ 补一条失败,「获取中」不卡死;已交出过结果再断连
+    /// 不重复报错(与 `BedState::saw_result` 同口径)。
+    #[test]
+    fn model_list_state_disconnected_without_result_synthesizes_failure() {
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        let mut models = ModelListState {
+            rx: Some(rx),
+            ..ModelListState::default()
+        };
+        assert_eq!(
+            models.poll(),
+            vec![Message::AiModelsFetchFinished {
+                result: Err("获取模型列表失败:后台线程意外中断".to_owned())
+            }]
+        );
+
+        // 已交出过结果:断连不再追加第二条失败
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec!["x".to_owned()])).unwrap();
+        drop(tx);
+        let mut models = ModelListState {
+            rx: Some(rx),
+            ..ModelListState::default()
+        };
+        assert_eq!(models.poll().len(), 1, "结果照常交付");
+        assert!(models.poll().is_empty(), "断连不重复补失败");
+    }
+
+    /// 渲 AI 页若干帧并把全部 TextShape 的文本拼进 `sink`(time 逐帧推进,
+    /// 无头老坑见 `ai_page_renders_kept_fields…`)。直渲 `ai_page`(同
+    /// `appearance` 探针:设置窗视口外的内容不进 clip,直渲控件最聚焦)。
+    fn render_ai_page_collect(state: &mut State, frames: usize, sink: &mut String) {
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+        let mut now = 0.0_f64;
+        for _ in 0..frames {
+            now += 0.1;
+            let State {
+                settings,
+                ai_key,
+                ai,
+                ..
+            } = state;
+            let mut outbox = Vec::new();
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    time: Some(now),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ai_page(ui, settings, ai, ai_key, &mut outbox);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            for clipped in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                    sink.push_str(text.galley.text());
+                    sink.push('\n');
+                }
+            }
+        }
+    }
+
+    /// 按钮状态机四态真实渲出,且拉取期间 UI 不阻塞:慢装配(300ms)在途
+    /// 时连续五帧的总耗时远小于装配延迟(同步等待会 ≥300ms),「获取中…」
+    /// 可见;成功帧出现候选下拉与手输回显;失败帧错误文案落地。禁用态的
+    /// 「点击不产消息」防线在归约侧
+    /// (`state::tests::ai_models_fetch_request_gate_and_finish_landing`)。
+    #[test]
+    fn ai_page_renders_fetch_states_and_stays_responsive_while_fetching() {
+        let mut state = State::default();
+        state.ai_key.creds = latermd_creds::Credentials::in_memory();
+        state.settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
+
+        // 空闲:按钮文案在场
+        let mut text = String::new();
+        render_ai_page_collect(&mut state, 2, &mut text);
+        assert!(text.contains("获取模型列表"), "空闲按钮在场:{text}");
+
+        // 发起(慢装配 300ms):连续五帧远小于装配延迟 = UI 没有同步等待
+        state.settings.models.spawner = fake_spawner(
+            std::time::Duration::from_millis(300),
+            Ok(vec!["fake-model".to_owned()]),
+        );
+        state.apply(Message::AiModelsFetchRequested);
+        assert!(state.settings.models.is_fetching());
+
+        let mut text = String::new();
+        let start = std::time::Instant::now();
+        render_ai_page_collect(&mut state, 5, &mut text);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "拉取中五帧耗时 {elapsed:?},UI 疑似被后台拉取阻塞"
+        );
+        assert!(text.contains("获取中…"), "拉取中状态可见:{text}");
+        assert!(
+            !text.contains("获取模型列表"),
+            "拉取中原按钮文案不出现:{text}"
+        );
+
+        // 结果到达:收流归约 → 成功帧出现候选下拉;出厂模型名不在候选,
+        // 回显「(手输)」标记(不强制改写,decisions-pending #109)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.settings.models.is_fetching() && std::time::Instant::now() < deadline {
+            for message in state.poll_models() {
+                state.apply(message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!state.settings.models.is_fetching(), "结果已落地");
+        let mut text = String::new();
+        render_ai_page_collect(&mut state, 2, &mut text);
+        assert!(text.contains("已获取"), "成功后出现候选下拉:{text}");
+        assert!(text.contains("(手输)"), "手输名不在候选时回显标记:{text}");
+
+        // 手输名恰在候选里:回显名字本身,无标记
+        state.settings.ai_draft.model = "fake-model".to_owned();
+        let mut text = String::new();
+        render_ai_page_collect(&mut state, 2, &mut text);
+        assert!(text.contains("fake-model"), "{text}");
+        assert!(!text.contains("(手输)"), "候选内的名字不带标记:{text}");
+
+        // 失败态:错误文案上屏(警示色错误行)
+        state.settings.models.spawner = fake_spawner(
+            std::time::Duration::ZERO,
+            Err("获取模型列表失败:HTTP 401:bad key".to_owned()),
+        );
+        state.apply(Message::AiModelsFetchRequested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.settings.models.is_fetching() && std::time::Instant::now() < deadline {
+            for message in state.poll_models() {
+                state.apply(message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut text = String::new();
+        render_ai_page_collect(&mut state, 2, &mut text);
+        assert!(
+            text.contains("获取模型列表失败:HTTP 401:bad key"),
+            "失败文案上屏:{text}"
+        );
+        assert!(text.contains("已获取"), "失败帧旧候选下拉保留:{text}");
     }
 
     /// #23 F2:外观页两根排版滑杆真实渲出 —— 「字号」「行距」标签与 theme
