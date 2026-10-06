@@ -23,6 +23,7 @@ fn section_rows(doc: &str, body_size: f32, style: &MarkdownStyle) -> Vec<(f32, O
       None,
       false,
       false,
+      true,
       style,
       Default::default(),
     );

@@ -86,6 +86,7 @@ fn probe(doc: &str) -> (Vec<Dispatch>, Option<(f32, Option<f32>)>) {
       Some(&handler as &dyn LinkHandler),
       false,
       false,
+      true,
       &MarkdownStyle::default(),
       Default::default(),
     );

@@ -46,6 +46,12 @@ struct CachedMarkdownLayout {
 /// Cached layout result for a single flush range (used by segmented render path).
 #[derive(Clone)]
 struct CachedFlushRange {
+  /// True when this range's code blocks were built without syntect colors
+  /// (deferred highlight, [`MarkdownLabel::defer_offscreen_highlight`]) and
+  /// must be rebuilt with highlighting before the range can become visible.
+  /// Text, metrics and geometry are already final, so sizes and block tables
+  /// recorded while deferred stay valid.
+  deferred_highlight: bool,
   ctx_hash: u64,
   layout: Arc<LayoutResult>,
   tokens: Arc<Vec<Token<'static>>>,
@@ -350,6 +356,7 @@ pub struct MarkdownLabel<'a> {
   code_block_buttons: Option<&'a dyn Fn(&mut Ui, &str, &str)>,
   scroll_code_blocks: bool,
   shrink_code_blocks: bool,
+  defer_offscreen_highlight: bool,
   hug_content: bool,
   code_block_min_width: Option<f32>,
   style: Option<&'a MarkdownStyle>,
@@ -438,17 +445,24 @@ pub fn block_rect_at_offset(ui: &egui::Ui, id: egui::Id, offset: usize) -> Optio
 
 /// Append one block record to the label's per-frame table, resetting the table
 /// on the first write of a frame (stale entries from earlier frames never leak).
+///
+/// Records mutate the stored table in place (`get_temp_mut_or_insert_with`).
+/// A read-modify-write via `get_temp` + `insert_temp` clones the whole `Vec`
+/// for every record, making a frame with N blocks cost O(N²) memcpy — measured
+/// at 4673 records/frame on a 20k-line document, that alone was ~16 ms/frame.
 fn record_block_rect(ui: &egui::Ui, id: egui::Id, span: std::ops::Range<usize>, rect: Rect) {
   let table_id = block_rects_id(id);
+  // Read outside the data lock: `cumulative_pass_nr` acquires the context lock
+  // in egui 0.36 and would self-deadlock inside the `data_mut` closure.
   let frame = ui.ctx().cumulative_pass_nr();
-  let mut blocks = ui
-    .ctx()
-    .data(|d| d.get_temp::<(u64, Vec<BlockSpanRect>)>(table_id))
-    .filter(|(seen, _)| *seen == frame)
-    .map(|(_, blocks)| blocks)
-    .unwrap_or_default();
-  blocks.push(BlockSpanRect { span, rect });
-  ui.ctx().data_mut(|d| d.insert_temp(table_id, (frame, blocks)));
+  ui.ctx().data_mut(|d| {
+    let (seen, blocks) = d.get_temp_mut_or_insert_with::<(u64, Vec<BlockSpanRect>)>(table_id, || (frame, Vec::new()));
+    if *seen != frame {
+      *seen = frame;
+      blocks.clear();
+    }
+    blocks.push(BlockSpanRect { span, rect });
+  });
 }
 
 /// Does token `i` start a new block within a flushed text run?
@@ -565,6 +579,7 @@ impl<'a> MarkdownLabel<'a> {
       code_block_buttons: None,
       scroll_code_blocks: false,
       shrink_code_blocks: false,
+      defer_offscreen_highlight: false,
       hug_content: false,
       code_block_min_width: None,
       style: None,
@@ -662,6 +677,26 @@ impl<'a> MarkdownLabel<'a> {
   /// Useful for tooltips and popovers that should hug their content.
   pub fn shrink_code_blocks(self, shrink: bool) -> Self {
     Self { shrink_code_blocks: shrink, ..self }
+  }
+
+  /// Lay out flush ranges that start below the viewport without syntax
+  /// highlighting, and highlight them the moment they can become visible.
+  /// Default: `false`.
+  ///
+  /// A code block whose flush range starts entirely below the clip rect's
+  /// bottom edge is built from the same padded text in the same monospace
+  /// metrics — identical geometry, absent colors — and is rebuilt with full
+  /// highlighting on the first frame where it is no longer below the fold.
+  /// This removes the syntect run for every below-fold block from cache-miss
+  /// frames (first paint of a long document) without any height estimation:
+  /// the deferral decision reads the exact layout cursor, never a guess, so
+  /// there is nothing to correct and nothing jumps.
+  ///
+  /// Only the segmented render path defers (ranges exist there); the
+  /// whole-document path and builds without the `syntax_highlighting` feature
+  /// are unaffected.
+  pub fn defer_offscreen_highlight(self, defer: bool) -> Self {
+    Self { defer_offscreen_highlight: defer, ..self }
   }
 
   /// Size the whole widget to the laid-out galley instead of filling available width.
@@ -785,6 +820,7 @@ impl<'a> MarkdownLabel<'a> {
       self.link_handler,
       false,
       false,
+      true,
       style,
       code_theme,
     );
@@ -812,6 +848,7 @@ impl<'a> MarkdownLabel<'a> {
       self.link_handler,
       false,
       false,
+      true,
       style,
       code_theme,
     );
@@ -854,8 +891,15 @@ impl<'a> MarkdownLabel<'a> {
     // from an empty table, so records from the previous frame never leak into a
     // query (a render that records nothing — e.g. fully culled — yields an empty
     // table, which readers report as "no blocks" rather than stale geometry).
+    // Cleared in place so the table's allocation survives frame-to-frame reuse
+    // instead of being freed and regrown every frame on block-heavy documents.
     let frame = ui.ctx().cumulative_pass_nr();
-    ui.data_mut(|d| d.insert_temp(block_rects_id(self.id), (frame, Vec::<BlockSpanRect>::new())));
+    ui.data_mut(|d| {
+      let (seen, blocks) =
+        d.get_temp_mut_or_insert_with::<(u64, Vec<BlockSpanRect>)>(block_rects_id(self.id), || (frame, Vec::new()));
+      *seen = frame;
+      blocks.clear();
+    });
 
     // Check if we have a cached layout for this text.
     let cached: Option<CachedMarkdownLayout> = ui.data(|d| d.get_temp(cache_id));
@@ -924,6 +968,7 @@ impl<'a> MarkdownLabel<'a> {
       wrap.break_anywhere,
       self.link_handler,
       self.scroll_code_blocks,
+      true,
       true,
       style,
       code_theme,
@@ -1262,6 +1307,10 @@ impl<'a> MarkdownLabel<'a> {
     let wrap = self.resolve_wrap(ui);
     let max_width = wrap.max_width;
     let dark_mode = ui.visuals().dark_mode;
+    // Deferral trigger: the range starts entirely below the viewport's bottom
+    // edge. The cursor y is the sum of real heights (placeholders keep exact
+    // heights), so this is an exact geometric fact, not an estimate.
+    let below_fold = self.defer_offscreen_highlight && ui.available_rect_before_wrap().min.y > ui.clip_rect().max.y;
     let ctx_hash = hash_flush_context(token_slice, style, font, color, dark_mode, self.link_handler);
     let cache_id = self.id.with(("flush", start));
     let size_cache_id = self.id.with(("flush_sz", start));
@@ -1286,7 +1335,11 @@ impl<'a> MarkdownLabel<'a> {
     }
 
     if let Some(cached) = ui.data(|d| d.get_temp::<CachedFlushRange>(cache_id)) {
-      if cached.ctx_hash == ctx_hash {
+      // A deferred range stops being deferred the moment it could become
+      // visible: fall through to the full build below, which re-highlights and
+      // stores `deferred_highlight: false`. One-time per range (~per-fence
+      // syntect cost on the frame it scrolls into view).
+      if cached.ctx_hash == ctx_hash && !(cached.deferred_highlight && !below_fold) {
         // The shaped galley can only be reused when no per-frame job transform
         // (`map_job` on the trailing range) would have shaped a different one.
         let reusable = !apply_map_job || self.map_job.is_none();
@@ -1344,6 +1397,7 @@ impl<'a> MarkdownLabel<'a> {
           d.insert_temp(
             cache_id,
             CachedFlushRange {
+              deferred_highlight: cached.deferred_highlight,
               ctx_hash,
               layout: Arc::clone(&cached.layout),
               tokens: Arc::clone(&cached.tokens),
@@ -1369,6 +1423,7 @@ impl<'a> MarkdownLabel<'a> {
       self.link_handler,
       false,
       segment_large_code_blocks,
+      !below_fold,
       style,
       code_theme,
     );
@@ -1404,7 +1459,13 @@ impl<'a> MarkdownLabel<'a> {
     ui.data_mut(|d| {
       d.insert_temp(
         cache_id,
-        CachedFlushRange { ctx_hash, layout: Arc::clone(&layout), tokens: Arc::clone(&owned), galley: shaped },
+        CachedFlushRange {
+          deferred_highlight: below_fold,
+          ctx_hash,
+          layout: Arc::clone(&layout),
+          tokens: Arc::clone(&owned),
+          galley: shaped,
+        },
       )
     });
     ui.data_mut(|d| d.insert_temp(size_cache_id, (ctx_hash, max_width, size)));

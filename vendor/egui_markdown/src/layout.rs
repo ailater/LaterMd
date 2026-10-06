@@ -318,6 +318,11 @@ pub fn needs_segmentation(
 /// `max_width` and `break_anywhere` seed [`LayoutJob::wrap`]. Callers that cache the
 /// resulting job should re-apply the live wrap width (and break flag) before shaping,
 /// since those values are typically excluded from layout cache keys.
+///
+/// `highlight_code_blocks = false` builds code-block sections with the plain
+/// monospace format (identical text, metrics and geometry — only colors are
+/// absent). This is the deferred-highlight placeholder for off-screen ranges:
+/// callers re-run the build with `true` before the range can become visible.
 #[allow(clippy::too_many_arguments)]
 pub fn build_layout(
   ui: &mut Ui,
@@ -330,6 +335,7 @@ pub fn build_layout(
   link_handler: Option<&dyn LinkHandler>,
   scroll_code_blocks: bool,
   segment_large_code_blocks: bool,
+  highlight_code_blocks: bool,
   style: &MarkdownStyle,
   code_theme: CodeThemeArg<'_>,
 ) -> LayoutResult {
@@ -440,7 +446,21 @@ pub fn build_layout(
             padded_text.push_str(line);
           }
 
-          let highlighted_job = highlight_code(ui, &padded_text, lang, code_font_size, code_theme);
+          let highlighted_job = if highlight_code_blocks {
+            highlight_code(ui, &padded_text, lang, code_font_size, code_theme)
+          } else {
+            // Deferred-highlight placeholder: same padded text, monospace font
+            // and default metrics as the highlighted job, so the shaped
+            // geometry is identical and only colors are absent. Rebuilt with
+            // `highlight_code_blocks = true` before the range scrolls into view.
+            let mut plain = LayoutJob::default();
+            plain.append(
+              &padded_text,
+              0.0,
+              TextFormat { font_id: FontId::monospace(code_font_size), ..Default::default() },
+            );
+            plain
+          };
 
           let start_char = job.text.chars().count();
 

@@ -130,7 +130,12 @@ fn preview_frame(ctx: &egui::Context, id: &egui::Id, rendered: &str, scroll: f32
             .auto_shrink([false, false])
             .vertical_scroll_offset(scroll)
             .show(ui, |ui| {
-                MarkdownLabel::new(*id, rendered).wrap().show(ui);
+                // 生产同配置:#59 M2 起预览开 defer_offscreen_highlight
+                // (vendor ①类,几何零变化,miss 帧视口外段免 syntect)。
+                MarkdownLabel::new(*id, rendered)
+                    .wrap()
+                    .defer_offscreen_highlight(true)
+                    .show(ui);
             });
     });
     start.elapsed()
@@ -243,7 +248,10 @@ fn profile_scroll(rendered_big: &str) {
             .id_salt(id.with("scroll"))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                MarkdownLabel::new(id, rendered_big).wrap().show(ui);
+                MarkdownLabel::new(id, rendered_big)
+                    .wrap()
+                    .defer_offscreen_highlight(true)
+                    .show(ui);
             });
         blocks = egui_markdown::block_span_rects(ui, id)
             .map(|b| b.len())

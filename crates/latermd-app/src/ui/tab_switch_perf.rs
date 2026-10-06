@@ -121,7 +121,13 @@ fn label_frame_with_id(ctx: &egui::Context, id: &egui::Id, rendered: &str) -> Du
                 .show(ui, |ui| {
                     // 与生产 preview.rs 同一 id 命名空间:切换文本时的缓存
                     // 行为(同 id 覆盖/hash 不匹配 → miss)与生产一致。
-                    MarkdownLabel::new(*id, rendered).wrap().heal(true).show(ui);
+                    // defer_offscreen_highlight 同步生产(#59 M2 起预览开启,
+                    // miss 帧视口外段免 syntect,几何零变化)。
+                    MarkdownLabel::new(*id, rendered)
+                        .wrap()
+                        .heal(true)
+                        .defer_offscreen_highlight(true)
+                        .show(ui);
                 });
         },
     )

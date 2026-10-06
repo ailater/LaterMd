@@ -726,6 +726,12 @@ pub fn ui(
                 .font(font)
                 .wrap()
                 .heal(heal)
+                // 视口外代码块高亮延迟(#59/#60 首切卡顿,vendor ①类配套):
+                // 缓存 miss 帧里起始于视口下缘之外的 flush 段不做 syntect
+                // 高亮(几何/文本零变化,仅颜色缺席),滚动到可见前的同帧
+                // 补齐高亮——20k 行冷首切 876→173ms(探针口径)。等价关系
+                // 由 vendored tests/deferred_highlight.rs 钉住。
+                .defer_offscreen_highlight(true)
                 .link_handler(&handler)
                 // 代码块复制头(#38):挂载点上游自带,点击经回调出 app 侧
                 // 执行复制(见 [`code_copy_buttons`])。源码/Live 两种模式下
