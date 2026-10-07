@@ -122,14 +122,17 @@ fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<latermd_md::Rewrit
 }
 
 /// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
-/// 偏移。四层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
+/// 偏移。五层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
 /// `latermd_md::OffsetMap`):wikilink 展开(源文本 → 展开后,表由
-/// `PreviewState::offset_map` 持有)、emoji 链接改写(展开后 → emoji 层
-/// 输出,`PreviewState::emoji_map`,#48 B1)、任务 checkbox 链接改写
-/// (emoji 层输出 → `rendered`,`PreviewState::task_map`,#63)与相对图片
-/// `file://` 改写(`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
+/// `PreviewState::offset_map` 持有)、高亮 `==` 链接改写(展开后 → 高亮层
+/// 输出,`PreviewState::highlight_map`,#65)、emoji 链接改写(高亮层输出
+/// → emoji 层输出,`PreviewState::emoji_map`,#48 B1)、任务 checkbox 链接
+/// 改写(emoji 层输出 → `rendered`,`PreviewState::task_map`,#63)与相对
+/// 图片 `file://` 改写(`rendered` → 最终渲染文本,点击是低频事件,消费点
+/// 现算)。
 fn map_source_offset(
     offset_map: &latermd_md::OffsetMap,
+    highlight_map: &latermd_md::OffsetMap,
     emoji_map: &latermd_md::OffsetMap,
     task_map: &latermd_md::OffsetMap,
     rendered: &str,
@@ -137,7 +140,8 @@ fn map_source_offset(
     offset: usize,
 ) -> usize {
     let after_wikilinks = offset_map.source_to_rendered(offset);
-    let after_emoji = emoji_map.source_to_rendered(after_wikilinks);
+    let after_highlight = highlight_map.source_to_rendered(after_wikilinks);
+    let after_emoji = emoji_map.source_to_rendered(after_highlight);
     let after_task = task_map.source_to_rendered(after_emoji);
     let image_map = latermd_md::OffsetMap::from_rewrites(image_rewrites(rendered, base_dir));
     image_map.source_to_rendered(after_task)
@@ -556,7 +560,8 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
 /// 各话,必须带上出身才不会串台。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TaskProbeDomain {
-    /// 右栏预览:emoji 层输出坐标,消费时逆穿 `offset_map` + `emoji_map`。
+    /// 右栏预览:emoji 层输出坐标,消费时逆穿 `offset_map` +
+    /// `highlight_map` + `emoji_map`。
     Preview,
     /// 编辑器 Live 富渲染块:块内坐标,消费时加记录时的块首字节偏移。
     Live(usize),
@@ -993,7 +998,7 @@ pub fn ui(
             // inline widget 的 hover 光标同样到不了(section 错位),这里按
             // 本帧探针几何自设 PointingHand(checkbox 是可点件,与 emoji 的
             // 手型抑制相反方向);②点击命中 —— 读原始指针事件,载荷偏移
-            // 逆穿两层映射回源码坐标发切换消息(命中区即占位区,13a)。
+            // 逆穿三层映射回源码坐标发切换消息(命中区即占位区,13a)。
             let task_entries = task_checkbox_entries(ui.ctx());
             if let Some(pos) = ui.input(|input| input.pointer.latest_pos()) {
                 if task_entries.iter().any(|(rect, _, _)| rect.contains(pos)) {
@@ -1004,17 +1009,20 @@ pub fn ui(
                 // 只认预览域的条目:点击落在 Live 列的 checkbox 上时由
                 // live.rs 的帧末判定消费,这里不得串台(#63 探针带坐标域)。
                 if let Some((_, offset)) = parse_task_href(&href) {
-                    let source = preview
-                        .offset_map
-                        .rendered_to_source(preview.emoji_map.rendered_to_source(offset));
+                    let source = preview.offset_map.rendered_to_source(
+                        preview
+                            .highlight_map
+                            .rendered_to_source(preview.emoji_map.rendered_to_source(offset)),
+                    );
                     outbox.push(Message::TaskCheckboxToggled { byte: source });
                     // 焦点归还:按下帧被让走的键盘焦点交还原持有者。
                     restore_stashed_focus(ui.ctx());
                 }
             }
 
-            // 大纲跳转的预览侧(#42):源码偏移(大纲 span 口径)先穿过两层
-            // 渲染改写(wikilink 展开 + 相对图片 URI)映射到喂给 label 的文本
+            // 大纲跳转的预览侧(#42):源码偏移(大纲 span 口径)先穿过渲染
+            // 改写链(map_source_offset,wikilink/高亮/emoji/任务/相对图片
+            // 五层串行)映射到喂给 label 的文本
             // 偏移,再查 vendored 块表拿目标块 rect。两件事都必须发生在
             // ScrollArea 闭包内、label 渲染之后:scroll_to_rect 写的是本 pass
             // 的滚动目标,由 ScrollArea 收尾消费 —— 闭包外写会在下一帧开头被
@@ -1024,6 +1032,7 @@ pub fn ui(
             if let Some(target) = preview.scroll_target.take() {
                 let offset = map_source_offset(
                     &preview.offset_map,
+                    &preview.highlight_map,
                     &preview.emoji_map,
                     &preview.task_map,
                     &preview.rendered,
@@ -1232,6 +1241,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                highlight_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
                 task_map: latermd_md::OffsetMap::empty(),
                 text,
@@ -1327,6 +1337,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.to_owned(),
             offset_map: latermd_md::OffsetMap::empty(),
+            highlight_map: latermd_md::OffsetMap::empty(),
             emoji_map: latermd_md::OffsetMap::empty(),
             task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
@@ -1351,17 +1362,17 @@ mod tests {
         assert!(outbox.is_empty(), "滚动不产消息");
     }
 
-    /// 偏移映射三层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
-    /// emoji 链接与相对图片改写按同一顺序叠加;偏移落在改写区间内归段首。
-    /// (各层的「映射与输出逐字节一致」由 latermd-md 的
-    /// `expand_wikilinks_with_map` / `expand_emoji_links` 测试直接锁死 ——
-    /// 本侧只验三层串行穿过。)
+    /// 偏移映射多层口径:无改写恒等;wikilink 之后的源偏移按长度差平移;
+    /// 高亮/emoji 链接与相对图片改写按同一顺序叠加;偏移落在改写区间内归
+    /// 段首。(各层的「映射与输出逐字节一致」由 latermd-md 的
+    /// `expand_wikilinks_with_map` / `expand_highlight_links` /
+    /// `expand_emoji_links` 测试直接锁死 —— 本侧只验多层串行穿过。)
     #[test]
     fn map_source_offset_through_both_rewrites() {
         // 无改写:恒等
         let identity = latermd_md::OffsetMap::empty();
         assert_eq!(
-            map_source_offset(&identity, &identity, &identity, "# h\n", None, 3),
+            map_source_offset(&identity, &identity, &identity, &identity, "# h\n", None, 3),
             3
         );
 
@@ -1376,6 +1387,7 @@ mod tests {
             &offset_map,
             &identity,
             &identity,
+            &identity,
             &rendered,
             None,
             heading_src,
@@ -1386,24 +1398,52 @@ mod tests {
         // 但边界语义仍要确定):归改写段首。
         let link_start = source.find("[[").expect("wikilink");
         let in_link = link_start + 3;
-        let mapped_in =
-            map_source_offset(&offset_map, &identity, &identity, &rendered, None, in_link);
+        let mapped_in = map_source_offset(
+            &offset_map,
+            &identity,
+            &identity,
+            &identity,
+            &rendered,
+            None,
+            in_link,
+        );
         assert_eq!(
             &rendered[mapped_in..].chars().take(3).collect::<String>(),
             "[架构",
             "区间内偏移归改写段首: {mapped_in}"
         );
 
-        // emoji 层叠加(#48 B1):展开文本里的覆盖枚改写成链接后,标题偏移
-        // 在 wikilink 平移之上再平移一次。
-        let source = "见 [[架构决策]] 与 😀 再谈。\n\n## 后续标题\n\n正文。\n";
+        // 高亮层叠加(#65):展开文本里的 `==…==` 改写成链接后,标题偏移在
+        // wikilink 平移之上再平移一次。
+        let source = "==高亮== [[架构决策]]。\n\n## 后续标题\n\n正文。\n";
         let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(source);
-        let (rendered, emoji_map) =
-            latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
+        let (rendered, highlight_map) = latermd_md::expand_highlight_links(&after_wikilinks);
+        assert!(rendered.contains("[高亮](<hl://>)"), "前置:高亮已改写");
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
         let mapped = map_source_offset(
             &offset_map,
+            &highlight_map,
+            &identity,
+            &identity,
+            &rendered,
+            None,
+            heading_src,
+        );
+        assert_eq!(mapped, heading_out, "高亮改写叠加平移");
+
+        // emoji 层叠加(#48 B1):展开文本里的覆盖枚改写成链接后,标题偏移
+        // 在前层平移之上再平移一次。
+        let source = "见 [[架构决策]] 与 😀 再谈。\n\n## 后续标题\n\n正文。\n";
+        let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(source);
+        let (after_highlight, highlight_map) = latermd_md::expand_highlight_links(&after_wikilinks);
+        let (rendered, emoji_map) =
+            latermd_md::expand_emoji_links(&after_highlight, emoji_data::covered_glyphs());
+        let heading_src = source.find("## 后续标题").expect("heading in source");
+        let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
+        let mapped = map_source_offset(
+            &offset_map,
+            &highlight_map,
             &emoji_map,
             &identity,
             &rendered,
@@ -1413,8 +1453,8 @@ mod tests {
         assert_eq!(mapped, heading_out, "emoji 改写叠加平移");
 
         // 图片层叠加:渲染文本里相对图片地址换成 file:// URI 后,标题偏移
-        // 再平移一次(与 emoji 层共存,三层全穿)。`rendered` 是 emoji 层的
-        // 真实输出 —— 图片层扫描的正是这份字符串(生产同款口径)。
+        // 再平移一次(与前层共存)。`rendered` 是 emoji 层的真实输出 ——
+        // 图片层扫描的正是这份字符串(生产同款口径)。
         let doc = "![图](./x.png) 😀\n\n## 标题\n";
         let (rendered, emoji_map) =
             latermd_md::expand_emoji_links(doc, emoji_data::covered_glyphs());
@@ -1422,8 +1462,9 @@ mod tests {
         let with_uri = resolve_relative_images(&rendered, base);
         let heading = doc.find("## 标题").expect("heading");
         let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
-        let mapped_img =
-            map_source_offset(&identity, &emoji_map, &identity, &rendered, base, heading);
+        let mapped_img = map_source_offset(
+            &identity, &identity, &emoji_map, &identity, &rendered, base, heading,
+        );
         assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
     }
 
@@ -1493,6 +1534,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: frame_rendered,
                 offset_map,
+                highlight_map: latermd_md::OffsetMap::empty(),
                 emoji_map,
                 task_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
@@ -1526,8 +1568,8 @@ mod tests {
     // —— #48 B2:emoji:// inline widget 接线(可行性调查 §3.2 点名的
     // 段落/标题/表格覆盖断言 + 副作用压住 + 回落面)——
 
-    /// 一帧生产入口渲染的汇集(测试断言素材)。文档先走 B1 同款两层改写
-    /// (wikilink → emoji),与 `PreviewState::new` 生产链一致。
+    /// 一帧生产入口渲染的汇集(测试断言素材)。文档先走 B1 同款改写链
+    /// (wikilink → 高亮 → emoji),与 `PreviewState::new` 生产链一致。
     struct EmojiFrame {
         /// 全部 Text shape 的文本(painted_text 同款汇集)。
         texts: Vec<String>,
@@ -1561,6 +1603,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered,
             offset_map,
+            highlight_map: latermd_md::OffsetMap::empty(),
             emoji_map,
             task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
@@ -1932,6 +1975,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered: doc.clone(),
             offset_map: latermd_md::OffsetMap::empty(),
+            highlight_map: latermd_md::OffsetMap::empty(),
             emoji_map: latermd_md::OffsetMap::empty(),
             task_map: latermd_md::OffsetMap::empty(),
             text: doc.clone(),
@@ -2059,6 +2103,7 @@ mod tests {
                             let tab = state.tabs.current();
                             let mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.highlight_map,
                                 &tab.preview.emoji_map,
                                 &tab.preview.task_map,
                                 &tab.preview.rendered,
@@ -2216,6 +2261,7 @@ mod tests {
                             let tab = state.tabs.current();
                             mapped = map_source_offset(
                                 &tab.preview.offset_map,
+                                &tab.preview.highlight_map,
                                 &tab.preview.emoji_map,
                                 &tab.preview.task_map,
                                 &tab.preview.rendered,
@@ -2397,6 +2443,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: doc.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                highlight_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
                 task_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
@@ -2552,6 +2599,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered: rendered.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
+                highlight_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
                 task_map: latermd_md::OffsetMap::empty(),
                 text: rendered.to_owned(),
@@ -2638,6 +2686,7 @@ mod tests {
         let mut preview = PreviewState {
             rendered,
             offset_map,
+            highlight_map: latermd_md::OffsetMap::empty(),
             emoji_map: latermd_md::OffsetMap::empty(),
             task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
@@ -2770,6 +2819,7 @@ mod tests {
             let mut preview = PreviewState {
                 rendered,
                 offset_map,
+                highlight_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
                 task_map: latermd_md::OffsetMap::empty(),
                 text: doc.clone(),
@@ -2872,7 +2922,7 @@ mod tests {
         doc
     }
 
-    /// 以生产入口渲染一帧(快照走 `PreviewState::new` 的完整三层链),
+    /// 以生产入口渲染一帧(快照走 `PreviewState::new` 的完整四层链),
     /// 返回 (本帧 checkbox 探针 rect, 产生的消息, 画出的文本)。
     fn render_task_frame(
         ctx: &egui::Context,
@@ -2918,7 +2968,7 @@ mod tests {
 
     /// 存在与命中:每个任务一枚 checkbox(嵌套/空任务/有序都算),点击
     /// 命中出 [`Message::TaskCheckboxToggled`] 且载荷指向**源码**里该标记
-    /// 的 `[`(两层映射逆穿后);代码块/行内代码的 `[ ]` 不产 checkbox。
+    /// 的 `[`(三层映射逆穿后);代码块/行内代码的 `[ ]` 不产 checkbox。
     /// 悬停不切换(只有抬起帧的消息算数)。
     #[test]
     fn task_checkboxes_click_through_to_source_offsets() {
