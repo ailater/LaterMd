@@ -1229,6 +1229,56 @@ fn toc_label(text: &str) -> String {
     out
 }
 
+/// TOC 块的开始标记行(LaterMD 生成形态,HTML 注释;#66 M2 的区域识别
+/// 口径登记 decisions-pending #127)。
+pub const TOC_BEGIN_MARKER: &str = "<!-- TOC -->";
+
+/// TOC 块的结束标记行(与 [`TOC_BEGIN_MARKER`] 配对)。
+pub const TOC_END_MARKER: &str = "<!-- /TOC -->";
+
+/// 大纲 → 完整 TOC 块(#66 M2「插入/更新目录」的写入形态):[`generate_toc`]
+/// 产出被 [`TOC_BEGIN_MARKER`]/[`TOC_END_MARKER`] 两行包围,行以 `\n` 收尾,
+/// 产出的块可被 [`toc_region_span`] 原样识别回来 —— 写入与识别同一事实源,
+/// 不存在「生成的块认不出」的漂移面。
+///
+/// 空大纲(无 depth 内标题)产出的块只有两行空壳标记;消费方应先判
+/// 「无可收录标题」并落 UI 提示,不要把空壳块写进文档(提示属消费方,
+/// 与 [`generate_toc`] 回空串的口径同源)。
+pub fn toc_block(items: &[OutlineItem]) -> String {
+    format!(
+        "{TOC_BEGIN_MARKER}\n{}{TOC_END_MARKER}\n",
+        generate_toc(items)
+    )
+}
+
+/// 在 `text` 中定位既有 TOC 块的字节区间(整块替换的识别口径):第一行
+/// 「整行恰为 [`TOC_BEGIN_MARKER`]」的行起,到其后第一行「整行恰为
+/// [`TOC_END_MARKER`]」的行(**含行尾换行**)止。
+///
+/// 口径(decisions-pending #127):
+///
+/// - 行内容经 `trim` 全等比较 —— 容忍行尾空白与 CRLF 的 `\r`,不容忍
+///   标记与其它文本混排一行;
+/// - 取**第一对**配对标记;有头无尾、或结束标记都出现在开始标记之前,
+///   视为无块(`None`,消费方按「首次插入」处理);
+/// - 已知边界:标记行写在围栏代码块内同样会被识别(不做围栏感知,与
+///   doctoc 等工具同宽);区域内的手工改动由消费方整块替换覆盖。
+pub fn toc_region_span(text: &str) -> Option<Range<usize>> {
+    let mut offset = 0;
+    let mut begin: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        match (begin, line.trim()) {
+            (None, marker) if marker == TOC_BEGIN_MARKER => begin = Some(offset),
+            (Some(start), marker) if marker == TOC_END_MARKER => {
+                return Some(start..offset + line.len());
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// 解析 Markdown 文本,产出拥有型文档模型(统一入口)。
 ///
 /// 代价是两次拷贝:源文本进 `String`,借用型 `CowStr::Borrowed` 转堆上的
@@ -2857,6 +2907,100 @@ mod tests {
         };
         assert_eq!(doc.outline()[0].text, "临时标题");
         assert_eq!(doc.text, "# 临时标题");
+    }
+
+    // —— TOC_BLOCK / TOC_REGION_SPAN(#66 M2 插入与整块替换的识别口径)——
+
+    /// `toc_block` 包住 `generate_toc` 产出,且被 `toc_region_span` 原样
+    /// 识别回来 —— 写入与识别同一事实源(模块文档的构造性一致断言)。
+    #[test]
+    fn toc_block_round_trips_through_region_span() {
+        let src = "# 甲\n\n## 乙\n";
+        let block = toc_block(&outline(src));
+        assert_eq!(
+            block,
+            "<!-- TOC -->\n- [甲](#甲)\n  - [乙](#乙)\n<!-- /TOC -->\n"
+        );
+        let text = format!("前言。\n\n{block}正文。\n");
+        let span = toc_region_span(&text).expect("生成的块应被识别回来");
+        assert_eq!(&text[span.clone()], block, "区间恰为块本体(含尾换行)");
+        assert!(text.is_char_boundary(span.start) && text.is_char_boundary(span.end));
+    }
+
+    /// 空大纲产出空壳块(消费方负责先判空,不把壳写进文档)。
+    #[test]
+    fn toc_block_empty_outline_is_marker_shell_only() {
+        assert_eq!(toc_block(&[]), "<!-- TOC -->\n<!-- /TOC -->\n");
+        assert_eq!(
+            toc_block(&outline("#### 只有大标题档\n")),
+            "<!-- TOC -->\n<!-- /TOC -->\n"
+        );
+    }
+
+    /// 区间识别:正文夹块取「第一对」标记,行尾空白与 CRLF 的 `\r` 容忍;
+    /// span 端点都是字符边界(CJK 夹块)。
+    #[test]
+    fn toc_region_span_tolerates_whitespace_and_crlf() {
+        // CRLF 文档(Windows 原样进出,file 层不做换行转换):整块含 `\r\n`
+        let crlf = "前文甲\r\n<!-- TOC -->\r\n- [甲](#甲)\r\n<!-- /TOC -->\r\n后文乙\r\n";
+        let span = toc_region_span(crlf).expect("CRLF 下的标记可识别");
+        assert!(crlf[span.clone()].starts_with("<!-- TOC -->\r\n"));
+        assert!(crlf[span].ends_with("<!-- /TOC -->\r\n"));
+
+        // 行尾空白容忍 + 块后无尾换行的文末块:区间到文末收口
+        let tail = "开头\n<!-- TOC --> \n- [甲](#甲)\n<!-- /TOC -->";
+        let span = toc_region_span(tail).expect("文末块可识别");
+        assert_eq!(span.start, "开头\n".len());
+        assert_eq!(span.end, tail.len(), "末行无换行时区间到文末");
+
+        // CJK 夹块:字节端点必须落在字符边界上
+        let cjk = "中文甲乙丙\n<!-- TOC -->\n<!-- /TOC -->\n中文丁戊\n";
+        let span = toc_region_span(cjk).expect("CJK 夹块可识别");
+        assert!(cjk.is_char_boundary(span.start) && cjk.is_char_boundary(span.end));
+    }
+
+    /// 识别的反面:无开始标记、有头无尾、结束标记先于开始标记,都按
+    /// 「无块」处理(消费方走首次插入);嵌套/重复时取第一对。
+    #[test]
+    fn toc_region_span_requires_paired_markers() {
+        assert_eq!(toc_region_span("# 没有标记\n\n正文\n"), None);
+        assert_eq!(
+            toc_region_span("<!-- TOC -->\n- [甲](#甲)\n"),
+            None,
+            "有头无尾"
+        );
+        assert_eq!(
+            toc_region_span("<!-- /TOC -->\n正文\n<!-- TOC -->\n"),
+            None,
+            "结束标记先于开始标记不成对"
+        );
+        // 第一对生效:第二个开始标记在第一对之外时被无视
+        let text = "x\n<!-- TOC -->\n<!-- /TOC -->\n<!-- TOC -->\n孤行\n";
+        let span = toc_region_span(text).expect("第一对生效");
+        assert_eq!(&text[span], "<!-- TOC -->\n<!-- /TOC -->\n");
+    }
+
+    /// 替换口径的收敛性:块内手工乱改后再「识别 → 整块替换」两轮,文本
+    /// 稳定不再漂(替换文本恰为块本体,块外字节零增删)。
+    #[test]
+    fn replace_round_trip_is_stable() {
+        let items = outline("# 甲\n\n## 乙\n");
+        let mut text = "前言\n\n".to_owned();
+        text.push_str(&toc_block(&items));
+        text.push_str("后记\n");
+        // 手工把块内改成乱内容,再按口径替换回生成块
+        let span = toc_region_span(&text).expect("前置:块可识别");
+        text.replace_range(span, "<!-- TOC -->\n随手乱写的一行\n<!-- /TOC -->\n");
+        let block = toc_block(&items);
+        let span = toc_region_span(&text).expect("手工块同样可识别");
+        text.replace_range(span, &block);
+        assert!(text.contains(&block));
+        assert!(!text.contains("随手乱写"));
+        // 再执行一轮(内容相同):文本不再变化
+        let span = toc_region_span(&text).expect("前置:块仍可识别");
+        let before = text.clone();
+        text.replace_range(span, &block);
+        assert_eq!(text, before, "同内容反复替换零漂移");
     }
 
     /// 借转拥有不丢数据:表格的表头/行/单元格逐层对照。
