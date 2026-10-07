@@ -10,6 +10,7 @@ use crate::live::{self, LiveState, RenderMode};
 use crate::state::{Message, OutlineCursor, PreviewState};
 use crate::ui::gutter;
 use crate::ui::minimap;
+use crate::ui::typewriter;
 use latermd_editor::EditorBuffer;
 use std::ops::Range;
 
@@ -154,6 +155,7 @@ pub fn ui(
     mode: RenderMode,
     editor_id: egui::Id,
     show_minimap: bool,
+    show_typewriter: bool,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let CursorChannel {
@@ -170,7 +172,16 @@ pub fn ui(
     // 两种模式共用同一个 rope buffer 与同一套撤销语义(roadmap 铁律):这里
     // 只是分派,没有任何「把光标/文本从一种模式搬到另一种」的恢复逻辑。
     if is_live {
-        return live::ui(panel, editor, preview, cursor, live, editor_id, outbox);
+        return live::ui(
+            panel,
+            editor,
+            preview,
+            cursor,
+            live,
+            editor_id,
+            show_typewriter,
+            outbox,
+        );
     }
 
     let line_height = {
@@ -205,6 +216,23 @@ pub fn ui(
     // 写回帧的 caret 目标在 ScrollArea 闭包里记下,IME 上报(闭包外)用:
     // 写回当帧 output.state 还是写回前的旧快照,定位只能用写回目标本身。
     let mut ime_write_back: Option<usize> = None;
+
+    // 打字机模式(#64 M1):每标签一份记忆(源码/Live 分槽),帧首读、
+    // 帧末写回。关闭态不读写 temp、闭包内不进任何打字机分支 —— 滚动行为
+    // 与从前逐字节相同(否决线)。
+    let mut tw = if show_typewriter {
+        panel
+            .ctx()
+            .data(|d| d.get_temp::<typewriter::Memory>(typewriter::source_memory_id(editor_id)))
+            .unwrap_or_default()
+    } else {
+        typewriter::Memory::default()
+    };
+    let tw_just_enabled = show_typewriter && !tw.enabled;
+    // 闭包回写:本帧发生了编辑/导航/写回(恢复事件)与打字机自身落地
+    // (offset diff 的接管判定要排除自己滚的)。
+    let mut tw_resumed = false;
+    let mut tw_landed = false;
 
     let scrolled = egui::ScrollArea::vertical()
         // 每标签一套滚动位置,与 TextEdit 持久状态的口径一致;id 不含内容
@@ -305,19 +333,76 @@ pub fn ui(
                     .map(|range| range.primary.index.0);
             }
 
+            // 打字机模式(#64 M1)的触发面扩展:除写回帧/键盘导航外,
+            // **修订号前进帧**(打字/IME/undo/redo/程序写入 —— TextEdit
+            // 已把消费掉的按键移出事件流,修订号是不依赖事件枚举的编辑
+            // 信号)与开关开启帧也跟随。开启即恢复接管、对齐一次;用户
+            // 主动滚动置入的 Override 由下一次这类帧恢复(#121 口径)。
+            // 关闭态整块不进。
+            if show_typewriter {
+                let edited = tw.last_rev.is_none_or(|rev| rev != editor.revision());
+                if edited || keyboard_nav || follow_char.is_some() || tw_just_enabled {
+                    if follow_char.is_none() {
+                        follow_char = output
+                            .state
+                            .cursor
+                            .char_range()
+                            .map(|range| range.primary.index.0);
+                    }
+                    tw_resumed = true;
+                    tw.phase = typewriter::step(tw.phase, typewriter::Turn::Edit);
+                }
+            }
+
             if let Some(index) = follow_char {
                 // galley 是本帧文本,折行下的行位置是精确的。
-                let rect = output
+                let row_rect = output
                     .galley
                     .pos_from_cursor(egui::text::CCursor::new(index));
-                ui.scroll_to_rect(
-                    egui::Rect::from_min_max(
-                        output.galley_pos + rect.min.to_vec2(),
-                        output.galley_pos + rect.max.to_vec2(),
-                    )
-                    .expand(1.5),
-                    None,
-                );
+                if show_typewriter {
+                    // 打字机落地:目标线 = 视口 1/3,死区外才滚(每越带
+                    // 一次滚一次,不逐键微跳)。落地用单像素矩形 + TOP
+                    // 对齐一次到位(egui end() 换算 TOP:`offset = rect顶
+                    // − 内容原点 − spacing`,把矩形顶放在「光标行屏幕 y −
+                    // 目标线」即滚 `view_y − anchor`;文首/文末钳位由
+                    // end() 的 offset 钳制兜底,这里只表意图)。
+                    let clip = ui.clip_rect();
+                    let cursor_screen_y = output.galley_pos.y + row_rect.min.y;
+                    let ask = typewriter::ScrollAsk {
+                        view_y: cursor_screen_y - clip.top(),
+                        row_h: row_rect.height().max(1.0),
+                        viewport: clip.height(),
+                    };
+                    if let Some(delta) = typewriter::scroll_delta(&ask) {
+                        // 落地矩形顶 = 视口顶 + 漂移量(+item_spacing 补
+                        // TOP 换算的扣减,与 minimap land 同一手法的相对版)
+                        let land_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                clip.left() + 1.0,
+                                clip.top() + delta + ui.spacing().item_spacing.y,
+                            ),
+                            egui::vec2(1.0, 1.0),
+                        );
+                        ui.scroll_to_rect_animation(
+                            land_rect,
+                            Some(egui::Align::TOP),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                        tw_landed = true;
+                    }
+                } else {
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_max(
+                            output.galley_pos + row_rect.min.to_vec2(),
+                            output.galley_pos + row_rect.max.to_vec2(),
+                        )
+                        .expand(1.5),
+                        None,
+                    );
+                }
+            }
+            if show_typewriter {
+                tw.last_rev = Some(editor.revision());
             }
 
             // minimap 滚动意图落地(#55 M2 跳转 + #105① 悬停滚轮):两者
@@ -428,6 +513,30 @@ pub fn ui(
             output
         });
     let output = scrolled.inner;
+
+    // 打字机接管判定(#64 M1):本帧偏移动了、且不是打字机自己落的地、
+    // 也不是编辑/导航帧、也不在落地动画宽限内 —— 即用户主动滚动(滚轮/
+    // 滚动条/内容拖拽/minimap 跳转),记一次 Override 暂停跟随。编辑帧
+    // 优先(打字+滚轮同帧罕见,打字赢);滚动条拖动的连续帧幂等记
+    // Override。egui 的滚动落地是「本帧记目标、下一帧 begin() 才应用」,
+    // land 后的渐近帧靠宽限豁免(否则打字机自己把自己记成接管)。
+    if show_typewriter {
+        let in_grace = tw.land_grace > 0;
+        let moved = (scrolled.state.offset.y - tw.last_offset).abs() > typewriter::MOVED_EPSILON;
+        if moved && !tw_landed && !tw_resumed && !in_grace {
+            tw.phase = typewriter::step(tw.phase, typewriter::Turn::UserScroll);
+        }
+        tw.land_grace = if tw_landed {
+            typewriter::LAND_GRACE_FRAMES
+        } else {
+            tw.land_grace.saturating_sub(1)
+        };
+        tw.last_offset = scrolled.state.offset.y;
+        tw.enabled = true;
+        panel
+            .ctx()
+            .data_mut(|d| d.insert_temp(typewriter::source_memory_id(editor_id), tw));
+    }
 
     // minimap 交互注册(#55 M2):排在 ScrollArea 之后注册 → 同层居上,
     // 点击/拖动不会被 ScrollArea 的背景拖拽抢走。命中即把指针 y(相对
@@ -741,6 +850,7 @@ mod tests {
             cursor,
             tab_editor_id(1),
             &mut outbox,
+            false,
         )
     }
 
@@ -767,6 +877,7 @@ mod tests {
             cursor,
             tab_editor_id(1),
             &mut outbox,
+            false,
         );
         let _ = ime;
         (id, outbox)
@@ -797,6 +908,7 @@ mod tests {
             cursor,
             tab_editor_id(tab_id),
             &mut outbox,
+            false,
         )
         .0
     }
@@ -816,6 +928,7 @@ mod tests {
         cursor: &mut OutlineCursor,
         editor_id: egui::Id,
         outbox: &mut Vec<Message>,
+        show_typewriter: bool,
     ) -> (egui::Id, Vec<egui::Rect>) {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut live = LiveState::default();
@@ -842,8 +955,11 @@ mod tests {
                         RenderMode::Source,
                         editor_id,
                         // 本模块的既有测试都验现状路径:minimap 关(其
-                        // 渲染与跳转的验收在 ui::minimap 的 tests 里)。
+                        // 渲染与跳转的验收在 ui::minimap 的 tests 里);
+                        // 打字机开关由调用方给(既有测试 false,打字机
+                        // 测试组显式 true)。
                         false,
+                        show_typewriter,
                         outbox,
                     )
                     .id,
@@ -2241,6 +2357,813 @@ mod tests {
             editor_rect(&ctx, id).top(),
             top,
             "空闲帧不请求滚动,内容纹丝不动"
+        );
+    }
+
+    /// 打字机测试驱动:[`frame_core`] 的开关显式版(写回通道一并交给调用
+    /// 方),返回 TextEdit id。`now` 逐帧递增(undoer 分组同 [`frame`])。
+    #[allow(clippy::too_many_arguments)]
+    fn frame_tw(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        now: f64,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        selection: &mut Option<(usize, usize)>,
+        pending: &mut Option<(usize, usize)>,
+        cursor: &mut OutlineCursor,
+        on: bool,
+    ) -> egui::Id {
+        let mut outbox = Vec::new();
+        frame_core(
+            ctx,
+            events,
+            now,
+            editor,
+            preview,
+            selection,
+            pending,
+            cursor,
+            tab_editor_id(1),
+            &mut outbox,
+            on,
+        )
+        .0
+    }
+
+    /// 读打字机记忆(接管状态机的探针;未写过帧 = 默认值)。
+    fn tw_memory(ctx: &egui::Context) -> typewriter::Memory {
+        ctx.data(|d| {
+            d.get_temp::<typewriter::Memory>(typewriter::source_memory_id(tab_editor_id(1)))
+        })
+        .unwrap_or_default()
+    }
+
+    /// 光标行顶的**视口相对 y**:光标字符偏移 → 行号 × 行高(行高从
+    /// TextEdit 响应矩形反推:内容全高 / 逻辑行数,与
+    /// `arrow_down_navigation_keeps_cursor_visible` 同一换算;TextEdit
+    /// 内边距的常量误差由断言容差吸收)。视口顶是屏幕 y=0(测试视口
+    /// 800×600 从 0 起),故光标行屏幕 y 即视口相对 y。
+    fn caret_view_y(ctx: &egui::Context, id: egui::Id, text: &str, caret_char: usize) -> f32 {
+        let rect = editor_rect(ctx, id);
+        let total_lines = text.lines().count().max(1);
+        let line_height = rect.height() / total_lines as f32;
+        let caret_line = text.chars().take(caret_char).filter(|c| *c == '\n').count();
+        rect.top() + caret_line as f32 * line_height
+    }
+
+    fn tw_caret_char(ctx: &egui::Context, id: egui::Id) -> usize {
+        TextEditState::load(ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index.0)
+            .expect("光标已落位")
+    }
+
+    fn long_doc(lines: usize) -> String {
+        (0..lines).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("第 {i} 行\n"));
+            acc
+        })
+    }
+
+    /// 目标带断言的容差:死区(1.5 行)+ 一个行步进(打字逐行推进的稳定
+    /// 摆幅)+ 文档行高反推的内边距常量误差。
+    fn band(row_h: f32) -> std::ops::RangeInclusive<f32> {
+        let anchor = 600.0 * typewriter::ANCHOR_RATIO;
+        (anchor - typewriter::DEAD_ZONE_ROWS * row_h - row_h)
+            ..=(anchor + typewriter::DEAD_ZONE_ROWS * row_h + row_h)
+    }
+
+    /// 打字推进(任务书「打字推进」档):逐帧敲换行把光标推进 60 行、
+    /// 越出首屏后,光标行始终被拉回目标带 —— 稳定态在目标线(600 视口的
+    /// 1/3 = 200)± 死区 + 一个行步进的包络内。
+    #[test]
+    fn typewriter_keeps_cursor_row_near_anchor_while_typing() {
+        let ctx = test_ctx();
+        let text = long_doc(500);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        // 落光标到第 10 行行首(写回帧即跟随;该行内容 y≈200 恰在带内)
+        let tenth = text
+            .match_indices('\n')
+            .nth(9)
+            .map(|(byte, _)| byte)
+            .unwrap_or(0);
+        let mut pending = Some((editor.byte_to_char(tenth), editor.byte_to_char(tenth)));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        assert!(pending.is_none(), "写回已消费");
+
+        // 逐帧敲回车:40 行推进,远超 600px 首屏(约 30 行)。换行走
+        // Event::Key Enter(egui 过滤 Event::Text 中的 "\n",builder.rs);
+        // 每个打字帧之间插两帧空转 —— 真实打字节奏下(60fps)人手 0.1s
+        // 一键之间有渲染帧把 offset 与布局追平,land 读到新鲜 clip。
+        let enter = Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let mut t = 0.1;
+        for _ in 0..40 {
+            frame_tw(
+                &ctx,
+                vec![enter.clone()],
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+            t += 0.1;
+            for _ in 0..2 {
+                frame_tw(
+                    &ctx,
+                    Vec::new(),
+                    t,
+                    &mut editor,
+                    &mut preview,
+                    &mut selection,
+                    &mut pending,
+                    &mut cursor,
+                    true,
+                );
+                t += 0.05;
+            }
+        }
+        // 布局定型(offset 次帧 begin 应用、布局再次帧反映)
+        for _ in 0..2 {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+            t += 0.05;
+        }
+
+        let text = editor.text();
+        let row_h = editor_rect(&ctx, id).height() / text.lines().count() as f32;
+        let view_y = caret_view_y(&ctx, id, text, tw_caret_char(&ctx, id));
+        assert!(
+            band(row_h).contains(&view_y),
+            "打字推进后光标行应停在目标带 [{:.0}, {:.0}],实测 {view_y:.1}(行高 {row_h:.1})",
+            band(row_h).start(),
+            band(row_h).end()
+        );
+    }
+
+    /// 光标移动(任务书「光标移动」档):ArrowDown 连按越出首屏后,光标
+    /// 行同样保持在目标带内 —— 键盘导航帧与打字帧共用同一决策。
+    #[test]
+    fn typewriter_keeps_cursor_row_near_anchor_on_navigation() {
+        let ctx = test_ctx();
+        let text = long_doc(500);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = Some((0, 0));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+
+        let down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for i in 0..45 {
+            frame_tw(
+                &ctx,
+                vec![down.clone()],
+                0.1 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        for t in [6.0, 6.1] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+
+        let row_h = editor_rect(&ctx, id).height() / text.lines().count() as f32;
+        let view_y = caret_view_y(&ctx, id, &text, tw_caret_char(&ctx, id));
+        assert!(
+            band(row_h).contains(&view_y),
+            "导航后光标行应停在目标带,实测 {view_y:.1}"
+        );
+    }
+
+    /// 文末边界(任务书「文末边界」档):目标 offset 超过可滚行程时由
+    /// egui end() 的钳制兜底 —— 视口贴到文档底,光标行仍在视口内可见
+    /// (不在 1/3 线是钳位语义,如实断言)。
+    #[test]
+    fn typewriter_document_end_clamps_with_cursor_visible() {
+        let ctx = test_ctx();
+        let text = long_doc(500);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let tail = editor.len_chars();
+        let mut pending = Some((tail, tail));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        for t in [0.1, 0.2, 0.3, 0.4, 0.5] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+
+        let rect = editor_rect(&ctx, id);
+        let view_y = caret_view_y(&ctx, id, editor.text(), tw_caret_char(&ctx, id));
+        assert!(
+            rect.bottom() <= 601.5,
+            "视口已贴文档底(实测 bottom {:.1})",
+            rect.bottom()
+        );
+        assert!(
+            (0.0..=600.0).contains(&view_y),
+            "文末光标行在视口内(钳位语义,不追 1/3 线;实测 {view_y:.1})"
+        );
+    }
+
+    /// 否决线:开关关闭(出厂默认)时滚动行为与从前逐字节相同 —— 写回帧
+    /// 照旧最小滚入(既有 #29 路径),随后的**打字帧不触发任何滚动**
+    /// (现状:打字帧无跟随标志;egui 内建跟随永不落地,#29 实证)。
+    #[test]
+    fn typewriter_off_keeps_legacy_scroll_behavior() {
+        let ctx = test_ctx();
+        let text = long_doc(500);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        // 写回到第 300 行(远超首屏):关闭态走既有 follow 路径滚入视口
+        let at = text
+            .match_indices('\n')
+            .nth(299)
+            .map(|(byte, _)| byte)
+            .unwrap_or(0);
+        let mut pending = Some((editor.byte_to_char(at), editor.byte_to_char(at)));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            false,
+        );
+        // 写回滚动动画完成 + 布局生效(照 outline_jump_scrolls 既有帧序:
+        // 程序化滚动 = end 记目标、次帧 begin 应用、再次帧布局反映)
+        for t in [1.5, 2.0, 2.1, 2.2] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                false,
+            );
+        }
+        let settled = editor_rect(&ctx, id).top();
+        assert!(settled < 0.0, "前置:写回帧把视口滚到了第 300 行");
+
+        // 同行打字 40 帧:关闭态视口一步不动(同行打字光标行不变,无任何
+        // 跟随源;现状口径。换行帧的滚动由 egui 内建跟随处理,是既有行为,
+        // 不在本模块的否决线范围)
+        let enter = Event::Text("字".into());
+        for i in 0..40 {
+            frame_tw(
+                &ctx,
+                vec![enter.clone()],
+                2.0 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                false,
+            );
+        }
+        frame_tw(
+            &ctx,
+            Vec::new(),
+            7.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            false,
+        );
+        let after = editor_rect(&ctx, id).top();
+        assert!(
+            (after - settled).abs() < 1.0,
+            "关闭态打字帧不得滚动(稳定于 {settled:.1},现在 {after:.1})"
+        );
+    }
+
+    /// 用户主动滚动 = 临时接管(#121 口径):滚轮把视口滚离光标后记
+    /// Override,空闲帧不拽回(接管生效);下一次键盘导航帧恢复 Follow
+    /// 并把光标行带回目标带。
+    #[test]
+    fn typewriter_user_scroll_takes_over_until_next_edit() {
+        let ctx = test_ctx();
+        let text = long_doc(500);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+        let mut pending = Some((0, 0));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+
+        // 推进光标到第 45 行附近(导航帧跟随,光标行入带)
+        let down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for i in 0..45 {
+            frame_tw(
+                &ctx,
+                vec![down.clone()],
+                0.1 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        for t in [6.0, 6.1] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        assert_eq!(
+            tw_memory(&ctx).phase,
+            typewriter::Phase::Follow,
+            "导航帧保持跟随态"
+        );
+
+        // 用户滚轮向下滚离光标(光标被甩在视口上方):接管态置入。向下
+        // 滚不撞文档底,smooth_scroll_delta 每帧消费清零 —— 撞边界时 egui
+        // 保留未消费的滚动量不启动下一次消费,会抵消之后恢复帧的 land。
+        let pointer = egui::pos2(400.0, 300.0);
+        let wheel = |delta: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        };
+        for i in 0..8 {
+            frame_tw(
+                &ctx,
+                vec![Event::PointerMoved(pointer), wheel(-120.0)],
+                6.1 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        // 滚轮帧的布局收敛(先空转数帧到稳定,再取 settled)
+        for t in [7.0, 7.1, 7.2] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        assert_eq!(
+            tw_memory(&ctx).phase,
+            typewriter::Phase::Override,
+            "滚轮后接管态置入"
+        );
+        let settled = editor_rect(&ctx, id).top();
+
+        // 接管期间空闲帧:视口不拽回光标(打字机暂停生效)
+        for i in 0..5 {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                8.0 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        let idle_top = editor_rect(&ctx, id).top();
+        assert!(
+            (idle_top - settled).abs() < 20.0,
+            "接管期空闲帧不得拽回光标(稳定于 {settled:.1},现在 {idle_top:.1})"
+        );
+
+        // 下一次键盘导航帧:恢复 Follow 并把光标行带回目标带
+        frame_tw(
+            &ctx,
+            vec![down],
+            9.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        for t in [9.1, 9.2, 9.3, 9.4, 9.5] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        assert_eq!(
+            tw_memory(&ctx).phase,
+            typewriter::Phase::Follow,
+            "编辑/导航帧恢复跟随"
+        );
+        let row_h = editor_rect(&ctx, id).height() / text.lines().count() as f32;
+        let view_y = caret_view_y(&ctx, id, &text, tw_caret_char(&ctx, id));
+        assert!(
+            band(row_h).contains(&view_y),
+            "恢复后光标行回目标带,实测 {view_y:.1}"
+        );
+    }
+
+    /// undo 帧跟随(任务书「undo 后跟随」档):撤销把光标带回第 10 行
+    /// (相对已滚走的视口在带外上方),修订号前进即触发跟随 —— 视口跟
+    /// 回文档头,光标行回目标带。TextEdit 已把 Ctrl+Z 从事件流移除,触发
+    /// 面靠修订号判定(这正是用修订号而不是枚举按键事件的理由)。
+    #[test]
+    fn typewriter_undo_frame_follows() {
+        let ctx = test_ctx();
+        let original = long_doc(500);
+        let mut editor = EditorBuffer::new(&original);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        // 光标落第 200 行,敲一个字制造撤销点(undo 后光标行 y≈3000,
+        // 视口在滚离后的位置上,land 的目标偏移保持为正)
+        let tenth = original
+            .match_indices('\n')
+            .nth(199)
+            .map(|(byte, _)| byte)
+            .unwrap_or(0);
+        let mut pending = Some((editor.byte_to_char(tenth), editor.byte_to_char(tenth)));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        frame_tw(
+            &ctx,
+            vec![Event::Text("字".into())],
+            0.1,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        // 稳定 ≥1s:提交撤销组(与 builtin_undo_redo 同款节奏)
+        frame_tw(
+            &ctx,
+            Vec::new(),
+            1.5,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+
+        // 滚轮把视口滚到第 300 行区域(不动光标、不走写回 —— 程序化写回
+        // 会污染 TextEdit undoer 的 feed_state,undo 就回不到打字前了);
+        // 视口远离光标后,undo 前提就位。向下滚不撞边界(smooth_scroll_
+        // delta 在边界外不消费会残留,egui 会用它抵消之后的 land)。
+        let pointer = egui::pos2(400.0, 300.0);
+        let wheel_down = Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -1200.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        };
+        let mut t = 1.6;
+        for _ in 0..4 {
+            frame_tw(
+                &ctx,
+                vec![Event::PointerMoved(pointer), wheel_down.clone()],
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+            t += 0.1;
+        }
+        for _ in 0..3 {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+            t += 0.1;
+        }
+        let far_top = editor_rect(&ctx, id).top();
+        assert!(
+            far_top < -3000.0,
+            "前置:视口已滚到第 300 行区域(实测 {far_top:.1})"
+        );
+
+        // Ctrl+Z:光标回第 10 行(修订号前进),打字机同帧跟随回带
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_tw(
+            &ctx,
+            vec![undo],
+            t,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        t += 0.1;
+        assert_eq!(editor.text(), original, "前置:undo 回退了那个字");
+        // undo 帧的 land:offset 次帧应用、布局再次帧(留足收敛帧)
+        for _ in 0..5 {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+            t += 0.1;
+        }
+        let row_h = editor_rect(&ctx, id).height() / original.lines().count() as f32;
+        let view_y = caret_view_y(&ctx, id, editor.text(), tw_caret_char(&ctx, id));
+        assert!(
+            band(row_h).contains(&view_y),
+            "undo 后光标行应跟回目标带,实测 {view_y:.1}(视口 top {:.1})",
+            editor_rect(&ctx, id).top()
+        );
+    }
+
+    /// 10000 行档(任务书「大文档」):写回文末 → 钳位滚到底且光标可见;
+    /// 其后同行打字不滚(死区)、换行推进照常跟 —— 决策全程只读一次
+    /// galley 光标行,无逐帧全量重排(结构红线;帧率观感留真机)。
+    #[test]
+    fn typewriter_10000_line_document_tracks_cursor() {
+        let ctx = test_ctx();
+        let text = long_doc(10_000);
+        let mut editor = EditorBuffer::new(&text);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut selection = None;
+
+        let tail = editor.len_chars();
+        let mut pending = Some((tail, tail));
+        let id = frame_tw(
+            &ctx,
+            Vec::new(),
+            0.0,
+            &mut editor,
+            &mut preview,
+            &mut selection,
+            &mut pending,
+            &mut cursor,
+            true,
+        );
+        for t in [0.1, 0.2, 0.3, 0.4, 0.5] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        let rect = editor_rect(&ctx, id);
+        let view_y = caret_view_y(&ctx, id, editor.text(), tw_caret_char(&ctx, id));
+        assert!(
+            rect.bottom() <= 601.5,
+            "文末钳位:视口贴底(实测 bottom {:.1})",
+            rect.bottom()
+        );
+        assert!(
+            (0.0..=600.0).contains(&view_y),
+            "万行档文末光标行可见(实测 {view_y:.1})"
+        );
+
+        // 同行打字(死区内)不滚
+        let settled = rect.top();
+        let x = Event::Text("x".into());
+        for i in 0..5 {
+            frame_tw(
+                &ctx,
+                vec![x.clone()],
+                0.2 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        for t in [1.0, 1.1] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        let same_line_top = editor_rect(&ctx, id).top();
+        assert!(
+            (same_line_top - settled).abs() < 1.0,
+            "同行打字在死区内,视口不动({settled:.1} → {same_line_top:.1})"
+        );
+
+        // 换行推进:文末钳位下视口保持贴底、光标行仍可见
+        let enter = Event::Text("\n".into());
+        for i in 0..3 {
+            frame_tw(
+                &ctx,
+                vec![enter.clone()],
+                1.1 + f64::from(i) * 0.1,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        for t in [2.0, 2.1] {
+            frame_tw(
+                &ctx,
+                Vec::new(),
+                t,
+                &mut editor,
+                &mut preview,
+                &mut selection,
+                &mut pending,
+                &mut cursor,
+                true,
+            );
+        }
+        let rect = editor_rect(&ctx, id);
+        assert!(rect.bottom() <= 601.5, "文末继续打字仍贴底");
+        let view_y = caret_view_y(&ctx, id, editor.text(), tw_caret_char(&ctx, id));
+        assert!(
+            (0.0..=600.0).contains(&view_y),
+            "文末推进后光标行可见(实测 {view_y:.1})"
         );
     }
 

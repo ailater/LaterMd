@@ -81,13 +81,15 @@ const FORMAT_MENU: [&[Command]; 5] = [
     &[Command::ImageInsert, Command::EmojiPicker],
 ];
 
-/// 「视图」两段:布局/外观开关;禅定模式是整套面板组合(不是普通开关),
+/// 「视图」两段:布局/外观开关(打字机模式 #64 与 Live 同段,同为
+/// 编辑区呈现方式开关);禅定模式是整套面板组合(不是普通开关),
 /// 独立一段隔开。
 const VIEW_MENU: [&[Command]; 2] = [
     &[
         Command::ToggleSidebar,
         Command::ToggleRightPreview,
         Command::ToggleLivePreview,
+        Command::TypewriterToggle,
         Command::ToggleTheme,
     ],
     &[Command::ToggleZen],
@@ -163,6 +165,9 @@ fn command_mnemonic(cmd: Command) -> char {
         Command::ToggleSidebar => 'S',
         Command::ToggleRightPreview => 'P',
         Command::ToggleLivePreview => 'V',
+        // W = typewriter 的词尾;视图菜单内 S/P/V/T 已被占用,菜单内唯一
+        // (条目层助记是菜单内命名空间,与全局 Alt 层无关)
+        Command::TypewriterToggle => 'W',
         Command::ToggleTheme => 'T',
         Command::ToggleZen => 'Z',
         Command::ExportHtml => 'H',

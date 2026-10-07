@@ -307,6 +307,7 @@ pub fn ui(
     cursor: &mut OutlineCursor,
     live: &mut LiveState,
     editor_id: egui::Id,
+    show_typewriter: bool,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
@@ -315,6 +316,26 @@ pub fn ui(
     // 它还给活动块 —— 点击 checkbox 的意图是切换勾选,不是转移焦点。预览
     // 面板同帧先画时它已收过首份快照(帧号核对,后画者不覆盖)。
     crate::ui::preview::stash_focus_on_press(panel.ctx());
+
+    // 打字机模式(#64 M1):每标签一份记忆(与源码模式分槽),帧首读、
+    // 帧末写回。关闭态不读写 temp、活动块不进任何打字机分支 —— LP2-3 的
+    // 跟随路径与从前逐字节相同(否决线)。
+    let mut tw = if show_typewriter {
+        panel
+            .ctx()
+            .data(|d| {
+                d.get_temp::<crate::ui::typewriter::Memory>(crate::ui::typewriter::live_memory_id(
+                    editor_id,
+                ))
+            })
+            .unwrap_or_default()
+    } else {
+        crate::ui::typewriter::Memory::default()
+    };
+    let tw_just_enabled = show_typewriter && !tw.enabled;
+    // 闭包回写:编辑/路由落地帧(恢复事件)与打字机自身落地。
+    let mut tw_resumed = false;
+    let mut tw_landed = false;
 
     // 大纲/搜索跳转(LP2-3):与源码模式同一入口(`cursor.jump_to`)、同一
     // 时序口径 —— 当帧把目标块切成活动块并交 pending_caret,本帧闭包内
@@ -561,6 +582,24 @@ pub fn ui(
                         if nav_key && ui.ctx().memory(|mem| mem.has_focus(response_id)) {
                             follow = caret;
                         }
+                        // 打字机模式(#64 M1)的触发面扩展:活动块持焦的
+                        // **修订号前进帧**(打字/IME/undo/redo —— 修订号是
+                        // 不依赖事件枚举的编辑信号)、键盘导航帧(接管后的
+                        // 恢复事件,与源码模式同口径)与开关开启帧也跟随。
+                        // 关闭态整块不进,LP2-3 路径原样。
+                        if show_typewriter {
+                            let edited = tw.last_rev.is_none_or(|rev| rev != editor.revision());
+                            if (edited || nav_key || tw_just_enabled)
+                                && ui.ctx().memory(|mem| mem.has_focus(response_id))
+                            {
+                                follow = follow.or(caret);
+                                tw_resumed = true;
+                                tw.phase = crate::ui::typewriter::step(
+                                    tw.phase,
+                                    crate::ui::typewriter::Turn::Edit,
+                                );
+                            }
+                        }
                     }
                     // 上一帧交过来的光标:落到本块的指定字符偏移并要焦点
                     // (放在回填之后 —— `output.state` 在这里被移走)。写回
@@ -580,22 +619,60 @@ pub fn ui(
                             live.pending_caret = None;
                             if live.caret_follow {
                                 follow = Some(char_idx);
+                                // 跨块路由/大纲跳转 = 光标移动 = 打字机恢复
+                                // 事件(#121 口径)
+                                if show_typewriter {
+                                    tw_resumed = true;
+                                    tw.phase = crate::ui::typewriter::step(
+                                        tw.phase,
+                                        crate::ui::typewriter::Turn::Edit,
+                                    );
+                                }
                             }
                             live.caret_follow = false;
                         }
                     }
                     if let Some(index) = follow {
-                        let rect = output
+                        let row_rect = output
                             .galley
                             .pos_from_cursor(egui::text::CCursor::new(index));
-                        ui.scroll_to_rect(
-                            egui::Rect::from_min_max(
-                                output.galley_pos + rect.min.to_vec2(),
-                                output.galley_pos + rect.max.to_vec2(),
-                            )
-                            .expand(1.5),
-                            None,
-                        );
+                        if show_typewriter {
+                            // 打字机落地:与源码模式同一决策面(1/3 目标线 +
+                            // 死区),单像素矩形 + TOP 对齐一次到位,文首/
+                            // 文末钳位由 egui end() 兜底。
+                            let clip = ui.clip_rect();
+                            let cursor_screen_y = output.galley_pos.y + row_rect.min.y;
+                            let ask = crate::ui::typewriter::ScrollAsk {
+                                view_y: cursor_screen_y - clip.top(),
+                                row_h: row_rect.height().max(1.0),
+                                viewport: clip.height(),
+                            };
+                            if let Some(delta) = crate::ui::typewriter::scroll_delta(&ask) {
+                                let land_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        clip.left() + 1.0,
+                                        clip.top() + delta + ui.spacing().item_spacing.y,
+                                    ),
+                                    egui::vec2(1.0, 1.0),
+                                );
+                                eprintln!("DBG-L-LAND view_y={:.1} delta={:.1}", ask.view_y, delta);
+                                ui.scroll_to_rect_animation(
+                                    land_rect,
+                                    Some(egui::Align::TOP),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                                tw_landed = true;
+                            }
+                        } else {
+                            ui.scroll_to_rect(
+                                egui::Rect::from_min_max(
+                                    output.galley_pos + row_rect.min.to_vec2(),
+                                    output.galley_pos + row_rect.max.to_vec2(),
+                                )
+                                .expand(1.5),
+                                None,
+                            );
+                        }
                     }
                     active_response = Some(response);
                 } else {
@@ -643,6 +720,32 @@ pub fn ui(
         // 点击进编辑不跟随:指针刚把视口定位到点击处(decisions-pending #83)
         live.caret_follow = false;
         live.drag_anchor = None;
+    }
+
+    // 打字机接管判定(#64 M1):本帧偏移动了、且不是打字机自己落的地、
+    // 也不是编辑/路由落地帧 —— 即用户主动滚动,记一次 Override 暂停。
+    // 已知边界(如实):活动块切换引起内容高度变化的 offset 钳位也会被
+    // 记一次(无法与用户滚动区分),后果 = 一次无害的暂停,下次编辑即
+    // 恢复(取舍登记 decisions-pending #121)。帧末写回记忆。
+    if show_typewriter {
+        let in_grace = tw.land_grace > 0;
+        let moved =
+            (scrolled.state.offset.y - tw.last_offset).abs() > crate::ui::typewriter::MOVED_EPSILON;
+        if moved && !tw_landed && !tw_resumed && !in_grace {
+            tw.phase =
+                crate::ui::typewriter::step(tw.phase, crate::ui::typewriter::Turn::UserScroll);
+        }
+        tw.land_grace = if tw_landed {
+            crate::ui::typewriter::LAND_GRACE_FRAMES
+        } else {
+            tw.land_grace.saturating_sub(1)
+        };
+        tw.last_offset = scrolled.state.offset.y;
+        tw.last_rev = Some(editor.revision());
+        tw.enabled = true;
+        panel
+            .ctx()
+            .data_mut(|d| d.insert_temp(crate::ui::typewriter::live_memory_id(editor_id), tw));
     }
     if let Some(route) = route {
         live.active = Some(route.0);
@@ -976,6 +1079,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 egui::Id::new("live-test"),
+                false,
                 &mut outbox,
             );
         });
@@ -1128,6 +1232,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new("live-copy-test"),
+                    false,
                     &mut outbox,
                 );
             },
@@ -1488,6 +1593,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new(FADE_EDITOR_ID),
+                    false,
                     &mut outbox,
                 );
                 let bg = ui.visuals().text_edit_bg_color();
@@ -2126,6 +2232,7 @@ mod tests {
     /// 口径:默认测试视口永远装得下整篇,滚动路径测不到),返回本帧活动块
     /// TextEdit 的屏幕矩形 —— 滚动直接平移屏幕坐标,量 rect 比量内部滚动
     /// state 更黑盒(editor.rs #29 同款)。
+    #[allow(clippy::too_many_arguments)]
     fn live_scroll_frame(
         ctx: &egui::Context,
         time: f64,
@@ -2134,6 +2241,7 @@ mod tests {
         preview: &mut PreviewState,
         cursor: &mut OutlineCursor,
         live: &mut LiveState,
+        show_typewriter: bool,
     ) -> Option<egui::Rect> {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut id = egui::Id::NULL;
@@ -2153,6 +2261,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new(SCROLL_EDITOR_ID),
+                    show_typewriter,
                     &mut outbox,
                 )
                 .id;
@@ -2210,6 +2319,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读");
         assert_eq!(
@@ -2238,6 +2348,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
         for i in 0..45 {
             let _ = live_scroll_frame(
@@ -2248,6 +2359,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         // 光标写回/变化 → 请求滚动 → 动画完成(默认 ≤0.3s)→ 布局生效,各差一帧
@@ -2260,6 +2372,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2270,6 +2383,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读");
         assert!(
@@ -2312,6 +2426,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
 
         let pointer = egui::pos2(400.0, 300.0);
@@ -2331,6 +2446,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         // 滚动带动画:空转几帧让偏移落到最终值
@@ -2343,6 +2459,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let settled = live_scroll_frame(
@@ -2353,6 +2470,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读")
         .top();
@@ -2368,6 +2486,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let after = live_scroll_frame(
@@ -2378,6 +2497,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读")
         .top();
@@ -2414,6 +2534,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
 
         // ↑ 在块首 → 路由到段落块末尾
@@ -2425,6 +2546,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
         assert_eq!(live.active, Some(0), "路由切换活动块:{live:?}");
         assert_eq!(
@@ -2442,6 +2564,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
         let caret = scroll_block_caret(&ctx, 0).expect("目标块光标已写入");
         assert_eq!(caret, live.block_char_len(&editor, 0), "光标落在上一块末尾");
@@ -2465,6 +2588,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let top_next = live_scroll_frame(
@@ -2475,6 +2599,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读")
         .top();
@@ -2493,6 +2618,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2503,6 +2629,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读");
         assert!(rect.top() < 0.0, "视口离开文档顶部(实测 {})", rect.top());
@@ -2543,6 +2670,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
         assert_eq!(live.blocks.len(), 3, "标题/段落/标题:{:?}", live.blocks);
 
@@ -2564,6 +2692,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         );
         assert_eq!(live.active, Some(target), "跳转目标块成为活动块:{live:?}");
         assert_eq!(
@@ -2589,6 +2718,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let top_next = live_scroll_frame(
@@ -2599,6 +2729,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读")
         .top();
@@ -2617,6 +2748,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2627,6 +2759,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
         )
         .expect("活动块响应可读");
         let y = caret_screen_y(
@@ -2642,6 +2775,420 @@ mod tests {
             cursor.byte,
             Some(heading_byte),
             "光标回填随跳转落位(标题行首字节)"
+        );
+    }
+
+    // —— 打字机模式(#64 M1,Live 活动块)——
+
+    /// 读 Live 打字机记忆(接管状态机探针;live_memory_id 分槽)。
+    fn live_tw_memory(ctx: &egui::Context) -> crate::ui::typewriter::Memory {
+        ctx.data(|d| {
+            d.get_temp::<crate::ui::typewriter::Memory>(crate::ui::typewriter::live_memory_id(
+                egui::Id::new(SCROLL_EDITOR_ID),
+            ))
+        })
+        .unwrap_or_default()
+    }
+
+    /// Live 打字机跟随(任务书「两模式各自验证」的 Live 档):活动块持焦、
+    /// ArrowDown 逐行下移越出首屏后,光标行停在目标带(600 视口的 1/3 线
+    /// ±死区 + 一个行步进)—— 与源码模式同一决策面,不是 LP2-3 的最小
+    /// 滚入(关闭态仍走最小滚入,见 live_keyboard_navigation_scrolls_
+    /// caret_into_view)。
+    #[test]
+    fn live_typewriter_keeps_caret_row_near_anchor() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(0),
+            ..LiveState::default()
+        };
+        live.pending_caret = Some((0, 0));
+        live.caret_follow = false;
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        // 空转一帧再进导航键(set_focus_lock_filter,既有口径)
+        let _ = live_scroll_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let down = arrow(egui::Key::ArrowDown);
+        for i in 0..45 {
+            let _ = live_scroll_frame(
+                &ctx,
+                0.1 + f64::from(i) * 0.1,
+                vec![down.clone()],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        for t in [6.2, 6.3] {
+            let _ = live_scroll_frame(
+                &ctx,
+                t,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            6.4,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        )
+        .expect("活动块响应可读");
+        let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            caret,
+        );
+        let row_h = rect.height()
+            / BlockBuffer::slice(editor.text(), &live.blocks[0])
+                .lines()
+                .count()
+                .max(1) as f32;
+        let anchor = 600.0 * crate::ui::typewriter::ANCHOR_RATIO;
+        assert!(
+            ((anchor - crate::ui::typewriter::DEAD_ZONE_ROWS * row_h - row_h)
+                ..=(anchor + crate::ui::typewriter::DEAD_ZONE_ROWS * row_h + row_h))
+                .contains(&y),
+            "Live 导航后光标行应停在目标带,实测 {y:.1}(行高 {row_h:.1})"
+        );
+    }
+
+    /// Live 打字机打字帧跟随:活动块内逐帧敲换行推进,光标行保持在目标
+    /// 带内(修订号前进触发;关闭态打字帧不滚,见既有 wheel/idle 测试)。
+    #[test]
+    fn live_typewriter_typing_frames_follow() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(0),
+            ..LiveState::default()
+        };
+        live.pending_caret = Some((0, 0));
+        live.caret_follow = false;
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        // 焦点锁过滤帧
+        let _ = live_scroll_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+
+        // 换行走 Event::Key Enter(egui 过滤 Event::Text 中的 "\n");每帧
+        // 之间插空转,对齐真实打字节奏(见 editor 侧同款测试)
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let mut t = 0.1;
+        for _ in 0..30 {
+            let _ = live_scroll_frame(
+                &ctx,
+                t,
+                vec![enter.clone()],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+            t += 0.1;
+            for _ in 0..2 {
+                let _ = live_scroll_frame(
+                    &ctx,
+                    t,
+                    Vec::new(),
+                    &mut editor,
+                    &mut preview,
+                    &mut cursor,
+                    &mut live,
+                    true,
+                );
+                t += 0.05;
+            }
+        }
+        // 打字机 land:offset 次帧 begin 应用、布局再次帧反映
+        for _ in 0..3 {
+            let _ = live_scroll_frame(
+                &ctx,
+                t,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+            t += 0.05;
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            t,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        )
+        .expect("活动块响应可读");
+        let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            caret,
+        );
+        let row_h = rect.height()
+            / BlockBuffer::slice(editor.text(), &live.blocks[0])
+                .lines()
+                .count()
+                .max(1) as f32;
+        let anchor = 600.0 * crate::ui::typewriter::ANCHOR_RATIO;
+        assert!(
+            ((anchor - crate::ui::typewriter::DEAD_ZONE_ROWS * row_h - row_h)
+                ..=(anchor + crate::ui::typewriter::DEAD_ZONE_ROWS * row_h + row_h))
+                .contains(&y),
+            "Live 打字推进后光标行应停在目标带,实测 {y:.1}"
+        );
+    }
+
+    /// Live 用户滚动接管:滚轮滚离光标 → Override(空闲帧不拽回);下一
+    /// 次键盘导航帧恢复 Follow 并把光标行带回目标带(与源码模式同口径)。
+    #[test]
+    fn live_typewriter_user_scroll_takes_over_until_next_edit() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new(&scroll_doc_lines(100));
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState {
+            active: Some(0),
+            ..LiveState::default()
+        };
+        live.pending_caret = Some((0, 0));
+        live.caret_follow = false;
+        let _ = live_scroll_frame(
+            &ctx,
+            0.0,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let _ = live_scroll_frame(
+            &ctx,
+            0.05,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let down = arrow(egui::Key::ArrowDown);
+        for i in 0..45 {
+            let _ = live_scroll_frame(
+                &ctx,
+                0.1 + f64::from(i) * 0.1,
+                vec![down.clone()],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        for t in [6.2, 6.3, 6.4] {
+            let _ = live_scroll_frame(
+                &ctx,
+                t,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        assert_eq!(
+            live_tw_memory(&ctx).phase,
+            crate::ui::typewriter::Phase::Follow,
+            "导航帧保持跟随态"
+        );
+
+        // 用户滚轮向下滚离(光标被甩在视口上方;不撞边界,滚轮量不残留)
+        let pointer = egui::pos2(400.0, 300.0);
+        let wheel = |delta: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: Default::default(),
+        };
+        for i in 0..8 {
+            let _ = live_scroll_frame(
+                &ctx,
+                6.5 + f64::from(i) * 0.1,
+                vec![egui::Event::PointerMoved(pointer), wheel(-120.0)],
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        let _ = live_scroll_frame(
+            &ctx,
+            7.4,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let settled = live_scroll_frame(
+            &ctx,
+            7.5,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        )
+        .expect("活动块响应可读")
+        .top();
+        assert_eq!(
+            live_tw_memory(&ctx).phase,
+            crate::ui::typewriter::Phase::Override,
+            "滚轮后接管态置入"
+        );
+        for i in 0..5 {
+            let after = live_scroll_frame(
+                &ctx,
+                8.0 + f64::from(i) * 0.1,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            )
+            .expect("活动块响应可读")
+            .top();
+            assert!(
+                (after - settled).abs() < 1.0,
+                "接管期空闲帧不得拽回(稳定于 {settled:.1},现在 {after:.1})"
+            );
+        }
+
+        // 下一次导航帧:恢复 Follow,光标行回目标带
+        let _ = live_scroll_frame(
+            &ctx,
+            9.0,
+            vec![down],
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        for t in [9.1, 9.2, 9.3, 9.4] {
+            let _ = live_scroll_frame(
+                &ctx,
+                t,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+            eprintln!("DBG-LV{t} tw={:?}", live_tw_memory(&ctx));
+        }
+        let rect = live_scroll_frame(
+            &ctx,
+            9.5,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        )
+        .expect("活动块响应可读");
+        assert_eq!(
+            live_tw_memory(&ctx).phase,
+            crate::ui::typewriter::Phase::Follow,
+            "编辑/导航帧恢复跟随"
+        );
+        let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
+        let y = caret_screen_y(
+            rect,
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+            caret,
+        );
+        let row_h = rect.height()
+            / BlockBuffer::slice(editor.text(), &live.blocks[0])
+                .lines()
+                .count()
+                .max(1) as f32;
+        let anchor = 600.0 * crate::ui::typewriter::ANCHOR_RATIO;
+        assert!(
+            ((anchor - crate::ui::typewriter::DEAD_ZONE_ROWS * row_h - row_h)
+                ..=(anchor + crate::ui::typewriter::DEAD_ZONE_ROWS * row_h + row_h))
+                .contains(&y),
+            "恢复后光标行回目标带,实测 {y:.1}"
         );
     }
 

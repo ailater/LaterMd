@@ -176,6 +176,13 @@ pub enum Command {
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
     ToggleZen,
+    /// 打字机模式(#64 M1):光标所在行滚动保持视口 1/3 线(源码与 Live
+    /// 两模式同一开关)。Ctrl/Cmd+Alt+W:出厂表 W 键无第二个占用者
+    /// (Ctrl/Cmd+W 是关标签,差一个 Alt 由「修饰键个数降序」的消费顺序
+    /// 共存,与 EmojiPicker/ExportHtml 同款),Alt 层字母 F/E/O/V/X/A/S/T
+    /// 已被菜单标题助记与主题键占用(#119/#45 K1),W 空闲 —— 避让口径
+    /// 与冲突审计见 decisions-pending #121。
+    TypewriterToggle,
 }
 
 impl Command {
@@ -186,7 +193,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 40] = [
+    pub const ALL: [Command; 41] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
@@ -227,6 +234,7 @@ impl Command {
         Self::GotoLine,
         Self::ToggleRightPreview,
         Self::ToggleZen,
+        Self::TypewriterToggle,
     ];
 
     /// 格式命令 → 对应的动作,非格式命令为 `None`。
@@ -286,7 +294,8 @@ impl Command {
             | Self::ToggleSidebar
             | Self::ToggleRightPreview
             | Self::ToggleLivePreview
-            | Self::ToggleZen => CommandGroup::View,
+            | Self::ToggleZen
+            | Self::TypewriterToggle => CommandGroup::View,
             Self::TabNext | Self::TabClose | Self::TabRestore => CommandGroup::Tab,
             Self::ExportHtml | Self::ExportPdf => CommandGroup::Export,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => CommandGroup::Ai,
@@ -337,6 +346,7 @@ impl Command {
             Self::GotoLine => "goto_line",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
+            Self::TypewriterToggle => "toggle_typewriter",
         }
     }
 
@@ -386,6 +396,7 @@ impl Command {
             Self::GotoLine => "跳转到行",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
+            Self::TypewriterToggle => "打字机模式",
         }
     }
 
@@ -501,6 +512,14 @@ impl Command {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
             Self::ToggleZen => egui::KeyboardShortcut::new(Modifiers::NONE, egui::Key::F11),
+            // 打字机模式(#64 M1):Ctrl/Cmd+Alt+W。出厂表整条 Shortcut 无
+            // 占用者;与 Ctrl/Cmd+W(关标签)只差一个 Alt,消费顺序按修饰键
+            // 个数降序互不抢(#9 口径的撞键核查在 tests)。Alt 层纯字母
+            // (F/E/O/V/X/A/S/T)是菜单标题助记与主题键的命名空间,避让
+            // 口径见 decisions-pending #121。
+            Self::TypewriterToggle => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::W)
+            }
             // 无快捷键。前三条是 AI 联调入口:不抢键位,等 provider 选型
             // 定案再定;FormatDivider/FormatTable 只从工具条按钮触发
             // (插画布性质的动作,不像加粗那样高频到需要键位);ExportPdf
@@ -556,6 +575,9 @@ impl Command {
             | Self::GotoLine => Icon::Search,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
+            // 与视图组两个开关共用禅定同心圆(icons 无打字机专用形;既有
+            // 「多命令一图标」先例:ToggleLivePreview/ToggleZen 同源)
+            Self::TypewriterToggle => Icon::Zen,
         }
     }
 
@@ -582,6 +604,10 @@ impl Command {
             Self::TabRestore => Message::TabRestore,
             Self::ToggleRightPreview => Message::RightPanelToggled,
             Self::ToggleZen => Message::ZenToggled,
+            // 菜单/快捷键是「翻转」语义(现值在 State 里,消息层拿不到),
+            // 走无参翻转消息(与 ToggleLivePreview/ZenToggled 同构);带值
+            // 的 TypewriterToggled(bool) 归设置页复选框专用。
+            Self::TypewriterToggle => Message::ToggleTypewriter,
             // 十六条格式动作一条 match 收干:动作枚举已经在 cmd 里定死了,
             // 这里只把它装进消息,语义一律看 `compose::apply`
             Self::FormatBold
@@ -989,6 +1015,67 @@ mod tests {
         assert_eq!(Command::GotoLine.message(), Message::GotoBarToggled(true));
     }
 
+    /// 打字机模式(#64 M1)默认键位:Ctrl/Cmd+Alt+W,出厂表无第二个占用者
+    /// (#9 口径的撞键核查);与 Ctrl/Cmd+W(关标签)只差一个 Alt,靠
+    /// 「修饰键个数降序」的消费顺序共存(与 EmojiPicker/ExportHtml 同款
+    /// —— Shift 组合先被问到,这里 Alt 组合同理)。Alt 层纯字母(F/E/O/
+    /// V/X/A/S/T)是菜单标题助记与主题键(#119/#45 K1)的命名空间,W 在
+    /// 那一层空闲(避让口径见 decisions-pending #121)。真按键只触发这一
+    /// 条,消息映射到无参翻转消息。
+    #[test]
+    fn typewriter_shortcut_is_ctrl_alt_w_and_conflict_free() {
+        let ctrl_alt_w = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::ALT,
+            key: Key::W,
+        };
+        assert_eq!(
+            Command::TypewriterToggle
+                .default_shortcut()
+                .map(|shortcut| {
+                    crate::keymap::Shortcut {
+                        modifiers: shortcut.modifiers,
+                        key: shortcut.logical_key,
+                    }
+                }),
+            Some(ctrl_alt_w),
+            "TypewriterToggle 出厂默认 = Ctrl/Cmd+Alt+W"
+        );
+        assert_eq!(
+            Keymap::builtin().get(Command::TypewriterToggle),
+            Some(ctrl_alt_w)
+        );
+        assert_eq!(
+            Keymap::builtin().conflict(Command::TypewriterToggle, ctrl_alt_w),
+            None,
+            "Ctrl/Cmd+Alt+W 不该撞任何出厂键位"
+        );
+        assert_eq!(
+            Command::TypewriterToggle.group(),
+            CommandGroup::View,
+            "打字机是视图命令(菜单「视图」/蒙层同一归属)"
+        );
+
+        // Alt 组合先被问到,Ctrl+W 不得误吞
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::W, Modifiers::COMMAND | Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::TypewriterToggle]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            Command::TypewriterToggle.message(),
+            Message::ToggleTypewriter
+        );
+    }
+
     /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T,
     /// 不撞任何出厂键位;Cmd/Ctrl+Shift+T 的占用者 == TabRestore(#45 K2
     /// 落地后的联动断言,浏览器「恢复关闭标签」同款),且不与任何其他
@@ -1125,7 +1212,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 40);
+        assert_eq!(Command::ALL.len(), 41);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();

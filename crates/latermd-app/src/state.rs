@@ -948,6 +948,15 @@ pub enum Message {
     /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
     /// 全局偏好,非每标签)。
     ShowMinimapToggled(bool),
+    /// 打字机模式开关设值(#64 M1):外观页复选框产出,落
+    /// `theme.show_typewriter` 并即时写 settings.json(minimap 开关
+    /// 同款通路;全局偏好,源码与 Live 两模式共用一个开关)。
+    TypewriterToggled(bool),
+    /// 打字机模式开关翻转(#64 M1):视图菜单条目/快捷键产出 —— 菜单与
+    /// 快捷键是「翻转」语义(现值在 State,消息层拿不到),与设置页的
+    /// 带值消息([`Message::TypewriterToggled`])分立;归约同样即时写
+    /// settings.json。
+    ToggleTypewriter,
     /// 禅定导航显示方式切换(#57 M2):外观页三态选择产出,落
     /// `theme.zen_nav` 并即时写 settings.json(与 minimap 开关同款通路)。
     /// 归约同时复位会话级悬停态:新模式从干净状态起算(常显不继承旧会话
@@ -1154,6 +1163,14 @@ impl State {
             }
             Message::ShowMinimapToggled(show) => {
                 self.theme.show_minimap = show;
+                self.persist_theme();
+            }
+            Message::TypewriterToggled(on) => {
+                self.theme.show_typewriter = on;
+                self.persist_theme();
+            }
+            Message::ToggleTypewriter => {
+                self.theme.show_typewriter = !self.theme.show_typewriter;
                 self.persist_theme();
             }
             Message::ZenNavModeChanged(mode) => {
@@ -4709,6 +4726,32 @@ mod tests {
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(!reloaded.show_minimap, "重启后仍为关");
         assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #64 M1:打字机开关消息归约落 `theme.show_typewriter` 并即时写
+    /// settings.json;重启(load_from)后值仍在。只动该字段,minimap 与
+    /// 排版偏好不受影响(#55 同款通路)。
+    #[test]
+    fn show_typewriter_toggle_updates_field_and_persists() {
+        let dir = temp_path("show-typewriter-toggle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert!(!state.theme.show_typewriter, "出厂默认关");
+        let font_before = state.theme.editor_font_size;
+
+        state.apply(Message::TypewriterToggled(true));
+        assert!(state.theme.show_typewriter);
+        state.apply(Message::TypewriterToggled(false));
+        assert!(!state.theme.show_typewriter, "往返翻回关");
+        state.apply(Message::TypewriterToggled(true));
+
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert!(reloaded.show_typewriter, "重启后仍为开");
+        assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        assert!(reloaded.show_minimap, "minimap 开关不受影响");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
