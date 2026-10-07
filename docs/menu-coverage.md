@@ -28,6 +28,8 @@
 | 关闭标签 TabClose | 菜单「文件」尾段 · 标签条 × · 快速打开 | Ctrl/Cmd+W |
 | 恢复关闭的标签 TabRestore | 菜单「文件」尾段 · 快速打开 | Ctrl/Cmd+Shift+T(#45 K2) |
 | 切换 Live Preview ToggleLivePreview | **菜单「视图」(M1 补)** · 快速打开 | Ctrl/Cmd+/ |
+| 打字机模式 TypewriterToggle | **菜单「视图」(#64 M1 补)** · 外观设置页复选框 · 快速打开 | Ctrl/Cmd+Alt+W |
+| 专注模式 FocusModeToggle | **菜单「视图」(#64 M2 补)** · 外观设置页复选框 · 快速打开 | Ctrl/Cmd+Alt+D |
 | 加粗 FormatBold | **菜单「格式」(M1 补)** · 格式工具条 · 快速打开 | Ctrl/Cmd+B |
 | 斜体 FormatItalic | 同上 | Ctrl/Cmd+I |
 | 删除线 FormatStrike | 同上 | Ctrl/Cmd+Shift+X |
