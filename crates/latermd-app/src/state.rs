@@ -948,6 +948,24 @@ pub enum Message {
     /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
     /// 全局偏好,非每标签)。
     ShowMinimapToggled(bool),
+    /// 打字机模式开关设值(#64 M1):外观页复选框产出,落
+    /// `theme.show_typewriter` 并即时写 settings.json(minimap 开关
+    /// 同款通路;全局偏好,源码与 Live 两模式共用一个开关)。
+    TypewriterToggled(bool),
+    /// 打字机模式开关翻转(#64 M1):视图菜单条目/快捷键产出 —— 菜单与
+    /// 快捷键是「翻转」语义(现值在 State,消息层拿不到),与设置页的
+    /// 带值消息([`Message::TypewriterToggled`])分立;归约同样即时写
+    /// settings.json。
+    ToggleTypewriter,
+    /// 专注模式开关设值(#64 M2):外观页复选框产出,落
+    /// `theme.show_focus_mode` 并即时写 settings.json(typewriter 开关
+    /// 同款通路;全局偏好,仅 Live 模式淡化非活动块)。
+    FocusModeToggled(bool),
+    /// 专注模式开关翻转(#64 M2):视图菜单条目/快捷键产出 —— 菜单与
+    /// 快捷键是「翻转」语义(现值在 State,消息层拿不到),与设置页的
+    /// 带值消息([`Message::FocusModeToggled`])分立;归约同样即时写
+    /// settings.json。
+    ToggleFocusMode,
     /// 禅定导航显示方式切换(#57 M2):外观页三态选择产出,落
     /// `theme.zen_nav` 并即时写 settings.json(与 minimap 开关同款通路)。
     /// 归约同时复位会话级悬停态:新模式从干净状态起算(常显不继承旧会话
@@ -1154,6 +1172,22 @@ impl State {
             }
             Message::ShowMinimapToggled(show) => {
                 self.theme.show_minimap = show;
+                self.persist_theme();
+            }
+            Message::TypewriterToggled(on) => {
+                self.theme.show_typewriter = on;
+                self.persist_theme();
+            }
+            Message::ToggleTypewriter => {
+                self.theme.show_typewriter = !self.theme.show_typewriter;
+                self.persist_theme();
+            }
+            Message::FocusModeToggled(on) => {
+                self.theme.show_focus_mode = on;
+                self.persist_theme();
+            }
+            Message::ToggleFocusMode => {
+                self.theme.show_focus_mode = !self.theme.show_focus_mode;
                 self.persist_theme();
             }
             Message::ZenNavModeChanged(mode) => {
@@ -4708,6 +4742,66 @@ mod tests {
 
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(!reloaded.show_minimap, "重启后仍为关");
+        assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #64 M1:打字机开关消息归约落 `theme.show_typewriter` 并即时写
+    /// settings.json;重启(load_from)后值仍在。只动该字段,minimap 与
+    /// 排版偏好不受影响(#55 同款通路)。
+    #[test]
+    fn show_typewriter_toggle_updates_field_and_persists() {
+        let dir = temp_path("show-typewriter-toggle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert!(!state.theme.show_typewriter, "出厂默认关");
+        let font_before = state.theme.editor_font_size;
+
+        state.apply(Message::TypewriterToggled(true));
+        assert!(state.theme.show_typewriter);
+        state.apply(Message::TypewriterToggled(false));
+        assert!(!state.theme.show_typewriter, "往返翻回关");
+        state.apply(Message::TypewriterToggled(true));
+
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert!(reloaded.show_typewriter, "重启后仍为开");
+        assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        assert!(reloaded.show_minimap, "minimap 开关不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #64 M2:专注模式开关消息(带值设值 + 无参翻转)归约落
+    /// `theme.show_focus_mode` 并即时写 settings.json;重启(load_from)后
+    /// 值仍在。只动该字段,打字机与排版偏好不受影响(#55 同款通路)。
+    #[test]
+    fn show_focus_mode_toggle_updates_field_and_persists() {
+        let dir = temp_path("show-focus-mode-toggle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert!(!state.theme.show_focus_mode, "出厂默认关");
+        let font_before = state.theme.editor_font_size;
+
+        // 设置页带值消息:设值即落
+        state.apply(Message::FocusModeToggled(true));
+        assert!(state.theme.show_focus_mode);
+        state.apply(Message::FocusModeToggled(false));
+        assert!(!state.theme.show_focus_mode, "往返翻回关");
+
+        // 菜单/快捷键无参翻转:翻即取反
+        state.apply(Message::ToggleFocusMode);
+        assert!(state.theme.show_focus_mode);
+        state.apply(Message::ToggleFocusMode);
+        assert!(!state.theme.show_focus_mode, "再翻回关");
+
+        // 持久化以最后一次翻转为准(关),重启读档一致
+        state.apply(Message::FocusModeToggled(true));
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert!(reloaded.show_focus_mode, "重启后仍为开");
+        assert!(!reloaded.show_typewriter, "打字机开关不受影响");
         assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
         let _ = std::fs::remove_dir_all(&dir);
     }

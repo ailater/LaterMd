@@ -984,6 +984,9 @@ mod tests {
                     RenderMode::Source,
                     editor_id,
                     show_minimap,
+                    // 打字机/专注关:本模块测试验 minimap 自身路径
+                    false,
+                    false,
                     &mut Vec::new(),
                 );
             },
@@ -1704,6 +1707,8 @@ mod tests {
                     RenderMode::Live,
                     editor_id,
                     true,
+                    false,
+                    false,
                     &mut Vec::new(),
                 );
             },

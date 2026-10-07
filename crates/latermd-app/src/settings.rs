@@ -505,6 +505,26 @@ fn appearance(
     {
         outbox.push(Message::ShowMinimapToggled(show_minimap));
     }
+    // #64 M1:打字机模式开关(#55 同款「回显副本 + changed() 即时发消息」
+    // 模式)。全局偏好,源码与 Live 两模式共用;默认关(改变滚动行为的
+    // 功能出厂不替用户决定,取舍见 decisions-pending #121)。
+    let mut show_typewriter = theme.show_typewriter;
+    if ui
+        .checkbox(&mut show_typewriter, "打字机模式(光标行保持视口 1/3 线)")
+        .changed()
+    {
+        outbox.push(Message::TypewriterToggled(show_typewriter));
+    }
+    // #64 M2:专注模式开关(#55 同款「回显副本 + changed() 即时发消息」
+    // 模式)。全局偏好;Live 模式淡化非活动块,源码模式不接线(单
+    // TextEdit 无法分段淡化,decisions-pending #122);默认关。
+    let mut show_focus_mode = theme.show_focus_mode;
+    if ui
+        .checkbox(&mut show_focus_mode, "专注模式(Live 下淡化光标块之外的块)")
+        .changed()
+    {
+        outbox.push(Message::FocusModeToggled(show_focus_mode));
+    }
 
     ui.add_space(crate::ui::tokens::SPACE_MD);
     ui.label("禅定模式:");

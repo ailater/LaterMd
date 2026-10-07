@@ -279,6 +279,19 @@ pub struct ThemeSettings {
     /// 一致,取舍登记 decisions-pending #105);关闭时编辑器走与从前
     /// 逐字节相同的路径(零 minimap 元素,ui::editor 的否决线)。
     pub show_minimap: bool,
+    /// 打字机模式开关(#64 M1):开启后光标所在行滚动保持视口 1/3 线
+    /// (源码与 Live 两模式;全局偏好,照 #55 minimap 开关同款通路落
+    /// settings.json,旧档缺字段由 struct 级 `#[serde(default)]` 兜底)。
+    /// 默认**关** —— 它改变滚动行为,出厂不替用户决定;关闭时编辑器滚动
+    /// 路径与从前逐字节相同(否决线,decisions-pending #121)。
+    pub show_typewriter: bool,
+    /// 专注模式开关(#64 M2):开启后 Live 模式淡化非活动块(遮罩纯绘制,
+    /// 照 #81/#55 通路落 settings.json,旧档缺字段由 struct 级
+    /// `#[serde(default)]` 兜底)。默认**关** —— 强视觉改变,出厂不替用户
+    /// 决定;关闭时 Live 绘制路径与从前逐像素相同(否决线,
+    /// decisions-pending #122)。仅 Live 模式生效:源码是单个 TextEdit,
+    /// 分段淡化不接线(边界同登记 #122)。
+    pub show_focus_mode: bool,
     /// 禅定模式左缘标签导航的显示方式(#57 M2):全局偏好,照 #55 minimap
     /// 开关先例落 settings.json(旧档缺字段由 struct 级 `#[serde(default)]`
     /// 兜底回悬停)。关闭档在禅定帧走零路径(不进任何绘制分支)。
@@ -312,6 +325,8 @@ impl Default for ThemeSettings {
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             line_height: LINE_HEIGHT_DEFAULT,
             show_minimap: true,
+            show_typewriter: false,
+            show_focus_mode: false,
             zen_nav: ZenNavMode::default(),
             overrides: None,
             emoji_recent: Vec::new(),
@@ -1123,6 +1138,52 @@ mod tests {
         // 旧版 settings.json 没有 show_minimap:serde(default) 兜底回 true
         std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
         assert!(ThemeSettings::load_from(&dir).unwrap().show_minimap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #64 M1:打字机模式开关随 settings.json 往返;默认**关**(它改变
+    /// 滚动行为,出厂不替用户决定,取舍见 decisions-pending #121);旧文件
+    /// 缺该项由 serde(default) 兜底回关(关闭 = 现状,升级零行为变化)。
+    #[test]
+    fn show_typewriter_round_trips_and_old_settings_default_off() {
+        assert!(!ThemeSettings::default().show_typewriter, "出厂默认关");
+
+        let dir = temp_dir("show-typewriter");
+        let settings = ThemeSettings {
+            show_typewriter: true,
+            ..ThemeSettings::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(json.contains(r#""show_typewriter": true"#), "{json}");
+
+        // 旧版 settings.json 没有 show_typewriter:serde(default) 兜底回关
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert!(!ThemeSettings::load_from(&dir).unwrap().show_typewriter);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #64 M2:专注模式开关随 settings.json 往返;默认**关**(强视觉改变,
+    /// 出厂不替用户决定,取舍见 decisions-pending #122);旧文件缺该项由
+    /// serde(default) 兜底回关(关闭 = 逐像素现状,升级零行为变化)。
+    #[test]
+    fn show_focus_mode_round_trips_and_old_settings_default_off() {
+        assert!(!ThemeSettings::default().show_focus_mode, "出厂默认关");
+
+        let dir = temp_dir("show-focus-mode");
+        let settings = ThemeSettings {
+            show_focus_mode: true,
+            ..ThemeSettings::default()
+        };
+        settings.save_to(Some(&dir)).unwrap();
+        assert_eq!(ThemeSettings::load_from(&dir).unwrap(), settings);
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(json.contains(r#""show_focus_mode": true"#), "{json}");
+
+        // 旧版 settings.json 没有 show_focus_mode:serde(default) 兜底回关
+        std::fs::write(dir.join(SETTINGS_FILE), br#"{"mode":"dark"}"#).unwrap();
+        assert!(!ThemeSettings::load_from(&dir).unwrap().show_focus_mode);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
