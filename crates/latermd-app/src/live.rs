@@ -84,11 +84,12 @@ pub struct LiveState {
     /// 地方(#29「滚轮/空闲帧不抢滚动」的同族红线)。与 pending_caret
     /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。
     caret_follow: bool,
-    /// 任务 checkbox 链接改写的块级缓存(#63):块序号 → (修订号, 改写后
-    /// 块文本)。富渲染块每帧渲染,改写要解析块文本,稳态帧不该重付
-    /// (与 `marks` 缓存同一条纪律,只是富渲染块逐块都要,不是单槽)。
-    /// 修订号前进时整表清空(块序号随编辑漂移,旧条目不可信)。
-    task_cache: std::collections::HashMap<usize, (u64, String)>,
+    /// 富渲染块链接改写的块级缓存(#63;#65 M2 起高亮层并入同一条缓存):
+    /// 块序号 → (修订号, 改写后块文本)。富渲染块每帧渲染,改写要解析
+    /// 块文本,稳态帧不该重付(与 `marks` 缓存同一条纪律,只是富渲染块
+    /// 逐块都要,不是单槽)。修订号前进时整表清空(块序号随编辑漂移,
+    /// 旧条目不可信)。
+    rich_cache: std::collections::HashMap<usize, (u64, String)>,
 }
 
 impl LiveState {
@@ -108,22 +109,25 @@ impl LiveState {
         }
         self.blocks = latermd_md::blocks(editor.text());
         self.synced_rev = Some(rev);
-        self.task_cache.clear();
+        self.rich_cache.clear();
         self.active = cursor_byte
             .and_then(|byte| self.block_containing(byte))
             .or_else(|| self.active.filter(|index| *index < self.blocks.len()));
     }
 
-    /// 富渲染块的 checkbox 链接改写文本(#63):缓存命中直取,未命中重算
-    /// 并入表。快路径让无 `[` 的块近似零成本(不启动解析)。
-    fn task_block(&mut self, index: usize, rev: u64, block_text: &str) -> String {
-        if let Some((seen_rev, cached)) = self.task_cache.get(&index) {
+    /// 富渲染块的链接改写文本(#63 checkbox + #65 高亮):缓存命中直取,
+    /// 未命中重算并入表。层序与预览四层链一致(高亮在任务之前,生产顺序
+    /// wikilink → 高亮 → emoji → 任务的 Live 子集);两层各有「无目标字符
+    /// 不启动解析」的快路径,两层快路径直接恒等返回。
+    fn rich_block(&mut self, index: usize, rev: u64, block_text: &str) -> String {
+        if let Some((seen_rev, cached)) = self.rich_cache.get(&index) {
             if *seen_rev == rev {
                 return cached.clone();
             }
         }
-        let (rendered, _) = latermd_md::expand_task_links(block_text);
-        self.task_cache.insert(index, (rev, rendered.clone()));
+        let (after_highlight, _) = latermd_md::expand_highlight_links(block_text);
+        let (rendered, _) = latermd_md::expand_task_links(&after_highlight);
+        self.rich_cache.insert(index, (rev, rendered.clone()));
         rendered
     }
 
@@ -152,7 +156,7 @@ impl LiveState {
         self.marks = None;
         self.drag_anchor = None;
         self.caret_follow = false;
-        self.task_cache.clear();
+        self.rich_cache.clear();
     }
 }
 
@@ -169,11 +173,22 @@ struct LiveRichHandler<'a> {
     mermaid: &'a crate::ui::mermaid::LiveMermaidHandler,
     /// 本块在全文中的字节起点(checkbox 探针坐标域携带,帧末命中换算用)。
     task_base: usize,
+    /// 正文文本色(#65 M2 高亮取色用;构造时取真实 visuals,与预览
+    /// handler 同一纪律 —— 不用 `Visuals::dark()/light()` 推)。
+    text_color: egui::Color32,
 }
 
 impl<'a> LiveRichHandler<'a> {
-    fn new(mermaid: &'a crate::ui::mermaid::LiveMermaidHandler, task_base: usize) -> Self {
-        Self { mermaid, task_base }
+    fn new(
+        mermaid: &'a crate::ui::mermaid::LiveMermaidHandler,
+        task_base: usize,
+        text_color: egui::Color32,
+    ) -> Self {
+        Self {
+            mermaid,
+            task_base,
+            text_color,
+        }
     }
 }
 
@@ -192,8 +207,15 @@ impl LinkHandler for LiveRichHandler<'_> {
     }
 
     /// 与预览 handler 同款意图声明:checkbox 不吃超链接样式(占位透明,
-    /// 视觉由自绘接管;同时兜住退化路径)。
+    /// 视觉由自绘接管;同时兜住退化路径);`hl://`(#65 M2)同样不是
+    /// 可点链接,正文色 + 无下划线,下划线颜色的处理与预览一致。
     fn link_style(&self, href: &str) -> Option<LinkStyle> {
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(self.text_color),
+                underline: false,
+            });
+        }
         href.starts_with(latermd_md::TASK_SCHEME)
             .then_some(LinkStyle {
                 color: None,
@@ -202,21 +224,32 @@ impl LinkHandler for LiveRichHandler<'_> {
     }
 
     fn click(&self, _text: &str, href: &str, _ui: &mut egui::Ui) -> bool {
+        // `hl://`(#65 M2):高亮没有点击语义,吞掉不开浏览器,与预览
+        // handler 同一口径。
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
+            return true;
+        }
         // 只吞不发:切换消息由帧末探针判定单点发出,这里若转发,将来
         // vendored 错位修好时会双发(两次切换 = 一步空转 + 两份 undo)。
         crate::ui::preview::parse_task_href(href).is_some()
     }
 
     /// 透明占位:与预览 handler 同一实现(链接文字本体 + 同款字体)。
+    /// `hl://`(#65 M2)走非 widget 分支:追加「正文色文字 + 推导底色」
+    /// 的排版段,与预览同一共享实现(一个真源)。
     fn layout_link(
         &self,
-        _ui: &egui::Ui,
+        ui: &egui::Ui,
         text: &str,
         href: &str,
         job: &mut egui::text::LayoutJob,
         font: &egui::FontId,
         color: egui::Color32,
     ) -> bool {
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
+            crate::ui::preview::append_highlight_section(ui, text, job, font);
+            return true;
+        }
         if !href.starts_with(latermd_md::TASK_SCHEME) {
             return false;
         }
@@ -679,16 +712,21 @@ pub fn ui(
                     // 富渲染。区域用渲染前后的 cursor 差值框出来;「点击进
                     // 编辑」的命中不走 egui widget,理由见 [`clicked_for_edit`]。
                     let top = ui.cursor().top();
-                    // 任务 checkbox 改写(#63):块文本先过改写层(缓存键是
-                    // 修订号 + 块序号,稳态帧零解析),`task://` 链接由本块
-                    // 专属 handler 画成自绘 checkbox —— 探针坐标域带块首,
-                    // 点击切换由 `ui` 帧末的探针命中判定统一发出。非任务块
-                    // 改写恒等,渲染零变化。
-                    let block_rendered = live.task_block(index, editor.revision(), &block_text);
+                    // 链接改写(#63 checkbox + #65 高亮):块文本先过改写层
+                    // (缓存键是修订号 + 块序号,稳态帧零解析),`task://`
+                    // 链接由本块专属 handler 画成自绘 checkbox、`hl://` 画
+                    // 成底色段 —— 探针坐标域带块首,点击切换由 `ui` 帧末的
+                    // 探针命中判定统一发出。无目标字符的块改写恒等,渲染
+                    // 零变化。
+                    let block_rendered = live.rich_block(index, editor.revision(), &block_text);
                     // 字体与右栏预览同源(#23 F3):size = 用户字号偏好,
                     // 族 = 预览专用族(#43 M2 的行 metrics 对齐副本,无 CJK
                     // 回落 Proportional)。源码/Live 两种模式下排版偏好同观感。
-                    let rich_handler = LiveRichHandler::new(&mermaid_handler, range.start);
+                    let rich_handler = LiveRichHandler::new(
+                        &mermaid_handler,
+                        range.start,
+                        ui.visuals().text_color(),
+                    );
                     MarkdownLabel::new(editor_id.with(("live-render", index)), &block_rendered)
                         .font(egui::FontId::new(
                             crate::theme::editor_font_size(ui.ctx()),
@@ -1449,7 +1487,7 @@ mod tests {
         let char_at = editor.byte_to_char(byte);
         editor.replace_range(char_at + 1..char_at + 2, "x");
         live.sync(&editor, None);
-        let block_rendered = live.task_block(
+        let block_rendered = live.rich_block(
             0,
             editor.revision(),
             BlockBuffer::slice(editor.text(), &live.blocks[0]),
@@ -3838,5 +3876,137 @@ mod tests {
             true,
         );
         assert!(fades.is_empty(), "无活动块不淡化任何块:{fades:?}");
+    }
+
+    // —— ==高亮== Live 接入(#65 M2)——
+
+    /// 富渲染块改写:高亮层先跑、任务层后跑(与预览四层链的生产顺序一
+    /// 致),缓存命中直取;无目标字符的块恒等(零变化护栏)。
+    #[test]
+    fn live_rich_block_stacks_highlight_and_task_layers() {
+        let mut live = LiveState::default();
+        let doc = "- [ ] ==完== 成\n";
+        let rendered = live.rich_block(0, 1, doc);
+        assert!(rendered.contains("[完](<hl://>)"), "高亮层先跑:{rendered}");
+        assert!(rendered.contains("task://"), "任务层后跑:{rendered}");
+        assert!(!rendered.contains("=="), "标记被改写消费,不回流:{rendered}");
+
+        // 缓存:同修订号直取同一份
+        assert_eq!(live.rich_block(0, 1, doc), rendered, "同修订号缓存命中");
+
+        // 零变化护栏:无 == 无任务标记的块恒等
+        assert_eq!(
+            live.rich_block(1, 1, "普通段落。\n"),
+            "普通段落。\n",
+            "无目标字符的块改写恒等"
+        );
+    }
+
+    /// Live handler 收口:`hl://` 接管排版段(底色 = 与预览同一共享推导
+    /// 真源)、link_style 正文色无下划线、click 吞掉(不开浏览器);任务
+    /// checkbox 路径分毫不动。
+    #[test]
+    fn live_highlight_handler_contained() {
+        let ctx = egui::Context::default();
+        let mermaid = crate::ui::mermaid::LiveMermaidHandler::new();
+        let body = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+        let handler = LiveRichHandler::new(&mermaid, 0, body);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(15.0);
+            let mut job = egui::text::LayoutJob::default();
+            assert!(
+                handler.layout_link(
+                    ui,
+                    "完",
+                    "hl://",
+                    &mut job,
+                    &font,
+                    egui::Color32::TRANSPARENT
+                ),
+                "Live 里 hl:// 同样接管排版段"
+            );
+            assert_eq!(job.sections.len(), 1, "恰一段(非 inline widget 占位)");
+            assert_eq!(
+                job.sections[0].format.background,
+                crate::ui::preview::highlight_bg_color(ui.visuals()),
+                "底色 = 与预览同一推导真源"
+            );
+            let style = handler.link_style("hl://").expect("hl:// 有样式");
+            assert_eq!(style.color, Some(body), "正文色");
+            assert!(!style.underline, "无下划线");
+            assert!(handler.click("完", "hl://", ui), "点击吞掉,不开浏览器");
+            // 任务路径不受牵连:仍走 inline widget 占位
+            let mut task_job = egui::text::LayoutJob::default();
+            assert!(
+                handler.layout_link(
+                    ui,
+                    " ",
+                    "task://c",
+                    &mut task_job,
+                    &font,
+                    egui::Color32::TRANSPARENT
+                ),
+                "task:// 仍走占位路径"
+            );
+            assert_eq!(
+                task_job.sections[0].format.color,
+                egui::Color32::TRANSPARENT,
+                "task:// 占位仍是透明文字"
+            );
+        });
+        output.drop_without_applying_deltas();
+    }
+
+    /// 面板端到端:Live 富渲染块(非活动)里的 `==高亮==` 与右栏预览同一
+    /// 观感 —— 底色段落进 galley,且不开浏览器(`click` 吞掉后 vendored
+    /// 不会把 `hl://` 交给 `OpenUrl`)。
+    #[test]
+    fn live_rich_block_renders_highlight_section() {
+        use eframe::epaint::text::ByteRangeExt as _;
+        let ctx = egui::Context::default();
+        let mut editor =
+            EditorBuffer::new("正文 ==高亮内容== 收尾\n\n[链接](https://example.com)\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+        let mut outbox = Vec::new();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            super::ui(
+                ui,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                egui::Id::new("live-highlight-test"),
+                false,
+                false,
+                &mut outbox,
+            );
+        });
+        let hl = crate::ui::preview::highlight_bg_color(&egui::Visuals::dark());
+        let mut marked = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                for section in &t.galley.job.sections {
+                    if section.format.background == hl {
+                        marked.push(section.byte_range.slice(&t.galley.job.text).to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            marked,
+            vec!["高亮内容".to_owned()],
+            "Live 富渲染块恰一段高亮底色:{marked:?}"
+        );
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::OutputCommand::OpenUrl(_))),
+            "无浏览器弹出(hl:// 点击即使触发也吞掉)"
+        );
+        output.drop_without_applying_deltas();
     }
 }

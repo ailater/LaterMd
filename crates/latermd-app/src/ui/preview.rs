@@ -36,6 +36,67 @@ fn wiki_link_color(dark_mode: bool) -> egui::Color32 {
     }
 }
 
+/// `==高亮==` 底色的混色锚(#65 M2):荧光笔语义,色相固定黄,不随主题;
+/// 明度端取当前主题的 `extreme_bg_color`(文本背景最远端)推导 —— 一条
+/// 推导式出明暗两档,不硬编码双份十六进制(#122 同族:对比度下限由
+/// `highlight_bg_meets_contrast_floor` 测试钉住 ≥ 4.5:1)。从 `visuals`
+/// 推导还顺带吃进皮肤/主题覆盖:用户换了 extreme_bg,高亮跟着换。
+const HIGHLIGHT_TINT: egui::Color32 = egui::Color32::from_rgb(255, 230, 0);
+/// 黄的混入比例:出厂明主题(白底)出 ≈#fff8b3 淡黄(经典 mark 观感),
+/// 出厂暗主题(灰阶 10 底)出 ≈#544c07 暗橄榄。HTML 导出的内嵌 CSS
+/// (latermd-export)写的是同一推导式的产物,两边同源。
+const HIGHLIGHT_TINT_RATIO: f32 = 0.30;
+/// 高亮底色四周外扩(像素),与行内代码观感一致
+/// (`InlineCodeStyle::default().expand_bg`)。
+const HIGHLIGHT_BG_EXPAND: f32 = 3.0;
+/// 行高下限的绝对补偿,复制 vendored `layout.rs` 的
+/// `LINE_HEIGHT_FLOOR_SLACK_PX`(私有常量,epaint 整像素行高吸附的最坏
+/// 下探 + 1/32 pt 量化)。
+const LINE_HEIGHT_FLOOR_SLACK_PX: f32 = 0.75;
+
+/// `==高亮==` 底色:30% 荧光黄 × 70% 主题背景端,逐通道按 u8 四舍五入。
+/// `pub(crate)`:Live 富渲染块与测试同源取色 —— 高亮底色只有一个真源。
+pub(crate) fn highlight_bg_color(visuals: &egui::Visuals) -> egui::Color32 {
+    let mix = |tint: u8, base: u8| -> u8 {
+        (tint as f32 * HIGHLIGHT_TINT_RATIO + base as f32 * (1.0 - HIGHLIGHT_TINT_RATIO)).round()
+            as u8
+    };
+    egui::Color32::from_rgb(
+        mix(HIGHLIGHT_TINT.r(), visuals.extreme_bg_color.r()),
+        mix(HIGHLIGHT_TINT.g(), visuals.extreme_bg_color.g()),
+        mix(HIGHLIGHT_TINT.b(), visuals.extreme_bg_color.b()),
+    )
+}
+
+/// `hl://` 链接的排版段(#65 M2):正文色文字 + 推导底色,行高/底对齐与
+/// vendored 给普通链接段用的 `base_format` 同式。行高公式复制 vendored
+/// `line_height_for`(私有,不能调),由
+/// `highlight_section_matches_plain_text_metrics` 钉住:同一 Ui 里正文
+/// section 的行高与本段相等,vendored 公式变化当场红。
+pub(crate) fn append_highlight_section(
+    ui: &egui::Ui,
+    text: &str,
+    job: &mut egui::text::LayoutJob,
+    font: &egui::FontId,
+) {
+    let style = egui_markdown::global_style(ui.ctx());
+    let line_height = (font.size * style.line_height_ratio)
+        .max(font.size * style.min_line_height_em + LINE_HEIGHT_FLOOR_SLACK_PX);
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: ui.visuals().text_color(),
+            background: highlight_bg_color(ui.visuals()),
+            expand_bg: HIGHLIGHT_BG_EXPAND,
+            valign: egui::Align::BOTTOM,
+            line_height: Some(line_height),
+            ..egui::TextFormat::default()
+        },
+    );
+}
+
 /// 指令卡「已完成」状态色(绿),按明暗主题取两档,取色法同 [`ai_link_color`]。
 fn done_color(dark_mode: bool) -> egui::Color32 {
     if dark_mode {
@@ -356,6 +417,16 @@ impl LinkHandler for AiLinkHandler {
                 underline: true,
             });
         }
+        // `hl://`(#65 M2):高亮不是可点链接,是底色标记 —— 意图声明为
+        // 正文色 + 无下划线(与 emoji:// 同款协议)。vendored 对悬停中的
+        // 普通链接无条件画下划线(#11 已知限),这里能定的是下划线颜色取
+        // 正文色,悬停时低调呈现。
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(self.text_color),
+                underline: false,
+            });
+        }
         href.starts_with(SCHEME).then_some(LinkStyle {
             color: Some(self.color),
             underline: true,
@@ -366,6 +437,11 @@ impl LinkHandler for AiLinkHandler {
         // emoji:// 没有点击语义:吞掉(返回 true),绝不交系统浏览器 ——
         // `emoji://😀` 不是合法 URL,交给浏览器只会弹错误提示
         if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return true;
+        }
+        // `hl://`(#65 M2)同理:高亮没有点击语义,吞掉不发消息、不开
+        // 浏览器(`hl://` 也不是合法 URL)。
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
             return true;
         }
         // task://(#63):吞掉(绝不交系统浏览器),但**不发消息** —— 列表项
@@ -402,13 +478,21 @@ impl LinkHandler for AiLinkHandler {
     /// 的高度强制盖到这些 section 上(append_link_to_job)。
     fn layout_link(
         &self,
-        _ui: &egui::Ui,
+        ui: &egui::Ui,
         text: &str,
         href: &str,
         job: &mut egui::text::LayoutJob,
         font: &egui::FontId,
         color: egui::Color32,
     ) -> bool {
+        // `hl://`(#65 M2)走的是非 widget 分支(layout.rs `append_link_to_job`
+        // 对普通链接以超链接色调用本方法,返回 true 即接管 section 样式,
+        // #123 探明口径):追加「正文色文字 + 推导底色」的排版段,不走
+        // inline widget —— 文字要可见、行高要随正文,不是占位件。
+        if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
+            append_highlight_section(ui, text, job, font);
+            return true;
+        }
         if !href.starts_with(latermd_md::EMOJI_SCHEME) && !href.starts_with(latermd_md::TASK_SCHEME)
         {
             return false;
@@ -1093,6 +1177,7 @@ mod tests {
     use super::*;
     use crate::ui::emoji_data;
     use eframe::egui::RawInput;
+    use eframe::epaint::text::ByteRangeExt as _;
 
     /// 造一个指定流式/最近 prompt 的 AI 状态(卡片状态的三个输入)。
     fn ai_state(streaming: bool, last_prompt: Option<&str>) -> AiState {
@@ -3193,5 +3278,417 @@ mod tests {
             ctx.memory(|mem| mem.has_focus(editor_id)),
             "点击 checkbox 不抢编辑器焦点"
         );
+    }
+
+    // —— ==高亮== 渲染(#65 M2)——
+
+    /// WCAG 相对亮度对比度(#122 同族口径),测试本地实现,不引依赖。
+    fn contrast_ratio(fg: egui::Color32, bg: egui::Color32) -> f32 {
+        fn channel(c: u8) -> f32 {
+            let v = c as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(c: egui::Color32) -> f32 {
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        }
+        let (l1, l2) = (luminance(fg), luminance(bg));
+        let (hi, lo) = (l1.max(l2), l1.min(l2));
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 底色 token:一条推导式出明暗两档(常量只有锚黄与比例),输入是
+    /// **出厂皮肤投影**(`theme.rs apply_shell_to`:extreme_bg = code_bg
+    /// token,正文 = shell text token)—— 出厂值与 HTML 导出内嵌 CSS
+    /// 同源(#f8f1ad / #655e1b),两主题正文色压底色均 ≥ 4.5:1(#122
+    /// 同族对比度下限)。
+    #[test]
+    fn highlight_bg_token_two_themes_and_contrast_floor() {
+        for (dark, expected, label) in [
+            (true, egui::Color32::from_rgb(101, 94, 27), "暗档 ≈#655e1b"),
+            (
+                false,
+                egui::Color32::from_rgb(248, 241, 173),
+                "明档 ≈#f8f1ad",
+            ),
+        ] {
+            let tokens = crate::theme::shell_tokens(dark);
+            let mut visuals = if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            // 与 apply_shell_to 同投影:高亮底色的生产输入是 code_bg
+            visuals.extreme_bg_color = tokens.code_bg;
+            let bg = highlight_bg_color(&visuals);
+            assert_eq!(bg, expected, "{label}");
+            let ratio = contrast_ratio(tokens.text, bg);
+            assert!(
+                ratio >= 4.5,
+                "{}主题高亮对比度 {ratio:.2} < 4.5(WCAG AA 正文线)",
+                if dark { "暗" } else { "明" }
+            );
+        }
+    }
+
+    /// handler 层收口:`hl://` 接管排版段(底色 = 共享推导、正文色、行高
+    /// 与 global_style 推导一致、底对齐、外扩常数),非 `hl://` 不接管;
+    /// link_style 正文色无下划线;click 吞掉且不产消息。
+    #[test]
+    fn highlight_layout_link_paints_background_section() {
+        let ctx = egui::Context::default();
+        let body = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+        let handler = AiLinkHandler::new(ai_link_color(true), true, body, &AiState::default());
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(15.0);
+            let mut job = egui::text::LayoutJob::default();
+            assert!(
+                handler.layout_link(
+                    ui,
+                    "高亮内容",
+                    "hl://",
+                    &mut job,
+                    &font,
+                    egui::Color32::TRANSPARENT
+                ),
+                "hl:// 接管排版段"
+            );
+            assert_eq!(job.sections.len(), 1, "恰一段");
+            let format = &job.sections[0].format;
+            assert_eq!(
+                format.background,
+                highlight_bg_color(ui.visuals()),
+                "底色 = 共享推导 token"
+            );
+            assert_eq!(
+                format.color,
+                ui.visuals().text_color(),
+                "正文色,不吃超链接色"
+            );
+            assert_eq!(format.valign, egui::Align::BOTTOM, "与正文段同底对齐");
+            assert_eq!(format.expand_bg, HIGHLIGHT_BG_EXPAND, "底色外扩常数");
+            let style = egui_markdown::global_style(ui.ctx());
+            assert_eq!(
+                format.line_height,
+                Some(
+                    (15.0 * style.line_height_ratio)
+                        .max(15.0 * style.min_line_height_em + LINE_HEIGHT_FLOOR_SLACK_PX)
+                ),
+                "行高 = vendored line_height_for 同式"
+            );
+
+            let mut other = egui::text::LayoutJob::default();
+            assert!(
+                !handler.layout_link(
+                    ui,
+                    "文本",
+                    "https://example.com",
+                    &mut other,
+                    &font,
+                    egui::Color32::TRANSPARENT
+                ),
+                "非 hl:// 不接管,走 vendored 默认"
+            );
+            let link_style = handler.link_style("hl://").expect("hl:// 有样式");
+            assert_eq!(link_style.color, Some(body), "正文色意图");
+            assert!(!link_style.underline, "无下划线意图");
+            assert!(handler.click("x", "hl://", ui), "点击吞掉,不开浏览器");
+        });
+        output.drop_without_applying_deltas();
+        let mut outbox = Vec::new();
+        handler.drain_into(&mut outbox);
+        assert!(outbox.is_empty(), "吞掉的高亮点击不产消息:{outbox:?}");
+    }
+
+    /// vendored 端到端:M1 改写产物进 `build_layout`,高亮段落成带底色的
+    /// section,行高与相邻正文 section 相等(行高公式复制的钉子);否决线
+    /// —— 无 `==` 的文档任何 section 都不吃推导底色(行内代码有自己的
+    /// 底色,值不同,天然区分)。
+    #[test]
+    fn highlight_section_matches_plain_text_metrics_and_veto_line() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            let handler = AiLinkHandler::new(
+                ai_link_color(ui.visuals().dark_mode),
+                ui.visuals().dark_mode,
+                ui.visuals().text_color(),
+                &AiState::default(),
+            );
+            let style = egui_markdown::global_style(ui.ctx());
+            let font = egui::FontId::proportional(15.0);
+            let doc = egui_markdown::parse("前文 [高亮](<hl://>) 后文\n");
+            let layout = egui_markdown::layout::build_layout(
+                ui,
+                &doc.tokens,
+                font,
+                ui.visuals().text_color(),
+                None,
+                400.0,
+                false,
+                Some(&handler),
+                false,
+                false,
+                true,
+                &style,
+                None,
+            );
+            let hl = highlight_bg_color(ui.visuals());
+            let hits: Vec<&egui::text::LayoutSection> = layout
+                .job
+                .sections
+                .iter()
+                .filter(|section| section.format.background == hl)
+                .collect();
+            assert_eq!(hits.len(), 1, "恰一段带高亮底色");
+            assert_eq!(
+                hits[0].byte_range.slice(&layout.job.text),
+                "高亮",
+                "底色段正是高亮内容"
+            );
+            let plain = layout
+                .job
+                .sections
+                .iter()
+                .find(|section| {
+                    section.format.background == egui::Color32::TRANSPARENT
+                        && !section.byte_range.slice(&layout.job.text).trim().is_empty()
+                })
+                .expect("正文段在");
+            assert_eq!(
+                plain.format.line_height, hits[0].format.line_height,
+                "高亮段行高与相邻正文段相等(公式复制钉住)"
+            );
+
+            // 否决线:无 == 文档零底色段
+            let doc2 = egui_markdown::parse("前文 [链接](https://example.com) `code` 后文\n");
+            let layout2 = egui_markdown::layout::build_layout(
+                ui,
+                &doc2.tokens,
+                egui::FontId::proportional(15.0),
+                ui.visuals().text_color(),
+                None,
+                400.0,
+                false,
+                Some(&handler),
+                false,
+                false,
+                true,
+                &style,
+                None,
+            );
+            assert!(
+                layout2
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.background != hl),
+                "无 == 文档不吃高亮底色"
+            );
+        });
+        output.drop_without_applying_deltas();
+    }
+
+    /// 生产入口一帧的汇集(测试断言素材):galley 全集 + 携带高亮底色的
+    /// mesh 顶点(像素级证据 —— 底色矩形真的进了绘制网格)。
+    struct HighlightFrame {
+        galleys: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
+        bg_vertices: Vec<egui::Pos2>,
+    }
+
+    fn render_highlight_frame(ctx: &egui::Context, doc: &str, tab_id: u64) -> HighlightFrame {
+        // 与生产 `PreviewState::new` 同一条四层链(wikilink → 高亮 → emoji
+        // → 任务),预览面板吃的就是这份渲染副本。
+        let mut preview = PreviewState::new(&latermd_editor::EditorBuffer::new(doc));
+        let mut outbox = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    tab_id,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            },
+        );
+        // 两主题 token 都收(行内代码底色灰阶 50/225,与两 token 均不同值,
+        // 不会误报):哪一档出现都算高亮底色进了绘制网格。
+        let tokens = [
+            highlight_bg_color(&egui::Visuals::dark()),
+            highlight_bg_color(&egui::Visuals::light()),
+        ];
+        let mut galleys = Vec::new();
+        let mut bg_vertices = Vec::new();
+        fn collect(
+            shape: &egui::epaint::Shape,
+            tokens: &[egui::Color32; 2],
+            galleys: &mut Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
+            bg_vertices: &mut Vec<egui::Pos2>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Mesh(mesh) => {
+                    for vertex in &mesh.vertices {
+                        if tokens.contains(&vertex.color) {
+                            bg_vertices.push(vertex.pos);
+                        }
+                    }
+                }
+                egui::epaint::Shape::Text(t) => {
+                    galleys.push((t.pos, t.galley.clone()));
+                    // output.shapes 里的文本还没 tessellate(底色矩形要过
+                    // 渲染器才成网格)—— 这里显式 tessellate,像素级断言
+                    // 「底色真的进了绘制网格」。
+                    let mut tessellator = egui::epaint::Tessellator::new(
+                        1.0,
+                        egui::epaint::TessellationOptions::default(),
+                        [4096, 4096],
+                        Vec::new(),
+                    );
+                    let mut mesh = egui::epaint::Mesh::default();
+                    tessellator.tessellate_text(t, &mut mesh);
+                    for vertex in &mesh.vertices {
+                        if tokens.contains(&vertex.color) {
+                            bg_vertices.push(vertex.pos);
+                        }
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v
+                    .iter()
+                    .for_each(|s| collect(s, tokens, galleys, bg_vertices)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &tokens, &mut galleys, &mut bg_vertices);
+        }
+        output.drop_without_applying_deltas();
+        HighlightFrame {
+            galleys,
+            bg_vertices,
+        }
+    }
+
+    /// 面板端到端(暗主题):正文与表格 cell 里的高亮段落成带底色的
+    /// galley section,底色真的被画出来(mesh 顶点携带推导底色);普通
+    /// 文本照旧无底色。
+    #[test]
+    fn highlight_flows_through_preview_panel_and_table_cell() {
+        let ctx = egui::Context::default();
+        let doc = "正文 ==高亮内容== 收尾\n\n| 列 |\n|---|\n| ==格== |\n";
+        let frame = render_highlight_frame(&ctx, doc, 21);
+        let hl = highlight_bg_color(&egui::Visuals::dark());
+        let marked: Vec<String> = frame
+            .galleys
+            .iter()
+            .flat_map(|(_, galley)| {
+                galley
+                    .job
+                    .sections
+                    .iter()
+                    .filter(|section| section.format.background == hl)
+                    .map(|section| section.byte_range.slice(&galley.job.text).to_owned())
+            })
+            .collect();
+        assert!(
+            marked.contains(&"高亮内容".to_owned()),
+            "正文高亮段带底色:{marked:?}"
+        );
+        assert!(
+            marked.contains(&"格".to_owned()),
+            "表格 cell 高亮段带底色:{marked:?}"
+        );
+        assert_eq!(marked.len(), 2, "恰好两段:{marked:?}");
+        assert!(
+            !frame.bg_vertices.is_empty(),
+            "像素级:高亮底色真的进了绘制网格"
+        );
+    }
+
+    /// 面板端到端(明主题):同一推导式在明主题出明档底色,渲染路径同
+    /// 样出底色段与网格像素。
+    #[test]
+    fn highlight_renders_in_light_theme_too() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::light());
+        let frame = render_highlight_frame(&ctx, "==明档高亮==\n", 22);
+        let hl = highlight_bg_color(&egui::Visuals::light());
+        let marked: Vec<&str> = frame
+            .galleys
+            .iter()
+            .flat_map(|(_, galley)| {
+                galley
+                    .job
+                    .sections
+                    .iter()
+                    .filter(|section| section.format.background == hl)
+                    .map(|section| section.byte_range.slice(&galley.job.text))
+            })
+            .collect();
+        assert_eq!(marked, vec!["明档高亮"], "明主题同通道出底色段");
+        assert!(!frame.bg_vertices.is_empty(), "明主题底色同样有实际绘制");
+    }
+
+    /// 否决线(生产入口全帧口径):无 `==` 的文档 —— 链接/行内代码/emoji/
+    /// wikilink 照常渲染 —— 不画任何高亮底色像素、无底色 galley 段。
+    #[test]
+    fn highlight_absent_document_stays_free_of_highlight_paint() {
+        let ctx = egui::Context::default();
+        let doc = "正文 [链接](https://example.com) `code` 😀 与 [目标](<wiki://X>)\n";
+        let frame = render_highlight_frame(&ctx, doc, 23);
+        let hl_dark = highlight_bg_color(&egui::Visuals::dark());
+        assert!(frame.bg_vertices.is_empty(), "无 == 文档不画高亮底色像素");
+        assert!(
+            frame.galleys.iter().all(|(_, galley)| galley
+                .job
+                .sections
+                .iter()
+                .all(|section| section.format.background != hl_dark)),
+            "无 == 文档零高亮底色段"
+        );
+    }
+
+    /// 组合叠加:同一行里高亮与任务标记/粗体/行内代码/链接共存 —— 高亮
+    /// 恰一段带底色,其余构造照常渲染、互不破(M1 豁免清单的同侧验证:
+    /// 粗体/行内代码/链接内的 `==` 本就不会成对)。
+    #[test]
+    fn highlight_composes_with_other_inline_constructs() {
+        let ctx = egui::Context::default();
+        let doc = "- [ ] **粗体** ==真高亮== `code` [链接](https://example.com) 收尾\n";
+        let frame = render_highlight_frame(&ctx, doc, 24);
+        let hl = highlight_bg_color(&egui::Visuals::dark());
+        let marked: Vec<String> = frame
+            .galleys
+            .iter()
+            .flat_map(|(_, galley)| {
+                galley
+                    .job
+                    .sections
+                    .iter()
+                    .filter(|section| section.format.background == hl)
+                    .map(|section| section.byte_range.slice(&galley.job.text).to_owned())
+            })
+            .collect();
+        assert_eq!(marked, vec!["真高亮"], "恰高亮段带底色:{marked:?}");
+        let all: String = frame
+            .galleys
+            .iter()
+            .map(|(_, galley)| galley.text().to_owned())
+            .collect();
+        for piece in ["粗体", "code", "链接", "收尾"] {
+            assert!(
+                all.contains(piece),
+                "既有 inline 构造照常渲染,缺 {piece}:{all:?}"
+            );
+        }
     }
 }

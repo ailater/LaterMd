@@ -20,7 +20,7 @@ pub use pdf::{
     export_document, export_pdf, PdfError, PdfExportOptions, PdfFont, PdfFonts, A4_HEIGHT, A4_WIDTH,
 };
 
-use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 /// 无标题文档的 `<title>` 回退值,与应用内「未命名」词汇一致。
 const FALLBACK_TITLE: &str = "未命名";
@@ -73,6 +73,17 @@ blockquote {
 img {
   max-width: 100%;
 }
+/* mark 底色与 app 内 `highlight_bg_color` 同一条推导式(#65 M2):
+   30% 荧光黄 (255,230,0) 混 70% 出厂 extreme_bg token —— 明 #F5F6F7
+   出 #f8f1ad,暗 #232427 出 #655e1b(式子记录在 decisions-pending)。
+   暗档文字取出厂皮肤正文色 #e8eaed(压底色 5.5:1,≥ AA 正文线);
+   明档 inherit(黑字压 #f8f1ad ≈ 13.7:1)。 */
+mark {
+  padding: 0.1em 0.2em;
+  border-radius: 3px;
+  background: #f8f1ad;
+  color: inherit;
+}
 @media (prefers-color-scheme: dark) {
   pre, code, th {
     background: #161b22;
@@ -84,12 +95,18 @@ img {
     border-color: #30363d;
     color: #8b949e;
   }
+  mark {
+    background: #655e1b;
+    color: #e8eaed;
+  }
 }"#;
 
 /// Markdown → 完整 HTML 文档(UTF-8,含内嵌 CSS)。
 pub fn export_html(text: &str) -> String {
-    // 事件先收进 Vec:渲染与取标题共用一次解析结果
-    let events: Vec<Event> = Parser::new_ext(text, parser_options()).collect();
+    // 事件先收进 Vec:渲染与取标题共用一次解析结果;标题取自高亮包裹
+    // **之后**的事件流 —— `# ==重点==` 的标题是「重点」,`==` 是语法
+    // 不是内容(与预览一致,标记不回流正文文本)。
+    let events = wrap_highlights(Parser::new_ext(text, parser_options()).collect());
     let title = document_title(&events);
     let mut body = String::new();
     html::push_html(&mut body, events.into_iter());
@@ -99,6 +116,83 @@ pub fn export_html(text: &str) -> String {
          <title>{title}</title>\n<style>\n{CSS}\n</style>\n</head>\n<body>\n{body}</body>\n</html>\n"
     )
 }
+
+/// `==高亮==` → `<mark>`(HTML 语义同义标签的口径:#65 M2 选原生
+/// `<mark>`,观感由内嵌 CSS 接管,浏览器默认黄只作无 CSS 兜底)。
+///
+/// 扫描复用 [`latermd_md::highlight_spans`](唯一扫描器):与预览管线同一
+/// 配对口径,不产生第二套 == 方言。豁免构造(代码块/链接/图片/强调类/
+/// 脚注定义/HTML 块 —— 与 `highlight_spans` 的豁免清单同一份)内部的
+/// Text 事件不扫,由事件嵌套深度门控表达:这些构造在 pulldown 事件流里
+/// 本就成对出现,深度计数天然平衡。行内代码(`Event::Code`)是原子事件,
+/// 到不了 Text 分支,天然豁免。
+fn wrap_highlights(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    let mut wrapped: Vec<Event<'_>> = Vec::with_capacity(events.len());
+    let mut exempt_depth = 0_usize;
+    for event in events {
+        match event {
+            Event::Start(
+                Tag::CodeBlock { .. }
+                | Tag::Link { .. }
+                | Tag::Image { .. }
+                | Tag::HtmlBlock
+                | Tag::FootnoteDefinition(_)
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough,
+            ) => {
+                exempt_depth += 1;
+                wrapped.push(event);
+            }
+            Event::End(
+                TagEnd::CodeBlock
+                | TagEnd::Link
+                | TagEnd::Image
+                | TagEnd::HtmlBlock
+                | TagEnd::FootnoteDefinition
+                | TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough,
+            ) => {
+                exempt_depth = exempt_depth.saturating_sub(1);
+                wrapped.push(event);
+            }
+            Event::Text(text) if exempt_depth == 0 => push_marked_text(&mut wrapped, text),
+            other => wrapped.push(other),
+        }
+    }
+    wrapped
+}
+
+/// 单个 Text 事件按高亮段切开:`==` 标记被消费(与预览一致,不再出现在
+/// 输出文本),内容包 `<mark>`;标记外片段原样保留。切出的片段转 owned
+/// (`CowStr::Boxed`)—— 文本切片借的是 CowStr 内部缓冲,事件流还要继续
+/// 持有,owned 化一次买断生命周期;无高亮的快路径零拷贝原样透传。
+fn push_marked_text<'a>(out: &mut Vec<Event<'a>>, text: CowStr<'a>) {
+    let spans = latermd_md::highlight_spans(&text);
+    if spans.is_empty() {
+        out.push(Event::Text(text));
+        return;
+    }
+    let owned = text.into_string();
+    let mut last = 0_usize;
+    for span in spans {
+        out.push(Event::Text(CowStr::Boxed(
+            owned[last..span.span.start].into(),
+        )));
+        out.push(Event::InlineHtml(CowStr::Borrowed(MARK_OPEN)));
+        out.push(Event::Text(CowStr::Boxed(span.inner.into())));
+        out.push(Event::InlineHtml(CowStr::Borrowed(MARK_CLOSE)));
+        last = span.span.end;
+    }
+    out.push(Event::Text(CowStr::Boxed(owned[last..].into())));
+}
+
+/// `<mark>` 的开闭标签(`Event::InlineHtml` 由 pulldown 的 html writer
+/// 原样透传,pulldown-cmark 0.13.4 html.rs `Html(html) | InlineHtml(html)`
+/// 分支 —— 不走文本转义,这正是行内标记的通道)。
+const MARK_OPEN: &str = "<mark>";
+const MARK_CLOSE: &str = "</mark>";
 
 /// 与 vendored `egui_markdown::parser::parse`(egui_markdown/src/parser.rs
 /// `parse` 内的 options 组装)逐项一致的扩展开关,委托 [`latermd_render`]
@@ -246,6 +340,105 @@ mod tests {
             Options::ENABLE_TASKLISTS,
         ] {
             assert!(parser_options().contains(flag));
+        }
+    }
+
+    // —— ==高亮== → <mark>(#65 M2)——
+
+    /// 基本形态:高亮段输出 `<mark>`,标记不回流正文文本,内嵌 CSS 带
+    /// mark 底色规则(明暗两档)。
+    #[test]
+    fn highlight_exports_as_mark() {
+        let html = export_html("重点 ==高亮内容== 收尾。");
+        assert_no_mojibake(&html, "重点 <mark>高亮内容</mark> 收尾。");
+        // `==` 标记被消费:正文区不再出现(mark 标签与 CSS 里也不含 ==)
+        assert!(!html.contains("=="), "标记不得回流正文:\n{html}");
+        assert!(html.contains("mark {"), "内嵌 CSS 缺 mark 规则:\n{html}");
+        assert!(
+            html.contains("background: #f8f1ad"),
+            "明档底色缺失:\n{html}"
+        );
+        assert!(
+            html.contains("background: #655e1b"),
+            "暗档底色缺失:\n{html}"
+        );
+        assert!(
+            html.contains("color: #e8eaed"),
+            "暗档 mark 文字色缺失:\n{html}"
+        );
+    }
+
+    /// 豁免面与预览同一份:围栏/行内代码/链接/强调内部的 `==` 不进
+    /// `<mark>`;豁免构造之外的照常标。
+    #[test]
+    fn highlight_skips_exempt_constructs() {
+        let fenced = export_html("```text\n==x==\n```\n\n==真高亮==");
+        assert!(
+            !fenced.contains("<mark>x</mark>"),
+            "围栏内不高亮:\n{fenced}"
+        );
+        assert!(
+            fenced.contains("<mark>真高亮</mark>"),
+            "围栏外照常高亮:\n{fenced}"
+        );
+
+        let code = export_html("`==x==` 与 ==真高亮==");
+        assert!(
+            !code.contains("<mark>x</mark>"),
+            "行内代码内不高亮:\n{code}"
+        );
+        assert!(code.contains("<mark>真高亮</mark>"), "{code}");
+
+        let link = export_html("[甲 ==乙==](u) 之后的 ==丙==");
+        assert!(
+            !link.contains("<mark>乙</mark>"),
+            "链接文字内不高亮:\n{link}"
+        );
+        assert!(link.contains("<mark>丙</mark>"), "{link}");
+
+        let strong = export_html("**粗 ==不标== 体** 与 ==标==");
+        assert!(
+            !strong.contains("<mark>不标</mark>"),
+            "强调内部不高亮(与预览豁免清单一致):\n{strong}"
+        );
+        assert!(strong.contains("<mark>标</mark>"), "{strong}");
+    }
+
+    /// 多对与相邻对、转义文本:片段切开互不粘连,`&` 在 mark 内照常转义。
+    #[test]
+    fn highlight_splits_pairs_and_escapes_content() {
+        // 相邻对(中间恰 4 个 `=`:闭标 2 + 开标 2,scanner 首尾相接)
+        let html = export_html("==甲====乙==");
+        assert_no_mojibake(&html, "<mark>甲</mark><mark>乙</mark>");
+
+        let escaped = export_html("==a & b==");
+        assert_no_mojibake(&escaped, "<mark>a &amp; b</mark>");
+    }
+
+    /// 表格 cell 内照常高亮(表格不在豁免清单,与预览一致);标题里的
+    /// 高亮同时把 `==` 从 `<title>` 里带走(标题取自包裹后的事件流)。
+    #[test]
+    fn highlight_works_in_table_cells_and_cleans_title() {
+        let table = export_html("| 列 |\n|---|\n| ==格== |");
+        assert_no_mojibake(&table, "<td><mark>格</mark></td>");
+
+        let titled = export_html("# ==重点==\n\n正文。");
+        assert!(titled.contains("<title>重点</title>"), "{titled}");
+        assert!(titled.contains("<h1><mark>重点</mark></h1>"), "{titled}");
+    }
+
+    /// 否决线:无 `==` 的文档输出零 `<mark>`;未闭合/不配对的形态同样
+    /// 不产生标记(与 `highlight_spans` 口径一致,导出不做第二套判定)。
+    #[test]
+    fn no_highlight_means_no_mark() {
+        for text in [
+            "普通文档,毫无高亮。\n\n- 列表项\n",
+            "未闭合 ==x 不算\n",
+            "空对 ==== 与纯空白 == == 都不算\n",
+            "跨行 ==甲\n乙== 不算\n",
+        ] {
+            let html = export_html(text);
+            assert!(!html.contains("<mark>"), "缺 guard {text:?}:\n{html}");
         }
     }
 }
