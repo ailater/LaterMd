@@ -656,7 +656,6 @@ pub fn ui(
                                     ),
                                     egui::vec2(1.0, 1.0),
                                 );
-                                eprintln!("DBG-L-LAND view_y={:.1} delta={:.1}", ask.view_y, delta);
                                 ui.scroll_to_rect_animation(
                                     land_rect,
                                     Some(egui::Align::TOP),
@@ -3225,7 +3224,6 @@ mod tests {
                 true,
                 false,
             );
-            eprintln!("DBG-LV{t} tw={:?}", live_tw_memory(&ctx));
         }
         let rect = live_scroll_frame(
             &ctx,
