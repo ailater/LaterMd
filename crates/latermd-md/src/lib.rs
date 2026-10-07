@@ -1109,6 +1109,126 @@ pub fn heading_section_span(text: &str, level: u8, heading: &str) -> Option<Rang
     Some(start..end)
 }
 
+/// TOC(目录)生成的深度上限:收录 1–3 级标题(#66 M1,口径登记
+/// decisions-pending #126)。消费方 [`generate_toc`] 与测试读同一常量,
+/// 要调层级改这一处即可。
+pub const TOC_MAX_DEPTH: u8 = 3;
+
+/// 标题纯文本 → 锚点 slug(无去重,导出 HTML 的标题 id 与 TOC 链接共用)。
+///
+/// 规则(GitHub 风格 + CJK 保留,自选口径登记 decisions-pending #126;
+/// 导出现状 `export_html` 原本无锚点,HTML 侧的 id 由 latermd-export 按本
+/// 函数补齐,两侧一致性由构造保证):
+///
+/// - Unicode 空白 → `-`(逐字符替换,连续空白产出连续 `-`);
+/// - `alphanumeric`(含 CJK、假名等)与 `-`/`_` 保留,字母走
+///   `to_lowercase`(CJK 无大小写,原样通过);
+/// - 其余(标点/emoji/符号)删除;
+/// - **不 trim**:首尾空白产出首尾 `-`(`# 🚀 Launch` → `-launch`,
+///   与 GitHub anchor 同款),规则纯函数化,逐字符可断言。
+pub fn heading_slug(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_whitespace() {
+            slug.push('-');
+        } else if c.is_alphanumeric() || c == '-' || c == '_' {
+            slug.extend(c.to_lowercase());
+        }
+    }
+    slug
+}
+
+/// 标题 slug 分配器:同一份文档序贯分配,重复标题去重(`x` → `x-1` →
+/// `x-2`,GitHub 口径)。
+///
+/// TOC 生成与导出 id 注入**必须各自持有一个实例、但对同一标题全集按同一
+/// 顺序调用** —— 去重计数不分层级,深度外的标题([`TOC_MAX_DEPTH`] 之外)
+/// 也要过一遍才能让两侧锚点不漂移([`generate_toc`] 内部已按此口径)。
+#[derive(Debug, Default, Clone)]
+pub struct Slugger {
+    /// 已分配的 slug 集合(`insert` 语义:命中即返回 false 触发加后缀重试)。
+    seen: HashSet<String>,
+}
+
+impl Slugger {
+    /// 空分配器。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 为下一条标题分配去重后的 slug。
+    pub fn slug(&mut self, text: &str) -> String {
+        let base = heading_slug(text);
+        let mut candidate = base.clone();
+        let mut serial = 0_usize;
+        while !self.seen.insert(candidate.clone()) {
+            serial += 1;
+            candidate = format!("{base}-{serial}");
+        }
+        candidate
+    }
+}
+
+/// 大纲 → TOC markdown 文本(#66 M1 纯函数):层级缩进列表
+/// `- [标题](#锚点)`,每行以 `\n` 收尾。
+///
+/// 口径(登记 decisions-pending #126):
+///
+/// - **深度上限** [`TOC_MAX_DEPTH`](=3):h4–h6 不进目录;
+/// - **锚点**与导出 HTML 的标题 id 同一条规则:全部条目(**含 depth 外**)
+///   按文档序消费同一 [`Slugger`] —— 去重计数与导出侧对齐,只是 depth 外
+///   的条目不产出文本行;
+/// - **缩进** = 2 空格 × (`level` − 入选条目的最小层级):相对层级保持,
+///   且首行永远零缩进 —— 按绝对层级缩进会让 h3 开头的文档首行吃 4 空格,
+///   在 CommonMark 里落成缩进代码块;
+/// - **空文档/无标题**(空切片或无 depth 内条目)返回**空串**,不做提示
+///   (提示属 UI,消费方拿空串自行决定);
+/// - 显示文本转义 `[`/`]`/`\`,含字面方括号的标题不拆坏链接语法。
+///
+/// 已知边界:标题纯文本来自 [`outline`] 通道,含内联格式的标题行会被
+/// vendored 解析器拆成多条(既有廉价口径),TOC 条目随之拆条;纯 emoji
+/// 标题 slug 为空,产出的链接是合法语法 `(#)`——点击无效但文本合法。
+pub fn generate_toc(items: &[OutlineItem]) -> String {
+    let Some(base) = items
+        .iter()
+        .map(|item| item.level)
+        .filter(|level| *level <= TOC_MAX_DEPTH)
+        .min()
+    else {
+        return String::new();
+    };
+    let mut slugger = Slugger::new();
+    let mut out = String::new();
+    for item in items {
+        // 去重计数吃全部标题(与导出侧 id 注入同序同集),只收录 depth 内条目
+        let anchor = slugger.slug(&item.text);
+        if item.level > TOC_MAX_DEPTH {
+            continue;
+        }
+        for _ in 0..item.level - base {
+            out.push_str("  ");
+        }
+        out.push_str("- [");
+        out.push_str(&toc_label(&item.text));
+        out.push_str("](#");
+        out.push_str(&anchor);
+        out.push_str(")\n");
+    }
+    out
+}
+
+/// TOC 条目显示文本的链接转义(私有):`[`/`]`/`\` 前置反斜杠。
+fn toc_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// 解析 Markdown 文本,产出拥有型文档模型(统一入口)。
 ///
 /// 代价是两次拷贝:源文本进 `String`,借用型 `CowStr::Borrowed` 转堆上的
@@ -2511,6 +2631,221 @@ mod tests {
         // 双击词「中文」(字符 2..4)→ 扩到字符 0..6
         let out = mark_interaction(text, &marks, 2, 4, Some(MarkGesture::DoubleClick));
         assert_eq!(out.expanded, Some(0..6));
+    }
+
+    // —— heading_slug / Slugger / generate_toc(#66 M1 TOC 生成纯函数)——
+
+    #[test]
+    fn heading_slug_keeps_cjk_lowercases_ascii_and_maps_spaces() {
+        // CJK 保留原样
+        assert_eq!(heading_slug("架构设计"), "架构设计");
+        assert_eq!(heading_slug("中文 标题"), "中文-标题");
+        // ASCII 小写化 + 空格 → 连字符
+        assert_eq!(heading_slug("Hello World"), "hello-world");
+        assert_eq!(heading_slug("API Design"), "api-design");
+        // 下划线与已有连字符保留
+        assert_eq!(heading_slug("snake_case-name"), "snake_case-name");
+        // 连续空白逐个映射,不合并
+        assert_eq!(heading_slug("a  b"), "a--b");
+    }
+
+    /// 特殊字符与 emoji 逐字符断言:标点删除、emoji 删除、`+`/`&`/`.` 的
+    /// 产物按规则手工展开核对(含首尾空白不 trim 的产出)。
+    #[test]
+    fn heading_slug_punctuation_and_emoji_char_by_char() {
+        // `+`/`&` 删,两处空格各变一个 `-`
+        assert_eq!(heading_slug("C++ & Rust"), "c--rust");
+        // `.` 删
+        assert_eq!(heading_slug("v1.2"), "v12");
+        // `/` 删
+        assert_eq!(heading_slug("a/b"), "ab");
+        // emoji 删,其后的空格照常变 `-`(GitHub anchor `-launch` 同款形态)
+        assert_eq!(heading_slug("🚀 Launch"), "-launch");
+        // 前导空格同样产出首 `-`
+        assert_eq!(heading_slug(" Launch"), "-launch");
+        // 纯 emoji:全部删除 → 空 slug(已知边界,TOC 产出 (#))
+        assert_eq!(heading_slug("🚀🚀"), "");
+        // 全角标点(非 alphanumeric)删,CJK 正文保留
+        assert_eq!(heading_slug("标题:副题"), "标题副题");
+        // 空输入
+        assert_eq!(heading_slug(""), "");
+    }
+
+    /// 重复标题去重:第二个同名标题加 `-1`,第三个加 `-2`;与真实标题
+    /// `x-1` 撞车时继续加后缀不回吸。
+    #[test]
+    fn slugger_dedupes_repeated_headings() {
+        let mut slugger = Slugger::new();
+        assert_eq!(slugger.slug("同"), "同");
+        assert_eq!(slugger.slug("同"), "同-1");
+        assert_eq!(slugger.slug("同"), "同-2");
+        assert_eq!(slugger.slug("同-1"), "同-1-1", "与已分配的后缀撞车继续加");
+        assert_eq!(slugger.slug("别的"), "别的");
+    }
+
+    /// 多级标题:1–3 级进 TOC,2 空格 × 相对层级缩进;h4–h6 被深度上限
+    /// 滤除,但仍消耗去重计数(与导出侧 id 注入对齐的前提)。
+    #[test]
+    fn generate_toc_levels_indent_and_depth_cap() {
+        let items = vec![
+            OutlineItem {
+                level: 1,
+                text: "甲".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 2,
+                text: "乙".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 3,
+                text: "丙".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 4,
+                text: "丁".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 5,
+                text: "戊".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 6,
+                text: "己".into(),
+                span: 0..0,
+            },
+        ];
+        assert_eq!(
+            generate_toc(&items),
+            "- [甲](#甲)\n  - [乙](#乙)\n    - [丙](#丙)\n"
+        );
+        // depth 外的重复标题照样吃计数:后续「丙」的第二个拿到 -1
+        let items = vec![
+            OutlineItem {
+                level: 3,
+                text: "丙".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 4,
+                text: "丙".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 3,
+                text: "丙".into(),
+                span: 0..0,
+            },
+        ];
+        assert_eq!(
+            generate_toc(&items),
+            "- [丙](#丙)\n- [丙](#丙-2)\n",
+            "h4 的同名标题消耗「丙-1」但不产出文本行,第二个 h3 拿「丙-2」"
+        );
+    }
+
+    /// 文档从更深层级开头时,缩进基线取入选条目的最小层级:首行永远零
+    /// 缩进,不会在文件顶端落成缩进代码块;中间缺级照实缩进。
+    #[test]
+    fn generate_toc_indent_baseline_is_min_selected_level() {
+        let items = vec![
+            OutlineItem {
+                level: 2,
+                text: "壹".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 3,
+                text: "贰".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 3,
+                text: "叁".into(),
+                span: 0..0,
+            },
+        ];
+        assert_eq!(
+            generate_toc(&items),
+            "- [壹](#壹)\n  - [贰](#贰)\n  - [叁](#叁)\n"
+        );
+        // 跳级:h1 直接到 h3,相对层级 2 → 4 空格
+        let items = vec![
+            OutlineItem {
+                level: 1,
+                text: "甲".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 3,
+                text: "丙".into(),
+                span: 0..0,
+            },
+        ];
+        assert_eq!(generate_toc(&items), "- [甲](#甲)\n    - [丙](#丙)\n");
+    }
+
+    /// 空文档/无标题文档:空切片与全 depth 外条目都返回空串(不产提示,
+    /// 提示属消费方 UI)。
+    #[test]
+    fn generate_toc_empty_input_yields_empty_string() {
+        assert_eq!(generate_toc(&[]), "");
+        let deep_only = vec![OutlineItem {
+            level: 4,
+            text: "深".into(),
+            span: 0..0,
+        }];
+        assert_eq!(generate_toc(&deep_only), "");
+    }
+
+    /// 重复标题去重与显示文本方括号转义:`[x]` 标题产出 `\[x\]`,链接
+    /// 语法不被拆坏;纯 emoji 标题产空锚点 `(#)`。
+    #[test]
+    fn generate_toc_dedupes_and_escapes_labels() {
+        let items = vec![
+            OutlineItem {
+                level: 2,
+                text: "同名".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 2,
+                text: "同名".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 2,
+                text: "勾选 [x] 态".into(),
+                span: 0..0,
+            },
+            OutlineItem {
+                level: 2,
+                text: "🚀🚀".into(),
+                span: 0..0,
+            },
+        ];
+        assert_eq!(
+            generate_toc(&items),
+            "- [同名](#同名)\n- [同名](#同名-1)\n- [勾选 \\[x\\] 态](#勾选-x-态)\n- [🚀🚀](#)\n"
+        );
+    }
+
+    /// 端到端:真实 `outline()` 通道 → TOC。含内联格式的标题行按 vendored
+    /// 解析器拆成多条(既有廉价口径),此处如实钉住行为。
+    #[test]
+    fn generate_toc_feeds_from_real_outline_channel() {
+        let src = "# 后来的指南\n\n正文。\n\n## 中文 标题\n\n### 🚀 Launch\n\n## **粗**体标题\n\n#### 太深\n";
+        let toc = generate_toc(&outline(src));
+        // 内联标题 `## **粗**体标题` 被解析器拆成「粗」「体标题」两条
+        // (outline 既有口径),TOC 忠实呈现拆条结果
+        assert_eq!(
+            toc,
+            "- [后来的指南](#后来的指南)\n  - [中文 标题](#中文-标题)\n    - [🚀 Launch](#-launch)\n  - [粗](#粗)\n  - [体标题](#体标题)\n"
+        );
     }
 
     /// 拥有型的意义:文档模型活得比源字符串久。

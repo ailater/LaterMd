@@ -5431,7 +5431,7 @@ mod tests {
         state.export_html_to(&path);
         let html = std::fs::read_to_string(&path).unwrap();
         assert!(html.starts_with("<!DOCTYPE html>"), "{html}");
-        assert!(html.contains("<h1>导出标题</h1>"), "{html}");
+        assert!(html.contains("<h1 id=\"导出标题\">导出标题</h1>"), "{html}");
         assert!(html.contains("max-width: 46em"), "{html}");
         // 派生物:dirty 保留、路径不认领
         assert!(state.tabs.current_mut().editor.is_dirty());
