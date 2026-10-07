@@ -925,6 +925,170 @@ pub fn is_task_marker_start(text: &str, byte: usize) -> bool {
         .any(|(event, span)| matches!(event, Event::TaskListMarker(_)) && span.start == byte)
 }
 
+/// `==高亮==` 改写产出链接的 scheme(#65):预览层按前缀拦截,非本 scheme
+/// 的链接照常走默认行为。载荷为空 —— 链接**文字本体**就是高亮内容(与
+/// emoji/task 的「scheme 后带载荷」不同),无解码步骤,也没有编码约束。
+pub const HIGHLIGHT_SCHEME: &str = "hl://";
+
+/// 一处 `==高亮==`:内部文本与它在源码中的字节区间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightSpan {
+    /// `==` 与 `==` 之间的文本(原样,不 trim)。
+    pub inner: String,
+    /// 开 `==` 起到闭 `==` 止的源码区间(含两侧标记)。
+    pub span: Range<usize>,
+}
+
+/// 抽出全部成对的 `==高亮==`(#10 [`wikilinks`] 先例)。
+///
+/// 口径(自选,登记 decisions-pending #123):
+///
+/// - **贴字定界(flanking)**:开 `==` 的后一字符必须非空白(char 级
+///   判定),闭 `==` 的前一字符必须非空白(ASCII 级判定,全角空格等
+///   多字节空白视作内容)—— `== ==`、`x== `、`==x ==` 都不配对;
+/// - **最左最近配对、不嵌套**:开标与第一个通过闭标 flanking 的 `==`
+///   配对;该对因内容/豁免作废时,开标按字面、闭标不回收 ——
+///   `==a ==b== c==` 只高亮 `b`;
+/// - **内部禁**空、`\n`(行内构造不跨块,wikilink 内部禁换行同一口径)、
+///   `[`/`]`(改写形态是链接文字 [`expand_highlight_links`],未配平的
+///   方括号会把链接拆成字面)与 `==`(嵌套形态);
+/// - **豁免与渲染同一语义**(照 [`expand_emoji_links`] 的豁免纪律:同一套
+///   pulldown-cmark options):候选区间(含两侧标记)与代码块/行内代码/
+///   链接/图片/HTML/脚注/**强调类**的任一区间重叠即整对作废。比 emoji 层
+///   多豁免强调类,是渠道形态决定的 —— vendored 渲染对链接文字只取其中
+///   **最后一个** Text/Code 事件(parser.rs `in_link` 分支),多段内容的
+///   链接会**丢字**而非仅丢样式,宁缺勿错。
+pub fn highlight_spans(text: &str) -> Vec<HighlightSpan> {
+    highlight_candidates(text)
+        .into_iter()
+        .map(|(span, inner)| HighlightSpan { inner, span })
+        .collect()
+}
+
+/// 把 `==高亮==` 改写成 `[高亮](<hl://>)`,供**预览渲染**使用;源码一字
+/// 不动 —— 与 [`expand_wikilinks`] 同一承诺、同一层叠加。
+///
+/// 叠加顺序固定:**wikilink 展开 → 本层 → emoji 链接改写 → 任务 checkbox
+/// 改写**。排在 wikilink 之后:展开出的链接文本/目标里的 `==` 靠豁免清单
+/// 不误伤(裸改写会把既有链接拆坏);排在 emoji 之前:`==😀==` 先成
+/// `hl://` 链接,emoji 层的「链接文本/目标整体豁免」顺势保护它 —— 高亮
+/// 保住、内部 emoji 以字形直显(不再做成纹理 widget)。
+///
+/// 快路径:文本不含 `==` 时不启动解析,直接恒等返回。
+pub fn expand_highlight_links(text: &str) -> (String, OffsetMap) {
+    let rewrites: Vec<Rewrite> = highlight_candidates(text)
+        .into_iter()
+        .map(|(span, inner)| Rewrite {
+            replacement: format!("[{inner}](<{HIGHLIGHT_SCHEME}>)"),
+            span,
+        })
+        .collect();
+    let map = OffsetMap::from_rewrites(rewrites);
+    (map.apply(text), map)
+}
+
+/// [`highlight_spans`] / [`expand_highlight_links`] 的扫描核心(私有):
+/// `(含两侧标记的源码区间, 内部文本)` 清单,升序且互不重叠。
+fn highlight_candidates(text: &str) -> Vec<(Range<usize>, String)> {
+    if !text.contains("==") {
+        return Vec::new();
+    }
+    let exempt = highlight_exempt_ranges(text);
+    let overlaps_exempt = |candidate: &Range<usize>| {
+        exempt
+            .iter()
+            .any(|range| range.start < candidate.end && candidate.start < range.end)
+    };
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0_usize;
+    'scan: while index + 2 <= text.len() {
+        if !text[index..].starts_with("==") {
+            index += text[index..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        // 开标 flanking:后一字符必须非空白(文末视为空白)
+        if text[index + 2..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+        {
+            index += 2;
+            continue;
+        }
+        // 闭标:第一个「前驱非空白」的 ==(ASCII 级判定,多字节字节的
+        // 尾巴天然非 ASCII 空白);它就是本对的定终闭标
+        let mut probe = index + 2;
+        while let Some(rel) = text[probe..].find("==") {
+            let close = probe + rel;
+            if !bytes[close - 1].is_ascii_whitespace() {
+                let end = close + 2;
+                let inner = &text[index + 2..close];
+                let ok = !inner.is_empty()
+                    && !inner.contains('\n')
+                    && !inner.contains('[')
+                    && !inner.contains(']')
+                    && !inner.contains("==")
+                    && !overlaps_exempt(&(index..end));
+                if ok {
+                    candidates.push((index..end, inner.to_owned()));
+                    index = end;
+                    continue 'scan;
+                }
+                // 首个合法闭标即定终:整对作废,开标按字面,闭标不回收
+                break;
+            }
+            probe = close + 2;
+        }
+        index += 2;
+    }
+    candidates
+}
+
+/// 高亮层的豁免区间(私有):与 [`expand_emoji_links`] 同一豁免清单再叠加
+/// 强调类(Start 事件区间覆盖整个构造,pulldown 0.13 实测事实,emoji 层与
+/// LP2-1 `inline_marks` 都依赖)。清单不与 emoji 层共享参数化:两边不同
+/// (emoji 不豁免强调),两份各自贴着各自的承诺。
+fn highlight_exempt_ranges(text: &str) -> Vec<Range<usize>> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut exempt: Vec<Range<usize>> = Vec::new();
+    for (event, span) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::CodeBlock { .. }
+                | Tag::Link { .. }
+                | Tag::Image { .. }
+                | Tag::HtmlBlock
+                | Tag::FootnoteDefinition(_)
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough,
+            )
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_) => exempt.push(span),
+            _ => {}
+        }
+    }
+    exempt.sort_unstable_by_key(|span| span.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in exempt {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
 /// 它的标题前(无则到文末)。更深层级的标题(`###`)是该节的子内容,一并
 /// 属于节;标题文本按 `trim` 后全等匹配,层级精确匹配。
@@ -1605,6 +1769,207 @@ mod tests {
         assert!(!is_task_marker_start(cjk, mid), "多字节字符中间不命中");
         assert!(is_task_marker_start(cjk, cjk.find("[ ]").expect("task")));
         assert!(!is_task_marker_start("无方括号文档", 0), "快路径不命中");
+    }
+
+    // —— highlight_spans / expand_highlight_links(#65 高亮扩展语法)——
+
+    /// 期望表断言:(区间字面, 内部文本) 双重核对 —— span 切片与 inner 都
+    /// 必须对上,字节手算错当场失败。
+    fn assert_highlights(text: &str, spans: &[HighlightSpan], expected: &[(&str, &str)]) {
+        assert_eq!(
+            spans.len(),
+            expected.len(),
+            "对数不符:{spans:?} vs {expected:?}"
+        );
+        for (span, (whole, inner)) in spans.iter().zip(expected) {
+            assert_eq!(&text[span.span.clone()], *whole);
+            assert_eq!(span.inner, *inner);
+        }
+    }
+
+    /// 成对 + 多个同段 + CJK/emoji 混排:区间落在字符边界上,`==` 不吃
+    /// 多字节字符的尾巴。
+    #[test]
+    fn highlight_spans_pairs_cjk_emoji_and_multiple() {
+        let text = "中文==高亮==与==重点 😀==收尾,再来 ==两段== 同段 ==并排==。";
+        let spans = highlight_spans(text);
+        assert_highlights(
+            text,
+            &spans,
+            &[
+                ("==高亮==", "高亮"),
+                ("==重点 😀==", "重点 😀"),
+                ("==两段==", "两段"),
+                ("==并排==", "并排"),
+            ],
+        );
+        for span in &spans {
+            assert!(text.is_char_boundary(span.span.start));
+            assert!(text.is_char_boundary(span.span.end));
+        }
+    }
+
+    /// 未闭合、空标记、贴不上字(空白邻接):一律不成对,标记按字面。
+    #[test]
+    fn highlight_spans_skip_unclosed_empty_and_blank() {
+        for text in [
+            "==未闭合到底",
+            "开头就收 x==",
+            "====",
+            "== ==",
+            "==\t==",
+            "==x ==", // 闭标前驱是空白,贴不上字
+            "x == ",  // 开标后随是空白
+            "",
+        ] {
+            assert!(highlight_spans(text).is_empty(), "{text:?} 不应产出高亮");
+        }
+    }
+
+    /// 嵌套口径 = 最左最近配对、首个合法闭标即定终:`==a ==b== c==` 只高亮
+    /// `b`(外层开标的首个合法闭标已定终,作废后闭标不回收);单词内的
+    /// `==` 照常配对。
+    #[test]
+    fn highlight_spans_leftmost_pairing_not_nested() {
+        let text = "==a ==b== c==";
+        assert_highlights(text, &highlight_spans(text), &[("==b==", "b")]);
+
+        let text = "x==y==z";
+        assert_highlights(text, &highlight_spans(text), &[("==y==", "y")]);
+    }
+
+    /// 跨行与方括号:内部含换行、`[` 或 `]` 整对作废(wikilink 未展开形态
+    /// `==[[目标]]==` 同样作废);作废后的后文照常参与配对。
+    #[test]
+    fn highlight_spans_reject_cross_line_and_brackets() {
+        for text in ["==跨\n行==", "==a [b]==", "==a ] b==", "==[[目标]]=="] {
+            assert!(highlight_spans(text).is_empty(), "{text:?} 整对作废");
+        }
+        let text = "==[x](y)== 与 ==好== 混排";
+        assert_highlights(text, &highlight_spans(text), &[("==好==", "好")]);
+        let text = "==a ] b== 后 ==好==";
+        assert_highlights(text, &highlight_spans(text), &[("==好==", "好")]);
+    }
+
+    /// 代码区豁免且不误伤:围栏/缩进代码块里的 `==` 原样,行内代码夹心
+    /// 整对作废,块外的 `==` 照常配对。
+    #[test]
+    fn highlight_spans_skip_code_blocks_and_inline_code() {
+        let text = "```rust\nlet a == b; // ==x==\n```\n\n尾 ==真高亮==\n";
+        assert_highlights(text, &highlight_spans(text), &[("==真高亮==", "真高亮")]);
+
+        let text = "    缩进 ==x== 代码\n\n尾 ==真高亮==\n";
+        assert_highlights(text, &highlight_spans(text), &[("==真高亮==", "真高亮")]);
+
+        // 行内代码整体是一条豁免区间:覆盖它的候选作废,圈外的不受牵连
+        assert!(highlight_spans("`==x==`").is_empty(), "行内代码内不成对");
+        let text = "==a `b` c== 与 ==真高亮==";
+        assert_highlights(text, &highlight_spans(text), &[("==真高亮==", "真高亮")]);
+        let text = "前 ==真高亮== 与 `==x==` 后";
+        assert_highlights(text, &highlight_spans(text), &[("==真高亮==", "真高亮")]);
+    }
+
+    /// 链接/图片/强调/HTML/脚注豁免:候选区间与这些构造重叠即整对作废
+    /// (渠道是链接文字,vendored 对链接文字只取最后一个 Text 事件,混入
+    /// 富构造会丢字);圈外的 `==真高亮==` 不受牵连。
+    #[test]
+    fn highlight_spans_skip_links_emphasis_html_and_footnotes() {
+        for text in [
+            "[==x==](u) 与 ==真高亮==",
+            "![alt ==x==](i.png) 与 ==真高亮==",
+            "==**b**== 与 ==真高亮==",
+            "==a <b>c== 与 ==真高亮==",
+            "引用[^1]。\n\n[^1]: 定义 ==x== 这里\n\n尾 ==真高亮==\n",
+            "<div>\n==x==\n</div>\n\n尾 ==真高亮==\n",
+        ] {
+            let spans = highlight_spans(text);
+            assert_eq!(spans.len(), 1, "{text:?}");
+            assert_eq!(spans[0].inner, "真高亮");
+        }
+    }
+
+    /// 展开:变成 `[高亮](<hl://>)` 链接,其余字节逐字保留;改写产物真能
+    /// 解析成 `hl://` 链接(预览拦截的前提)。
+    #[test]
+    fn expand_highlight_links_rewrites_into_links() {
+        let text = "重点 ==高亮内容== 收尾。";
+        let (rendered, map) = expand_highlight_links(text);
+        assert_eq!(rendered, "重点 [高亮内容](<hl://>) 收尾。");
+        assert_eq!(map.rewrites_for_test().len(), 1);
+        let doc = parse(&rendered);
+        let hrefs: Vec<&str> = doc
+            .tokens
+            .iter()
+            .filter_map(|token| match token {
+                Token::Link { href, .. } => Some(href.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hrefs, vec![HIGHLIGHT_SCHEME]);
+
+        // 无 == 文档:恒等返回,映射为空(快路径不启动解析)
+        let (rendered, map) = expand_highlight_links("# 没有高亮\n\n正文。\n");
+        assert_eq!(rendered, "# 没有高亮\n\n正文。\n");
+        assert!(map.is_identity());
+    }
+
+    /// 偏移映射:改写段内归段首、段外平移、文末闭合(与既有层同语义)。
+    #[test]
+    fn expand_highlight_links_map_translates_offsets() {
+        let source = "前 ==高亮== 中\n\n## 标题\n";
+        let (rendered, map) = expand_highlight_links(source);
+        let heading_src = source.find("## 标题").expect("heading");
+        assert_eq!(
+            map.source_to_rendered(heading_src),
+            rendered.find("## 标题").expect("heading in rendered")
+        );
+        assert_eq!(map.rendered_to_source(rendered.len()), source.len());
+        let mark_at = source.find("==高亮==").expect("mark");
+        assert_eq!(map.source_to_rendered(mark_at + 3), mark_at, "段内归段首");
+        assert_eq!(map.rendered_to_source(map.source_to_rendered(0)), 0);
+    }
+
+    /// 四层生产顺序(wikilink → highlight → emoji → task)串行叠加:高亮
+    /// 保住、wikilink 照常展开、`==😀==` 里的 emoji 以字形直显不被二次
+    /// 改写;标题偏移四层正穿落在渲染串同一文本处、逆穿回源码。
+    #[test]
+    fn expand_highlight_links_stacks_in_production_order() {
+        let covered = cover(&["😀"]);
+        let source = "==高亮😀== 与 [[目标]]\n\n## 标题\n";
+        let (layer1, map1) = expand_wikilinks_with_map(source);
+        let (layer2, map2) = expand_highlight_links(&layer1);
+        let (layer3, map3) = expand_emoji_links(&layer2, &covered);
+        let (rendered, map4) = expand_task_links(&layer3);
+        assert_eq!(
+            rendered, "[高亮😀](<hl://>) 与 [目标](<wiki://目标>)\n\n## 标题\n",
+            "emoji 层对 hl:// 链接文本整体豁免,😀 不再改成 emoji://"
+        );
+
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let heading_out = rendered.find("## 标题").expect("heading in rendered");
+        let after1 = map1.source_to_rendered(heading_src);
+        let after2 = map2.source_to_rendered(after1);
+        let after3 = map3.source_to_rendered(after2);
+        assert_eq!(map4.source_to_rendered(after3), heading_out);
+        assert_eq!(
+            map1.rendered_to_source(
+                map2.rendered_to_source(
+                    map3.rendered_to_source(map4.rendered_to_source(heading_out))
+                )
+            ),
+            heading_src,
+            "四层逆穿回源码原处"
+        );
+    }
+
+    /// 幂等:自己产出的 `[x](<hl://>)` 不含 `==`,二次穿过恒等(快路径
+    /// 直接返回,流式重建反复穿过同层的稳态保证)。
+    #[test]
+    fn expand_highlight_links_is_idempotent_on_own_output() {
+        let (once, _) = expand_highlight_links("a ==x== b ==y==");
+        let (twice, map) = expand_highlight_links(&once);
+        assert_eq!(twice, once);
+        assert!(map.is_identity());
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块

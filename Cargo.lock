@@ -2632,6 +2632,7 @@ name = "latermd-export"
 version = "0.0.4"
 dependencies = [
  "krilla",
+ "latermd-md",
  "latermd-render",
  "pulldown-cmark",
  "rustybuzz",

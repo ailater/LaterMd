@@ -190,23 +190,28 @@ pub struct PreviewState {
     /// 文档大纲,与 `text` 同一次重建产出,`span` 直接索引该文本。
     pub outline: Vec<OutlineItem>,
     /// 喂给预览的**渲染文本**:`[[wikilink]]` 已展开成 `wiki://` 链接
-    /// (P3 双向链接),覆盖集内的 emoji 已改写成 `emoji://` 链接(#48 B1)。
-    /// 源码 `text` 一字不改 —— 两层改写都只影响渲染。
+    /// (P3 双向链接),`==文本==` 已改写成 `hl://` 链接(#65),覆盖集内的
+    /// emoji 已改写成 `emoji://` 链接(#48 B1)。源码 `text` 一字不改 ——
+    /// 各层改写都只影响渲染。
     pub rendered: String,
     /// 「源码偏移 ↔ wikilink 展开后偏移」映射表(LP2-4 第一层):与
     /// `rendered` 同一次重建产出(`latermd_md::expand_wikilinks_with_map`)。
     /// 预览侧消费(大纲跳转/section anchor 的偏移换算,见 `ui::preview`),
     /// 只读派生物,不回写编辑缓冲。
     pub offset_map: latermd_md::OffsetMap,
-    /// 「wikilink 展开后偏移 ↔ `rendered` 偏移」映射表(#48 B1 第二层:
-    /// emoji 链接改写),与 `rendered` 同次产出。消费点把它与 `offset_map`
-    /// **按改写顺序串行穿过**(可组合口径见 `latermd_md::OffsetMap`),
-    /// 不与第一层预合并。
+    /// 「wikilink 展开后偏移 ↔ 高亮层输出偏移」映射表(#65 第二层:
+    /// `==文本==` 改写成 `hl://` 链接),与 `rendered` 同次产出
+    /// (`latermd_md::expand_highlight_links`)。消费点与相邻表**按改写顺序
+    /// 串行穿过**(可组合口径见 `latermd_md::OffsetMap`),不预合并。
+    pub highlight_map: latermd_md::OffsetMap,
+    /// 「高亮层输出偏移 ↔ `rendered` 偏移」映射表(#48 B1 第三层:emoji
+    /// 链接改写),与 `rendered` 同次产出。消费点把它与前两层**按改写顺序
+    /// 串行穿过**(可组合口径见 `latermd_md::OffsetMap`),不与前者预合并。
     pub emoji_map: latermd_md::OffsetMap,
-    /// 「emoji 层输出偏移 ↔ `rendered` 偏移」映射表(#63 第三层:任务列表
+    /// 「emoji 层输出偏移 ↔ `rendered` 偏移」映射表(#63 第四层:任务列表
     /// checkbox 链接改写),与 `rendered` 同次产出。正向消费(大纲跳转)
-    /// 三层串行穿过;任务链接载荷本身是 emoji 层输出坐标,点击回写时逆穿
-    /// 本表与 `emoji_map` 两层即回源码。
+    /// 四层串行穿过;任务链接载荷本身是 emoji 层输出坐标,点击回写时逆穿
+    /// 本表与 `emoji_map`、`highlight_map` 三层即回源码。
     pub task_map: latermd_md::OffsetMap,
     /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
     /// 面板收起期间悬置(消费只发生在预览绘制帧);快照 rebuild(文档
@@ -219,23 +224,27 @@ impl PreviewState {
     /// 以编辑器当前内容建立快照(文本 + 大纲)。
     pub fn new(editor: &EditorBuffer) -> Self {
         let text = editor.text().to_owned();
-        // 三层改写都放在重建里而不是每帧:wikilink 展开要遍历全文、emoji
-        // 与任务标记改写要解析全文,空闲帧不该付这个代价(与「修订号前进
-        // 才重建」同一条规则)。顺序固定 **wikilink 展开 → emoji 链接改写
-        // → 任务 checkbox 链接改写**(再往预览绘制帧叠相对图片 URI):
-        // wikilink 展开把 `[[X]]` 变成链接后,emoji 层才能把它的文本/目标
-        // 整体豁免,反过来会拆坏 wikilink;任务层最后,它的载荷偏移因此
-        // 是 emoji 层输出坐标(点击回写时逆穿两层映射)。每层一张映射表,
-        // 与渲染串同次产出,消费点按同一顺序串行穿过。
+        // 四层改写都放在重建里而不是每帧:wikilink 展开要遍历全文、高亮/
+        // emoji/任务标记改写要解析全文,空闲帧不该付这个代价(与「修订号
+        // 前进才重建」同一条规则)。顺序固定 **wikilink 展开 → 高亮 `==`
+        // 链接改写 → emoji 链接改写 → 任务 checkbox 链接改写**(再往预览
+        // 绘制帧叠相对图片 URI):wikilink 展开把 `[[X]]` 变成链接后,高亮
+        // 层才能靠豁免清单不拆坏它;高亮层在 emoji 之前,`==😀==` 先成
+        // `hl://` 链接,emoji 层的「链接文本/目标整体豁免」顺势保护它;
+        // 任务层最后,它的载荷偏移因此是 emoji 层输出坐标(点击回写时逆穿
+        // 三层映射)。每层一张映射表,与渲染串同次产出,消费点按同一顺序
+        // 串行穿过。
         let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
+        let (after_highlight, highlight_map) = latermd_md::expand_highlight_links(&after_wikilinks);
         let (after_emoji, emoji_map) = latermd_md::expand_emoji_links(
-            &after_wikilinks,
+            &after_highlight,
             crate::ui::emoji_data::covered_glyphs(),
         );
         let (rendered, task_map) = latermd_md::expand_task_links(&after_emoji);
         Self {
             rendered,
             offset_map,
+            highlight_map,
             emoji_map,
             task_map,
             outline: latermd_md::outline(&text),
@@ -3746,6 +3755,85 @@ mod tests {
             std::fs::read(&path).unwrap(),
             source.as_bytes(),
             "盘上字节 == 源码,emoji 改写零外泄"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #65 M1:高亮改写只进 `rendered` 渲染副本 —— `==文本==` 成 `hl://`
+    /// 链接;源码、快照真源、修订号与 dirty 分毫不动;四层映射串行穿过,
+    /// 标题偏移落在渲染串同一文本处、逆穿回源码;代码区豁免。
+    #[test]
+    fn preview_highlight_rewrite_touches_only_rendered_copy() {
+        let source = "重点 ==高亮内容== 与 [[架构决策]]\n\n## 标题\n\n```rust\nlet a == b;\n```\n\n行内 `a == b` 免\n";
+        let mut editor = EditorBuffer::new(source);
+        editor.clear_dirty();
+        let (rev, dirty) = (editor.revision(), editor.is_dirty());
+        let preview = PreviewState::new(&editor);
+
+        // 源码零外泄:缓冲、快照真源、修订号与 dirty 分毫不动
+        assert_eq!(editor.text(), source);
+        assert_eq!(preview.text, source);
+        assert_eq!(editor.revision(), rev);
+        assert_eq!(editor.is_dirty(), dirty);
+
+        // 渲染副本:`==…==` 成 hl:// 链接;wikilink 照旧展开;围栏与行内
+        // 代码豁免(代码里的 == 是等号,原样)
+        assert!(preview
+            .rendered
+            .starts_with("重点 [高亮内容](<hl://>) 与 [架构决策](<wiki://架构决策>)\n"));
+        assert!(preview.rendered.contains("let a == b;"));
+        assert!(preview.rendered.contains("行内 `a == b` 免"));
+
+        // 四层串行穿过:标题(在全部改写之后)落在渲染串同一文本处
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let after1 = preview.offset_map.source_to_rendered(heading_src);
+        let after2 = preview.highlight_map.source_to_rendered(after1);
+        let after3 = preview.emoji_map.source_to_rendered(after2);
+        let after4 = preview.task_map.source_to_rendered(after3);
+        assert_eq!(
+            after4,
+            preview.rendered.find("## 标题").expect("in rendered")
+        );
+        assert_eq!(
+            preview.offset_map.rendered_to_source(
+                preview.highlight_map.rendered_to_source(
+                    preview
+                        .emoji_map
+                        .rendered_to_source(preview.task_map.rendered_to_source(after4))
+                )
+            ),
+            heading_src,
+            "四层逆穿回源码原处"
+        );
+    }
+
+    /// #65 硬红线:高亮改写零外泄到落盘 —— #32 快照护栏同法(#48 口径),
+    /// 建快照后保存,盘上字节与源码逐字节相同。
+    #[test]
+    fn highlight_rewrite_never_leaks_into_saved_bytes() {
+        let path = temp_path("highlight-m1.md");
+        let source = "# 标题 ==高亮==\n\n正文 ==x== 与 😀\n\n```rust\nlet a == b;\n```\n";
+        let mut state = State::default();
+        {
+            let tab = state.tabs.current_mut();
+            tab.editor.replace_all(source);
+            tab.preview.rebuild(&tab.editor);
+        }
+        assert!(
+            state
+                .tabs
+                .current()
+                .preview
+                .rendered
+                .contains("[高亮](<hl://>)"),
+            "前置:渲染副本确实被改写(断言非恒真)"
+        );
+
+        state.save_to(path.clone());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            source.as_bytes(),
+            "盘上字节 == 源码,高亮改写零外泄"
         );
         let _ = std::fs::remove_file(&path);
     }
