@@ -45,13 +45,16 @@ const FILE_MENU: [&[Command]; 2] = [
     &[Command::TabNext, Command::TabClose, Command::TabRestore],
 ];
 
-/// 「编辑」一段:文档内动作(undo/redo 是 TextEdit 内建,不列)。
+/// 「编辑」一段:文档内动作(undo/redo 是 TextEdit 内建,不列)。插入
+/// 目录(#66 M2)同段:与复制行/查找/替换/跳转同族的不作用选区的文档级
+/// 辅助动作(归位口径 decisions-pending #127)。
 const EDIT_MENU: [&[Command]; 1] = [&[
     Command::DuplicateSelection,
     Command::DuplicateLine,
     Command::FindInDoc,
     Command::ReplaceInDoc,
     Command::GotoLine,
+    Command::InsertToc,
 ]];
 
 /// 「格式」五段:行内 / 标题 / 块 / 列表四段与格式工具条
@@ -146,6 +149,8 @@ fn command_mnemonic(cmd: Command) -> char {
         Command::FindInDoc => 'F',
         Command::ReplaceInDoc => 'H',
         Command::GotoLine => 'G',
+        // T = TOC 词首;编辑菜单内 D/L/F/H/G 均未占 T,菜单内唯一
+        Command::InsertToc => 'T',
         Command::FormatBold => 'B',
         Command::FormatItalic => 'I',
         Command::FormatStrike => 'K',

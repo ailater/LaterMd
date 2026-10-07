@@ -20,6 +20,7 @@ pub use pdf::{
     export_document, export_pdf, PdfError, PdfExportOptions, PdfFont, PdfFonts, A4_HEIGHT, A4_WIDTH,
 };
 
+use latermd_md::Slugger;
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 /// 无标题文档的 `<title>` 回退值,与应用内「未命名」词汇一致。
@@ -106,7 +107,9 @@ pub fn export_html(text: &str) -> String {
     // 事件先收进 Vec:渲染与取标题共用一次解析结果;标题取自高亮包裹
     // **之后**的事件流 —— `# ==重点==` 的标题是「重点」,`==` 是语法
     // 不是内容(与预览一致,标记不回流正文文本)。
-    let events = wrap_highlights(Parser::new_ext(text, parser_options()).collect());
+    let events = attach_heading_ids(wrap_highlights(
+        Parser::new_ext(text, parser_options()).collect(),
+    ));
     let title = document_title(&events);
     let mut body = String::new();
     html::push_html(&mut body, events.into_iter());
@@ -221,6 +224,42 @@ fn push_marked_text<'a>(out: &mut Vec<Event<'a>>, texts: Vec<CowStr<'a>>) {
 const MARK_OPEN: &str = "<mark>";
 const MARK_CLOSE: &str = "</mark>";
 
+/// 给无 `id` 的标题注入锚点 id(#66 M1):slug 规则与 TOC 链接同一持有点
+/// ([`latermd_md::heading_slug`] + [`Slugger`],登记 decisions-pending
+/// #126)。导出现状原无锚点;`parser_options` 未开
+/// `ENABLE_HEADING_ATTRIBUTES`,`{#custom-id}` 不被解析,id 恒为 `None`,
+/// 注入无覆盖冲突,pulldown 0.13.4 的 html writer 对 `id: Some` 输出
+/// `id="…"`。重复标题去重按**全文档全部标题**序贯计数(不分层级)——
+/// TOC 侧同一口径,两侧锚点才不漂移。标题纯文本与 [`document_title`]
+/// 同源:只收 Text/Code,高亮包裹产出的 `<mark>`(InlineHtml)不进文本。
+///
+/// PDF 链路不补锚点(同 #65 先例:如实不硬做)。
+fn attach_heading_ids(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    let mut slugger = Slugger::new();
+    let mut index = 0;
+    while index < events.len() {
+        if matches!(events[index], Event::Start(Tag::Heading { id: None, .. })) {
+            // 标题不嵌套标题,配对的 End(Heading) 就是往后第一个
+            let mut text = String::new();
+            let mut probe = index + 1;
+            while probe < events.len() {
+                match &events[probe] {
+                    Event::Text(t) | Event::Code(t) => text.push_str(t),
+                    Event::End(TagEnd::Heading(_)) => break,
+                    _ => {}
+                }
+                probe += 1;
+            }
+            let anchor = CowStr::Boxed(slugger.slug(&text).into_boxed_str());
+            if let Event::Start(Tag::Heading { id, .. }) = &mut events[index] {
+                *id = Some(anchor);
+            }
+        }
+        index += 1;
+    }
+    events
+}
+
 /// 与 vendored `egui_markdown::parser::parse`(egui_markdown/src/parser.rs
 /// `parse` 内的 options 组装)逐项一致的扩展开关,委托 [`latermd_render`]
 /// 的唯一持有点——HTML 与 PDF 两条链路同方言由构造保证。
@@ -267,7 +306,7 @@ mod tests {
     #[test]
     fn heading_renders_and_feeds_title() {
         let html = export_html("# 后来MD 指南\n\n正文段落。");
-        assert_no_mojibake(&html, "<h1>后来MD 指南</h1>");
+        assert_no_mojibake(&html, "<h1 id=\"后来md-指南\">后来MD 指南</h1>");
         assert!(html.contains("<title>后来MD 指南</title>"), "{html}");
     }
 
@@ -336,8 +375,12 @@ mod tests {
         assert!(export_html("只有段落。").contains(&format!("<title>{FALLBACK_TITLE}</title>")));
         let html = export_html("# a & b < c\n\n正文");
         assert!(html.contains("<title>a &amp; b &lt; c</title>"), "{html}");
-        // 转义只作用于 <title>,正文交给 push_html 自己转义
-        assert!(html.contains("<h1>a &amp; b &lt; c</h1>"), "{html}");
+        // 转义只作用于 <title>,正文交给 push_html 自己转义;id 注入不影响
+        // 标签内的转义(slug 里标点已按规则删除,只剩 `a--b--c`)
+        assert!(
+            html.contains("<h1 id=\"a--b--c\">a &amp; b &lt; c</h1>"),
+            "{html}"
+        );
     }
 
     /// 标题里的行内代码同样进 `<title>`(见 `document_title` 的 Code 分支)。
@@ -460,7 +503,10 @@ mod tests {
 
         let titled = export_html("# ==重点==\n\n正文。");
         assert!(titled.contains("<title>重点</title>"), "{titled}");
-        assert!(titled.contains("<h1><mark>重点</mark></h1>"), "{titled}");
+        assert!(
+            titled.contains("<h1 id=\"重点\"><mark>重点</mark></h1>"),
+            "{titled}"
+        );
     }
 
     /// 否决线:无 `==` 的文档输出零 `<mark>`;未闭合/不配对的形态同样
@@ -476,5 +522,110 @@ mod tests {
             let html = export_html(text);
             assert!(!html.contains("<mark>"), "缺 guard {text:?}:\n{html}");
         }
+    }
+
+    // —— 标题锚点 id(#66 M1:与 TOC 生成同一条 slug 规则)——
+
+    /// TOC 文本里的 `(#锚点)` 清单(测试契约用)。
+    fn toc_anchors(toc: &str) -> Vec<String> {
+        toc.lines()
+            .filter_map(|line| {
+                let at = line.find("](#")?;
+                Some(line[at + 3..].trim_end_matches(')').to_owned())
+            })
+            .collect()
+    }
+
+    /// 导出 HTML 里的全部 `id="…"` 值(本文档模板中 id 只出现在标题上)。
+    fn heading_ids(html: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("id=\"") {
+            let tail = &rest[at + 4..];
+            let end = tail.find('"').expect("id 属性必有闭合引号");
+            ids.push(tail[..end].to_owned());
+            rest = &tail[end + 1..];
+        }
+        ids
+    }
+
+    /// 标题带锚点 id:CJK 原样、层级标签 `<h1 id="…">`。
+    #[test]
+    fn headings_carry_anchor_ids() {
+        let html = export_html("# 甲标题\n\n正文。\n\n## 乙节\n");
+        assert!(html.contains("<h1 id=\"甲标题\">"), "{html}");
+        assert!(html.contains("<h2 id=\"乙节\">"), "{html}");
+        // 无标题文档零 id
+        assert!(!export_html("只有段落。\n").contains("id=\""));
+    }
+
+    /// 重复标题序贯去重:`同名` → `同名-1` → (h4 吃 `同名-2`) → `同名-3`;
+    /// 去重不分层级,深度外的标题同样消耗计数。
+    #[test]
+    fn repeated_headings_get_deduped_ids() {
+        let html = export_html("## 同名\n\n## 同名\n\n#### 同名\n\n## 同名\n");
+        for (tag, id) in [
+            ("h2", "同名"),
+            ("h2", "同名-1"),
+            ("h4", "同名-2"),
+            ("h2", "同名-3"),
+        ] {
+            assert!(
+                html.contains(&format!("<{tag} id=\"{id}\">")),
+                "<{tag} id={id:?}> 缺失:\n{html}"
+            );
+        }
+    }
+
+    /// 高亮标题的 id 取包裹后的纯文本(`==` 是语法不是内容,与 `<title>`
+    /// 同源口径);slug 逐字符钉住特殊字符形态。
+    #[test]
+    fn highlight_heading_and_special_char_slugs() {
+        let html = export_html("# ==重点==\n\n正文。");
+        assert!(
+            html.contains("<h1 id=\"重点\"><mark>重点</mark></h1>"),
+            "{html}"
+        );
+
+        let html = export_html("### 🚀 Launch\n\n## C++ & Rust\n\n## v1.2\n");
+        for id in ["-launch", "c--rust", "v12"] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "缺 id={id:?}:\n{html}"
+            );
+        }
+    }
+
+    /// 核心验收:TOC 链接锚点与导出标题 id **逐标题一致**。含中文/emoji/
+    /// 特殊字符/重复标题/深度外消耗计数的全形态文档;h4 消耗
+    /// `中文-标题-2` 却不进 TOC(深度上限),不污染 TOC 侧去重。
+    #[test]
+    fn toc_anchors_align_with_exported_heading_ids() {
+        let src = "# 后来的指南\n\n正文。\n\n## 中文 标题\n\n### 🚀 Launch\n\n## C++ & Rust\n\n## 中文 标题\n\n#### 中文 标题\n\n### 🚀🚀\n";
+        let html = export_html(src);
+        let toc = latermd_md::generate_toc(&latermd_md::outline(src));
+        let anchors = toc_anchors(&toc);
+        let ids = heading_ids(&html);
+        assert_eq!(
+            anchors,
+            vec![
+                "后来的指南".to_owned(),
+                "中文-标题".to_owned(),
+                "-launch".to_owned(),
+                "c--rust".to_owned(),
+                "中文-标题-1".to_owned(),
+                String::new(),
+            ],
+            "TOC 锚点序列不符:{toc}"
+        );
+        for anchor in &anchors {
+            assert!(
+                ids.contains(anchor),
+                "TOC 锚点 {anchor:?} 不在导出 id {ids:?}"
+            );
+        }
+        // h4 拿走的「中文-标题-2」只在导出侧:消耗计数但不进 TOC
+        assert!(ids.contains(&"中文-标题-2".to_owned()), "{ids:?}");
+        assert!(!anchors.iter().any(|anchor| anchor == "中文-标题-2"));
     }
 }

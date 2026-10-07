@@ -3417,6 +3417,120 @@ mod tests {
             "一步重做恢复勾选(整次切换 = 单个撤销组)"
         );
     }
+
+    /// 插入目录(#66 M2)的单条 undo 契约(真实 undoer,无头):无论首次
+    /// 插入还是整块替换,命令经消息路径(`State::apply(Message::InsertToc)`)
+    /// 一次 `replace_range` 写入后,**一次** Ctrl+Z 整体回原状(整块 TOC
+    /// 消失/还原,正文逐字节不变),Ctrl+Shift+Z 一步重做恢复。undoer 看
+    /// 不到程序化写入,快照按绘制帧落(与 #17 全部替换、#61 M3 润色确认、
+    /// #63 任务勾选同语义)。
+    #[test]
+    fn undo_after_insert_toc_reverts_whole_block_in_one_step() {
+        use crate::state::{Message, State};
+
+        // 帧驱动借用当前标签的三件套(与 undo_after_replace_all 同一手法)
+        fn draw(ctx: &egui::Context, events: Vec<Event>, now: f64, state: &mut State) -> egui::Id {
+            let tab = state.tabs.current_mut();
+            frame(
+                ctx,
+                events,
+                now,
+                &mut tab.editor,
+                &mut tab.preview,
+                &mut tab.cursor,
+            )
+        }
+
+        let ctx = test_ctx();
+        let mut state = State::default();
+        let original = "# 甲标题\n\n正文一段。\n\n## 乙小节\n\n正文二段。首";
+        state.tabs.current_mut().editor.replace_all(original);
+
+        let id = draw(&ctx, Vec::new(), 0.0, &mut state); // undoer 首喂:原文快照
+        ctx.memory_mut(|m| m.request_focus(id));
+        draw(&ctx, vec![Event::Text("。".into())], 0.1, &mut state); // 用户编辑(文末追加)
+        draw(&ctx, Vec::new(), 1.5, &mut state); // 稳定 ≥1s:已提交撤销点
+        let before = format!("{original}。");
+        assert_eq!(state.tabs.current().editor.text(), before);
+
+        // 首次插入:一次写入,一次撤销组
+        state.apply(Message::InsertToc);
+        let inserted = state.tabs.current().editor.text().to_owned();
+        assert!(
+            inserted.starts_with("<!-- TOC -->\n"),
+            "前置:块已插入文档头"
+        );
+
+        draw(&ctx, Vec::new(), 1.6, &mut state); // undoer 看到插入结果(进 flux)
+        draw(&ctx, Vec::new(), 3.0, &mut state); // 稳定:插入结果成为一份新快照
+
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        draw(&ctx, vec![undo], 3.1, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            before,
+            "一次 Ctrl+Z 整块回原状(TOC 消失,正文逐字节不变)"
+        );
+
+        let redo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        };
+        draw(&ctx, vec![redo], 3.2, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            inserted,
+            "一步重做恢复整块 TOC(整次插入 = 单个撤销组)"
+        );
+
+        // 替换路径同契约:用户在正文里改标题(真实帧提交撤销点;TOC 块内
+        // 条目没跟着手改,已是过期锚点),原样再执行 = 整块替换;一次
+        // Ctrl+Z 回到「新标题 + 旧块」—— 撤销粒度恰为本次 TOC 写入,而非
+        // 回滚到更早的插入点
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all(&inserted.replace("# 甲标题", "# 丙标题"));
+        draw(&ctx, Vec::new(), 3.3, &mut state); // undoer 看到改标题后的文档(进 flux)
+        draw(&ctx, Vec::new(), 4.5, &mut state); // 稳定 ≥1s:成为已提交快照
+        let replaced_from = state.tabs.current().editor.text().to_owned();
+        assert!(
+            replaced_from.contains("# 丙标题") && replaced_from.contains("- [甲标题]"),
+            "前置:正文新标题 + 过期旧锚点"
+        );
+        state.apply(Message::InsertToc);
+        let replaced = state.tabs.current().editor.text().to_owned();
+        assert!(
+            replaced.contains("- [丙标题](#丙标题)") && !replaced.contains("- [甲标题]"),
+            "前置:整块替换已更新锚点"
+        );
+
+        draw(&ctx, Vec::new(), 4.6, &mut state); // undoer 看到替换结果
+        draw(&ctx, Vec::new(), 5.8, &mut state); // 稳定 ≥1s:成为新快照
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        draw(&ctx, vec![undo], 5.9, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            replaced_from,
+            "替换路径同样一步撤销:回到旧块,不回滚到插入前的正文"
+        );
+    }
     use crate::state::SelectionAiAction;
 
     /// 指针主键按下/抬起事件(pos 处)。

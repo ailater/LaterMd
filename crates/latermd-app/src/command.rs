@@ -172,6 +172,12 @@ pub enum Command {
     /// 「跳转到行」浮条(#60 M1,Ctrl+G):输入行号回车,编辑器光标落该
     /// 行行首并滚动到可见;源码/Live 两模式同一 `jump_to` 入口。
     GotoLine,
+    /// 插入/更新目录(#66 M2):有可收录标题(h1–h3)的文档,首次执行在
+    /// 文档头插入标记包围的 TOC 块,再执行整块替换既有块(识别与替换
+    /// 口径 decisions-pending #127,单步 undo);无可收录标题只落提示行。
+    /// 归位「编辑」:与复制行/查找/替换/跳转同族,都是不作用选区的文档级
+    /// 辅助动作(格式菜单十五条全是选区/光标处的格式化)。
+    InsertToc,
     /// 右侧只读预览栏展开/折叠(§3.1)。
     ToggleRightPreview,
     /// 禅定模式(§7)。F11:`KeyboardShortcut` 允许无修饰的 F1-F12。
@@ -201,7 +207,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 42] = [
+    pub const ALL: [Command; 43] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
@@ -240,6 +246,7 @@ impl Command {
         Self::FindInDoc,
         Self::ReplaceInDoc,
         Self::GotoLine,
+        Self::InsertToc,
         Self::ToggleRightPreview,
         Self::ToggleZen,
         Self::TypewriterToggle,
@@ -281,7 +288,8 @@ impl Command {
             | Self::DuplicateLine
             | Self::FindInDoc
             | Self::ReplaceInDoc
-            | Self::GotoLine => CommandGroup::Edit,
+            | Self::GotoLine
+            | Self::InsertToc => CommandGroup::Edit,
             Self::FormatBold
             | Self::FormatItalic
             | Self::FormatStrike
@@ -354,6 +362,7 @@ impl Command {
             Self::FindInDoc => "find_in_doc",
             Self::ReplaceInDoc => "replace_in_doc",
             Self::GotoLine => "goto_line",
+            Self::InsertToc => "insert_toc",
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
             Self::TypewriterToggle => "toggle_typewriter",
@@ -405,6 +414,7 @@ impl Command {
             Self::FindInDoc => "查找",
             Self::ReplaceInDoc => "替换",
             Self::GotoLine => "跳转到行",
+            Self::InsertToc => "插入目录",
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
             Self::TypewriterToggle => "打字机模式",
@@ -520,6 +530,17 @@ impl Command {
             // Ctrl/Cmd+G(#60 M1):VS Code 的跳转到行键位;出厂表 G 键无占用者
             // (mac 侧 ⌘G 与系统「查找下一个」惯例的取舍见 decisions-pending #113)
             Self::GotoLine => egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G),
+            // 插入目录(#66 M2):Ctrl/Cmd+Alt+C(C = Contents)。出厂表
+            // Ctrl/Cmd+Alt 层只有 R/W/D(切预览栏/打字机/专注),C 在该层
+            // 空闲(#9 口径的撞键核查在 tests);含 Alt 的绑定按保守口径避开
+            // 菜单标题助记集(F/E/O/V/X/A/S),C 不在其中(与 #122 同款审计)。
+            // 与 Ctrl/Cmd+Shift+C(围栏代码块)同键不同修饰,egui 的
+            // `matches_logically` 只把 Shift 当「可忽略的额外键」,Alt 必须
+            // 显式按下 —— 两个方向互不误触(egui 0.36.2 modifiers.rs:
+            // matches_logically 实读核验)。
+            Self::InsertToc => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::C)
+            }
             Self::ToggleRightPreview => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::R)
             }
@@ -593,6 +614,9 @@ impl Command {
             | Self::FindInDoc
             | Self::ReplaceInDoc
             | Self::GotoLine => Icon::Search,
+            // 与大纲页签同源(icons 无目录专用形;「多命令一图标」先例:
+            // ToggleLivePreview/ToggleZen 同源)。缩进列表即 TOC 的形。
+            Self::InsertToc => Icon::Outline,
             Self::ToggleRightPreview => Icon::PanelRight,
             Self::ToggleZen => Icon::Zen,
             // 与视图组两个开关共用禅定同心圆(icons 无打字机专用形;既有
@@ -653,6 +677,7 @@ impl Command {
             Self::FindInDoc => Message::FindBarToggled(true),
             Self::ReplaceInDoc => Message::ReplaceBarToggled(true),
             Self::GotoLine => Message::GotoBarToggled(true),
+            Self::InsertToc => Message::InsertToc,
         }
     }
 }
@@ -1038,6 +1063,75 @@ mod tests {
         assert_eq!(Command::GotoLine.message(), Message::GotoBarToggled(true));
     }
 
+    /// 插入目录(#66 M2)默认键位:Ctrl/Cmd+Alt+C,出厂表整条 Shortcut 无
+    /// 占用者(#9 口径的撞键核查);与 Ctrl/Cmd+Shift+C(围栏代码块)同键
+    /// 不同修饰,`matches_logically` 的 Alt 必须显式按下(只忽略多余
+    /// Shift),双向不误触 —— Shift 组合按键不触发本命令、Alt 组合按键不
+    /// 触发代码块,两条对照都实测。含 Alt 的绑定避开菜单标题助记集
+    /// (F/E/O/V/X/A/S),C 不在其中(#122 同款避让,menubar 的标题审计
+    /// 测试共同钉住)。真按键只触发这一条,消息映射到
+    /// `Message::InsertToc`,分组归「编辑」。
+    #[test]
+    fn insert_toc_shortcut_is_ctrl_alt_c_and_conflict_free() {
+        let ctrl_alt_c = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::ALT,
+            key: Key::C,
+        };
+        assert_eq!(
+            Command::InsertToc.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(ctrl_alt_c),
+            "InsertToc 出厂默认 = Ctrl/Cmd+Alt+C"
+        );
+        assert_eq!(Keymap::builtin().get(Command::InsertToc), Some(ctrl_alt_c));
+        assert_eq!(
+            Keymap::builtin().conflict(Command::InsertToc, ctrl_alt_c),
+            None,
+            "Ctrl/Cmd+Alt+C 不该撞任何出厂键位"
+        );
+        assert_eq!(
+            Command::InsertToc.group(),
+            CommandGroup::Edit,
+            "插入目录是编辑命令(菜单「编辑」/蒙层同一归属)"
+        );
+
+        // Alt 组合先被问到(修饰键个数降序),只触发本命令;Shift 同键对照
+        // 不误触(matches_logically 对 Alt 的显式要求,双向实证)
+        for (key, modifiers, expected) in [
+            (
+                Key::C,
+                Modifiers::COMMAND | Modifiers::ALT,
+                vec![Command::InsertToc],
+            ),
+            (
+                Key::C,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                vec![Command::FormatCodeBlock],
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![key_event(key, modifiers)],
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(
+                        poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                        expected,
+                        "{modifiers:?}+C 的触发面"
+                    );
+                },
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(Command::InsertToc.message(), Message::InsertToc);
+    }
+
     /// 打字机模式(#64 M1)默认键位:Ctrl/Cmd+Alt+W,出厂表无第二个占用者
     /// (#9 口径的撞键核查);与 Ctrl/Cmd+W(关标签)只差一个 Alt,靠
     /// 「修饰键个数降序」的消费顺序共存(与 EmojiPicker/ExportHtml 同款
@@ -1291,7 +1385,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 42);
+        assert_eq!(Command::ALL.len(), 43);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();

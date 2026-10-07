@@ -5715,9 +5715,11 @@ mod tests {
     /// 从 visuals 推导,不硬编码)。
     #[test]
     fn shortcut_overlay_paints_grouped_rows_in_both_themes() {
-        let ctx = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
         for theme in ["dark", "light"] {
+            // 每轮独立 Context:后半段要滚动蒙层的 ScrollArea,其偏移持久在
+            // egui memory —— 共享 ctx 会把滚动状态泄进下一轮的首屏断言
+            let ctx = egui::Context::default();
             let mut app = LaterMdApp::default();
             if theme == "light" {
                 app.state.apply(Message::ToggleTheme);
@@ -5746,9 +5748,39 @@ mod tests {
                 texts.iter().any(|t| t == "Ctrl+S"),
                 "{theme}:键位 kbd 文本已渲染(平台化显示):{texts:?}"
             );
+            // 无绑定命令照列(#54 产品决定):蒙层卡片可视高钉在 502px,
+            // 命令全集(#66 M2 起 43 条)的内容超出视口、靠内建 ScrollArea
+            // 滚动 —— 「未绑定」行(AI 组,排序在最末)在首屏之外,把指针
+            // 移进蒙层卡滚到底再取证。滚轮的消费条件是指针在 ScrollArea
+            // 外框内(egui 0.36.2 scroll_area.rs 实读;构造手法与 live.rs
+            // 的滚动测试同款)。
+            let wheel = Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            };
+            let card_center = screen.center();
+            for events in [
+                vec![Event::PointerMoved(card_center)],
+                vec![wheel.clone()],
+                vec![wheel.clone()],
+                vec![wheel],
+            ] {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                );
+                output.drop_without_applying_deltas();
+            }
+            let scrolled = draw_frame(&mut app, &ctx, screen);
             assert!(
-                texts.iter().any(|t| t.contains("未绑定")),
-                "{theme}:无绑定命令照列:{texts:?}"
+                scrolled.iter().any(|t| t.contains("未绑定")),
+                "{theme}:无绑定命令照列(滚到蒙层底部):{scrolled:?}"
             );
         }
     }

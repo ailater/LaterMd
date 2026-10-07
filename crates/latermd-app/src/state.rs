@@ -747,6 +747,11 @@ pub enum Message {
     GotoLineRequested {
         line: usize,
     },
+    /// 插入/更新目录(#66 M2,命令层 `InsertToc` 与菜单/快捷键的共同归约
+    /// 入口):有可收录标题(一至三级)则在文档头插入标记包围的 TOC 块
+    /// (首次)或整块替换既有块(再执行,单次定点写入 = 单步 undo,口径
+    /// decisions-pending #127);无可收录标题只落提示行,文档不动。
+    InsertToc,
     SearchQueryChanged,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
@@ -1047,6 +1052,7 @@ impl State {
             Message::ReplaceAllInDoc => self.replace_all_in_doc(),
             Message::GotoBarToggled(open) => self.toggle_goto(open),
             Message::GotoLineRequested { line } => self.goto_line(line),
+            Message::InsertToc => self.insert_toc(),
             Message::ImageDialogOpened => self.open_image_dialog(),
             Message::ImageInserted { alt, url } => self.insert_image(&alt, &url),
             Message::ImageDialogClosed => self.close_image_dialog(),
@@ -2080,6 +2086,57 @@ impl State {
         tab.cursor.jump_to = Some(tab.editor.byte_to_char(byte));
         self.goto.open = false;
         self.goto.input.clear();
+    }
+
+    /// 插入/更新目录([`Message::InsertToc`],#66 M2)的归约:
+    ///
+    /// 1. 全文走大纲通道取标题;无可收录标题只落提示行,文档/选区/修订号
+    ///    一概不动(与 AI 摘要的空文档防御同款;全无标题与「只有四级及
+    ///    更深标题」两种提示分开,口径 decisions-pending #127);
+    /// 2. 有可收录标题:组装完整 TOC 块(标记行包围,`latermd_md::toc_block`,
+    ///    锚点为 M1 `generate_toc` 口径),既有块(`toc_region_span` 标记
+    ///    识别)**整块替换**,否则插入文档头 —— 一次
+    ///    [`EditorBuffer::replace_range`] 定点写入,TextEdit 内建 undoer 的
+    ///    快照按绘制帧落,一次 Ctrl+Z 整体回原状(#17 全部替换 / #61 润色
+    ///    确认同语义,无头实证见 `ui::editor` 的 TOC undo 测试);区域内的
+    ///    手工改动随整块覆盖(同 #127);
+    /// 3. 写入后光标折叠到块首(`cursor.jump_to`,源码/Live 两模式同一
+    ///    入口,写回帧视口随光标滚到块首),`cursor.byte` 按字符边界折算
+    ///    (`apply_format` 同款);dirty 由 `EditorBuffer::touch` 置位,走
+    ///    正常保存链路。
+    fn insert_toc(&mut self) {
+        let text = self.tabs.current().editor.text().to_owned();
+        let items = latermd_md::outline(&text);
+        let notice = if items.is_empty() {
+            Some("文档没有标题,无法生成目录".to_owned())
+        } else if !items
+            .iter()
+            .any(|item| item.level <= latermd_md::TOC_MAX_DEPTH)
+        {
+            Some("目录只收录一至三级标题,当前文档没有可收录的标题".to_owned())
+        } else {
+            None
+        };
+        if let Some(notice) = notice {
+            self.tabs.current_mut().document.notice = Some(notice);
+            return;
+        }
+        let block = latermd_md::toc_block(&items);
+        // 既有块整块替换;无块则插入文档头。替换文本恰为块本体(块外字节
+        // 零增删,反复执行不涨空行);首插多补一个空行把块与正文隔开。
+        let (byte_start, byte_end, pad) = match latermd_md::toc_region_span(&text) {
+            Some(span) => (span.start, span.end, ""),
+            None => (0, 0, "\n"),
+        };
+        let tab = self.tabs.current_mut();
+        let start = tab.editor.byte_to_char(byte_start);
+        let end = tab.editor.byte_to_char(byte_end);
+        tab.editor
+            .replace_range(start..end, &format!("{block}{pad}"));
+        tab.cursor.jump_to = Some(start);
+        if let Some(byte) = tab.cursor.byte {
+            tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
+        }
     }
 
     /// 替换前刷新过期的命中缓存(#17 评审修复):`hits`/`hit` 只在查找词
@@ -5431,7 +5488,7 @@ mod tests {
         state.export_html_to(&path);
         let html = std::fs::read_to_string(&path).unwrap();
         assert!(html.starts_with("<!DOCTYPE html>"), "{html}");
-        assert!(html.contains("<h1>导出标题</h1>"), "{html}");
+        assert!(html.contains("<h1 id=\"导出标题\">导出标题</h1>"), "{html}");
         assert!(html.contains("max-width: 46em"), "{html}");
         // 派生物:dirty 保留、路径不认领
         assert!(state.tabs.current_mut().editor.is_dirty());
@@ -9462,6 +9519,141 @@ mod tests {
             "空文档钳到第 1 行行首"
         );
         assert!(!state.goto.open, "空文档跳转同样关闭浮条");
+    }
+
+    // —— 插入/更新目录(#66 M2,Message::InsertToc 归约)——
+
+    /// 首次执行:TOC 块(标记包围)插到文档头,块与正文之间补一个空行;
+    /// dirty 置位走正常保存链路,光标折叠到块首(`jump_to` 通道),不落
+    /// 提示。CJK 标题的锚点为 M1 slug 口径。
+    #[test]
+    fn insert_toc_first_run_inserts_block_at_head() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("中文前言\n\n# 甲标题\n\n正文。\n\n## 乙标题\n");
+        state.tabs.current_mut().editor.clear_dirty();
+
+        state.apply(Message::InsertToc);
+
+        let tab = state.tabs.current();
+        assert_eq!(
+            tab.editor.text(),
+            "<!-- TOC -->\n- [甲标题](#甲标题)\n  - [乙标题](#乙标题)\n<!-- /TOC -->\n\n中文前言\n\n# 甲标题\n\n正文。\n\n## 乙标题\n",
+            "首插 = 块落文档头 + 补空行隔开正文,原文零改动"
+        );
+        assert!(tab.editor.is_dirty(), "TOC 写入置位 dirty(正常保存链路)");
+        assert_eq!(tab.cursor.jump_to, Some(0), "光标折叠到块首");
+        assert_eq!(tab.document.notice, None, "成功不落提示");
+    }
+
+    /// 再执行:识别既有块**整块替换**,不堆叠第二份;标题变动后内容随之
+    /// 更新,块外字节零增删;内容已同步时再执行幂等(同内容替换零漂移)。
+    #[test]
+    fn insert_toc_second_run_replaces_block_and_follows_heading_changes() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("# 旧标题\n\n正文。\n\n## 小节\n");
+        state.apply(Message::InsertToc);
+        let first = state.tabs.current().editor.text().to_owned();
+        assert_eq!(
+            first,
+            "<!-- TOC -->\n- [旧标题](#旧标题)\n  - [小节](#小节)\n<!-- /TOC -->\n\n# 旧标题\n\n正文。\n\n## 小节\n",
+            "前置:首插形态"
+        );
+
+        // 改标题后原样再执行:块内容更新,文档里始终只有一对标记
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all(&first.replace("旧标题", "新标题"));
+        state.apply(Message::InsertToc);
+        let text = state.tabs.current().editor.text().to_owned();
+        assert!(
+            text.contains("- [新标题](#新标题)"),
+            "TOC 内容随标题更新:{text}"
+        );
+        assert!(!text.contains("旧标题"), "旧锚点整块消失");
+        assert_eq!(text.matches("<!-- TOC -->").count(), 1, "替换不堆叠新块");
+        assert_eq!(
+            text,
+            "<!-- TOC -->\n- [新标题](#新标题)\n  - [小节](#小节)\n<!-- /TOC -->\n\n# 新标题\n\n正文。\n\n## 小节\n",
+            "块外字节(正文与标题行)零增删"
+        );
+
+        // 内容已同步时再执行:幂等
+        state.apply(Message::InsertToc);
+        assert_eq!(state.tabs.current().editor.text(), text, "同内容替换零漂移");
+    }
+
+    /// 手工改过 TOC 区域再执行 = 整块覆盖(#127 口径):标记之间的手工内容
+    /// 不保留,块外正文(含块后既有空行)不受影响。
+    #[test]
+    fn insert_toc_overwrites_hand_edited_region_wholesale() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("# 甲\n\n<!-- TOC -->\n手写的目录行(不想保留)\n<!-- /TOC -->\n\n正文。\n");
+
+        state.apply(Message::InsertToc);
+
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "# 甲\n\n<!-- TOC -->\n- [甲](#甲)\n<!-- /TOC -->\n\n正文。\n",
+            "手工内容整块覆盖;块在原位替换,块前标题与块后正文(含既有空行)不动"
+        );
+    }
+
+    /// 无可收录标题:只落提示行,文档/修订号/光标一动不动。全无标题与
+    /// 「只有四级及更深标题」两种提示分开(#127)。
+    #[test]
+    fn insert_toc_without_usable_headings_only_notices() {
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("只有段落,没有标题。\n");
+        state.tabs.current_mut().editor.clear_dirty();
+
+        state.apply(Message::InsertToc);
+
+        let tab = state.tabs.current();
+        assert_eq!(
+            tab.document.notice,
+            Some("文档没有标题,无法生成目录".to_owned())
+        );
+        assert_eq!(tab.editor.text(), "只有段落,没有标题。\n", "文档不动");
+        assert!(!tab.editor.is_dirty(), "提示路径不置脏");
+        assert_eq!(tab.cursor.jump_to, None, "不发生跳转");
+
+        // 只有一级 + 四级:大纲非空,但深度内只有一级可收录 —— 有标题可
+        // 收录,正常生成(对照:四级单独存在才落第二种提示)
+        let mut state = State::default();
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("#### 只有四级小节\n");
+        state.apply(Message::InsertToc);
+        assert_eq!(
+            state.tabs.current().document.notice,
+            Some("目录只收录一至三级标题,当前文档没有可收录的标题".to_owned()),
+            "深度内无可收录条目,提示与全无标题分开"
+        );
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "#### 只有四级小节\n",
+            "文档不动"
+        );
     }
 
     /// 单个替换(#17 M1):定点改写文本、置脏推进修订号、重扫计数回落、
