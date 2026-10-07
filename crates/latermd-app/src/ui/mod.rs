@@ -4,6 +4,7 @@ pub mod editor;
 pub mod emoji_data;
 pub mod emoji_panel;
 pub mod fade;
+pub mod focus;
 pub mod format_bar;
 pub mod gutter;
 pub mod icons;

@@ -502,6 +502,10 @@ impl LaterMdApp {
                     // #64 M1:打字机模式开关(全局偏好,源码/Live 两模式
                     // 共用;关闭 = 现状零变化)。
                     state.theme.show_typewriter,
+                    // #64 M2:专注模式开关(全局偏好;仅 Live 模式淡化非
+                    // 活动块,源码模式不接线 —— 边界见 decisions-pending #122;
+                    // 关闭 = 现状零变化)。
+                    state.theme.show_focus_mode,
                     outbox,
                 );
                 // 命中回填沿用编辑器的选区/滚动通道,但不能终止查找框的连续输入。

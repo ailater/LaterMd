@@ -308,6 +308,7 @@ pub fn ui(
     live: &mut LiveState,
     editor_id: egui::Id,
     show_typewriter: bool,
+    show_focus: bool,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
@@ -707,6 +708,14 @@ pub fn ui(
                         egui::pos2(ui.min_rect().left(), top),
                         egui::pos2(ui.min_rect().right(), bottom.max(top + 1.0)),
                     );
+                    // 专注模式(#64 M2):非活动块整块蒙一层背景色遮罩(#81
+                    // 内联标记半隐藏同款纯绘制 —— 后画覆盖,不注册交互、
+                    // 不参与命中测试),淡化块的点击仍走 `clicked_for_edit`
+                    // 进入编辑,进入即变活动块、下帧起不再淡化。关闭态整块
+                    // 不进(逐像素现状,否决线)。
+                    if show_focus && crate::ui::focus::dimmed(live.active, index) {
+                        paint_block_fade(ui, rect);
+                    }
                     if clicked_for_edit(ui, rect, editor_id) {
                         activate = Some(index);
                     }
@@ -876,6 +885,18 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> boo
 /// 标记半隐藏的遮罩不透明度(遮罩色 = 编辑框背景色)。「弱化但可辨识」,
 /// 不做用户可调的透明度配置面(规格口径)。
 const MARK_FADE_ALPHA: u8 = 166;
+
+/// 专注模式(#64 M2)的块级遮罩:编辑框背景色 × α 蒙在整块上(含块内
+/// checkbox/复制头等自绘件 —— 它们的命中探针独立于绘制,点击行为不受
+/// 影响)。遮罩不透明度与可读性折算见 [`crate::ui::focus::DIM_ALPHA`]。
+fn paint_block_fade(ui: &egui::Ui, rect: egui::Rect) {
+    let bg = ui.visuals().text_edit_bg_color();
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), crate::ui::focus::DIM_ALPHA),
+    );
+}
 
 /// 把活动块里的内联标记以半透明遮罩弱化(LP2-1)。
 ///
@@ -1080,6 +1101,7 @@ mod tests {
                 &mut live,
                 egui::Id::new("live-test"),
                 false,
+                false,
                 &mut outbox,
             );
         });
@@ -1232,6 +1254,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new("live-copy-test"),
+                    false,
                     false,
                     &mut outbox,
                 );
@@ -1593,6 +1616,7 @@ mod tests {
                     cursor,
                     live,
                     egui::Id::new(FADE_EDITOR_ID),
+                    false,
                     false,
                     &mut outbox,
                 );
@@ -2242,6 +2266,7 @@ mod tests {
         cursor: &mut OutlineCursor,
         live: &mut LiveState,
         show_typewriter: bool,
+        show_focus: bool,
     ) -> Option<egui::Rect> {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut id = egui::Id::NULL;
@@ -2262,6 +2287,7 @@ mod tests {
                     live,
                     egui::Id::new(SCROLL_EDITOR_ID),
                     show_typewriter,
+                    show_focus,
                     &mut outbox,
                 )
                 .id;
@@ -2320,6 +2346,7 @@ mod tests {
             &mut cursor,
             &mut live,
             false,
+            false,
         )
         .expect("活动块响应可读");
         assert_eq!(
@@ -2349,6 +2376,7 @@ mod tests {
             &mut cursor,
             &mut live,
             false,
+            false,
         );
         for i in 0..45 {
             let _ = live_scroll_frame(
@@ -2359,6 +2387,7 @@ mod tests {
                 &mut preview,
                 &mut cursor,
                 &mut live,
+                false,
                 false,
             );
         }
@@ -2373,6 +2402,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2383,6 +2413,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读");
@@ -2427,6 +2458,7 @@ mod tests {
             &mut cursor,
             &mut live,
             false,
+            false,
         );
 
         let pointer = egui::pos2(400.0, 300.0);
@@ -2447,6 +2479,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         // 滚动带动画:空转几帧让偏移落到最终值
@@ -2460,6 +2493,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let settled = live_scroll_frame(
@@ -2470,6 +2504,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读")
@@ -2487,6 +2522,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let after = live_scroll_frame(
@@ -2497,6 +2533,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读")
@@ -2535,6 +2572,7 @@ mod tests {
             &mut cursor,
             &mut live,
             false,
+            false,
         );
 
         // ↑ 在块首 → 路由到段落块末尾
@@ -2546,6 +2584,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         );
         assert_eq!(live.active, Some(0), "路由切换活动块:{live:?}");
@@ -2564,6 +2603,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         );
         let caret = scroll_block_caret(&ctx, 0).expect("目标块光标已写入");
@@ -2589,6 +2629,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let top_next = live_scroll_frame(
@@ -2599,6 +2640,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读")
@@ -2619,6 +2661,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2629,6 +2672,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读");
@@ -2671,6 +2715,7 @@ mod tests {
             &mut cursor,
             &mut live,
             false,
+            false,
         );
         assert_eq!(live.blocks.len(), 3, "标题/段落/标题:{:?}", live.blocks);
 
@@ -2692,6 +2737,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         );
         assert_eq!(live.active, Some(target), "跳转目标块成为活动块:{live:?}");
@@ -2719,6 +2765,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let top_next = live_scroll_frame(
@@ -2729,6 +2776,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读")
@@ -2749,6 +2797,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 false,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2759,6 +2808,7 @@ mod tests {
             &mut preview,
             &mut cursor,
             &mut live,
+            false,
             false,
         )
         .expect("活动块响应可读");
@@ -2816,6 +2866,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         // 空转一帧再进导航键(set_focus_lock_filter,既有口径)
         let _ = live_scroll_frame(
@@ -2827,6 +2878,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         let down = arrow(egui::Key::ArrowDown);
         for i in 0..45 {
@@ -2839,6 +2891,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
         }
         for t in [6.2, 6.3] {
@@ -2851,6 +2904,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
         }
         let rect = live_scroll_frame(
@@ -2862,6 +2916,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         )
         .expect("活动块响应可读");
         let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
@@ -2907,6 +2962,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         // 焦点锁过滤帧
         let _ = live_scroll_frame(
@@ -2918,6 +2974,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
 
         // 换行走 Event::Key Enter(egui 过滤 Event::Text 中的 "\n");每帧
@@ -2940,6 +2997,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
             t += 0.1;
             for _ in 0..2 {
@@ -2952,6 +3010,7 @@ mod tests {
                     &mut cursor,
                     &mut live,
                     true,
+                    false,
                 );
                 t += 0.05;
             }
@@ -2967,6 +3026,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
             t += 0.05;
         }
@@ -2979,6 +3039,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         )
         .expect("活动块响应可读");
         let caret = scroll_block_caret(&ctx, 0).expect("光标已落位");
@@ -3024,6 +3085,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         let _ = live_scroll_frame(
             &ctx,
@@ -3034,6 +3096,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         let down = arrow(egui::Key::ArrowDown);
         for i in 0..45 {
@@ -3046,6 +3109,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
         }
         for t in [6.2, 6.3, 6.4] {
@@ -3058,6 +3122,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
         }
         assert_eq!(
@@ -3084,6 +3149,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
         }
         let _ = live_scroll_frame(
@@ -3095,6 +3161,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         let settled = live_scroll_frame(
             &ctx,
@@ -3105,6 +3172,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         )
         .expect("活动块响应可读")
         .top();
@@ -3123,6 +3191,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             )
             .expect("活动块响应可读")
             .top();
@@ -3142,6 +3211,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         );
         for t in [9.1, 9.2, 9.3, 9.4] {
             let _ = live_scroll_frame(
@@ -3153,6 +3223,7 @@ mod tests {
                 &mut cursor,
                 &mut live,
                 true,
+                false,
             );
             eprintln!("DBG-LV{t} tw={:?}", live_tw_memory(&ctx));
         }
@@ -3165,6 +3236,7 @@ mod tests {
             &mut cursor,
             &mut live,
             true,
+            false,
         )
         .expect("活动块响应可读");
         assert_eq!(
@@ -3419,5 +3491,354 @@ mod tests {
             crate::ui::selection_ai::Probe::default(),
             "无选区零浮标(Live)"
         );
+    }
+
+    // —— M2 专注模式(Live 非活动块淡化)——
+
+    /// 专注模式测试文档:五块等距(块序 0..=4)。active=Some(2) 时淡化集
+    /// = {0, 4},一段文档同时摆出「活动块/邻块正常、远块淡化」三种位形;
+    /// 用 ASCII 免掉 CJK 字体缺席的测试环境分叉。
+    const FOCUS_DOC: &str = "block zero\n\nblock one\n\nblock two\n\nblock three\n\nblock four\n";
+    const FOCUS_EDITOR_ID: &str = "live-focus";
+
+    /// 专注模式的帧驱动:跑一帧 Live(生产入口 `super::ui`),返回(块级
+    /// 遮罩矩形、帧内文本 rect、全部 shape —— 供逐 shape 对照)。遮罩取证
+    /// 以「编辑框背景色 × DIM_ALPHA」从 shapes 里挑 Rect(#81 同款手法,
+    /// 明暗主题各自当帧取色)。
+    #[allow(clippy::too_many_arguments)]
+    fn live_focus_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        editor: &mut EditorBuffer,
+        preview: &mut PreviewState,
+        cursor: &mut OutlineCursor,
+        live: &mut LiveState,
+        show_focus: bool,
+    ) -> (
+        Vec<egui::Rect>,
+        Vec<(String, egui::Rect)>,
+        Vec<egui::epaint::ClippedShape>,
+    ) {
+        let mut outbox = Vec::new();
+        let mut fade = egui::Color32::TRANSPARENT;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(
+                    ui,
+                    editor,
+                    preview,
+                    cursor,
+                    live,
+                    egui::Id::new(FOCUS_EDITOR_ID),
+                    false,
+                    show_focus,
+                    &mut outbox,
+                );
+                let bg = ui.visuals().text_edit_bg_color();
+                fade = egui::Color32::from_rgba_unmultiplied(
+                    bg.r(),
+                    bg.g(),
+                    bg.b(),
+                    crate::ui::focus::DIM_ALPHA,
+                );
+            },
+        );
+        let mut fades = Vec::new();
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::epaint::Shape::Rect(shape) if shape.fill == fade => fades.push(shape.rect),
+                egui::epaint::Shape::Text(t) => texts.push((
+                    t.galley.text().to_owned(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                _ => {}
+            }
+        }
+        let shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        (fades, texts, shapes)
+    }
+
+    /// 块文本的渲染 rect(遮罩「该盖谁/不该盖谁」的取证锚点)。
+    fn text_rect(texts: &[(String, egui::Rect)], needle: &str) -> egui::Rect {
+        texts
+            .iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("文本 {needle} 未渲染:{texts:?}"))
+    }
+
+    fn focus_state() -> (EditorBuffer, PreviewState, OutlineCursor, LiveState) {
+        let editor = EditorBuffer::new(FOCUS_DOC);
+        let preview = PreviewState::new(&editor);
+        (
+            editor,
+            preview,
+            OutlineCursor::default(),
+            LiveState {
+                active: Some(2),
+                ..LiveState::default()
+            },
+        )
+    }
+
+    /// 开启 = 非活动块绘制淡化(像素取证):恰两枚遮罩,分别盖住距活动块
+    /// ≥2 的块 0 与块 4;活动块(2)与光标邻块(1、3)不被任何遮罩覆盖。
+    #[test]
+    fn focus_mode_fades_distant_blocks_keeps_active_and_neighbors() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+
+        let (fades, texts, _) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        assert_eq!(fades.len(), 2, "淡化块 = {{0, 4}}:{fades:?}");
+        // 遮罩与块矩形同形状全宽(点击命中区同一 rect),相邻遮罩与邻块
+        // 文本边界相接不算「盖住」 —— 判定用文本 rect 中心是否落入遮罩。
+        for needle in ["block zero", "block four"] {
+            let center = text_rect(&texts, needle).center();
+            assert!(
+                fades.iter().any(|fade| fade.contains(center)),
+                "{needle} 应被遮罩盖住:{fades:?} vs 中心 {center:?}"
+            );
+        }
+        for needle in ["block one", "block two", "block three"] {
+            let center = text_rect(&texts, needle).center();
+            assert!(
+                fades.iter().all(|fade| !fade.contains(center)),
+                "{needle}(活动块/邻块)不该被遮罩盖住:{fades:?} vs 中心 {center:?}"
+            );
+        }
+    }
+
+    /// 点击淡化块进入编辑且恢复正常:遮罩不参与命中,点击仍触发
+    /// `clicked_for_edit`;块切换后焦点与光标路由到新活动块,下一帧该块
+    /// 无遮罩,原活动块(与新活动块隔一块)转为淡化。
+    #[test]
+    fn focus_click_on_faded_block_enters_edit_and_recovers() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+        let (_, texts, _) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let target = text_rect(&texts, "block four").center();
+        for events in click_events(target) {
+            let _ = live_focus_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+        }
+        assert_eq!(live.active, Some(4), "点击淡化块进入编辑");
+
+        // pending_caret 落地帧:焦点与光标落进块 4
+        let _ = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        let id = egui::Id::new(FOCUS_EDITOR_ID).with(("live-block", 4));
+        assert!(
+            ctx.memory(|mem| mem.has_focus(id)),
+            "点击后块 4 TextEdit 持焦"
+        );
+
+        // 恢复正常:块 4 不再淡化;淡化集随活动块移到 {0, 1, 2}
+        let (fades, texts, _) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        assert_eq!(fades.len(), 3, "淡化块 = {{0, 1, 2}}:{fades:?}");
+        let center = text_rect(&texts, "block four").center();
+        assert!(
+            fades.iter().all(|fade| !fade.contains(center)),
+            "点过的块已恢复正常(无遮罩):{fades:?} vs 中心 {center:?}"
+        );
+    }
+
+    /// 否决线:关闭 = 逐像素现状。关闭帧零遮罩;重复两帧 shape 序列逐项
+    /// 相等(确定性);开启帧剔除遮罩 shape 后与关闭帧完全一致(遮罩对
+    /// 其余绘制零扰动);开启/关闭两帧整体不同(开关真的改变输出)。
+    #[test]
+    fn focus_off_matches_baseline_shapes_pixel_for_pixel() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+
+        let (off_fades, _, off_shapes) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            false,
+        );
+        assert!(off_fades.is_empty(), "关闭帧零遮罩形状:{off_fades:?}");
+
+        let (off_fades2, _, off_shapes2) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            false,
+        );
+        assert!(off_fades2.is_empty());
+        assert_eq!(off_shapes, off_shapes2, "关闭帧逐 shape 确定重现");
+
+        // 开启帧:剔除遮罩后应与关闭帧逐 shape 一致(纯叠加,零扰动)
+        let (on_fades, _, on_shapes) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        assert_eq!(on_fades.len(), 2, "前置:开启帧有两枚遮罩");
+        let bg = ctx.global_style().visuals.text_edit_bg_color();
+        let fade = egui::Color32::from_rgba_unmultiplied(
+            bg.r(),
+            bg.g(),
+            bg.b(),
+            crate::ui::focus::DIM_ALPHA,
+        );
+        let on_without_fades: Vec<_> = on_shapes
+            .into_iter()
+            .filter(|clipped| {
+                !matches!(
+                    &clipped.shape,
+                    egui::epaint::Shape::Rect(shape) if shape.fill == fade
+                )
+            })
+            .collect();
+        assert_eq!(
+            on_without_fades, off_shapes,
+            "开启帧剔除遮罩后与关闭帧逐 shape 一致(遮罩零扰动)"
+        );
+    }
+
+    /// 开关叠加组合矩阵:打字机 × 专注 4 组合各画一帧不 panic;遮罩数量
+    /// 只由专注开关决定(与打字机正交,两开关独立)。
+    #[test]
+    fn focus_and_typewriter_matrix_independent() {
+        for (typewriter, focus) in [(false, false), (true, false), (false, true), (true, true)] {
+            let ctx = egui::Context::default();
+            let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+            let mut outbox = Vec::new();
+            let mut fade = egui::Color32::TRANSPARENT;
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::ui(
+                    ui,
+                    &mut editor,
+                    &mut preview,
+                    &mut cursor,
+                    &mut live,
+                    egui::Id::new(FOCUS_EDITOR_ID),
+                    typewriter,
+                    focus,
+                    &mut outbox,
+                );
+                let bg = ui.visuals().text_edit_bg_color();
+                fade = egui::Color32::from_rgba_unmultiplied(
+                    bg.r(),
+                    bg.g(),
+                    bg.b(),
+                    crate::ui::focus::DIM_ALPHA,
+                );
+            });
+            let fades = output
+                .shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(
+                        &clipped.shape,
+                        egui::epaint::Shape::Rect(shape) if shape.fill == fade
+                    )
+                })
+                .count();
+            let want = if focus { 2 } else { 0 };
+            assert_eq!(
+                fades, want,
+                "打字机={typewriter} 专注={focus}:遮罩数只随专注开关"
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    /// 明暗两主题:遮罩都画(存在性断言,非目视裁决 —— 对比度折算见
+    /// focus::DIM_ALPHA 文档,真机观感留人工)。
+    #[test]
+    fn focus_fades_under_both_themes() {
+        for (name, visuals) in [
+            ("亮", egui::Visuals::light()),
+            ("暗", egui::Visuals::dark()),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+            let (fades, _, _) = live_focus_frame(
+                &ctx,
+                Vec::new(),
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+                true,
+            );
+            assert_eq!(fades.len(), 2, "{name}色主题下遮罩仍在:{fades:?}");
+        }
+    }
+
+    /// 无活动块(光标未落):全部正常,零遮罩 —— 专注的对象是「正在编辑
+    /// 的块」,没有编辑焦点就没有淡化(decisions-pending #122)。
+    #[test]
+    fn focus_no_active_block_fades_nothing() {
+        let ctx = egui::Context::default();
+        let (mut editor, mut preview, mut cursor, mut live) = focus_state();
+        live.active = None;
+
+        let (fades, _, _) = live_focus_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+            true,
+        );
+        assert!(fades.is_empty(), "无活动块不淡化任何块:{fades:?}");
     }
 }

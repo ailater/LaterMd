@@ -515,6 +515,16 @@ fn appearance(
     {
         outbox.push(Message::TypewriterToggled(show_typewriter));
     }
+    // #64 M2:专注模式开关(#55 同款「回显副本 + changed() 即时发消息」
+    // 模式)。全局偏好;Live 模式淡化非活动块,源码模式不接线(单
+    // TextEdit 无法分段淡化,decisions-pending #122);默认关。
+    let mut show_focus_mode = theme.show_focus_mode;
+    if ui
+        .checkbox(&mut show_focus_mode, "专注模式(Live 下淡化光标块之外的块)")
+        .changed()
+    {
+        outbox.push(Message::FocusModeToggled(show_focus_mode));
+    }
 
     ui.add_space(crate::ui::tokens::SPACE_MD);
     ui.label("禅定模式:");

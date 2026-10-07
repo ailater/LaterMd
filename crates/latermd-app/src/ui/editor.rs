@@ -156,6 +156,7 @@ pub fn ui(
     editor_id: egui::Id,
     show_minimap: bool,
     show_typewriter: bool,
+    show_focus: bool,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     let CursorChannel {
@@ -180,6 +181,7 @@ pub fn ui(
             live,
             editor_id,
             show_typewriter,
+            show_focus,
             outbox,
         );
     }
@@ -957,9 +959,10 @@ mod tests {
                         // 本模块的既有测试都验现状路径:minimap 关(其
                         // 渲染与跳转的验收在 ui::minimap 的 tests 里);
                         // 打字机开关由调用方给(既有测试 false,打字机
-                        // 测试组显式 true)。
+                        // 测试组显式 true);专注关(验收在 ui::live)。
                         false,
                         show_typewriter,
+                        false,
                         outbox,
                     )
                     .id,

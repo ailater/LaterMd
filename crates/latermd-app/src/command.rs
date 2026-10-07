@@ -183,6 +183,14 @@ pub enum Command {
     /// 已被菜单标题助记与主题键占用(#119/#45 K1),W 空闲 —— 避让口径
     /// 与冲突审计见 decisions-pending #121。
     TypewriterToggle,
+    /// 专注模式(#64 M2):Live 模式淡化非活动块(活动块与光标邻块保持
+    /// 全对比度;纯绘制层,淡化块仍可点击进入编辑)。源码模式不接线。
+    /// Ctrl/Cmd+Alt+D(D = Dim,淡化非活动块):出厂表 Ctrl/Cmd+Alt 层
+    /// 只有 R/W(切预览栏/打字机),D 空闲;含 Alt 的绑定按保守口径避开
+    /// 菜单标题助记集(F/E/O/V/X/A/S),D 不在其中(menubar 标题审计
+    /// 测试钉住)—— 首选 F 因「文件」标题撞键被该审计否决,避让口径与
+    /// 冲突审计见 decisions-pending #122。
+    FocusModeToggle,
 }
 
 impl Command {
@@ -193,7 +201,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 41] = [
+    pub const ALL: [Command; 42] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
@@ -235,6 +243,7 @@ impl Command {
         Self::ToggleRightPreview,
         Self::ToggleZen,
         Self::TypewriterToggle,
+        Self::FocusModeToggle,
     ];
 
     /// 格式命令 → 对应的动作,非格式命令为 `None`。
@@ -295,7 +304,8 @@ impl Command {
             | Self::ToggleRightPreview
             | Self::ToggleLivePreview
             | Self::ToggleZen
-            | Self::TypewriterToggle => CommandGroup::View,
+            | Self::TypewriterToggle
+            | Self::FocusModeToggle => CommandGroup::View,
             Self::TabNext | Self::TabClose | Self::TabRestore => CommandGroup::Tab,
             Self::ExportHtml | Self::ExportPdf => CommandGroup::Export,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => CommandGroup::Ai,
@@ -347,6 +357,7 @@ impl Command {
             Self::ToggleRightPreview => "toggle_right_preview",
             Self::ToggleZen => "toggle_zen",
             Self::TypewriterToggle => "toggle_typewriter",
+            Self::FocusModeToggle => "toggle_focus_mode",
         }
     }
 
@@ -397,6 +408,7 @@ impl Command {
             Self::ToggleRightPreview => "切换预览栏",
             Self::ToggleZen => "禅定模式",
             Self::TypewriterToggle => "打字机模式",
+            Self::FocusModeToggle => "专注模式",
         }
     }
 
@@ -520,6 +532,14 @@ impl Command {
             Self::TypewriterToggle => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::W)
             }
+            // 专注模式(#64 M2):Ctrl/Cmd+Alt+D。出厂表 Ctrl/Cmd+Alt 层
+            // 只有 R(切预览栏)与 W(打字机),D 在该层空闲(#9 口径的
+            // 撞键核查在 tests);含 Alt 的绑定按保守口径避开菜单标题助记
+            // 集(F/E/O/V/X/A/S),D 不在其中 —— 首选 F 被该审计否决
+            // (menubar 标题审计),取舍见 decisions-pending #122。
+            Self::FocusModeToggle => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::D)
+            }
             // 无快捷键。前三条是 AI 联调入口:不抢键位,等 provider 选型
             // 定案再定;FormatDivider/FormatTable 只从工具条按钮触发
             // (插画布性质的动作,不像加粗那样高频到需要键位);ExportPdf
@@ -578,6 +598,8 @@ impl Command {
             // 与视图组两个开关共用禅定同心圆(icons 无打字机专用形;既有
             // 「多命令一图标」先例:ToggleLivePreview/ToggleZen 同源)
             Self::TypewriterToggle => Icon::Zen,
+            // 与视图组开关同源(#64 M1 同款先例:icons 无专注专用形)
+            Self::FocusModeToggle => Icon::Zen,
         }
     }
 
@@ -608,6 +630,7 @@ impl Command {
             // 走无参翻转消息(与 ToggleLivePreview/ZenToggled 同构);带值
             // 的 TypewriterToggled(bool) 归设置页复选框专用。
             Self::TypewriterToggle => Message::ToggleTypewriter,
+            Self::FocusModeToggle => Message::ToggleFocusMode,
             // 十六条格式动作一条 match 收干:动作枚举已经在 cmd 里定死了,
             // 这里只把它装进消息,语义一律看 `compose::apply`
             Self::FormatBold
@@ -1076,6 +1099,62 @@ mod tests {
         );
     }
 
+    /// 专注模式(#64 M2)默认键位:Ctrl/Cmd+Alt+D,出厂表 Ctrl/Cmd+Alt
+    /// 层 D 无第二个占用者(#9 口径的撞键核查);含 Alt 的绑定按保守口径
+    /// 避开菜单标题助记集(F/E/O/V/X/A/S),D 不在其中 —— 首选 F 因
+    /// 「文件」标题撞键被 menubar 标题审计否决(取舍见 decisions-pending
+    /// #122)。三修饰组合按「修饰键个数降序」先被问到,与 Ctrl/Cmd+D
+    /// (复制选中)只差一个 Alt,两者共存(与打字机之于关标签同款)。
+    /// 真按键只触发这一条,消息映射到无参翻转消息。
+    #[test]
+    fn focus_mode_shortcut_is_ctrl_alt_d_and_conflict_free() {
+        let ctrl_alt_d = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::ALT,
+            key: Key::D,
+        };
+        assert_eq!(
+            Command::FocusModeToggle.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(ctrl_alt_d),
+            "FocusModeToggle 出厂默认 = Ctrl/Cmd+Alt+D"
+        );
+        assert_eq!(
+            Keymap::builtin().get(Command::FocusModeToggle),
+            Some(ctrl_alt_d)
+        );
+        assert_eq!(
+            Keymap::builtin().conflict(Command::FocusModeToggle, ctrl_alt_d),
+            None,
+            "Ctrl/Cmd+Alt+D 不该撞任何出厂键位"
+        );
+        assert_eq!(
+            Command::FocusModeToggle.group(),
+            CommandGroup::View,
+            "专注模式是视图命令(菜单「视图」/蒙层同一归属)"
+        );
+
+        // Alt 组合先被问到;同帧只触发本命令,不连带复制选中的 Ctrl/Cmd+D
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::D, Modifiers::COMMAND | Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::FocusModeToggle]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(Command::FocusModeToggle.message(), Message::ToggleFocusMode);
+    }
+
     /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T,
     /// 不撞任何出厂键位;Cmd/Ctrl+Shift+T 的占用者 == TabRestore(#45 K2
     /// 落地后的联动断言,浏览器「恢复关闭标签」同款),且不与任何其他
@@ -1212,7 +1291,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 41);
+        assert_eq!(Command::ALL.len(), 42);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();
