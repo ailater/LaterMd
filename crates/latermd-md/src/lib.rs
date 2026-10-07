@@ -839,6 +839,92 @@ fn emoji_rewrites(text: &str, covered: &HashSet<&str>) -> Vec<Rewrite> {
     rewrites
 }
 
+/// 任务列表 checkbox 链接改写产出链接的 scheme(#63):预览层按前缀拦截
+/// (inline widget 画 checkbox、点击吞掉并回写源码),非本 scheme 的链接
+/// 照常走默认行为。载荷形态 `task://u<偏移>` / `task://c<偏移>`:`u`/`c`
+/// 是未勾/已勾态(渲染侧据此画空框或对勾),`<偏移>` 是**本层输入文本**
+/// 中 `[` 的字节偏移 —— 消费点按改写顺序逆穿各层映射换算回源码坐标。
+pub const TASK_SCHEME: &str = "task://";
+
+/// 任务 checkbox 的透明占位文字(#63):链接文本本体,渲染时透明追加,
+/// 推进宽度与「vendored 原生把任务标记画成 `☑ ` 两字形」同量级(符号 +
+/// 尾空格),改写前后的文本流视觉密度不漂移。真正的 checkbox 由 app 侧
+/// 在占位区上自绘。
+const TASK_PLACEHOLDER: &str = "☐ ";
+
+/// 把任务列表标记 `[ ]`/`[x]`(含大写 `[X]`)改写成
+/// `[☐ ](<task://u偏移>)` 形态的链接,供**预览/Live 富渲染**使用;源码
+/// 一字不动 —— 与 [`expand_emoji_links`] 同一承诺、再叠一层。改写后
+/// pulldown 不再产出 TaskListMarker 事件(标记变成了链接),渲染从
+/// vendored 的字面 `☑ `/`☐ ` 符号换成 app 侧 inline widget 自绘的
+/// 可点 checkbox。
+///
+/// **判定即豁免**:改写区间只取 pulldown `TaskListMarker` 事件的 range
+/// (实测 pulldown 0.13.4:range 恰覆盖三个字符,标记后无空格的形态如
+/// `- [ ]无空格` 不产出事件)。因此代码块/行内代码/普通文本里的 `[ ]`
+/// 天然不改写,非任务列表文档恒等返回 —— 这就是「行首定义」的口径:
+/// 以 pulldown 事件为准,不在 app 侧二次猜列表缩进与 `-`/`*`/`+` 前缀。
+///
+/// 快路径:文本不含 `[` 时不启动解析,直接恒等返回。
+pub fn expand_task_links(text: &str) -> (String, OffsetMap) {
+    let map = OffsetMap::from_rewrites(task_rewrites(text));
+    (map.apply(text), map)
+}
+
+/// [`expand_task_links`] 的扫描核心(私有):TaskListMarker 事件的区间
+/// 替换清单。与 emoji 层不同,本层不需要豁免区间 —— 命中集本身就是
+/// 「确认过是任务标记」的区间,再减豁免只是重复 pulldown 的工作。
+fn task_rewrites(text: &str) -> Vec<Rewrite> {
+    use pulldown_cmark::{Event, Parser};
+
+    if !text.contains('[') {
+        return Vec::new();
+    }
+    let mut rewrites = Vec::new();
+    for (event, span) in Parser::new_ext(text, task_options()).into_offset_iter() {
+        let Event::TaskListMarker(checked) = event else {
+            continue;
+        };
+        rewrites.push(Rewrite {
+            replacement: format!(
+                "[{TASK_PLACEHOLDER}](<{TASK_SCHEME}{}{}>)",
+                if checked { 'c' } else { 'u' },
+                span.start
+            ),
+            span,
+        });
+    }
+    rewrites
+}
+
+/// 与 vendored parser.rs 同一套 options(emoji 层同款纪律):渲染认得
+/// 的构造这里才认得,ENABLE_TASKLISTS 不开就全漏。
+fn task_options() -> pulldown_cmark::Options {
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
+    options.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
+    options
+}
+
+/// 判定 `byte` 是否恰为某个任务列表标记 `[` 的字节位置(pulldown 事件
+/// 口径,与 [`expand_task_links`] 同一次语义)。回写源码前的最终核验
+/// (#63):点击消息携带的偏移可能因并发编辑过期,与其猜「三字符形态」,
+/// 不如重扫一遍 —— 行内代码、代码块、普通文本里的 `[ ]` 都不会命中,
+/// 误触在归约层被这条闸住。点击是低频事件,一次全文解析(与 emoji 层
+/// 同量级)可接受。
+pub fn is_task_marker_start(text: &str, byte: usize) -> bool {
+    use pulldown_cmark::{Event, Parser};
+
+    if !text.contains('[') || byte >= text.len() || !text.is_char_boundary(byte) {
+        return false;
+    }
+    Parser::new_ext(text, task_options())
+        .into_offset_iter()
+        .any(|(event, span)| matches!(event, Event::TaskListMarker(_)) && span.start == byte)
+}
+
 /// 定位指定标题的「节」在源文本中的字节区间:从该标题起到下一个**不深于**
 /// 它的标题前(无则到文末)。更深层级的标题(`###`)是该节的子内容,一并
 /// 属于节;标题文本按 `trim` 后全等匹配,层级精确匹配。
@@ -1367,6 +1453,158 @@ mod tests {
         let emoji_at = source.find("😀").expect("emoji");
         assert_eq!(map.source_to_rendered(emoji_at + 1), emoji_at, "段内归段首");
         assert_eq!(map.source_to_rendered(0), 0, "段前原样");
+    }
+
+    // —— expand_task_links(#63 任务列表 checkbox 链接改写)——
+
+    /// 任务标记逐个改写成 `task://` 链接:占位、勾选态、载荷偏移齐全,且
+    /// 改写结果真能被解析成链接(预览拦截的前提);无序 `-`、有序 `1.`、
+    /// 嵌套缩进、`*`/`+` 前缀、引用内任务全认(pulldown 事件口径)。
+    #[test]
+    fn expand_task_links_rewrites_markers_into_links() {
+        let text = "- [ ] 待办\n- [x] 已办\n\n1. [ ] 有序\n\n  * [X] 大写\n\n> + [x] 引用内\n";
+        let (rendered, map) = expand_task_links(text);
+        assert_eq!(
+            rendered,
+            "- [☐ ](<task://u2>) 待办\n- [☐ ](<task://c15>) 已办\n\n1. [☐ ](<task://u30>) 有序\n\n  * [☐ ](<task://c46>) 大写\n\n> + [☐ ](<task://c62>) 引用内\n"
+        );
+        assert_eq!(map.rewrites_for_test().len(), 5);
+        // 改写产物再解析:五个链接,不再有 TaskListMarker token。
+        let doc = parse(&rendered);
+        assert!(doc
+            .tokens
+            .iter()
+            .all(|token| !matches!(token, Token::TaskListMarker { .. })));
+        let hrefs: Vec<&str> = doc
+            .tokens
+            .iter()
+            .filter_map(|token| match token {
+                Token::Link { href, .. } => Some(href.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hrefs,
+            vec![
+                "task://u2",
+                "task://c15",
+                "task://u30",
+                "task://c46",
+                "task://c62"
+            ]
+        );
+    }
+
+    /// 判定即豁免(#10 同款否决线):代码块/行内代码/普通文本里的 `[ ]`
+    /// 不是任务标记,一律不改写;标记后无空格的形态(pulldown 不产出
+    /// 事件)同样不改写。
+    #[test]
+    fn expand_task_links_skips_non_task_brackets() {
+        for text in [
+            "```rust\nlet a = [ ];\nlet b = [x];\n```\n",
+            "行内 `[ ]` 与 `[x]` 代码\n",
+            "普通段落的 [ ] 方括号 与数组 arr[0]\n",
+            "- [ ]无空格不是任务(pulldown 口径)\n- [] 也不是\n",
+        ] {
+            let (rendered, map) = expand_task_links(text);
+            assert_eq!(rendered, text, "非任务形态不得改写: {text:?}");
+            assert!(map.is_identity());
+        }
+    }
+
+    /// 空任务(纯 `- [ ]` 无文字)、CJK 与 emoji 混排任务文本都改写,
+    /// 载荷偏移按字节计(多字节字符之后的任务不漂移)。
+    #[test]
+    fn expand_task_links_handles_empty_cjk_and_emoji_tasks() {
+        let text = "- [ ]\n\n中文 😀 任务\n\n- [ ] emoji 😀 任务\n- [x] 完成\n";
+        let (rendered, map) = expand_task_links(text);
+        assert_eq!(
+            rendered,
+            "- [☐ ](<task://u2>)\n\n中文 😀 任务\n\n- [☐ ](<task://u29>) emoji 😀 任务\n- [☐ ](<task://c53>) 完成\n"
+        );
+        // 偏移落在字符边界上(改写区间是 pulldown 事件的 range)。
+        for rewrite in map.rewrites_for_test() {
+            assert!(text.is_char_boundary(rewrite.span.start));
+            assert!(text.is_char_boundary(rewrite.span.end));
+        }
+        assert_eq!(text.as_bytes()[29], b'[');
+        assert_eq!(text.as_bytes()[53], b'[');
+    }
+
+    /// 与前两层叠加(顺序 wikilink → emoji → task):改写段互不拆坏,三层
+    /// 逆穿回源码原处;正向串穿落在渲染串同一文本处(大纲跳转口径)。
+    #[test]
+    fn expand_task_links_stacks_after_wikilink_and_emoji_layers() {
+        let covered = cover(&["😀"]);
+        let source = "见 [[目标]] 与 😀\n\n- [ ] 任务\n\n## 标题\n";
+        let (layer1, map1) = expand_wikilinks_with_map(source);
+        let (layer2, map2) = expand_emoji_links(&layer1, &covered);
+        let (rendered, map3) = expand_task_links(&layer2);
+        assert_eq!(
+            rendered,
+            "见 [目标](<wiki://目标>) 与 [😀](<emoji://😀>)\n\n- [☐ ](<task://u60>) 任务\n\n## 标题\n"
+        );
+
+        // 正向:源码的标题偏移 → 三层串穿 → 渲染串的标题偏移。
+        let heading_src = source.find("## 标题").expect("heading in source");
+        let heading_out = rendered.find("## 标题").expect("heading in rendered");
+        let after1 = map1.source_to_rendered(heading_src);
+        let after2 = map2.source_to_rendered(after1);
+        assert_eq!(map3.source_to_rendered(after2), heading_out);
+        // 逆向:任务载荷偏移(u60,layer2 坐标)→ 两层逆穿 → 源码的 `[`。
+        let task_src = source.find("[ ]").expect("task marker in source");
+        assert_eq!(
+            map1.rendered_to_source(map2.rendered_to_source(60)),
+            task_src,
+            "任务载荷两层逆穿回源码原处"
+        );
+    }
+
+    /// 恒等路径:无 `[` 文档快路径直接返回;含 `[` 但全是非任务形态的文档
+    /// 解析后零改写(非任务文档零改动的否决线)。
+    #[test]
+    fn expand_task_links_identity_on_non_task_documents() {
+        let (rendered, map) = expand_task_links("# 标题\n\n正文段落,没有方括号\n");
+        assert_eq!(rendered, "# 标题\n\n正文段落,没有方括号\n");
+        assert!(map.is_identity());
+        let (rendered, map) = expand_task_links("链接 [文字](https://a.com) 与图片 ![x](y.png)\n");
+        assert_eq!(rendered, "链接 [文字](https://a.com) 与图片 ![x](y.png)\n");
+        assert!(map.is_identity());
+    }
+
+    /// 幂等:自己产出的 `[☐ ](<task://…>)` 是链接构造,二次穿过时该处
+    /// 不再是任务标记,不再改写(快路径含 `[` 会启动解析,但零命中)。
+    #[test]
+    fn expand_task_links_is_idempotent_on_own_output() {
+        let (_, map) = expand_task_links("- [ ] 一次\n");
+        let once = map.apply("- [ ] 一次\n");
+        let (twice, map2) = expand_task_links(&once);
+        assert_eq!(twice, once);
+        assert!(map2.is_identity());
+    }
+
+    /// 回写侧核验:真任务的 `[` 命中;行内代码/普通文本的 `[ ]`、标记的
+    /// 第二字符、越界与多字节中间一律不命中(过期偏移闸门)。
+    #[test]
+    fn is_task_marker_start_matches_only_real_markers() {
+        let text = "普通 [ ] 括号\n\n- [ ] 任务\n\n```rust\nlet a = [ ];\n```\n";
+        let real = text.find("[ ] 任务").expect("real task");
+        assert!(is_task_marker_start(text, real));
+        let plain = text.find("[ ]").expect("first bracket pair");
+        assert_ne!(plain, real);
+        assert!(!is_task_marker_start(text, plain), "普通文本的 [ ] 不命中");
+        let code = text
+            .find("let a = [ ]")
+            .map(|at| at + "let a = ".len())
+            .expect("code");
+        assert!(!is_task_marker_start(text, code), "代码块内的 [ ] 不命中");
+        assert!(!is_task_marker_start(text, real + 1), "标记内部不命中");
+        assert!(!is_task_marker_start(text, usize::MAX));
+        let cjk = "中文段落\n\n- [ ] 任务\n";
+        let mid = cjk.find("文").map(|at| at + 1).expect("cjk mid");
+        assert!(!is_task_marker_start(cjk, mid), "多字节字符中间不命中");
+        assert!(is_task_marker_start(cjk, cjk.find("[ ]").expect("task")));
+        assert!(!is_task_marker_start("无方括号文档", 0), "快路径不命中");
     }
 
     /// 块划分的自检:区间首尾相接、并集等于整篇 —— Live Preview 下光标块

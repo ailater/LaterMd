@@ -2420,6 +2420,77 @@ mod tests {
             "一步重做恢复润色结果(整次替换 = 单个撤销组)"
         );
     }
+
+    /// #63 任务勾选切换的单条 undo 契约(真实 undoer,无头):checkbox
+    /// 点击经消息路径(`State::apply(TaskCheckboxToggled)`)一次
+    /// `replace_range` 写入后,**一次** Ctrl+Z 整体回原状(勾选消失,其余
+    /// 逐字节不变),Ctrl+Shift+Z 一步重做恢复勾选。undoer 看不到程序化
+    /// 写入,快照按绘制帧落(与 #17 全部替换、#61 M3 润色确认同语义)。
+    #[test]
+    fn undo_after_task_toggle_reverts_in_one_step() {
+        use crate::state::{Message, State};
+
+        // 帧驱动借用当前标签的三件套(与 undo_after_replace_all 同一手法)
+        fn draw(ctx: &egui::Context, events: Vec<Event>, now: f64, state: &mut State) -> egui::Id {
+            let tab = state.tabs.current_mut();
+            frame(
+                ctx,
+                events,
+                now,
+                &mut tab.editor,
+                &mut tab.preview,
+                &mut tab.cursor,
+            )
+        }
+
+        let ctx = test_ctx();
+        let mut state = State::default();
+        state.tabs.current_mut().editor.replace_all("- [ ] 待办\n");
+
+        let id = draw(&ctx, Vec::new(), 0.0, &mut state); // undoer 首喂:原文快照
+        ctx.memory_mut(|m| m.request_focus(id));
+        draw(&ctx, vec![Event::Text("首".into())], 0.1, &mut state); // 用户编辑(文末追加)
+        draw(&ctx, Vec::new(), 1.5, &mut state); // 稳定 ≥1s:已提交撤销点
+        let before = "- [ ] 待办\n首".to_owned();
+        assert_eq!(state.tabs.current().editor.text(), before);
+
+        // 勾选切换走真实消息路径:一次 replace_range(三字符中段一字)
+        let byte = before.find("[ ]").expect("task marker in source");
+        state.apply(Message::TaskCheckboxToggled { byte });
+        let toggled = "- [x] 待办\n首".to_owned();
+        assert_eq!(state.tabs.current().editor.text(), toggled);
+
+        draw(&ctx, Vec::new(), 1.6, &mut state); // undoer 看到切换结果(进 flux)
+        draw(&ctx, Vec::new(), 3.0, &mut state); // 稳定:切换结果成为一份新快照
+
+        let undo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        draw(&ctx, vec![undo], 3.1, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            before,
+            "一次 Ctrl+Z 整体回原状(勾选消失,其余不动)"
+        );
+
+        let redo = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        };
+        draw(&ctx, vec![redo], 3.2, &mut state);
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            toggled,
+            "一步重做恢复勾选(整次切换 = 单个撤销组)"
+        );
+    }
     use crate::state::SelectionAiAction;
 
     /// 指针主键按下/抬起事件(pos 处)。

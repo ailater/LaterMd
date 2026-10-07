@@ -122,22 +122,25 @@ fn image_rewrites(text: &str, base_dir: Option<&Path>) -> Vec<latermd_md::Rewrit
 }
 
 /// 源码字节偏移(大纲 `OutlineItem.span` 的口径)→ 喂给预览 label 的文本
-/// 偏移。三层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
+/// 偏移。四层改写**各一张映射表,按改写顺序串行穿过**(可组合口径见
 /// `latermd_md::OffsetMap`):wikilink 展开(源文本 → 展开后,表由
-/// `PreviewState::offset_map` 持有)、emoji 链接改写(展开后 → `rendered`,
-/// `PreviewState::emoji_map`,#48 B1)与相对图片 `file://` 改写
-/// (`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
+/// `PreviewState::offset_map` 持有)、emoji 链接改写(展开后 → emoji 层
+/// 输出,`PreviewState::emoji_map`,#48 B1)、任务 checkbox 链接改写
+/// (emoji 层输出 → `rendered`,`PreviewState::task_map`,#63)与相对图片
+/// `file://` 改写(`rendered` → 最终渲染文本,点击是低频事件,消费点现算)。
 fn map_source_offset(
     offset_map: &latermd_md::OffsetMap,
     emoji_map: &latermd_md::OffsetMap,
+    task_map: &latermd_md::OffsetMap,
     rendered: &str,
     base_dir: Option<&Path>,
     offset: usize,
 ) -> usize {
     let after_wikilinks = offset_map.source_to_rendered(offset);
     let after_emoji = emoji_map.source_to_rendered(after_wikilinks);
+    let after_task = task_map.source_to_rendered(after_emoji);
     let image_map = latermd_md::OffsetMap::from_rewrites(image_rewrites(rendered, base_dir));
-    image_map.source_to_rendered(after_emoji)
+    image_map.source_to_rendered(after_task)
 }
 
 /// 扫出全部**内联图片** `![alt](dest)` / `![alt](<dest> "title")` 的目标:
@@ -327,13 +330,15 @@ impl LinkHandler for AiLinkHandler {
     /// ai:// 链接换色;`underline: true` 只是声明意图 —— vendored 层当前
     /// 未消费该字段(hover 下划线对全部链接无条件绘制),见 decisions-pending #11。
     ///
-    /// `emoji://`(#48 B2)是 inline widget:文字本就是透明占位,这里返回
-    /// 正文色 + 无下划线只是把「不吃超链接样式」的意图钉进协议 —— vendored
-    /// 对 inline widget 的 hover 本就不画下划线(label.rs `handle_hover`),
-    /// 该返回同时兜住「inline_widget_size 未来返回 None」的退化路径。
+    /// `emoji://`(#48 B2)与 `task://`(#63)是 inline widget:文字本就是
+    /// 透明占位,这里返回正文色 + 无下划线只是把「不吃超链接样式」的意图
+    /// 钉进协议 —— vendored 对 inline widget 的 hover 本就不画下划线
+    /// (label.rs `handle_hover`),该返回同时兜住「inline_widget_size 未来
+    /// 返回 None」的退化路径。
     fn link_style(&self, href: &str) -> Option<LinkStyle> {
-        // emoji:// 不吃默认超链接色/下划线:它不是可点的链接,是彩字形
-        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+        // emoji:// 不吃默认超链接色/下划线:它不是可点的链接,是彩字形;
+        // task:// 同理:它不是链接,是 checkbox(自绘矢量接管视觉)。
+        if href.starts_with(latermd_md::EMOJI_SCHEME) || href.starts_with(latermd_md::TASK_SCHEME) {
             return Some(LinkStyle {
                 color: Some(self.text_color),
                 underline: false,
@@ -359,6 +364,13 @@ impl LinkHandler for AiLinkHandler {
         if href.starts_with(latermd_md::EMOJI_SCHEME) {
             return true;
         }
+        // task://(#63):吞掉(绝不交系统浏览器),但**不发消息** —— 列表项
+        // 内 inline widget 的 vendored section/token 映射在 egui 0.36 下错位,
+        // 这条 click 路径对任务项不可达(到达时也不双发);点击统一由
+        // `ui` 帧末的探针命中判定发出。
+        if href.starts_with(latermd_md::TASK_SCHEME) {
+            return true;
+        }
         if let Some(target) = href.strip_prefix(latermd_md::WIKI_SCHEME) {
             let target = target.trim();
             if !target.is_empty() {
@@ -379,11 +391,11 @@ impl LinkHandler for AiLinkHandler {
         }
     }
 
-    /// `emoji://` 的透明占位(#48 B2):用**链接文字本体 + 周围同款字体**
-    /// 追加透明文本 —— 占位的推进宽度与「emoji 以普通文本出现」逐像素
-    /// 一致(同一 shaping 同一回退链),B1 改写前后的文本流零漂移。
-    /// 行高不在这里设:vendored 会把 `inline_widget_size` 的高度强制盖到
-    /// 这些 section 上(append_link_to_job)。
+    /// `emoji://` 与 `task://` 的透明占位(#48 B2 / #63):用**链接文字
+    /// 本体 + 周围同款字体**追加透明文本 —— 占位的推进宽度与「同一字符
+    /// 以普通文本出现」逐像素一致(同一 shaping 同一回退链),改写前后的
+    /// 文本流零漂移。行高不在这里设:vendored 会把 `inline_widget_size`
+    /// 的高度强制盖到这些 section 上(append_link_to_job)。
     fn layout_link(
         &self,
         _ui: &egui::Ui,
@@ -393,7 +405,8 @@ impl LinkHandler for AiLinkHandler {
         font: &egui::FontId,
         color: egui::Color32,
     ) -> bool {
-        if !href.starts_with(latermd_md::EMOJI_SCHEME) {
+        if !href.starts_with(latermd_md::EMOJI_SCHEME) && !href.starts_with(latermd_md::TASK_SCHEME)
+        {
             return false;
         }
         // 到这里的调用只来自 inline widget 分支,color 恒为 TRANSPARENT
@@ -407,12 +420,12 @@ impl LinkHandler for AiLinkHandler {
         true
     }
 
-    /// `emoji://` 判定(#48 B2):返回与正文字号匹配的尺寸。宽度分量仅是
-    /// 声明(vendored 只消费 `.y` 作占位行高);高度取 `font.size`,恒不
-    /// 超过正文自然行高(epaint 行高取行内 max,不缩行),含 emoji 的行
-    /// 与相邻行同高,文档布局不被改写扰动。
+    /// `emoji://` / `task://` 判定(#48 B2 / #63):返回与正文字号匹配的
+    /// 尺寸。宽度分量仅是声明(vendored 只消费 `.y` 作占位行高);高度取
+    /// `font.size`,恒不超过正文自然行高(epaint 行高取行内 max,不缩行),
+    /// 含 widget 的行与相邻行同高,文档布局不被改写扰动。
     fn inline_widget_size(&self, href: &str, font: &egui::FontId) -> Option<egui::Vec2> {
-        href.starts_with(latermd_md::EMOJI_SCHEME)
+        (href.starts_with(latermd_md::EMOJI_SCHEME) || href.starts_with(latermd_md::TASK_SCHEME))
             .then(|| egui::vec2(font.size, font.size))
     }
 
@@ -423,6 +436,13 @@ impl LinkHandler for AiLinkHandler {
     /// 单枚 emoji 的宽 ≈ 字体自然推进(与字号成正比),多字形跨度(旗帜等)
     /// 会被行高封顶,不横向溢出到邻字。
     fn paint_inline_widget(&self, ui: &mut egui::Ui, _text: &str, href: &str, rect: egui::Rect) {
+        // task://(#63):自绘 checkbox 替代字面 `☑`/`☐` 符号(vendored
+        // 原生渲染是普通文本,不可点)。占位区即命中区,点击由帧末的
+        // 探针判定发出(见 `task_click_hit`),这里只画 + 记录几何。
+        if href.starts_with(latermd_md::TASK_SCHEME) {
+            paint_task_checkbox(ui, rect, href, TaskProbeDomain::Preview);
+            return;
+        }
         let Some(glyph) = href.strip_prefix(latermd_md::EMOJI_SCHEME) else {
             return;
         };
@@ -526,6 +546,211 @@ fn status_label(ui: &mut egui::Ui, status: AiCardStatus, ai_color: egui::Color32
         AiCardStatus::Done => {
             ui.colored_label(done_color(ui.visuals().dark_mode), "已完成");
         }
+    }
+}
+
+// —— 任务列表 checkbox(#63)——
+
+/// checkbox 探针条目的坐标域(#63):载荷偏移在哪套坐标系里,消费侧据此
+/// 换算回源码。两面板同帧写进同一份全局探针(几何共享),载荷坐标各说
+/// 各话,必须带上出身才不会串台。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TaskProbeDomain {
+    /// 右栏预览:emoji 层输出坐标,消费时逆穿 `offset_map` + `emoji_map`。
+    Preview,
+    /// 编辑器 Live 富渲染块:块内坐标,消费时加记录时的块首字节偏移。
+    Live(usize),
+}
+
+/// 解析 `task://` 链接载荷:`Some((勾选态, emoji 层输出坐标偏移))`;
+/// 形态不符(非本 scheme / 首字符非 u,c / 余非数字)返回 `None`。
+/// 勾选态只在绘制时消费(画空框还是对勾);回写按偏移重新核验当前标记
+/// 形态,不信任这个态(点击帧到归约帧之间文档可能已变)。
+pub(crate) fn parse_task_href(href: &str) -> Option<(bool, usize)> {
+    let payload = href.strip_prefix(latermd_md::TASK_SCHEME)?;
+    let (checked, digits) = payload.split_at(1.min(payload.len()));
+    let checked = match checked {
+        "c" => true,
+        "u" => false,
+        _ => return None,
+    };
+    digits.parse::<usize>().ok().map(|offset| (checked, offset))
+}
+
+/// 在透明占位区上画 checkbox(#63):方框 + 已勾时叠 `Icon::Check` 对勾。
+/// 边长取占位区高的 0.72(行高内舒适,不顶满),垂直居中、水平靠左
+/// (与「行首标记」的视觉锚一致);颜色走正文色系(两主题各自成立),
+/// 已勾的对勾用 tokens::OK 强调。悬停 = 指针落在占位区内:边框换 hover
+/// 色 + 背景微亮(立即模式直接读指针位置,不注册 widget —— 点击命中
+/// 读原始指针事件,见 [`task_click_hit`],13a 同层纪律:命中区即占位区)。
+pub(crate) fn paint_task_checkbox(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    href: &str,
+    domain: TaskProbeDomain,
+) {
+    let Some((checked, _)) = parse_task_href(href) else {
+        return;
+    };
+    let side = rect.height() * 0.72;
+    if side <= 0.0 {
+        return;
+    }
+    record_task_checkbox(ui.ctx(), rect, href, domain);
+    let box_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - side / 2.0),
+        egui::vec2(side, side),
+    );
+    if !ui.is_rect_visible(box_rect) {
+        return;
+    }
+    let hovered = ui
+        .input(|input| input.pointer.latest_pos())
+        .is_some_and(|pos| rect.contains(pos));
+    let stroke = egui::Stroke::new(
+        if hovered { 2.0 } else { 1.0 },
+        if hovered {
+            ui.visuals().widgets.hovered.fg_stroke.color
+        } else {
+            ui.visuals().text_color()
+        },
+    );
+    if hovered {
+        ui.painter().rect_filled(
+            box_rect,
+            crate::ui::tokens::RADIUS_SM,
+            ui.visuals().widgets.hovered.bg_fill,
+        );
+    }
+    ui.painter().rect_stroke(
+        box_rect,
+        crate::ui::tokens::RADIUS_SM,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    if checked {
+        crate::ui::icons::Icon::Check.draw(
+            ui.painter(),
+            box_rect.center(),
+            side,
+            crate::ui::tokens::OK,
+        );
+    }
+}
+
+/// checkbox 探针在 egui data 的键(#63,照 [`copy_button_rects_id`] 的
+/// data 手法):本帧各 checkbox 的(占位区 rect, 链接载荷, 坐标域)。逐个
+/// 追加、帧号核对。**点击不走 vendored 链接命中**——列表项的布局里
+/// section_to_token 与 egui 0.36 galley 的空文本 section 会错位,vendored
+/// `handle_hover`/`handle_click` 对列表项内的 inline widget 到不了
+/// handler(实测两处:预览与 Live 富渲染块同样不可达,#63 live 测试
+/// 断零消息证实);照 #38 复制按钮与 #61 浮标的同款纪律读原始指针:
+/// [`task_click_hit`] 在渲染侧帧末判定,Live 列「点击进编辑」在
+/// [`task_checkbox_rects`] 里排除 checkbox 命中。
+fn task_checkbox_probe_id() -> egui::Id {
+    egui::Id::new("latermd-task-checkbox-probe")
+}
+
+/// 追加一枚本帧 checkbox(帧号变了就重开清单,一帧一份)。预览与 Live
+/// 两面板同帧都写进同一份全局清单(与 copy_button_rects 同语义);载荷
+/// 坐标各说各话,出身记进坐标域,消费侧按域过滤(几何判定只看屏幕位置)。
+fn record_task_checkbox(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    href: &str,
+    domain: TaskProbeDomain,
+) {
+    let probe_id = task_checkbox_probe_id();
+    let frame = ctx.cumulative_pass_nr();
+    let mut entries = ctx
+        .data(|d| d.get_temp::<(u64, Vec<(egui::Rect, String, TaskProbeDomain)>)>(probe_id))
+        .filter(|(seen, _)| *seen == frame)
+        .map(|(_, entries)| entries)
+        .unwrap_or_default();
+    entries.push((rect, href.to_owned(), domain));
+    ctx.data_mut(|d| d.insert_temp(probe_id, (frame, entries)));
+}
+
+/// 当前帧的 checkbox (rect, 载荷, 坐标域) 清单(帧号核对通过的才返回)。
+/// 零 checkbox 帧返回空 —— 上一帧的旧 rect 不得再拦 Live 的「点击进编辑」。
+fn task_checkbox_entries(ctx: &egui::Context) -> Vec<(egui::Rect, String, TaskProbeDomain)> {
+    ctx.data(|d| {
+        d.get_temp::<(u64, Vec<(egui::Rect, String, TaskProbeDomain)>)>(task_checkbox_probe_id())
+            .filter(|(seen, _)| *seen == ctx.cumulative_pass_nr())
+            .map(|(_, entries)| entries)
+            .unwrap_or_default()
+    })
+}
+
+/// 当前帧的 checkbox rect 清单(只留几何):Live 列「点击进编辑」的
+/// 排除判定用(点击归 checkbox 切换,不连带进编辑)。几何排除不分面板。
+pub(crate) fn task_checkbox_rects(ctx: &egui::Context) -> Vec<egui::Rect> {
+    task_checkbox_entries(ctx)
+        .into_iter()
+        .map(|(rect, _, _)| rect)
+        .collect()
+}
+
+/// 帧后读法(帧号已前进,核对必失配):测试按「最后写入者即本帧」拿
+/// 最后写入一帧的 rect 清单。
+#[cfg(test)]
+pub(crate) fn task_checkbox_probe(ctx: &egui::Context) -> Vec<egui::Rect> {
+    ctx.data(|d| {
+        d.get_temp::<(u64, Vec<(egui::Rect, String, TaskProbeDomain)>)>(task_checkbox_probe_id())
+            .map(|(_, entries)| entries.into_iter().map(|(rect, _, _)| rect).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// checkbox 的原始指针点击命中(#63):本帧主键 click(egui 已按拖动阈值
+/// 判定,块内拖选不算 click)且抬起点落在本帧某枚探针 rect 内 → 返回
+/// 该枚的(链接载荷, 坐标域)。与 Live 列 `clicked_for_edit` 同款读法
+/// (primary_clicked + interact_pos),不挂 egui widget、不依赖 vendored 的
+/// section/token 映射。坐标域随条目带回:预览只认 [`TaskProbeDomain::
+/// Preview`]、Live 只认 `Live(_)` 各自消费,同帧互不串台。
+pub(crate) fn task_click_hit(ui: &egui::Ui) -> Option<(String, TaskProbeDomain)> {
+    if !ui.input(|input| input.pointer.primary_clicked()) {
+        return None;
+    }
+    let pos = ui.input(|input| input.pointer.interact_pos())?;
+    task_checkbox_entries(ui.ctx())
+        .into_iter()
+        .find(|(rect, _, _)| rect.contains(pos))
+        .map(|(_, href, domain)| (href, domain))
+}
+
+/// checkbox 点击的焦点暂存键(#63):egui 0.36 的让焦
+/// (`SurrenderFocusOn::Presses`)发生在**按下帧**的 widget 绘制段,
+/// 释放帧帧首已查无可焦者 —— 按下帧帧首的持焦者快照存这里,释放帧
+/// 点击命中时归还(layout.rs `keep_find_focus` 同款:绘制段之后的
+/// `request_focus` 不再被同一帧的让焦吃掉)。
+fn task_focus_stash_id() -> egui::Id {
+    egui::Id::new("latermd-task-focus-stash")
+}
+
+/// 按下帧调用(#63):帧首持焦者进暂存,供同次点击的释放帧归还。一帧
+/// 只收首份快照(预览面板先画,持焦者尚未被让;Live 列后画时焦点可能
+/// 已被按下帧的让焦清掉,不得覆盖),释放帧消费,拖选不放则自然过期。
+pub(crate) fn stash_focus_on_press(ctx: &egui::Context) {
+    if !ctx.input(|input| input.pointer.primary_pressed()) {
+        return;
+    }
+    let frame = ctx.cumulative_pass_nr();
+    let seen: Option<(u64, Option<egui::Id>)> = ctx.data(|d| d.get_temp(task_focus_stash_id()));
+    if seen.is_some_and(|(seen_frame, _)| seen_frame == frame) {
+        return;
+    }
+    let focused = ctx.memory(|mem| mem.focused());
+    ctx.data_mut(|d| d.insert_temp(task_focus_stash_id(), (frame, focused)));
+}
+
+/// 点击命中帧调用(#63):把按下帧持焦者还回去(`request_focus` 的落地
+/// 在下一帧;暂存为空或持焦者已消亡则不动 —— egui 对消亡 id 的
+/// request_focus 是无害 no-op)。
+pub(crate) fn restore_stashed_focus(ctx: &egui::Context) {
+    let focused: Option<(u64, Option<egui::Id>)> = ctx.data(|d| d.get_temp(task_focus_stash_id()));
+    if let Some((_, Some(id))) = focused {
+        ctx.memory_mut(|mem| mem.request_focus(id));
     }
 }
 
@@ -687,6 +912,12 @@ pub fn ui(
     base_dir: Option<&Path>,
     outbox: &mut Vec<Message>,
 ) {
+    // 按下帧焦点快照(#63):checkbox 命中帧要把它还回去 —— MarkdownLabel
+    // 的 `Sense::click_and_drag` 含可聚焦位,点击预览任何位置都会把编辑器
+    // 的键盘焦点抢给 label;点 checkbox 的意图是切换勾选,不是转移焦点
+    // (#61 浮标「先还焦再判」的同一纪律)。让焦发生在按下帧的绘制段,
+    // 这里在帧首(未让)收快照,释放帧命中时归还。
+    stash_focus_on_press(panel.ctx());
     let label_id = tab_preview_id(tab_id);
     let scrolled = egui::ScrollArea::vertical()
         .id_salt(label_id.with("scroll"))
@@ -758,6 +989,30 @@ pub fn ui(
             ui.ctx()
                 .data_mut(|d| d.insert_temp(emoji_probe_id(tab_id), emoji_rects));
 
+            // 任务 checkbox 的收尾(#63):①悬停手型 —— vendored 对列表项内
+            // inline widget 的 hover 光标同样到不了(section 错位),这里按
+            // 本帧探针几何自设 PointingHand(checkbox 是可点件,与 emoji 的
+            // 手型抑制相反方向);②点击命中 —— 读原始指针事件,载荷偏移
+            // 逆穿两层映射回源码坐标发切换消息(命中区即占位区,13a)。
+            let task_entries = task_checkbox_entries(ui.ctx());
+            if let Some(pos) = ui.input(|input| input.pointer.latest_pos()) {
+                if task_entries.iter().any(|(rect, _, _)| rect.contains(pos)) {
+                    ui.output_mut(|out| out.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+            }
+            if let Some((href, TaskProbeDomain::Preview)) = task_click_hit(ui) {
+                // 只认预览域的条目:点击落在 Live 列的 checkbox 上时由
+                // live.rs 的帧末判定消费,这里不得串台(#63 探针带坐标域)。
+                if let Some((_, offset)) = parse_task_href(&href) {
+                    let source = preview
+                        .offset_map
+                        .rendered_to_source(preview.emoji_map.rendered_to_source(offset));
+                    outbox.push(Message::TaskCheckboxToggled { byte: source });
+                    // 焦点归还:按下帧被让走的键盘焦点交还原持有者。
+                    restore_stashed_focus(ui.ctx());
+                }
+            }
+
             // 大纲跳转的预览侧(#42):源码偏移(大纲 span 口径)先穿过两层
             // 渲染改写(wikilink 展开 + 相对图片 URI)映射到喂给 label 的文本
             // 偏移,再查 vendored 块表拿目标块 rect。两件事都必须发生在
@@ -770,6 +1025,7 @@ pub fn ui(
                 let offset = map_source_offset(
                     &preview.offset_map,
                     &preview.emoji_map,
+                    &preview.task_map,
                     &preview.rendered,
                     base_dir,
                     target,
@@ -977,6 +1233,7 @@ mod tests {
                 rendered,
                 offset_map,
                 emoji_map: latermd_md::OffsetMap::empty(),
+                task_map: latermd_md::OffsetMap::empty(),
                 text,
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1071,6 +1328,7 @@ mod tests {
             rendered: doc.to_owned(),
             offset_map: latermd_md::OffsetMap::empty(),
             emoji_map: latermd_md::OffsetMap::empty(),
+            task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1102,7 +1360,10 @@ mod tests {
     fn map_source_offset_through_both_rewrites() {
         // 无改写:恒等
         let identity = latermd_md::OffsetMap::empty();
-        assert_eq!(map_source_offset(&identity, &identity, "# h\n", None, 3), 3);
+        assert_eq!(
+            map_source_offset(&identity, &identity, &identity, "# h\n", None, 3),
+            3
+        );
 
         // wikilink 改写:[[架构决策]](12 字节)→ [架构决策](<wiki://架构决策>)
         // (2+12+2+4+8+12+2=…);标题在 wikilink 之后,映射后偏移必须落在
@@ -1111,14 +1372,22 @@ mod tests {
         let (rendered, offset_map) = latermd_md::expand_wikilinks_with_map(source);
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
-        let mapped = map_source_offset(&offset_map, &identity, &rendered, None, heading_src);
+        let mapped = map_source_offset(
+            &offset_map,
+            &identity,
+            &identity,
+            &rendered,
+            None,
+            heading_src,
+        );
         assert_eq!(mapped, heading_out, "wikilink 之后的偏移按平移映射");
 
         // 偏移落在 wikilink 区间内(点击目标是标题,标题不会落在链接里,
         // 但边界语义仍要确定):归改写段首。
         let link_start = source.find("[[").expect("wikilink");
         let in_link = link_start + 3;
-        let mapped_in = map_source_offset(&offset_map, &identity, &rendered, None, in_link);
+        let mapped_in =
+            map_source_offset(&offset_map, &identity, &identity, &rendered, None, in_link);
         assert_eq!(
             &rendered[mapped_in..].chars().take(3).collect::<String>(),
             "[架构",
@@ -1133,7 +1402,14 @@ mod tests {
             latermd_md::expand_emoji_links(&after_wikilinks, emoji_data::covered_glyphs());
         let heading_src = source.find("## 后续标题").expect("heading in source");
         let heading_out = rendered.find("## 后续标题").expect("heading in rendered");
-        let mapped = map_source_offset(&offset_map, &emoji_map, &rendered, None, heading_src);
+        let mapped = map_source_offset(
+            &offset_map,
+            &emoji_map,
+            &identity,
+            &rendered,
+            None,
+            heading_src,
+        );
         assert_eq!(mapped, heading_out, "emoji 改写叠加平移");
 
         // 图片层叠加:渲染文本里相对图片地址换成 file:// URI 后,标题偏移
@@ -1146,7 +1422,8 @@ mod tests {
         let with_uri = resolve_relative_images(&rendered, base);
         let heading = doc.find("## 标题").expect("heading");
         let heading_uri = with_uri.find("## 标题").expect("heading in uri text");
-        let mapped_img = map_source_offset(&identity, &emoji_map, &rendered, base, heading);
+        let mapped_img =
+            map_source_offset(&identity, &emoji_map, &identity, &rendered, base, heading);
         assert_eq!(mapped_img, heading_uri, "图片 URI 改写叠加平移");
     }
 
@@ -1217,6 +1494,7 @@ mod tests {
                 rendered: frame_rendered,
                 offset_map,
                 emoji_map,
+                task_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -1284,6 +1562,7 @@ mod tests {
             rendered,
             offset_map,
             emoji_map,
+            task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1654,6 +1933,7 @@ mod tests {
             rendered: doc.clone(),
             offset_map: latermd_md::OffsetMap::empty(),
             emoji_map: latermd_md::OffsetMap::empty(),
+            task_map: latermd_md::OffsetMap::empty(),
             text: doc.clone(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -1780,6 +2060,7 @@ mod tests {
                             let mapped = map_source_offset(
                                 &tab.preview.offset_map,
                                 &tab.preview.emoji_map,
+                                &tab.preview.task_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -1936,6 +2217,7 @@ mod tests {
                             mapped = map_source_offset(
                                 &tab.preview.offset_map,
                                 &tab.preview.emoji_map,
+                                &tab.preview.task_map,
                                 &tab.preview.rendered,
                                 None,
                                 span.start,
@@ -2116,6 +2398,7 @@ mod tests {
                 rendered: doc.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
+                task_map: latermd_md::OffsetMap::empty(),
                 text: doc.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -2270,6 +2553,7 @@ mod tests {
                 rendered: rendered.to_owned(),
                 offset_map: latermd_md::OffsetMap::empty(),
                 emoji_map: latermd_md::OffsetMap::empty(),
+                task_map: latermd_md::OffsetMap::empty(),
                 text: rendered.to_owned(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -2355,6 +2639,7 @@ mod tests {
             rendered,
             offset_map,
             emoji_map: latermd_md::OffsetMap::empty(),
+            task_map: latermd_md::OffsetMap::empty(),
             text: doc.to_owned(),
             synced_rev: 0,
             outline: Vec::new(),
@@ -2486,6 +2771,7 @@ mod tests {
                 rendered,
                 offset_map,
                 emoji_map: latermd_md::OffsetMap::empty(),
+                task_map: latermd_md::OffsetMap::empty(),
                 text: doc.clone(),
                 synced_rev: 0,
                 outline: Vec::new(),
@@ -2568,5 +2854,294 @@ mod tests {
                 "卡片要素 {expected} 缺失:{texts:?}"
             );
         }
+    }
+
+    // —— 任务列表 checkbox(#63)——
+
+    /// 覆盖 #63 验收面的文档:顶层未勾/已勾、嵌套缩进任务、空任务(纯
+    /// `- [ ]` 无文字)、CJK 任务文本、代码块与行内代码里的 `[ ]`(豁免
+    /// 面)、有序任务。
+    fn task_doc() -> String {
+        let mut doc = String::from("# 任务清单\n\n");
+        doc.push_str("- [ ] 首项待办\n- [x] 已完成项\n\n");
+        doc.push_str("  - [ ] 嵌套深层任务\n\n");
+        doc.push_str("- [ ]\n\n");
+        doc.push_str("```rust\nlet a = [ ];\nlet b = [x];\n```\n\n");
+        doc.push_str("行内 `[ ]` 代码豁免\n\n");
+        doc.push_str("1. [ ] 有序任务\n");
+        doc
+    }
+
+    /// 以生产入口渲染一帧(快照走 `PreviewState::new` 的完整三层链),
+    /// 返回 (本帧 checkbox 探针 rect, 产生的消息, 画出的文本)。
+    fn render_task_frame(
+        ctx: &egui::Context,
+        doc: &str,
+        events: Vec<egui::Event>,
+    ) -> (Vec<egui::Rect>, Vec<Message>, Vec<String>) {
+        let mut preview = PreviewState::new(&latermd_editor::EditorBuffer::new(doc));
+        let mut outbox = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let output = ctx.run_ui(
+            eframe::egui::RawInput {
+                events,
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |panel| {
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    1,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            },
+        );
+        let texts = painted_text(&output);
+        output.drop_without_applying_deltas();
+        // 帧后读取:帧号已前进,按「最后写入者即本帧」取原始探针。
+        (task_checkbox_probe(ctx), outbox, texts)
+    }
+
+    /// 按指针三帧点击 `target`,汇集整个序列的消息(点击在抬起帧产出)。
+    fn click_task_and_collect(ctx: &egui::Context, doc: &str, target: egui::Pos2) -> Vec<Message> {
+        let mut messages = Vec::new();
+        for events in click_events(target) {
+            let (_, mut frame, _) = render_task_frame(ctx, doc, events);
+            messages.append(&mut frame);
+        }
+        messages
+    }
+
+    /// 存在与命中:每个任务一枚 checkbox(嵌套/空任务/有序都算),点击
+    /// 命中出 [`Message::TaskCheckboxToggled`] 且载荷指向**源码**里该标记
+    /// 的 `[`(两层映射逆穿后);代码块/行内代码的 `[ ]` 不产 checkbox。
+    /// 悬停不切换(只有抬起帧的消息算数)。
+    #[test]
+    fn task_checkboxes_click_through_to_source_offsets() {
+        let ctx = egui::Context::default();
+        let doc = task_doc();
+        let (rects, messages, _) = render_task_frame(&ctx, &doc, Vec::new());
+        // 六个任务:首项/已完成/嵌套/空/有序 = 5 个(代码块 2 个 + 行内 1
+        // 个豁免)。首帧无点击 → 零消息。
+        assert_eq!(rects.len(), 5, "豁免面不产 checkbox:{rects:?}");
+        assert!(messages.is_empty(), "渲染帧不产消息");
+
+        // 逐个点击每个 checkbox:载荷必须是「源码里某个 `[ ]`/`[x]` 标记
+        // 的 `[` 字节偏移」,且五个互不相同(嵌套列表打到正确的行)。
+        let source_offsets: Vec<usize> =
+            ["[ ] 首项", "[x] 已完成", "[ ] 嵌套", "[ ]\n", "[ ] 有序"]
+                .iter()
+                .map(|needle| doc.find(needle).expect("needle"))
+                .collect();
+        let mut seen = std::collections::HashSet::new();
+        for rect in &rects {
+            let clicked = click_task_and_collect(&ctx, &doc, rect.center());
+            let toggles: Vec<_> = clicked
+                .iter()
+                .filter_map(|message| match message {
+                    Message::TaskCheckboxToggled { byte } => Some(*byte),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(toggles.len(), 1, "一次点击恰一条切换消息:{toggles:?}");
+            assert!(
+                source_offsets.contains(&toggles[0]),
+                "载荷 {}/{} 须指向源码任务标记的 [:{:?}",
+                toggles[0],
+                toggles[0] == 0,
+                doc.get(toggles[0]..toggles[0] + 3)
+            );
+            assert!(
+                matches!(&doc[toggles[0]..toggles[0] + 3], "[ ]" | "[x]" | "[X]"),
+                "载荷指向的须是任务标记三字符"
+            );
+            seen.insert(toggles[0]);
+        }
+        assert_eq!(seen.len(), 5, "五个 checkbox 各指其行(嵌套不串行)");
+    }
+
+    /// 端到端切换 + 反向再点:点击 → 消息 → 归约 → 源码翻转为 `[x]`;
+    /// 重建快照后 checkbox 数不变、再点同处载荷仍指向同一标记,归约翻回。
+    /// 切换后预览即时反映(快照重建后 `rendered` 里勾选态翻转)。
+    #[test]
+    fn task_click_toggles_source_and_back_with_fresh_preview() {
+        let ctx = egui::Context::default();
+        let mut state = crate::state::State::default();
+        {
+            let tab = state.tabs.current_mut();
+            tab.editor.replace_all("- [ ] 首项\n");
+            tab.preview.rebuild(&tab.editor);
+        }
+        let doc_before = state.tabs.current().editor.text().to_owned();
+
+        let (rects, _, _) = render_task_frame(&ctx, &doc_before, Vec::new());
+        assert_eq!(rects.len(), 1);
+        let messages = click_task_and_collect(&ctx, &doc_before, rects[0].center());
+        let byte = match &messages[0] {
+            Message::TaskCheckboxToggled { byte } => *byte,
+            other => panic!("应为切换消息:{other:?}"),
+        };
+        state.apply(messages[0].clone());
+        assert_eq!(state.tabs.current().editor.text(), "- [x] 首项\n");
+        // 快照重建(修订号前进后生产路径自动做):勾选态即时反映。
+        {
+            let tab = state.tabs.current_mut();
+            tab.preview.rebuild(&tab.editor);
+        }
+        let rendered = state.tabs.current().preview.rendered.clone();
+        assert!(rendered.contains("task://c"), "重建后勾选态 c 载荷");
+
+        // 反向再点:改写后 rect 位置可能微移,重新探针取新位置。
+        let doc_after = state.tabs.current().editor.text().to_owned();
+        let (rects2, messages2, _) = render_task_frame(&ctx, &doc_after, Vec::new());
+        assert_eq!(rects2.len(), 1, "取消勾选后 checkbox 仍在");
+        assert!(messages2.is_empty());
+        let back = click_task_and_collect(&ctx, &doc_after, rects2[0].center());
+        match &back[0] {
+            Message::TaskCheckboxToggled { byte: b } => assert_eq!(*b, byte, "同一标记"),
+            other => panic!("应为切换消息:{other:?}"),
+        }
+        state.apply(back[0].clone());
+        assert_eq!(state.tabs.current().editor.text(), "- [ ] 首项\n");
+    }
+
+    /// 非任务文档零元素(否决线):纯文本/代码块/链接文档探针零 rect、
+    /// 点击任意位置零消息。
+    #[test]
+    fn task_probe_empty_on_non_task_documents() {
+        let ctx = egui::Context::default();
+        for doc in [
+            "# 标题\n\n正文段落,普通 [ ] 方括号\n",
+            "```rust\nlet a = [ ];\n```\n",
+            "链接 [文字](https://a.com) 与 [[wikilink]]\n",
+        ] {
+            let (rects, messages, _) = render_task_frame(&ctx, doc, Vec::new());
+            assert!(rects.is_empty(), "非任务文档零 checkbox:{doc:?}");
+            assert!(messages.is_empty());
+        }
+    }
+
+    /// 两主题渲染不 panic + checkbox 形态在场(dark/light 各一帧,探针
+    /// 数量一致;勾选态对勾与未勾空框都画得出)。
+    #[test]
+    fn task_checkboxes_render_in_both_themes_without_panic() {
+        let ctx = egui::Context::default();
+        let doc = task_doc();
+        for dark in [true, false] {
+            ctx.all_styles_mut(|style| {
+                style.visuals = if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                }
+            });
+            let (rects, messages, _) = render_task_frame(&ctx, &doc, Vec::new());
+            assert_eq!(rects.len(), 5, "主题不改 checkbox 数量");
+            assert!(messages.is_empty());
+        }
+    }
+
+    /// 点击 checkbox 不抢编辑器焦点:同帧先渲染一个持焦 TextEdit,再渲染
+    /// 预览并点击 checkbox —— 编辑器焦点原样保持(#61 焦点纪律的预览侧
+    /// 对偶:预览面板本身无可聚焦件,点击不得惊动左栏)。
+    #[test]
+    fn task_click_keeps_editor_focus() {
+        let ctx = egui::Context::default();
+        let doc = "- [ ] 任务\n";
+        let editor_id = egui::Id::new("focus-editor");
+        let mut text = String::new();
+        // 每帧从同一文档重建快照(生产里修订号不变即缓存,测试重建等价)。
+        let render = |events: Vec<egui::Event>, text: &mut String| -> Option<egui::Rect> {
+            let mut preview = PreviewState::new(&latermd_editor::EditorBuffer::new(doc));
+            let mut outbox = Vec::new();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let output = ctx.run_ui(
+                eframe::egui::RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |panel| {
+                    egui::TextEdit::multiline(text).id(editor_id).show(panel);
+                    panel.ctx().memory_mut(|mem| mem.request_focus(editor_id));
+                    ui(
+                        panel,
+                        &mut preview,
+                        &AiState::default(),
+                        1,
+                        false,
+                        None,
+                        &mut outbox,
+                    );
+                },
+            );
+            output.drop_without_applying_deltas();
+            task_checkbox_probe(&ctx).first().copied()
+        };
+        let rect = render(Vec::new(), &mut text).expect("checkbox 在场");
+        assert!(
+            ctx.memory(|mem| mem.has_focus(editor_id)),
+            "前置:编辑器持焦"
+        );
+        let mut clicked_messages = Vec::new();
+        for events in click_events(rect.center()) {
+            // 三帧逐步喂:焦点断言在点击抬起帧之后(消息从 outbox 收集)。
+            let mut preview = PreviewState::new(&latermd_editor::EditorBuffer::new(doc));
+            let mut outbox = Vec::new();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let output = ctx.run_ui(
+                eframe::egui::RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |panel| {
+                    egui::TextEdit::multiline(&mut text)
+                        .id(editor_id)
+                        .show(panel);
+                    ui(
+                        panel,
+                        &mut preview,
+                        &AiState::default(),
+                        1,
+                        false,
+                        None,
+                        &mut outbox,
+                    );
+                },
+            );
+            output.drop_without_applying_deltas();
+            clicked_messages.extend(outbox);
+        }
+        assert_eq!(clicked_messages.len(), 1, "点击产出切换消息");
+        // 焦点归还排在下一帧生效(request_focus 的语义):再渲染一帧,
+        // 编辑器应重新持焦 —— 点击 checkbox 的意图是切换,不是转移焦点。
+        {
+            let mut preview = PreviewState::new(&latermd_editor::EditorBuffer::new(doc));
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(egui::RawInput::default(), |panel| {
+                egui::TextEdit::multiline(&mut text)
+                    .id(editor_id)
+                    .show(panel);
+                ui(
+                    panel,
+                    &mut preview,
+                    &AiState::default(),
+                    1,
+                    false,
+                    None,
+                    &mut outbox,
+                );
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            ctx.memory(|mem| mem.has_focus(editor_id)),
+            "点击 checkbox 不抢编辑器焦点"
+        );
     }
 }
