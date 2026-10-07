@@ -126,66 +126,93 @@ pub fn export_html(text: &str) -> String {
 /// Text 事件不扫,由事件嵌套深度门控表达:这些构造在 pulldown 事件流里
 /// 本就成对出现,深度计数天然平衡。行内代码(`Event::Code`)是原子事件,
 /// 到不了 Text 分支,天然豁免。
+///
+/// 扫描单元是**相邻 Text 事件的合并串**而非单条事件:pulldown 会把
+/// HTML 实体解码成独立 Text(`&amp;` → Text("&")),`==a&amp;b==` 因此
+/// 被拆进三条 Text,逐条扫描必漏标。合并到任何非 Text 事件即止(软换行/
+/// 行内代码/脚注引用等都打断),不跨构造拼接,配对口径与预览整串扫描一致。
 fn wrap_highlights(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     let mut wrapped: Vec<Event<'_>> = Vec::with_capacity(events.len());
     let mut exempt_depth = 0_usize;
+    let mut pending: Vec<CowStr<'_>> = Vec::new();
     for event in events {
         match event {
             Event::Start(
-                Tag::CodeBlock { .. }
+                tag @ (Tag::CodeBlock { .. }
                 | Tag::Link { .. }
                 | Tag::Image { .. }
                 | Tag::HtmlBlock
                 | Tag::FootnoteDefinition(_)
                 | Tag::Emphasis
                 | Tag::Strong
-                | Tag::Strikethrough,
+                | Tag::Strikethrough),
             ) => {
+                drain_pending(&mut wrapped, &mut pending);
                 exempt_depth += 1;
-                wrapped.push(event);
+                wrapped.push(Event::Start(tag));
             }
             Event::End(
-                TagEnd::CodeBlock
+                tag_end @ (TagEnd::CodeBlock
                 | TagEnd::Link
                 | TagEnd::Image
                 | TagEnd::HtmlBlock
                 | TagEnd::FootnoteDefinition
                 | TagEnd::Emphasis
                 | TagEnd::Strong
-                | TagEnd::Strikethrough,
+                | TagEnd::Strikethrough),
             ) => {
+                drain_pending(&mut wrapped, &mut pending);
                 exempt_depth = exempt_depth.saturating_sub(1);
-                wrapped.push(event);
+                wrapped.push(Event::End(tag_end));
             }
-            Event::Text(text) if exempt_depth == 0 => push_marked_text(&mut wrapped, text),
-            other => wrapped.push(other),
+            Event::Text(text) if exempt_depth == 0 => pending.push(text),
+            other => {
+                drain_pending(&mut wrapped, &mut pending);
+                wrapped.push(other);
+            }
         }
     }
+    drain_pending(&mut wrapped, &mut pending);
     wrapped
 }
 
-/// 单个 Text 事件按高亮段切开:`==` 标记被消费(与预览一致,不再出现在
-/// 输出文本),内容包 `<mark>`;标记外片段原样保留。切出的片段转 owned
-/// (`CowStr::Boxed`)—— 文本切片借的是 CowStr 内部缓冲,事件流还要继续
-/// 持有,owned 化一次买断生命周期;无高亮的快路径零拷贝原样透传。
-fn push_marked_text<'a>(out: &mut Vec<Event<'a>>, text: CowStr<'a>) {
-    let spans = latermd_md::highlight_spans(&text);
+/// 把累积的相邻 Text 事件交给 [`push_marked_text`] 产出,再清空缓冲。
+fn drain_pending<'a>(wrapped: &mut Vec<Event<'a>>, pending: &mut Vec<CowStr<'a>>) {
+    if !pending.is_empty() {
+        push_marked_text(wrapped, std::mem::take(pending));
+    }
+}
+
+/// 相邻 Text 事件合并串按高亮段切开:`==` 标记被消费(与预览一致,不再
+/// 出现在输出文本),内容包 `<mark>`;标记外片段原样保留。切出的片段转
+/// owned (`CowStr::Boxed`)—— 文本切片借的是 CowStr 内部缓冲,事件流还要
+/// 继续持有,owned 化一次买断生命周期;单段且无高亮的快路径零拷贝原样
+/// 透传。
+fn push_marked_text<'a>(out: &mut Vec<Event<'a>>, texts: Vec<CowStr<'a>>) {
+    if let [only] = texts.as_slice() {
+        if latermd_md::highlight_spans(only).is_empty() {
+            out.push(Event::Text(texts.into_iter().next().expect("len == 1")));
+            return;
+        }
+    }
+    let joined: String = texts.iter().map(|text| &**text).collect();
+    let spans = latermd_md::highlight_spans(&joined);
     if spans.is_empty() {
-        out.push(Event::Text(text));
+        // 合并串整体无配对:拆回原段透传,不动字节
+        out.extend(texts.into_iter().map(Event::Text));
         return;
     }
-    let owned = text.into_string();
     let mut last = 0_usize;
     for span in spans {
         out.push(Event::Text(CowStr::Boxed(
-            owned[last..span.span.start].into(),
+            joined[last..span.span.start].into(),
         )));
         out.push(Event::InlineHtml(CowStr::Borrowed(MARK_OPEN)));
         out.push(Event::Text(CowStr::Boxed(span.inner.into())));
         out.push(Event::InlineHtml(CowStr::Borrowed(MARK_CLOSE)));
         last = span.span.end;
     }
-    out.push(Event::Text(CowStr::Boxed(owned[last..].into())));
+    out.push(Event::Text(CowStr::Boxed(joined[last..].into())));
 }
 
 /// `<mark>` 的开闭标签(`Event::InlineHtml` 由 pulldown 的 html writer
@@ -413,6 +440,15 @@ mod tests {
 
         let escaped = export_html("==a & b==");
         assert_no_mojibake(&escaped, "<mark>a &amp; b</mark>");
+    }
+
+    /// 实体输入:pulldown 把 `&amp;` 解码成独立 Text 事件,一对 `==` 被
+    /// 拆进多条 Text——逐条扫描会漏标并让 `==` 回流正文。
+    #[test]
+    fn highlight_survives_entity_split_text_events() {
+        let html = export_html("==a&amp;b== 与 ==真高亮==");
+        assert_no_mojibake(&html, "<p><mark>a&amp;b</mark> 与 <mark>真高亮</mark></p>");
+        assert!(!html.contains("=="), "标记不得回流正文:\n{html}");
     }
 
     /// 表格 cell 内照常高亮(表格不在豁免清单,与预览一致);标题里的
