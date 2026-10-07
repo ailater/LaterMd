@@ -29,7 +29,7 @@
 use std::ops::Range;
 
 use eframe::egui;
-use egui_markdown::MarkdownLabel;
+use egui_markdown::{LinkHandler, LinkStyle, MarkdownLabel};
 use latermd_editor::EditorBuffer;
 
 use crate::state::{Message, OutlineCursor, PreviewState};
@@ -84,6 +84,11 @@ pub struct LiveState {
     /// 地方(#29「滚轮/空闲帧不抢滚动」的同族红线)。与 pending_caret
     /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。
     caret_follow: bool,
+    /// 任务 checkbox 链接改写的块级缓存(#63):块序号 → (修订号, 改写后
+    /// 块文本)。富渲染块每帧渲染,改写要解析块文本,稳态帧不该重付
+    /// (与 `marks` 缓存同一条纪律,只是富渲染块逐块都要,不是单槽)。
+    /// 修订号前进时整表清空(块序号随编辑漂移,旧条目不可信)。
+    task_cache: std::collections::HashMap<usize, (u64, String)>,
 }
 
 impl LiveState {
@@ -103,9 +108,23 @@ impl LiveState {
         }
         self.blocks = latermd_md::blocks(editor.text());
         self.synced_rev = Some(rev);
+        self.task_cache.clear();
         self.active = cursor_byte
             .and_then(|byte| self.block_containing(byte))
             .or_else(|| self.active.filter(|index| *index < self.blocks.len()));
+    }
+
+    /// 富渲染块的 checkbox 链接改写文本(#63):缓存命中直取,未命中重算
+    /// 并入表。快路径让无 `[` 的块近似零成本(不启动解析)。
+    fn task_block(&mut self, index: usize, rev: u64, block_text: &str) -> String {
+        if let Some((seen_rev, cached)) = self.task_cache.get(&index) {
+            if *seen_rev == rev {
+                return cached.clone();
+            }
+        }
+        let (rendered, _) = latermd_md::expand_task_links(block_text);
+        self.task_cache.insert(index, (rev, rendered.clone()));
+        rendered
     }
 
     /// 包含该字节的块序号;落在块之间的边界上取后一块(边界属于后一块的起点)。
@@ -133,6 +152,97 @@ impl LiveState {
         self.marks = None;
         self.drag_anchor = None;
         self.caret_follow = false;
+        self.task_cache.clear();
+    }
+}
+
+/// Live 富渲染块的链接 handler(#51 M3 + #63):mermaid 围栏出图原样
+/// 转发给 [`crate::ui::mermaid::LiveMermaidHandler`](行为零变化,含块序
+/// 计数);任务 checkbox 的点击在 `task://` 前缀处**吞掉**(不交系统
+/// 浏览器、也不在此发切换消息)—— 列表项内 inline widget 的 vendored
+/// section/token 映射在 egui 0.36 下错位,这条 click 路径实测不可达
+/// (#63 live 测试断零消息);切换统一由 `ui` 帧末的探针命中判定发出,
+/// 与右栏预览同一判定层。链接的其余行为(ai:// 卡、emoji、wikilink)
+/// 维持 Live 接入 handler 前的 vendored 默认(#51 M3 否决线,不因
+/// checkbox 顺手改变)。
+struct LiveRichHandler<'a> {
+    mermaid: &'a crate::ui::mermaid::LiveMermaidHandler,
+    /// 本块在全文中的字节起点(checkbox 探针坐标域携带,帧末命中换算用)。
+    task_base: usize,
+}
+
+impl<'a> LiveRichHandler<'a> {
+    fn new(mermaid: &'a crate::ui::mermaid::LiveMermaidHandler, task_base: usize) -> Self {
+        Self { mermaid, task_base }
+    }
+}
+
+impl LinkHandler for LiveRichHandler<'_> {
+    fn is_block_code_widget(&self, language: Option<&str>) -> bool {
+        self.mermaid.is_block_code_widget(language)
+    }
+
+    fn block_code_widget(
+        &self,
+        ui: &mut egui::Ui,
+        text: &str,
+        language: Option<&str>,
+    ) -> Option<egui::Response> {
+        self.mermaid.block_code_widget(ui, text, language)
+    }
+
+    /// 与预览 handler 同款意图声明:checkbox 不吃超链接样式(占位透明,
+    /// 视觉由自绘接管;同时兜住退化路径)。
+    fn link_style(&self, href: &str) -> Option<LinkStyle> {
+        href.starts_with(latermd_md::TASK_SCHEME)
+            .then_some(LinkStyle {
+                color: None,
+                underline: false,
+            })
+    }
+
+    fn click(&self, _text: &str, href: &str, _ui: &mut egui::Ui) -> bool {
+        // 只吞不发:切换消息由帧末探针判定单点发出,这里若转发,将来
+        // vendored 错位修好时会双发(两次切换 = 一步空转 + 两份 undo)。
+        crate::ui::preview::parse_task_href(href).is_some()
+    }
+
+    /// 透明占位:与预览 handler 同一实现(链接文字本体 + 同款字体)。
+    fn layout_link(
+        &self,
+        _ui: &egui::Ui,
+        text: &str,
+        href: &str,
+        job: &mut egui::text::LayoutJob,
+        font: &egui::FontId,
+        color: egui::Color32,
+    ) -> bool {
+        if !href.starts_with(latermd_md::TASK_SCHEME) {
+            return false;
+        }
+        let format = egui::TextFormat {
+            font_id: font.clone(),
+            color,
+            ..egui::TextFormat::default()
+        };
+        job.append(text, 0.0, format);
+        true
+    }
+
+    fn inline_widget_size(&self, href: &str, font: &egui::FontId) -> Option<egui::Vec2> {
+        href.starts_with(latermd_md::TASK_SCHEME)
+            .then(|| egui::vec2(font.size, font.size))
+    }
+
+    fn paint_inline_widget(&self, ui: &mut egui::Ui, _text: &str, href: &str, rect: egui::Rect) {
+        if href.starts_with(latermd_md::TASK_SCHEME) {
+            crate::ui::preview::paint_task_checkbox(
+                ui,
+                rect,
+                href,
+                crate::ui::preview::TaskProbeDomain::Live(self.task_base),
+            );
+        }
     }
 }
 
@@ -200,6 +310,11 @@ pub fn ui(
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
+
+    // 按下帧焦点快照(#63,与右栏预览共用同一暂存):checkbox 命中帧要把
+    // 它还给活动块 —— 点击 checkbox 的意图是切换勾选,不是转移焦点。预览
+    // 面板同帧先画时它已收过首份快照(帧号核对,后画者不覆盖)。
+    crate::ui::preview::stash_focus_on_press(panel.ctx());
 
     // 大纲/搜索跳转(LP2-3):与源码模式同一入口(`cursor.jump_to`)、同一
     // 时序口径 —— 当帧把目标块切成活动块并交 pending_caret,本帧闭包内
@@ -487,10 +602,17 @@ pub fn ui(
                     // 富渲染。区域用渲染前后的 cursor 差值框出来;「点击进
                     // 编辑」的命中不走 egui widget,理由见 [`clicked_for_edit`]。
                     let top = ui.cursor().top();
+                    // 任务 checkbox 改写(#63):块文本先过改写层(缓存键是
+                    // 修订号 + 块序号,稳态帧零解析),`task://` 链接由本块
+                    // 专属 handler 画成自绘 checkbox —— 探针坐标域带块首,
+                    // 点击切换由 `ui` 帧末的探针命中判定统一发出。非任务块
+                    // 改写恒等,渲染零变化。
+                    let block_rendered = live.task_block(index, editor.revision(), &block_text);
                     // 字体与右栏预览同源(#23 F3):size = 用户字号偏好,
                     // 族 = 预览专用族(#43 M2 的行 metrics 对齐副本,无 CJK
                     // 回落 Proportional)。源码/Live 两种模式下排版偏好同观感。
-                    MarkdownLabel::new(editor_id.with(("live-render", index)), &block_text)
+                    let rich_handler = LiveRichHandler::new(&mermaid_handler, range.start);
+                    MarkdownLabel::new(editor_id.with(("live-render", index)), &block_rendered)
                         .font(egui::FontId::new(
                             crate::theme::editor_font_size(ui.ctx()),
                             crate::fonts::preview_body_family(ui.ctx()),
@@ -499,8 +621,9 @@ pub fn ui(
                         // 代码块复制头(#38)与右栏预览同一份:Live 模式的
                         // 富渲染块也是「code 预览的地方」。
                         .code_block_buttons(&crate::ui::preview::code_copy_buttons)
-                        // mermaid 块出图(#51 M3),与右栏预览同一渲染入口。
-                        .link_handler(&mermaid_handler)
+                        // mermaid 块出图(#51 M3)+ 任务 checkbox(#63),
+                        // 与右栏预览同一渲染入口。
+                        .link_handler(&rich_handler)
                         .show(ui);
                     let bottom = ui.cursor().top();
                     let rect = egui::Rect::from_min_max(
@@ -527,6 +650,22 @@ pub fn ui(
         // 跨块路由:光标去了别的块,落地帧视口必须同帧跟上
         live.caret_follow = true;
         live.drag_anchor = None;
+    }
+
+    // 任务 checkbox 的帧末命中(#63,与右栏预览同一探针纪律):全部块
+    // 画完后读本帧探针,点击落在 Live 域某枚占位区内 → 切换消息(块内
+    // 载荷 + 记录时块首 = 源码偏移;过期偏移由归约侧 pulldown 重扫闸住),
+    // 并归还按下帧持焦者 —— vendored 的 handler.click 对列表项 widget
+    // 不可达(实测断零消息),这里是 Live 侧唯一切换入口。
+    if let Some((href, crate::ui::preview::TaskProbeDomain::Live(base))) =
+        crate::ui::preview::task_click_hit(panel)
+    {
+        if let Some((_, offset)) = crate::ui::preview::parse_task_href(&href) {
+            outbox.push(Message::TaskCheckboxToggled {
+                byte: base + offset,
+            });
+            crate::ui::preview::restore_stashed_focus(panel.ctx());
+        }
     }
 
     // 选区 AI 浮标(#61 M1):活动块持久选区 + 持焦 + 无拖拽进行中才弹,
@@ -604,6 +743,14 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> boo
     if crate::ui::preview::copy_button_rects(ui.ctx())
         .iter()
         .any(|button| button.contains(pos))
+    {
+        return false;
+    }
+    // 任务 checkbox(#63):点击归 checkbox 切换(帧内探针几何,由 paint
+    // 先于本判定写入),不连带进编辑。
+    if crate::ui::preview::task_checkbox_rects(ui.ctx())
+        .iter()
+        .any(|checkbox| checkbox.contains(pos))
     {
         return false;
     }
@@ -1114,6 +1261,76 @@ mod tests {
         }
         assert!(copied.is_empty(), "点正文不触发复制:{copied:?}");
         assert_eq!(live.active, Some(2), "点块内正文应切入编辑态:{live:?}");
+    }
+
+    /// Live 富渲染块的任务 checkbox(#63):任务块渲染出自绘 checkbox
+    /// (探针在场、豁免面的代码块不产),点击走块内载荷 + 块首换算出
+    /// [`Message::TaskCheckboxToggled`](载荷指向**源码**里标记的 `[`),
+    /// 且不切入编辑态(`clicked_for_edit` 的 checkbox 排除,#13a 同层)。
+    #[test]
+    fn live_task_checkbox_click_toggles_without_entering_edit() {
+        let ctx = egui::Context::default();
+        let doc = "- [ ] 首项待办\n\n第二块正文\n";
+        let mut editor = EditorBuffer::new(doc);
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        // 静帧:任务块富渲染,恰一枚 checkbox;零消息、零切入。
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert!(frame.messages.is_empty(), "静帧零消息");
+        let rects = crate::ui::preview::task_checkbox_probe(&ctx);
+        assert_eq!(rects.len(), 1, "任务块一枚 checkbox:{rects:?}");
+        assert_eq!(live.active, None, "静帧不切入编辑");
+
+        // 三帧点击 checkbox 中心:恰一条切换消息,载荷指向源码标记的 `[`;
+        // 点击不得切入编辑态(点 checkbox 的意图是切换,不是进编辑)。
+        let target = rects[0].center();
+        let mut toggles = Vec::new();
+        for events in click_events(target) {
+            let frame = live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+            toggles.extend(frame.messages.iter().filter_map(|message| match message {
+                Message::TaskCheckboxToggled { byte } => Some(*byte),
+                _ => None,
+            }));
+        }
+        assert_eq!(toggles.len(), 1, "一次点击恰一条切换消息:{toggles:?}");
+        assert_eq!(
+            toggles[0],
+            doc.find("[ ]").expect("task marker in source"),
+            "块内载荷 + 块首 = 源码标记的 ["
+        );
+        assert_eq!(live.active, None, "点 checkbox 不得切入编辑态");
+
+        // 切换落地(归约的同一写法)+ 重同步:勾选态即时反映 —— 修订号
+        // 前进 → sync 清块级改写缓存 → 块改写重算出 c 载荷。
+        let byte = toggles[0];
+        let char_at = editor.byte_to_char(byte);
+        editor.replace_range(char_at + 1..char_at + 2, "x");
+        live.sync(&editor, None);
+        let block_rendered = live.task_block(
+            0,
+            editor.revision(),
+            BlockBuffer::slice(editor.text(), &live.blocks[0]),
+        );
+        assert!(
+            block_rendered.contains("task://c"),
+            "切换后块改写即时反映勾选态:{block_rendered}"
+        );
     }
 
     /// #51 M3:Live 富渲染块里的 ```mermaid 围栏出图(生产入口 `ui` 经

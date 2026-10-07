@@ -203,6 +203,11 @@ pub struct PreviewState {
     /// **按改写顺序串行穿过**(可组合口径见 `latermd_md::OffsetMap`),
     /// 不与第一层预合并。
     pub emoji_map: latermd_md::OffsetMap,
+    /// 「emoji 层输出偏移 ↔ `rendered` 偏移」映射表(#63 第三层:任务列表
+    /// checkbox 链接改写),与 `rendered` 同次产出。正向消费(大纲跳转)
+    /// 三层串行穿过;任务链接载荷本身是 emoji 层输出坐标,点击回写时逆穿
+    /// 本表与 `emoji_map` 两层即回源码。
+    pub task_map: latermd_md::OffsetMap,
     /// 待滚动到的字节偏移(大纲点击交下来的目标),由预览绘制消费一次。
     /// 面板收起期间悬置(消费只发生在预览绘制帧);快照 rebuild(文档
     /// 变更)即丢弃 —— 旧偏移对重建后的文本没有意义。
@@ -214,21 +219,25 @@ impl PreviewState {
     /// 以编辑器当前内容建立快照(文本 + 大纲)。
     pub fn new(editor: &EditorBuffer) -> Self {
         let text = editor.text().to_owned();
-        // 两层改写都放在重建里而不是每帧:wikilink 展开要遍历全文、emoji
-        // 改写要解析全文,空闲帧不该付这个代价(与「修订号前进才重建」同
-        // 一条规则)。顺序固定 **wikilink 展开 → emoji 链接改写**(再往预览
-        // 绘制帧叠相对图片 URI):wikilink 展开把 `[[X]]` 变成链接后,emoji
-        // 层才能把它的文本/目标整体豁免,反过来会拆坏 wikilink。每层一张
-        // 映射表,与渲染串同次产出,消费点按同一顺序串行穿过。
+        // 三层改写都放在重建里而不是每帧:wikilink 展开要遍历全文、emoji
+        // 与任务标记改写要解析全文,空闲帧不该付这个代价(与「修订号前进
+        // 才重建」同一条规则)。顺序固定 **wikilink 展开 → emoji 链接改写
+        // → 任务 checkbox 链接改写**(再往预览绘制帧叠相对图片 URI):
+        // wikilink 展开把 `[[X]]` 变成链接后,emoji 层才能把它的文本/目标
+        // 整体豁免,反过来会拆坏 wikilink;任务层最后,它的载荷偏移因此
+        // 是 emoji 层输出坐标(点击回写时逆穿两层映射)。每层一张映射表,
+        // 与渲染串同次产出,消费点按同一顺序串行穿过。
         let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(&text);
-        let (rendered, emoji_map) = latermd_md::expand_emoji_links(
+        let (after_emoji, emoji_map) = latermd_md::expand_emoji_links(
             &after_wikilinks,
             crate::ui::emoji_data::covered_glyphs(),
         );
+        let (rendered, task_map) = latermd_md::expand_task_links(&after_emoji);
         Self {
             rendered,
             offset_map,
             emoji_map,
+            task_map,
             outline: latermd_md::outline(&text),
             text,
             synced_rev: editor.revision(),
@@ -788,6 +797,14 @@ pub enum Message {
     /// 放弃润色浮窗(#61 M3):关窗零改动 —— 文档、选区、修订号一概不动;
     /// 流式进行中放弃 = 作废在途流(剩余 chunk 丢弃)。
     SelectionAiPolishDismissed,
+    /// 点击预览/Live 富渲染里的任务列表 checkbox(#63),载荷为该任务标记
+    /// `[` 的**源码**字节偏移(ui 层已把链接载荷坐标逆穿映射):归约把
+    /// 标记中段的勾选字符翻转(` `↔`x`),单次 rope 定点编辑、单步 undo;
+    /// 形态核验不过(偏移过期/标记已被改写)静默忽略,不写错位置。
+    TaskCheckboxToggled {
+        /// `[` 在源码中的字节偏移。
+        byte: usize,
+    },
     /// 请求生成摘要(命令层入口):文档全文喂 provider,移除旧「AI 摘要」
     /// 节后在文档末尾以引用块形式流式追加新要点。流式进行中在归约里被
     /// 忽略(防重入,同一道闸)。
@@ -1102,6 +1119,7 @@ impl State {
                     self.abort_ai_stream();
                 }
             }
+            Message::TaskCheckboxToggled { byte } => self.toggle_task_checkbox(byte),
             Message::AiSummaryRequested => self.request_summary(),
             Message::AiCommitSuggestion { subject } => self.ai_commit_suggestion = Some(subject),
             Message::AiCommitDismissed => self.ai_commit_suggestion = None,
@@ -1591,6 +1609,34 @@ impl State {
         let polished = session.draft;
         tab.editor.replace_range(start..end, &polished);
         tab.pending_selection = Some((start, start + polished.chars().count()));
+    }
+
+    /// 翻转任务列表勾选态(`Message::TaskCheckboxToggled` 的归约,#63)。
+    ///
+    /// `byte` 指向源码中标记的 `[`;翻转 = 把中段字符 ` `↔`x`(`X` 视作
+    /// 已勾,取消写回空格,勾选统一写小写 `x`,与 GFM 主流一致)。
+    /// **单次** [`EditorBuffer::replace_range`] 定点编辑(与 #61 M3 润色
+    /// 替换同款):TextEdit 内建 undoer 按绘制帧取快照,一次 Ctrl+Z 即回
+    /// 原,不拆成逐字符写入。落点先经 [`latermd_md::is_task_marker_start`]
+    /// (pulldown 事件重扫,含字符边界防御)核验,不过即静默返回 ——
+    /// 点击帧到归约帧之间文档被并发编辑时偏移可能过期,行内代码/普通
+    /// 文本里的 `[ ]` 也在这里被挡住,宁可不写也不写错位置。
+    fn toggle_task_checkbox(&mut self, byte: usize) {
+        let editor = &mut self.tabs.current_mut().editor;
+        let text = editor.text();
+        // pulldown 事件口径重扫核验(单一解析器纪律):过期偏移落在行内
+        // 代码/普通文本的 `[ ]` 上时不命中,宁可不写也不写错位置。
+        if !latermd_md::is_task_marker_start(text, byte) {
+            return;
+        }
+        // 勾选方向按当前标记实况读(三字符全 ASCII,pulldown 已核验过形态)。
+        let marker = &text.as_bytes()[byte..byte + 3];
+        let replacement = match marker {
+            b"[ ]" => 'x',
+            _ => ' ',
+        };
+        let char_at = editor.byte_to_char(byte);
+        editor.replace_range(char_at + 1..char_at + 2, &replacement.to_string());
     }
 
     /// 写入 AI 增量块到**发起标签**(`Message::AiChunk` 的归约)。写入目标
@@ -3668,6 +3714,125 @@ mod tests {
             "盘上字节 == 源码,emoji 改写零外泄"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // —— 任务列表 checkbox 回写(#63)——
+
+    /// 切换语义:未勾 → 写小写 `x`;已勾(小写/大写 X)→ 写空格;嵌套
+    /// 列表的深层任务按偏移精确命中自己那行;每次切换修订号恰前进。
+    #[test]
+    fn task_toggle_flips_marker_state() {
+        let mut state = State::default();
+        let source = "- [ ] 首项\n- [x] 次项\n\n  - [X] 深层\n\n中文 😀 段\n\n- [ ] 末项\n";
+        state.tabs.current_mut().editor.replace_all(source);
+        let marker = |needle: &str| source.find(needle).expect("needle in source");
+
+        // 未勾 → 勾
+        state.apply(Message::TaskCheckboxToggled {
+            byte: marker("[ ] 首项"),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "- [x] 首项\n- [x] 次项\n\n  - [X] 深层\n\n中文 😀 段\n\n- [ ] 末项\n"
+        );
+        // 已勾(小写)→ 取消
+        state.apply(Message::TaskCheckboxToggled {
+            byte: marker("[x] 次项"),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "- [x] 首项\n- [ ] 次项\n\n  - [X] 深层\n\n中文 😀 段\n\n- [ ] 末项\n"
+        );
+        // 已勾(大写 X)→ 取消;嵌套深层任务命中自己
+        state.apply(Message::TaskCheckboxToggled {
+            byte: marker("[X] 深层"),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "- [x] 首项\n- [ ] 次项\n\n  - [ ] 深层\n\n中文 😀 段\n\n- [ ] 末项\n"
+        );
+        // CJK/emoji 之后的任务(多字节边界后的偏移)
+        state.apply(Message::TaskCheckboxToggled {
+            byte: marker("[ ] 末项"),
+        });
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "- [x] 首项\n- [ ] 次项\n\n  - [ ] 深层\n\n中文 😀 段\n\n- [x] 末项\n"
+        );
+    }
+
+    /// 形态核验(ByteIndex 边界防御):越界、落在多字节字符中间、非任务
+    /// 三字符(`[a]`、普通文本、行内代码形态)一律静默忽略 —— 文本与
+    /// 修订号零变化(过期偏移宁可不写也不写错位置)。
+    #[test]
+    fn task_toggle_rejects_stale_or_malformed_offsets() {
+        let mut state = State::default();
+        let source = "中文段 😀。\n\n行内 `[ ]` 代码与普通 [ ] 括号\n";
+        state.tabs.current_mut().editor.replace_all(source);
+        let rev = state.tabs.current().editor.revision();
+        let mid_cjk = source.find("文").map(|at| at + 1).expect("cjk");
+        for byte in [
+            usize::MAX,
+            source.len() + 10,
+            mid_cjk,                      // 「文」的第二字节:非边界
+            source.find("[ ]").unwrap(),  // 行内代码里的:三字符但……
+            source.find("[").unwrap(),    // 同上(首个 [)
+            source.find("普通").unwrap(), // 纯文本
+        ] {
+            state.apply(Message::TaskCheckboxToggled { byte });
+        }
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            source,
+            "全部形态核验不过,一字不改"
+        );
+        assert_eq!(
+            state.tabs.current().editor.revision(),
+            rev,
+            "零改动不得推进修订号"
+        );
+    }
+
+    /// 源码零扰动(#48 落盘口径):切换前后全文恰差一个字符,其余逐字节
+    /// 不变;保存落盘字节与切换后的源码一致,改写零外泄。
+    #[test]
+    fn task_toggle_touches_exactly_one_byte() {
+        let mut state = State::default();
+        let source = "# 标题\n\n- [ ] 任务 😀\n";
+        state.tabs.current_mut().editor.replace_all(source);
+        let byte = source.find("[ ]").expect("task");
+        state.apply(Message::TaskCheckboxToggled { byte });
+        let toggled = state.tabs.current().editor.text().to_owned();
+        assert_eq!(toggled, "# 标题\n\n- [x] 任务 😀\n");
+        // 逐字节 diff:恰一处不同且都是 ASCII 单字符
+        let diff = source
+            .bytes()
+            .zip(toggled.bytes())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diff, 1, "恰一个字节不同");
+        assert_eq!(source.len(), toggled.len());
+
+        let path = temp_path("task-toggle.md");
+        state.save_to(path.clone());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            toggled.as_bytes(),
+            "盘上字节 == 切换后的源码"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #63 第三层改写只进渲染副本:任务标记在 `rendered` 里已是 `task://`
+    /// 链接,editor 缓冲与源码一字不动(#48 B1 口径)。
+    #[test]
+    fn preview_task_rewrite_touches_only_rendered_copy() {
+        let source = "- [ ] 任务 😀\n\n```rust\nlet a = [ ];\n```\n";
+        let editor = EditorBuffer::new(source);
+        let preview = PreviewState::new(&editor);
+        assert!(preview.rendered.contains("task://u"), "未勾载荷在渲染副本");
+        assert_eq!(editor.text(), source, "源码一字不动");
+        assert!(!editor.is_dirty(), "渲染改写不置 dirty");
     }
 
     /// 大纲点击归约:跳过 span 吸收的前置换行落到标题行首,并按当前缓冲
