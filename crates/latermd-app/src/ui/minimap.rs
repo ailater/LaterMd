@@ -564,6 +564,16 @@ pub(crate) fn jump_id(editor_id: egui::Id) -> egui::Id {
     editor_id.with("minimap-jump")
 }
 
+/// #68 拖影手势的抓取状态 temp 键:值 = `Option<f32>`(按下帧指针相对
+/// 高亮框顶的偏移,窄条局部坐标)。闭外 **press 帧**判定写入 —— 指针在
+/// 上一帧高亮框内记 `Some(指针 y − 框 top)`,框外记 `None`(手势在而
+/// 无抓取,拖动走 #55 居中现状);拖动序列期间常驻,闭内消费跳转意图时
+/// 随读不删(整个序列用同一次判定的偏移),释放帧删除 —— 下一次按下
+/// 重新判定。
+pub(crate) fn grab_id(editor_id: egui::Id) -> egui::Id {
+    editor_id.with("minimap-grab")
+}
+
 /// 测试探针载荷(仅测试读;生产每帧写、从不读,字段读取豁免
 /// dead_code —— 与 preview.rs `ScrollProbe` 同款)。
 #[derive(Clone, Copy, Debug)]
@@ -1610,6 +1620,397 @@ mod tests {
             top < -50.0,
             "拖到窄条下部后视口深入文档(实测 top {top},offset {previous})"
         );
+    }
+
+    /// 读取某标签当前 grab 通道(#68 白盒锚点):`None` = 通道无值(无手势
+    /// 或已释放清零),`Some(None)` = 手势在而按在阴影外,`Some(Some(x))` =
+    /// 抓着阴影本体、偏移 x。
+    fn grab_slot(ctx: &egui::Context, id: egui::Id) -> Option<Option<f32>> {
+        ctx.data(|d| d.get_temp::<Option<f32>>(grab_id(id)))
+    }
+
+    /// #68 M2 端到端:按住高亮框本体拖动 → 抓取点相对高亮框不动(阴影
+    /// 顶对齐「指针 − 抓取偏移」的滑轨换算,而非视口中心追指针);拖动中
+    /// offset 单调跟随;释放帧抓取通道清零。与居中语义的差异断言:抓取
+    /// 点选在 0.3×阴影高(远离半高),若实现退回居中,落地后指针相对阴影
+    /// 的锚会被读成 ≈ 半高,断言红。
+    #[test]
+    fn dragging_highlight_body_pins_pointer_to_highlight() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, probe) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        // 初始在文档顶(阴影贴窄条顶),高亮框 top 即窄条 top。
+        let map_top = viewport_rect(&shapes).expect("高亮框定位窄条").top();
+        let hl0 = probe.expect("探针已写").viewport.expect("高亮框");
+        let height = hl0.height();
+        assert!(
+            height > 60.0 && height < 500.0,
+            "阴影高在可拖影区间(实测 {height}):太矮无拖影意义,太高贴满窄条"
+        );
+        let grab = height * 0.3;
+        let press = egui::pos2(hl0.center().x, map_top + grab);
+        frame(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // press 帧判定:按在阴影内,抓取偏移即入通道(判定用上一帧高亮
+        // 框,与用户按下时所见一致)。
+        assert_eq!(
+            grab_slot(&ctx, id),
+            Some(Some(grab)),
+            "按在阴影内:press 帧记录抓取偏移(指针 − 框顶)"
+        );
+
+        // 拖 6 帧每帧 +40px:offset 单调不减(与既有拖动测试同款容差)。
+        let mut previous = 0.0_f32;
+        for step in 0..6 {
+            let pos = egui::pos2(press.x, press.y + f32::from(step as u16) * 40.0);
+            frame(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(pos)],
+            );
+            let offset: f32 = ctx
+                .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .map_or(0.0, |m| m.offset);
+            assert!(
+                offset >= previous - 0.5,
+                "拖影下移滚动单调不减(第 {step} 步 {previous} → {offset})"
+            );
+            previous = offset;
+        }
+        // settle(意图→消费→落地→布局→metrics→绘制各差一帧)后验锚定。
+        for step in 0..4 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.9 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+        let pointer_local = press.y + 200.0 - map_top;
+        let hl1 = ctx
+            .data(|d| d.get_temp::<MinimapProbe>(probe_id(id)))
+            .expect("探针已写")
+            .viewport
+            .expect("高亮框");
+        let pinned = pointer_local - (hl1.top() - map_top);
+        assert!(
+            (pinned - grab).abs() < 3.0,
+            "抓取点相对高亮框不动(期望 ≈{grab},实测 {pinned})"
+        );
+        // 差异断言:退回居中语义时指针会被按在阴影半高处 —— 抓取点选
+        // 0.3×高远离半高,两条语义的锚可分;两个方向都断(后者同时是
+        // 测试自身有效性的前提,防高度退化到两锚重合)。
+        assert!(
+            (grab - height * 0.5).abs() > 6.0,
+            "测试有效性:抓取点远离半高锚(实测差 {})",
+            (grab - height * 0.5).abs()
+        );
+        assert!(
+            (pinned - height * 0.5).abs() > 6.0,
+            "落地是滑轨顶对齐(指针 − grab),不是居中(指针 − 半高)(实测锚 {pinned})"
+        );
+
+        // 释放:通道清零,下一次按下重新判定。
+        frame(
+            &ctx,
+            &mut editor,
+            1.4,
+            true,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(press.x, press.y + 200.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            grab_slot(&ctx, id).is_none(),
+            "释放帧清零抓取通道(下一次按下重新判定)"
+        );
+    }
+
+    /// #68 M2 端到端:按在高亮框**外**(窄条内)拖动 → 仍走 #55 居中现状
+    /// (grab 通道记录「手势在而无抓取」)。拖动的落地是逐帧反馈迭代,
+    /// 几何稳态 = 指针贴阴影中心(视口中心对准指针);若框外被误判成
+    /// 拖影,稳态会变成指针贴「框顶 + 抓取偏移」,与中心锚差 0.2×高,
+    /// 断言必红。
+    #[test]
+    fn dragging_outside_highlight_keeps_centered_target() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, probe) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let map_top = viewport_rect(&shapes).expect("高亮框定位窄条").top();
+        let hl0 = probe.expect("探针已写").viewport.expect("高亮框");
+        let metrics0: ScrollMetrics = ctx
+            .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+            .unwrap_or_default();
+        assert_eq!(metrics0.offset, 0.0, "起拖前在文档顶(公式 s=0 前提)");
+
+        // 框外按下:阴影下方 60px,仍在窄条内、x 取窄条中心避让滚动条。
+        let press_local = (hl0.top() - map_top) + hl0.height() + 60.0;
+        assert!(press_local < 580.0, "取样点留在窄条内(实测 {press_local})");
+        let press = egui::pos2(hl0.center().x, map_top + press_local);
+        frame(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            grab_slot(&ctx, id),
+            Some(None),
+            "按在阴影外:手势在而无抓取,拖动走居中现状"
+        );
+
+        // 拖 3 帧 +40px。落地链与稳态:拖动中意图逐帧带当帧 scroll_ratio,
+        // 居中公式是反馈迭代(每帧把视口中心往指针处收),收敛不动点
+        // s*=(指针−阴影半高)/滑轨 —— 几何稳态恰是「指针贴阴影中心」
+        // (#55 现状拖动的固有语义,与 M1 单次点击的单步公式不同)。
+        let mut previous = 0.0_f32;
+        for step in 0..3 {
+            let pos = egui::pos2(press.x, press.y + f32::from(step as u16) * 40.0);
+            frame(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(pos)],
+            );
+            let offset: f32 = ctx
+                .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .map_or(0.0, |m| m.offset);
+            assert!(
+                offset >= previous - 0.5,
+                "框外拖动滚动单调不减(第 {step} 步 {previous} → {offset})"
+            );
+            previous = offset;
+        }
+        // settle 到不动点:egui 的落地带逐帧平滑,反馈链每帧只推进一
+        // 部分(实测 40 帧从 204px 锚收敛到 60.0,理论不动点 = 半高
+        // 59.97;余量给足帧数,容差 2px ≈ 40 倍实测误差)。
+        for step in 0..40 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.7 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+        let pointer_final_local = press_local + 80.0;
+        let hl1 = ctx
+            .data(|d| d.get_temp::<MinimapProbe>(probe_id(id)))
+            .expect("探针已写")
+            .viewport
+            .expect("高亮框");
+        let center_anchor = pointer_final_local - (hl1.top() - map_top);
+        assert!(
+            (center_anchor - hl1.height() * 0.5).abs() < 2.0,
+            "居中稳态:指针贴阴影中心(期望 ≈{},实测 {center_anchor})",
+            hl1.height() * 0.5
+        );
+        // 与拖影语义分叉:抓着阴影本体时指针贴「框顶 + 0.3×高」(见
+        // dragging_highlight_body 测试),两条锚差 0.2×高,远超容差。
+        assert!(
+            hl1.height() * 0.2 > 6.0,
+            "测试有效性:两语义的锚距 0.2×高可分(实测 {})",
+            hl1.height() * 0.2
+        );
+        // 释放清零(与拖影路径同一条清零通路)。
+        frame(
+            &ctx,
+            &mut editor,
+            5.0,
+            true,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(press.x, press.y + 80.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(grab_slot(&ctx, id).is_none(), "释放帧清零抓取通道");
+    }
+
+    /// #68 M2 端到端:释放后再按下**重新判定** —— 拖影落地后阴影已移位,
+    /// 新的按下按当帧所见阴影重新算抓取:按新阴影外记「无抓取」,按新
+    /// 阴影内记新偏移;纯点击(按下即放)同样先判定、后随点击清零,点击
+    /// 意图仍是居中(否决线:点击跳转行为不变)。
+    #[test]
+    fn release_then_press_re_judges_grab_state() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+        let probe_hl = |ctx: &egui::Context| {
+            ctx.data(|d| d.get_temp::<MinimapProbe>(probe_id(id)))
+                .expect("探针已写")
+                .viewport
+                .expect("高亮框")
+        };
+        let press_frame =
+            |ctx: &egui::Context, editor: &mut EditorBuffer, now: f64, pos: egui::Pos2| {
+                frame(
+                    ctx,
+                    editor,
+                    now,
+                    true,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            };
+        let release_frame =
+            |ctx: &egui::Context, editor: &mut EditorBuffer, now: f64, pos: egui::Pos2| {
+                frame(
+                    ctx,
+                    editor,
+                    now,
+                    true,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            };
+
+        frame(&ctx, &mut editor, 0.0, true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, 0.1, true, Vec::new());
+        let map_top = viewport_rect(&shapes).expect("高亮框定位窄条").top();
+        let hl0 = probe_hl(&ctx);
+
+        // 第一次:按阴影内 0.25×高,小幅拖影把阴影带下去,释放。
+        let grab1 = hl0.height() * 0.25;
+        let p1 = egui::pos2(hl0.center().x, hl0.top() + grab1);
+        press_frame(&ctx, &mut editor, 0.2, p1);
+        assert_eq!(
+            grab_slot(&ctx, id),
+            Some(Some(grab1)),
+            "第一次按下:阴影内,记录偏移"
+        );
+        for step in 0..2 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    p1.x,
+                    p1.y + f32::from(step as u16) * 60.0,
+                ))],
+            );
+        }
+        for step in 0..3 {
+            frame(
+                &ctx,
+                &mut editor,
+                0.5 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+        release_frame(&ctx, &mut editor, 0.9, egui::pos2(p1.x, p1.y + 60.0));
+        assert!(grab_slot(&ctx, id).is_none(), "释放清零");
+
+        // 第二次:按当前(已移位)阴影外 → 无抓取;纯点击释放后意图是
+        // 居中,settle 让它落地,阴影再次移位。
+        let hl1 = probe_hl(&ctx);
+        assert!(
+            hl1.top() > hl0.top(),
+            "第一次拖影确实移动了阴影({} → {})",
+            hl0.top(),
+            hl1.top()
+        );
+        let p2 = egui::pos2(hl1.center().x, hl1.bottom() + 30.0);
+        assert!(
+            p2.y - map_top < 580.0,
+            "第二次取样留在窄条内(实测 {})",
+            p2.y - map_top
+        );
+        press_frame(&ctx, &mut editor, 1.0, p2);
+        assert_eq!(
+            grab_slot(&ctx, id),
+            Some(None),
+            "第二次按下:新阴影外,无抓取(居中路径)"
+        );
+        release_frame(&ctx, &mut editor, 1.1, p2);
+        assert!(grab_slot(&ctx, id).is_none(), "纯点击释放后清零");
+        for step in 0..4 {
+            frame(
+                &ctx,
+                &mut editor,
+                1.2 + f64::from(step) * 0.1,
+                true,
+                Vec::new(),
+            );
+        }
+
+        // 第三次:按(又移位了的)阴影内部 → 新偏移(取当帧 probe 为尺,
+        // 与判定读的上一帧 metrics 同帧稳态,自洽)。
+        let hl2 = probe_hl(&ctx);
+        let inside = hl2.top() + hl2.height() * 0.5;
+        let p3 = egui::pos2(hl2.center().x, inside);
+        press_frame(&ctx, &mut editor, 1.7, p3);
+        let expected = inside - hl2.top();
+        match grab_slot(&ctx, id) {
+            Some(Some(g)) => assert!(
+                (g - expected).abs() < 0.01,
+                "第三次按下:新阴影内,偏移按新框重算(期望 {expected},实测 {g})"
+            ),
+            other => panic!("第三次按下应记录抓取偏移,实测通道 {other:?}"),
+        }
+        release_frame(&ctx, &mut editor, 1.8, p3);
+        assert!(grab_slot(&ctx, id).is_none(), "最终释放清零");
     }
 
     /// ⑤-3b 评审修复回归:窄条最右的滚动条避让区**命中也让**。修复前

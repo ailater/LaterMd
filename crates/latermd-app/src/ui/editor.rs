@@ -219,6 +219,10 @@ pub fn ui(
     // 写回当帧 output.state 还是写回前的旧快照,定位只能用写回目标本身。
     let mut ime_write_back: Option<usize> = None;
 
+    // 总行数 = 1 + '\n' 数(与 galley 的逻辑行划分同构),闭内行号槽与
+    // 闭外 #68 拖影判定(上一帧高亮框重算)共用一份。
+    let total_lines = 1 + editor.text().bytes().filter(|b| *b == b'\n').count();
+
     // 打字机模式(#64 M1):每标签一份记忆(源码/Live 分槽),帧首读、
     // 帧末写回。关闭态不读写 temp、闭包内不进任何打字机分支 —— 滚动行为
     // 与从前逐字节相同(否决线)。
@@ -242,9 +246,8 @@ pub fn ui(
         .id_salt(editor_id.with("source-editor-scroll"))
         .auto_shrink([false, false])
         .show(panel, |ui| {
-            // 行号槽宽度先于 TextEdit 算好(总行数 = 1 + '\n' 数,与 galley
-            // 的逻辑行划分同构);位宽跨档才变,右对齐不抖。
-            let total_lines = 1 + editor.text().bytes().filter(|b| *b == b'\n').count();
+            // 行号槽宽度先于 TextEdit 算好(位宽跨档才变,右对齐不抖);
+            // total_lines 已在闭包外算好(闭外拖影判定共用)。
             let gutter_w = gutter::width(ui, total_lines);
             let mut buffer = EditorText(editor);
             let (slot, output) = ui
@@ -436,15 +439,27 @@ pub fn ui(
                 } else {
                     1.0
                 };
-                // 绝对滚动比例的落地出口:TOP 对齐语义下 ScrollArea::end
-                // 的换算会扣一个 item_spacing,rect 顶补回;单像素 rect 只
-                // 表位置。动画关闭(滚轮/拖动逐帧即时,不留弹性滞后)。
+                // 绝对滚动比例的落地出口(#68 修正):egui scroll_to_rect 的
+                // TOP 换算是**相对**的(delta = rect 顶 − clip 顶 − spacing,
+                // offset += delta)—— rect 顶直接写 clip.top + target×travel
+                // 会在已滚离文档顶时每次调用再累加一遍(实测同 target 连落
+                // 两帧 offset 1000→2000)。绝对意图须把 rect 顶写成
+                // 「clip.top + (目标 offset − 当帧 offset)」:当帧 offset 在
+                // 闭内布局前拿不到,用上一帧 metrics 真值(与上面的跳转换
+                // 算同一口径;拖动逐帧 land 逐帧校正,单帧差自愈)。TOP 换
+                // 算扣的 item_spacing 照旧补回;单像素 rect 只表位置;动画
+                // 关闭(滚轮/拖动逐帧即时,不留弹性滞后)。
                 let land = |ui: &egui::Ui, target: f32| {
                     let clip = ui.clip_rect();
+                    // (target×travel − metrics.offset) 可负 = 向上跳:
+                    // rect 顶落到 clip 上方,负 delta 合法,egui 的 offset
+                    // 边界(0..=max)统一钳,这里不预钳。
                     let rect = egui::Rect::from_min_size(
                         egui::pos2(
                             clip.left() + 1.0,
-                            clip.top() + target * travel + ui.spacing().item_spacing.y,
+                            clip.top()
+                                + (target * travel - metrics.offset)
+                                + ui.spacing().item_spacing.y,
                         ),
                         egui::vec2(1.0, 1.0),
                     );
@@ -494,12 +509,19 @@ pub fn ui(
                     }
                 }
 
-                // 点击/拖动跳转(#55 M2)。消费即清:一帧意图一帧落地,不
-                // 留旧值在拖动结束后复读。
+                // 点击/拖动跳转(#55 M2 + #68 M2 拖影)。意图消费即清:一帧
+                // 意图一帧落地,不留旧值在拖动结束后复读。grab 通道随拖影
+                // 手势常驻(闭外 press 帧判定、释放帧清零,见下方注册段),
+                // 消费帧只读不删 —— 拖动序列每一帧都用同一次判定的抓取
+                // 偏移,抓取点相对高亮框不动。
                 let pointer_y = ui
                     .ctx()
                     .data_mut(|d| d.remove_temp::<f32>(minimap::jump_id(editor_id)));
                 if let Some(pointer_y) = pointer_y {
+                    let grab = ui
+                        .ctx()
+                        .data(|d| d.get_temp::<Option<f32>>(minimap::grab_id(editor_id)))
+                        .flatten();
                     if let Some(target) = minimap::jump_ratio(minimap::JumpInput {
                         minimap_height: map_rect.height(),
                         total_lines,
@@ -507,8 +529,7 @@ pub fn ui(
                         row_h: minimap::ROW_H,
                         pointer_y,
                         viewport_frac,
-                        // grab 通道由 #68 M2 接线;M1 纯函数阶段恒居中现状。
-                        grab: None,
+                        grab,
                     }) {
                         land(ui, target);
                     }
@@ -563,12 +584,64 @@ pub fn ui(
             editor_id.with("minimap"),
             egui::Sense::click_and_drag(),
         );
+        // #68 M2 拖影:按下帧判定「指针是否在视口高亮框内」。egui 对
+        // click_and_drag 的 dragged() 要等指针移过点击阈值才为真,按下帧
+        // 没有现成信号 —— is_pointer_button_down_on 从 press 帧起为真
+        // (无 click/drag 判定窗口),叠当帧 press 事件精确抓一次。高亮框
+        // 用上一帧 metrics 重算(用户按下时看到的正是上一帧画的框,本帧
+        // 的框要等闭内排版后才画,与滚轮转发同款「上一帧足够」口径)。
+        // 框内记 Some(指针 − 框顶),框外记 None(拖动仍走居中现状)。
+        let pressed_now = response.is_pointer_button_down_on()
+            && panel.ctx().input(|i| i.pointer.primary_pressed());
+        if pressed_now {
+            let metrics: minimap::ScrollMetrics = panel.ctx().data(|d| {
+                d.get_temp(minimap::metrics_id(editor_id))
+                    .unwrap_or_default()
+            });
+            let travel = (metrics.content_height - metrics.viewport_height).max(0.0);
+            let scroll_ratio = if travel > 0.0 {
+                (metrics.offset / travel).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let viewport_frac = if metrics.content_height > 0.0 {
+                (metrics.viewport_height / metrics.content_height).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let (top, height) = minimap::viewport_highlight(
+                minimap::WindowInput {
+                    minimap_height: map_rect.height(),
+                    total_lines,
+                    scroll_ratio,
+                    row_h: minimap::ROW_H,
+                },
+                viewport_frac,
+            );
+            let grab = response
+                .interact_pointer_pos()
+                .map(|pos| pos.y - map_rect.top())
+                .filter(|y| *y >= top && *y < top + height)
+                .map(|y| y - top);
+            panel
+                .ctx()
+                .data_mut(|d| d.insert_temp(minimap::grab_id(editor_id), grab));
+        }
         if response.clicked() || response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
                 panel.ctx().data_mut(|d| {
                     d.insert_temp(minimap::jump_id(editor_id), pos.y - map_rect.top())
                 });
             }
+        }
+        // 释放清零(#68):拖动释放(drag_stopped)与纯点击(clicked)都
+        // 终结手势。clicked 帧上面刚写了居中意图,grab 必须当帧清掉 ——
+        // 下一帧闭内消费该意图时若读到残留的 Some,纯点击会被误当拖影
+        // (「点击跳转行为不变」否决线)。
+        if response.drag_stopped() || response.clicked() {
+            panel
+                .ctx()
+                .data_mut(|d| d.remove_temp::<Option<f32>>(minimap::grab_id(editor_id)));
         }
     }
 
