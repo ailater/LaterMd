@@ -5974,3 +5974,76 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod strip_geometry {
+    //! **三条「窄条」控件的几何守门**(2026-10-08 真机复核补)。
+    //!
+    //! 起因是 S1-2 状态栏的真实回归:三段被写成三个**平级**调用,而父 Ui
+    //! 是 `Panel::bottom` 的 `Layout::top_down`(`panel.rs:821`)—— 每个平级
+    //! 调用各占一行,状态栏从 18px 涨到 75px,而**当时 1386 个测试与六个
+    //! 门禁全绿**,是本机 X11 截图逐行量出来的。
+    //!
+    //! 守门断言的盲区有规律:**功能断言覆盖「有没有」,几乎不覆盖「长什么样」**。
+    //! 「窄条」控件的天花板就是「不能塌」,故三条各补一条高度断言。
+    //!
+    //! **上界一律硬编码,不读 `tokens`** —— 与 nav 段高度那条同因:
+    //! 若上界跟着实现一起变,断言就自我满足(见 `sidebar.rs`
+    //! `three_bands_fill_the_panel_top_down` 的红绿实测)。
+    use super::*;
+    use crate::keymap::Keymap;
+    use eframe::egui::{RawInput, Rect};
+
+    /// 在 `top_down` 父布局里跑一段绘制,返回它消费掉的高度。
+    fn measure<F: FnMut(&mut egui::Ui)>(mut f: F) -> f32 {
+        let ctx = egui::Context::default();
+        let mut h = 0.0f32;
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                f(ui);
+                h = ui.min_rect().height();
+            },
+        )
+        .drop_without_applying_deltas();
+        h
+    }
+
+    /// 格式工具条必须单行(实测 30px)。S2-2 把它从 17 按钮缩到 8 直出 +
+    /// 溢出菜单后仍须守住 —— 缩按钮数与「条会不会折叠」是两件事。
+    #[test]
+    fn format_bar_is_a_single_row() {
+        let h = measure(|ui| {
+            let mut out = Vec::new();
+            crate::ui::format_bar::ui(ui, &Keymap::builtin(), &mut out);
+        });
+        assert!(
+            (24.0..=40.0).contains(&h),
+            "格式工具条应单行(实测 {h}px,实测基准 30px)——              远超 40px 说明多组内容被摞成了多行"
+        );
+    }
+
+    /// 提示行必须单行(实测 18px)。它在文档上方常驻,折叠会把编辑区顶下去。
+    #[test]
+    fn notice_bar_is_a_single_row() {
+        let h = measure(|ui| {
+            let mut out = Vec::new();
+            let d = crate::state::DocumentState {
+                path: None,
+                dirty: false,
+                notice: Some("Ctrl+S 已被「导出 HTML」占用".to_owned()),
+            };
+            super::notice_bar(ui, &d, &mut out);
+        });
+        assert!(
+            (12.0..=30.0).contains(&h),
+            "提示行应单行(实测 {h}px,实测基准 18px)—— 折叠会把编辑区顶下去"
+        );
+    }
+}
