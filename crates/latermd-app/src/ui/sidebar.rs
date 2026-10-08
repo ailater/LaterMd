@@ -111,31 +111,19 @@ pub fn ui(
 
 /// 左栏三段各自的竖直区间,自上而下互不重叠。
 ///
-/// 由 [`ui`] 顺手测出来返回:`nav_row` 是手绘 widget(无可读名字),要算
-/// 「第 N 行的 y」只能靠 [`SidebarTab::ALL`] 的顺序 + `NAV_ROW_H` 自己推。
+/// 由 [`ui`] 顺手测出来返回:`view_nav` 是手绘 widget(无可读名字),要算
+/// 「第 N 枚 tab 的 x」只能靠 [`SidebarTab::ALL`] 的顺序 + `NAV_TAB_H`
+/// 自己推(无头测试里的 `nav_tab_center` 就是这么算的;它是 `#[cfg(test)]`,
+/// 故此处不能用文档链接指它 —— 生产构建里没有这个 item,写了会触发
+/// `broken_intra_doc_links` 警告)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SidebarBands {
     /// 顶段:高频文件动作。
     pub top: egui::Rect,
-    /// 次段:四行视图导航(每行 `NAV_ROW_H` 高)。
+    /// 次段:视图导航(2026-10-08 起为单行五 tab,`NAV_TAB_H` 高)。
     pub nav: egui::Rect,
     /// 中段:当前视图内容,吃掉剩余高度(至左栏底部)。
     pub body: egui::Rect,
-}
-
-/// 单条视图导航行的**竖直中心 y**(相对传进来的 `panel`)。
-///
-/// 给无头测试定位用:行本身是 `allocate_exact_size` 的手绘 widget,没有可
-/// 从外部读的名字;而顺序是 `SidebarTab::ALL`、行高是 `NAV_ROW_H`,与绘制
-/// 同源地算出来即可,不必把矩形一路传出去。
-// 只有无头测试用;生产路径靠 `SidebarBands` 定位。
-#[cfg(test)]
-pub(crate) fn nav_row_center_y(top: f32, tab: SidebarTab) -> f32 {
-    let index = SidebarTab::ALL
-        .iter()
-        .position(|candidate| *candidate == tab)
-        .expect("tab 必在 ALL 里");
-    top + crate::ui::tokens::NAV_ROW_H * (index as f32 + 0.5)
 }
 
 /// 左栏高频文件动作(docs/ui-shell-redesign.md §5 顶段;2026-09-27 起
@@ -188,37 +176,118 @@ fn tooltip_of(cmd: Command, keymap: &Keymap) -> String {
     }
 }
 
-/// 左栏次段的视图导航:四行竖排,**整行选中态** —— selected_bg 底 +
-/// 左侧 2px 强调色竖条(照抄 tabs 的页签选中态,不用重boBox 再辨证)。
+/// 左栏次段的视图导航:**单行横排五个图标 tab**。
 ///
-/// 点击只发 [`Message::SidebarTabChanged`],切换本身在归约。
+/// **2026-10-08 改版**(docs/ui-shell-redesign-v2.md §2):原为竖排五行
+/// ×`NAV_ROW_H` = 130px 常驻,而它下面才是主工作区(文件树)。改为单行
+/// 后 nav 段 26px,省下的 104px 全给中段 —— 侧栏可视高度 +48%。
+///
+/// 选中态从「浅色底 + 左侧 2px 竖条」换成「**下缘 2px 强调色横条**」:
+/// 横排时竖条会指向相邻 tab(五枚 26px 宽的 tab 挤在 180px 窄栏里,
+/// 竖条的「所属行」视觉上已经读不出来了),横条才与「页签」同构。
+/// 横条口径与 `ui::tabs` 的页签选中下划线一致(ui-polish §1.2 同款)。
+///
+/// 无障碍口径:每个 tab 仍带 tooltip(图标不自解释,ui-polish §1.1 铁律),
+/// 且命中区是整枚 26×26 而非仅图标。
 fn view_nav(panel: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Message>) {
+    // 五枚 tab 一行放得下(5×26 + 4×2 = 138 < SIDEBAR_MIN_W 180),
+    // 故不换行;逐枚 `allocate_rect` 摆位而非 `horizontal`,理由与
+    // `top_actions` 的探针同款:手绘 widget 才有确定的 x 供无头测试定位。
+    let size = egui::vec2(crate::ui::tokens::NAV_TAB_H, crate::ui::tokens::NAV_TAB_H);
+    let mut x = panel.max_rect().left();
+    let top = panel.cursor().top();
     for tab in SidebarTab::ALL {
-        let response = nav_row(panel, tab, tab == active);
+        let rect = egui::Rect::from_min_size(egui::pos2(x, top), size);
+        // 命中区铺满整枚 tab(不是仅图标),`is_rect_visible` 之外也照发
+        // 点击 —— 被裁掉的 tab 不该吃掉指针。
+        let response = panel
+            .allocate_rect(rect, egui::Sense::click())
+            .on_hover_text(tab.label());
+        if panel.is_rect_visible(rect) {
+            paint_nav_tab(panel, rect, tab, tab == active, response.hovered());
+        }
         if response.clicked() {
             outbox.push(Message::SidebarTabChanged(tab));
         }
+        x += size.x + crate::ui::tokens::NAV_TAB_GAP;
     }
+    // 推进游标到本段底部:逐枚 `allocate_rect` 吃的是**绝对**矩形,不吃
+    // 游标,不手动推的话后面的 ScrollArea 会与 nav 段重叠。
+    panel.set_min_height(top + size.y);
 }
 
-/// 单条导航行:图标 + 文字占满整行宽。返回响应以便点击测试定位。
-fn nav_row(ui: &mut egui::Ui, tab: SidebarTab, selected: bool) -> egui::Response {
-    icon_label_row(
-        ui,
-        tab.icon(),
-        tab.label(),
-        selected,
-        crate::ui::tokens::NAV_ROW_H,
+/// 单枚视图 tab 的绘制:圆角底(选中/hover)+居中图标+下缘横条。
+///
+/// 手绘而非 `Button`:`Button` 的文字排版与本项目的图标自绘铁律
+/// (ui-polish §1.1)不合,且拿不到「下缘横条」这种自定义选中标记。
+fn paint_nav_tab(ui: &egui::Ui, rect: egui::Rect, tab: SidebarTab, selected: bool, hovered: bool) {
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    // `CornerRadius` 收 u8,token 是 f32 —— 这里取整。RADIUS_SM=4 本来
+    // 就是整数,取整无损;真要改成非整数 token 时这条要重新核。
+    let radius = egui::CornerRadius::same(crate::ui::tokens::RADIUS_SM as u8);
+    if selected {
+        let selected_bg = crate::theme::shell_tokens(visuals.dark_mode).selected_bg;
+        painter.rect_filled(rect, radius, selected_bg);
+        // 下缘 2px 强调色横条:贴着 tab 底缘,宽度取 tab 宽的 60%,
+        // 视觉上是一枚「下划线」而非「边框」,与页签选中同款。
+        let bar_w = rect.width() * 0.6;
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.center().x - bar_w / 2.0,
+                    rect.bottom() - crate::ui::tokens::NAV_BAR_W,
+                ),
+                egui::vec2(bar_w, crate::ui::tokens::NAV_BAR_W),
+            ),
+            radius,
+            crate::ui::tokens::accent(ui),
+        );
+    } else if hovered {
+        // hover 用内建 hover 底(不自己调色,跟随主题)。
+        painter.rect_filled(rect, radius, visuals.widgets.hovered.bg_fill);
+    }
+    let color = if selected {
+        crate::ui::tokens::accent(ui)
+    } else {
+        visuals.text_color()
+    };
+    tab.icon().draw(
+        painter,
+        rect.center(),
+        crate::ui::tokens::NAV_TAB_ICON,
+        color,
+    );
+}
+
+/// 单枚视图 tab 的中心点(相对 panel 左缘与 nav 段顶缘),供无头测试定位。
+///
+/// 顺序是 [`SidebarTab::ALL`]、边长与间隙是 `NAV_TAB_H` / `NAV_TAB_GAP`,
+/// 与 [`view_nav`] 的摆位同源地算出来即可,不必把矩形一路传出去。
+#[cfg(test)]
+pub(crate) fn nav_tab_center(left: f32, top: f32, tab: SidebarTab) -> egui::Pos2 {
+    let index = SidebarTab::ALL
+        .iter()
+        .position(|candidate| *candidate == tab)
+        .expect("tab 必在 ALL 里");
+    let pitch = crate::ui::tokens::NAV_TAB_H + crate::ui::tokens::NAV_TAB_GAP;
+    egui::pos2(
+        left + crate::ui::tokens::NAV_TAB_H * 0.5 + pitch * index as f32,
+        top + crate::ui::tokens::NAV_TAB_H * 0.5,
     )
 }
 
-/// 图标 + 文字的整行按钮,高度可调(左栏次段视图导航用)。
+/// 图标 + 文字的整行按钮,高度可调。
 ///
-/// 手绘而非 `Button` 是为了「整行选中态」:浅色底打满可用宽 + 左侧 2px
-/// 强调色竖条(ui-polish 页签选中态的同款口径)。`Sense::click` 打在
-/// `allocate_exact_size` 上而非某个子控件,因此整行任意位置都能点 —— 这
-/// 也是它比起 `horizontal` 容器响应的差别:后者只有不可交互的 `label`,
-/// 压根收不到点击。
+/// **当前无生产调用方**:2026-10-08 视图导航从竖排五行改为单行图标 tab
+/// (`view_nav` + `paint_nav_tab`)后,本函数随之退役。它与
+/// `ui::outline`/Git 面板里的行式列表不同类(那些走各自的 `*_row`),留着
+/// 是纯死代码 —— 但删函数要连同其唯一的历史价值(整行选中态的画法)
+/// 一起搬走,故先在 `paint_nav_tab` 的文档里留了口径指针。
+///
+/// **保留而不删**的理由同 `tokens::NAV_ROW_H`:历史 commit 的测试引用它,
+/// 删掉会让旧 commit 无法 `git bisect` 复现。新代码不许新增调用方。
+#[allow(dead_code)]
 fn icon_label_row(
     ui: &mut egui::Ui,
     icon: crate::ui::icons::Icon,
@@ -2741,29 +2810,48 @@ mod tests {
 
     // —— M2 三段式(docs/ui-shell-redesign.md §5)——
 
-    /// 导航行顺序 helper:一行一 `NAV_ROW_H`,自上而下不重叠;第 5 行是
-    /// 反向链接(#15,追加在尾部不打乱既有四行)。
+    /// 视图 tab 顺序 helper:一枚占 `NAV_TAB_H` 宽,自左向右不重叠;第 5
+    /// 枚是反向链接(#15,追加在尾部不打乱既有四枚)。
+    ///
+    /// **2026-10-08 随 `view_nav` 改单行而从 y 轴改为 x 轴**:横排后
+    /// 「第 N 枚的 y」恒等于段中线,已无区分度,能区分的只有 x。
     #[test]
-    fn nav_row_center_y_follows_tab_order() {
-        let row = crate::ui::tokens::NAV_ROW_H;
+    fn nav_tab_center_x_follows_tab_order() {
+        let size = crate::ui::tokens::NAV_TAB_H;
+        let pitch = size + crate::ui::tokens::NAV_TAB_GAP;
         assert_eq!(
-            nav_row_center_y(100.0, SidebarTab::Files),
-            100.0 + row * 0.5
+            nav_tab_center(0.0, 0.0, SidebarTab::Files),
+            egui::pos2(size * 0.5, size * 0.5),
+            "第一枚贴着左缘"
         );
         assert_eq!(
-            nav_row_center_y(100.0, SidebarTab::Git),
-            100.0 + row * 3.5,
-            "Git 是第四行"
+            nav_tab_center(0.0, 0.0, SidebarTab::Git).x,
+            size * 0.5 + pitch * 3.0,
+            "Git 是第四枚"
         );
         assert_eq!(
-            nav_row_center_y(100.0, SidebarTab::Backlinks),
-            100.0 + row * 4.5,
-            "反向链接是第五行"
+            nav_tab_center(0.0, 0.0, SidebarTab::Backlinks).x,
+            size * 0.5 + pitch * 4.0,
+            "反向链接是第五枚"
         );
-        let ys = SidebarTab::ALL.map(|tab| nav_row_center_y(0.0, tab));
+        let xs = SidebarTab::ALL.map(|tab| nav_tab_center(0.0, 0.0, tab).x);
         assert!(
-            ys.windows(2).all(|pair| pair[1] > pair[0]),
-            "五行自上而下:{ys:?}"
+            xs.windows(2).all(|pair| pair[1] > pair[0]),
+            "五枚自左向右:{xs:?}"
+        );
+    }
+
+    /// 五枚 tab 一行放得下(窄栏下限 180px 也不换行/不裁切)—— 这是
+    /// 「nav 段只有 26px」这个改版的**前提断言**:放不下就得退回竖排,
+    /// 省下 104px 的收益随之归零。
+    #[test]
+    fn five_nav_tabs_fit_the_narrowest_sidebar() {
+        let pitch = crate::ui::tokens::NAV_TAB_H + crate::ui::tokens::NAV_TAB_GAP;
+        let total = crate::ui::tokens::NAV_TAB_H * 5.0 + crate::ui::tokens::NAV_TAB_GAP * 4.0;
+        assert!(
+            total <= crate::ui::tokens::SIDEBAR_MIN_W,
+            "五 tab 合计 {total}px 须 ≤ 窄栏下限 {}px(pitch={pitch})",
+            crate::ui::tokens::SIDEBAR_MIN_W
         );
     }
 
@@ -2798,8 +2886,24 @@ mod tests {
         .drop_without_applying_deltas();
         let bands = bands.unwrap();
 
-        assert!(bands.top.top() < bands.nav.top(), "顶段在次段之上");
-        assert!(bands.nav.top() < bands.body.top(), "次段在中段之上");
+        assert!(bands.top.top() < bands.nav.top(), "顶段在 nav 段之上");
+        assert!(bands.nav.top() < bands.body.top(), "nav 段在中段之上");
+        // 上界**硬编码 40px**,刻意不复用 `NAV_TAB_H`:段高由
+        // `set_min_height(top + NAV_TAB_H)` 报告,与绘制同源。若上界也读
+        // token,把 token 调大(哪怕是误改)会让绘制与断言一起变大 → 断言
+        // 自我满足、红绿验证失效(2026-10-08 实测踩过:把 NAV_TAB_H 改成
+        // 130 模拟回退,断言照样绿)。硬编码让「nav 段不超过 ~40px」成为
+        // 独立于实现的承诺。
+        //
+        // 组成 = tab 行 26 + `panel.separator()` 间距 3 + 1px 取整容差。
+        // 竖排五行的 130px 会被这条拦下。
+        const NAV_LIMIT_PX: f32 = 40.0;
+        assert!(
+            bands.nav.height() <= NAV_LIMIT_PX,
+            "nav 段实测 {}px,须 ≤ {NAV_LIMIT_PX}px(tab 行 + 分隔线)—— \
+             接近 130px 说明改版被回退成竖排",
+            bands.nav.height(),
+        );
         assert!(
             bands.body.bottom() >= height.get() - 1.0,
             "中段吃到左栏底部(不再为底段预留):body.bottom={} panel.bottom={}",
@@ -2808,21 +2912,21 @@ mod tests {
         );
     }
 
-    /// 点「搜索」行的手写命中区:走完整 `sidebar::ui` 三帧请求,只发一条
+    /// 点「搜索」tab 的手写命中区:走完整 `sidebar::ui` 三帧请求,只发一条
     /// `SidebarTabChanged`。
     ///
-    /// 直接驱 `sidebar::ui`(而非孤立 `nav_row`)是有意的:顶段的五个文件
-    /// 动作按钮紧贴次段,只测孤立行会漏掉「谁抢走了这次点击」—— 三栏重排
-    /// 时已经在标题栏上踩过一次。
+    /// 直接驱 `sidebar::ui`(而非孤立 tab)是有意的:顶段的六个文件动作
+    /// 按钮紧贴 nav 段,只测孤立 tab 会漏掉「谁抢走了这次点击」—— 三栏
+    /// 重排时已经在标题栏上踩过一次。
     #[test]
-    fn clicking_nav_row_switches_view() {
+    fn clicking_nav_tab_switches_view() {
         let (tree, _root) = sample_tree();
         let ctx = egui::Context::default();
         let mut outbox = Vec::new();
         let mut active = SidebarTab::Files;
         let mut search = SearchState::default();
         let git = GitPanelState::default();
-        let nav_top = Cell::new(0.0f32);
+        let nav_rect = Cell::new(Rect::NOTHING);
 
         ctx.run_ui(
             RawInput {
@@ -2833,14 +2937,18 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                nav_top.set(ui_whole(ui, SidebarTab::Files, &tree, &git).nav.top());
+                nav_rect.set(ui_whole(ui, SidebarTab::Files, &tree, &git).nav);
             },
         )
         .drop_without_applying_deltas();
 
-        let target = egui::pos2(
-            crate::ui::tokens::SIDEBAR_MIN_W / 2.0,
-            nav_row_center_y(nav_top.get(), SidebarTab::Search),
+        // 横排后目标点是 nav 段内的**第 2 枚 tab 中心**(`nav` 段左缘 +
+        // 顺序 pitch),不再是「整行任意 x + 第 N 行的 y」。
+        let nav = nav_rect.get();
+        let target = nav_tab_center(nav.left(), nav.top(), SidebarTab::Search);
+        assert!(
+            nav.contains(target),
+            "目标点须落在 nav 段内:{target:?} vs {nav:?}"
         );
         let click = |pressed| Event::PointerButton {
             pos: target,
