@@ -5994,15 +5994,25 @@ mod strip_geometry {
     use crate::keymap::Keymap;
     use eframe::egui::{RawInput, Rect};
 
-    /// 在 `top_down` 父布局里跑一段绘制,返回它消费掉的高度。
-    fn measure<F: FnMut(&mut egui::Ui)>(mut f: F) -> f32 {
+    /// 在 `top_down` 父布局里跑一段绘制,返回它消费掉的高度(屏宽 1400)。
+    fn measure<F: FnMut(&mut egui::Ui)>(f: F) -> f32 {
+        measure_at(1400.0, f)
+    }
+
+    /// 同 [`measure`],但可指定屏宽 —— **窄栏行为只能在窄屏下测出来**。
+    ///
+    /// 2026-10-08 教训:格式条「是否折叠」的关键断言原先固定在 1400px 量,
+    /// 那里它恒为一行 30px,于是「改成水平滚动」与「保持换行」两种实现
+    /// **都能通过** —— 断言没测到点子上。窄栏(240px = 900px 窗口下的
+    /// 编辑区实际宽度)才暴露差异:换行版 63px / 滚动版 30px。
+    fn measure_at<F: FnMut(&mut egui::Ui)>(width: f32, mut f: F) -> f32 {
         let ctx = egui::Context::default();
         let mut h = 0.0f32;
         ctx.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1400.0, 900.0),
+                    egui::vec2(width, 900.0),
                 )),
                 ..Default::default()
             },
@@ -6026,6 +6036,38 @@ mod strip_geometry {
         assert!(
             (24.0..=40.0).contains(&h),
             "格式工具条应单行(实测 {h}px,实测基准 30px)——              远超 40px 说明多组内容被摞成了多行"
+        );
+    }
+
+    /// **窄栏下格式条仍须单行**(2026-10-08 症状 A 的核心断言)。
+    ///
+    /// 屏宽 240px = 900px 窗口下编辑区的**实际**宽度(`min_inner_size`
+    /// 900 − 侧栏 240 − 预览 420)。此宽度下格式条一行要 331px(实测)必然放不下,
+    /// 于是「换行」与「水平滚动」两种实现分道扬镳:
+    ///
+    /// | 实现 | 240px 下高度 |
+    /// |---|---|
+    /// | `horizontal_wrapped`(改版前) | **63px**(两行) |
+    /// | `ScrollArea::horizontal`(改版后) | **30px**(恒定一行) |
+    ///
+    /// 63px 是顶部 chrome(共 128px)里最大的一项,且把编辑区整体下顶 ——
+    /// 标签条早就为同一个理由改成了滚动(见 `ui/tabs.rs` 的注释),
+    /// 格式条这次是补上同一处漏。
+    ///
+    /// 上界 40px 硬编码不读 token(与本模块另两条断言同因:上界跟着实现
+    /// 一起变则断言自我满足)。
+    #[test]
+    fn format_bar_stays_single_row_in_a_narrow_column() {
+        const NARROW: f32 = 240.0; // 900px 窗口下编辑区的实际宽度
+        let h = measure_at(NARROW, |ui| {
+            let mut out = Vec::new();
+            crate::ui::format_bar::ui(ui, &Keymap::builtin(), &mut out);
+        });
+        assert!(
+            (24.0..=40.0).contains(&h),
+            "窄栏({NARROW}px)下格式条应恒为单行(实测 {h}px;换行版会是 63px)—— \
+             若它又变回多行,说明有人把 `ScrollArea::horizontal` 换回了 \
+             `horizontal_wrapped`,顶部 chrome 会从 128px 涨回 161px"
         );
     }
 

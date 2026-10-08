@@ -95,63 +95,79 @@ pub fn ui_with_probe(
             .all(|g| FormatGroup::ALL.contains(g)),
         "DIRECT / OVERFLOW 里的组必须都出自 ALL"
     );
-    panel.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+    // 2026-10-08 症状 A(§6.3):原为 `horizontal_wrapped` **逐组换行**,
+    // 900×600 下编辑区列仅 240px 而本条一行要 331px → 必然换行成两行
+    // 63px,是顶部 chrome(共 128px)里最大的一项,且把编辑区往下顶。
+    // 改为**水平滚动**,照 `ui/tabs.rs` 的同款做法(其注释已写明:
+    // 「换行会让高度随按钮数成倍增长,把编辑区顶得上下跳」)——
+    // 高度恒定 30px,与按钮数、面板宽窄无关。
+    //
+    // 代价如实记:240px 极端窄列下「更多」会滚出视野,九个低频动作只能
+    // 经菜单栏「格式」触达。判为可接受 —— 菜单栏本就收了全部 17 项
+    // (menu-coverage 44/44 守门),可发现性不丢;而 33px 的稳定高度
+    // 收益是每天都吃得到的。
+    egui::ScrollArea::horizontal()
+        .id_salt("format-bar")
+        .auto_shrink([false, true])
+        .show(panel, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
 
-        // ① 直出组(2026-10-08 S2-2:只有行内五项,理由见
-        // `FormatGroup::DIRECT`)。
-        for group in FormatGroup::DIRECT {
-            for action in group.actions() {
-                let response = button(ui, *action, keymap);
-                if let Some(probe) = probe.as_mut() {
-                    probe(*action, response.rect);
+                // ① 直出组(2026-10-08 S2-2:只有行内五项,理由见
+                // `FormatGroup::DIRECT`)。
+                for group in FormatGroup::DIRECT {
+                    for action in group.actions() {
+                        let response = button(ui, *action, keymap);
+                        if let Some(probe) = probe.as_mut() {
+                            probe(*action, response.rect);
+                        }
+                        if response.clicked() {
+                            request(*action, outbox);
+                        }
+                    }
+                }
+
+                ui.separator();
+
+                // ② 溢出菜单:标题 / 块 / 列表三组十二项(低频,按语境才用)。
+                //
+                // 菜单项**走同一个 `button()`**,故 tooltip 口径、图标画法、
+                // 点击语义与直出完全一致;分段之间画分隔线(与菜单栏同款)。
+                //
+                // 「探针在菜单内也生效」是刻意的:无头测试据此在菜单打开后拿到条目
+                // 矩形,否则菜单里的动作**没有任何测试能定位** —— 等于格式动作
+                // 的点击路径在溢出后就失去覆盖。
+                ui.menu_button("更多", |ui| {
+                    for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
+                        if index > 0 {
+                            ui.separator();
+                        }
+                        for action in group.actions() {
+                            let response = button(ui, *action, keymap);
+                            if let Some(probe) = probe.as_mut() {
+                                probe(*action, response.rect);
+                            }
+                            if response.clicked() {
+                                request(*action, outbox);
+                            }
+                        }
+                    }
+                });
+
+                // ③ Emoji 面板入口(docs/emoji-plan.md E1):第二个「对话框类动作」,
+                // 与 Image 同款 —— 点了只开面板,不进 `FormatAction` 四组(emoji
+                // 字符无法从 text+sel 推导,§6.1 的边界)。它留在直出位:面板是
+                // 「插入一个字符」的高频动作,与低频的段落级格式不同层。
+                ui.separator();
+                let response = icons::icon_button(ui, Icon::Emoji, &emoji_tooltip(keymap));
+                if let Some(probe) = emoji_probe.as_mut() {
+                    probe(response.rect);
                 }
                 if response.clicked() {
-                    request(*action, outbox);
+                    outbox.push(Message::EmojiPickerToggle(true));
                 }
-            }
-        }
-
-        ui.separator();
-
-        // ② 溢出菜单:标题 / 块 / 列表三组十二项(低频,按语境才用)。
-        //
-        // 菜单项**走同一个 `button()`**,故 tooltip 口径、图标画法、
-        // 点击语义与直出完全一致;分段之间画分隔线(与菜单栏同款)。
-        //
-        // 「探针在菜单内也生效」是刻意的:无头测试据此在菜单打开后拿到条目
-        // 矩形,否则菜单里的动作**没有任何测试能定位** —— 等于格式动作
-        // 的点击路径在溢出后就失去覆盖。
-        ui.menu_button("更多", |ui| {
-            for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
-                if index > 0 {
-                    ui.separator();
-                }
-                for action in group.actions() {
-                    let response = button(ui, *action, keymap);
-                    if let Some(probe) = probe.as_mut() {
-                        probe(*action, response.rect);
-                    }
-                    if response.clicked() {
-                        request(*action, outbox);
-                    }
-                }
-            }
+            });
         });
-
-        // ③ Emoji 面板入口(docs/emoji-plan.md E1):第二个「对话框类动作」,
-        // 与 Image 同款 —— 点了只开面板,不进 `FormatAction` 四组(emoji
-        // 字符无法从 text+sel 推导,§6.1 的边界)。它留在直出位:面板是
-        // 「插入一个字符」的高频动作,与低频的段落级格式不同层。
-        ui.separator();
-        let response = icons::icon_button(ui, Icon::Emoji, &emoji_tooltip(keymap));
-        if let Some(probe) = emoji_probe.as_mut() {
-            probe(response.rect);
-        }
-        if response.clicked() {
-            outbox.push(Message::EmojiPickerToggle(true));
-        }
-    });
 }
 
 /// Emoji 按钮 tooltip(带当前键位,与动作按钮的 tooltip 同款口径)。
