@@ -308,9 +308,10 @@ impl LaterMdApp {
                 });
         }
 
-        // ① 次外层:顶部菜单栏(全部命令的可发现性入口)
+        // ① 次外层:顶部菜单栏(全部命令的可发现性入口;开关类条目的
+        // 勾选态从 state 取真值,#67 M2)
         egui::Panel::top("menubar").show(ui, |ui| {
-            crate::ui::menubar::ui(ui, &self.state.keymap, &mut self.outbox);
+            crate::ui::menubar::ui(ui, &self.state.keymap, &self.state, &mut self.outbox);
         });
 
         // ② 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行

@@ -25,8 +25,9 @@
 
 use crate::command::Command;
 use crate::keymap::Keymap;
+use crate::live::RenderMode;
 use crate::settings::SettingsTab;
-use crate::state::Message;
+use crate::state::{Message, State};
 use crate::ui::tokens;
 
 use eframe::egui;
@@ -85,7 +86,9 @@ const FORMAT_MENU: [&[Command]; 5] = [
 ];
 
 /// 「视图」两段:布局/外观开关(打字机 #64 与专注模式 #64 M2、Live 同段,
-/// 同为编辑区呈现方式开关);禅定模式是整套面板组合(不是普通开关),
+/// 同为编辑区呈现方式开关;minimap #67 M2 归此段「专注」之后「主题」
+/// 之前 —— 编辑区呈现方式开关聚在主题互换之前,位置取舍见
+/// decisions-pending #129);禅定模式是整套面板组合(不是普通开关),
 /// 独立一段隔开。
 const VIEW_MENU: [&[Command]; 2] = [
     &[
@@ -94,6 +97,7 @@ const VIEW_MENU: [&[Command]; 2] = [
         Command::ToggleLivePreview,
         Command::TypewriterToggle,
         Command::FocusModeToggle,
+        Command::ToggleMinimap,
         Command::ToggleTheme,
     ],
     &[Command::ToggleZen],
@@ -176,6 +180,8 @@ fn command_mnemonic(cmd: Command) -> char {
         Command::TypewriterToggle => 'W',
         // F = Focus 的词首;视图菜单内 S/P/V/W/T/Z 均未占 F,菜单内唯一
         Command::FocusModeToggle => 'F',
+        // M = Minimap 的词首;视图菜单内 S/P/V/W/F/T/Z 均未占 M,菜单内唯一
+        Command::ToggleMinimap => 'M',
         Command::ToggleTheme => 'T',
         Command::ToggleZen => 'Z',
         Command::ExportHtml => 'H',
@@ -200,6 +206,37 @@ fn label_with_mnemonic(label: &str, letter: char) -> String {
         label.to_owned()
     } else {
         format!("{label}({letter})")
+    }
+}
+
+/// 布偶开关命令的当前值(菜单条目勾选态;#67 M2):`Some(true/false)` =
+/// 开/关,`None` = 非开关类命令(菜单条目不带勾选列)。
+///
+/// 口径:只覆盖**有布尔语义**的开关 —— 视图菜单的侧边栏/预览栏/Live/
+/// 打字机/专注/minimap/禅定;「切换主题」是明暗互换而非开/关(哪个算
+/// 「开」没有自然答案),不加勾选态。真值从 [`State`] 单一事实源取,
+/// 与设置页/标题栏按钮同源(取舍见 decisions-pending #129)。
+fn toggle_checked(cmd: Command, state: &State) -> Option<bool> {
+    Some(match cmd {
+        Command::ToggleSidebar => state.layout.left,
+        Command::ToggleRightPreview => state.layout.right,
+        Command::ToggleLivePreview => state.render_mode == RenderMode::Live,
+        Command::TypewriterToggle => state.theme.show_typewriter,
+        Command::FocusModeToggle => state.theme.show_focus_mode,
+        Command::ToggleMinimap => state.theme.show_minimap,
+        Command::ToggleZen => state.layout.zen,
+        _ => return None,
+    })
+}
+
+/// 勾选前缀:开 = `✓ `(U+2713 + 空格),关 = 两个半角空格占位(开关条目
+/// 间的文字主体对齐;✓ 与两空格的字宽随字体略有出入,观感留真机核对)。
+/// `None` = 非开关条目,无前缀。
+fn check_prefix(checked: Option<bool>) -> &'static str {
+    match checked {
+        Some(true) => "✓ ",
+        Some(false) => "  ",
+        None => "",
     }
 }
 
@@ -356,9 +393,10 @@ fn fire_settings_item_letter(ui: &egui::Ui, outbox: &mut Vec<Message>) {
     }
 }
 
-/// 绘制菜单栏内容(挂在 top panel 内)。
-pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
-    ui_with_probe(bar, keymap, outbox, None::<fn(usize, egui::Id)>);
+/// 绘制菜单栏内容(挂在 top panel 内)。开关类条目的勾选态从 `state`
+/// 取真值(与设置页/标题栏按钮同一事实源)。
+pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, state: &State, outbox: &mut Vec<Message>) {
+    ui_with_probe(bar, keymap, state, outbox, None::<fn(usize, egui::Id)>);
 }
 
 /// 同 [`ui`],额外把每个菜单的 `(栏内序号, popup id)` 交给 `probe`
@@ -369,6 +407,7 @@ pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
 pub(crate) fn ui_with_probe(
     bar: &mut egui::Ui,
     keymap: &Keymap,
+    state: &State,
     outbox: &mut Vec<Message>,
     mut probe: Option<impl FnMut(usize, egui::Id)>,
 ) {
@@ -383,7 +422,7 @@ pub(crate) fn ui_with_probe(
         for (index, (title, mnemonic, sections)) in MENUS.iter().enumerate() {
             let response = ui
                 .menu_button(label_with_mnemonic(title, *mnemonic), |ui| {
-                    draw_sections(ui, sections, keymap, outbox);
+                    draw_sections(ui, sections, keymap, state, outbox);
                     fire_item_letter(ui, sections, outbox);
                 })
                 .response;
@@ -456,6 +495,7 @@ fn draw_sections(
     ui: &mut egui::Ui,
     sections: &[&[Command]],
     keymap: &Keymap,
+    state: &State,
     outbox: &mut Vec<Message>,
 ) {
     for (index, section) in sections.iter().enumerate() {
@@ -463,21 +503,26 @@ fn draw_sections(
             ui.separator();
         }
         for cmd in *section {
-            item(ui, *cmd, keymap, outbox);
+            item(ui, *cmd, keymap, toggle_checked(*cmd, state), outbox);
         }
     }
 }
 
-/// 单个菜单项:显示名(带助记后缀)+ 当前键位(未绑快捷键的命令只显示
-/// 名字);点击发消息(egui 菜单内点击任意控件自动收起)。返回按钮响应,
-/// 独立成函数便于点击测试定位。
+/// 单个菜单项:显示名(带助记后缀,开关类条目前置勾选列 `checked`)+
+/// 当前键位(未绑快捷键的命令只显示名字);点击发消息(egui 菜单内点击
+/// 任意控件自动收起)。返回按钮响应,独立成函数便于点击测试定位。
 pub fn item(
     ui: &mut egui::Ui,
     cmd: Command,
     keymap: &Keymap,
+    checked: Option<bool>,
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
-    let mut button = egui::Button::new(label_with_mnemonic(cmd.label(), command_mnemonic(cmd)));
+    let mut button = egui::Button::new(format!(
+        "{}{}",
+        check_prefix(checked),
+        label_with_mnemonic(cmd.label(), command_mnemonic(cmd))
+    ));
     if let Some(shortcut) = keymap.get(cmd) {
         button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut.keyboard()));
     }
@@ -536,7 +581,7 @@ mod tests {
 
         // 第一帧只渲染,借 Cell 拿到条目的屏幕位置
         ctx.run_ui(RawInput::default(), |ui| {
-            rect.set(item(ui, Command::ToggleSidebar, &keymap, &mut outbox).rect);
+            rect.set(item(ui, Command::ToggleSidebar, &keymap, None, &mut outbox).rect);
         })
         .drop_without_applying_deltas();
         assert!(outbox.is_empty(), "仅渲染不产生消息");
@@ -555,7 +600,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                item(ui, Command::ToggleSidebar, &keymap, &mut outbox);
+                item(ui, Command::ToggleSidebar, &keymap, None, &mut outbox);
             },
         )
         .drop_without_applying_deltas();
@@ -572,7 +617,7 @@ mod tests {
         let rect = Cell::new(Rect::NOTHING);
 
         ctx.run_ui(RawInput::default(), |ui| {
-            rect.set(item(ui, Command::AiMockStream, &keymap, &mut outbox).rect);
+            rect.set(item(ui, Command::AiMockStream, &keymap, None, &mut outbox).rect);
         })
         .drop_without_applying_deltas();
 
@@ -589,7 +634,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                item(ui, Command::AiMockStream, &keymap, &mut outbox);
+                item(ui, Command::AiMockStream, &keymap, None, &mut outbox);
             },
         )
         .drop_without_applying_deltas();
@@ -661,11 +706,12 @@ mod tests {
     #[test]
     fn all_menu_sections_render_without_panic() {
         let keymap = Keymap::builtin();
+        let state = State::default();
         let mut outbox = Vec::new();
         for (_, _, sections) in MENUS {
             let ctx = egui::Context::default();
             let output = ctx.run_ui(RawInput::default(), |ui| {
-                draw_sections(ui, sections, &keymap, &mut outbox);
+                draw_sections(ui, sections, &keymap, &state, &mut outbox);
             });
             output.drop_without_applying_deltas();
         }
@@ -674,7 +720,7 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_theme(theme);
             let output = ctx.run_ui(RawInput::default(), |ui| {
-                super::ui(ui, &keymap, &mut outbox);
+                super::ui(ui, &keymap, &state, &mut outbox);
             });
             output.drop_without_applying_deltas();
             assert!(outbox.is_empty(), "菜单栏收起态渲染不产生消息({theme:?})");
@@ -693,7 +739,7 @@ mod tests {
                 let keymap = Keymap::builtin();
                 let rect = Cell::new(Rect::NOTHING);
                 ctx.run_ui(RawInput::default(), |ui| {
-                    rect.set(item(ui, cmd, &keymap, &mut outbox).rect);
+                    rect.set(item(ui, cmd, &keymap, None, &mut outbox).rect);
                 })
                 .drop_without_applying_deltas();
                 assert!(outbox.is_empty(), "{cmd:?} 仅渲染不产生消息");
@@ -711,7 +757,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ui| {
-                        item(ui, cmd, &keymap, &mut outbox);
+                        item(ui, cmd, &keymap, None, &mut outbox);
                     },
                 )
                 .drop_without_applying_deltas();
@@ -759,8 +805,8 @@ mod tests {
         let expected_goto = ctx.format_shortcut(&goto_key);
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            item(ui, Command::Save, &keymap, &mut outbox);
-            item(ui, Command::GotoLine, &keymap, &mut outbox);
+            item(ui, Command::Save, &keymap, None, &mut outbox);
+            item(ui, Command::GotoLine, &keymap, None, &mut outbox);
         });
         let text = shape_text(&output);
         output.drop_without_applying_deltas();
@@ -788,7 +834,7 @@ mod tests {
         let old_text = expected_save.clone();
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            item(ui, Command::Save, &rebound, &mut outbox);
+            item(ui, Command::Save, &rebound, None, &mut outbox);
         });
         let text = shape_text(&output);
         output.drop_without_applying_deltas();
@@ -949,6 +995,7 @@ mod tests {
     /// 序号 0-5 对应 [`MENUS`],6 = 设置)。返回 popup id 表供开合断言。
     fn menubar_frame(ctx: &egui::Context, events: Vec<Event>) -> Vec<(usize, egui::Id)> {
         let keymap = Keymap::builtin();
+        let state = State::default();
         let mut outbox = Vec::new();
         let mut ids = Vec::new();
         let output = ctx.run_ui(
@@ -960,6 +1007,7 @@ mod tests {
                 super::ui_with_probe(
                     ui,
                     &keymap,
+                    &state,
                     &mut outbox,
                     Some(|index, id| {
                         ids.push((index, id));
@@ -1161,6 +1209,7 @@ mod tests {
     fn bare_letter_in_open_menu_fires_item_and_closes() {
         let ctx = egui::Context::default();
         let keymap = Keymap::builtin();
+        let state = State::default();
         let mut outbox = Vec::new();
         let mut ids = Vec::new();
         // 帧 1:Alt+E 开「编辑」
@@ -1173,6 +1222,7 @@ mod tests {
                 super::ui_with_probe(
                     ui,
                     &keymap,
+                    &state,
                     &mut outbox,
                     Some(|index, id| {
                         ids.push((index, id));
@@ -1184,7 +1234,7 @@ mod tests {
         assert!(outbox.is_empty());
         // 帧 2:展开帧(闭包执行,无输入)
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            super::ui_with_probe(ui, &keymap, &mut outbox, Some(|_, _| {}));
+            super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
         });
         output.drop_without_applying_deltas();
         // 帧 3:裸 F → 命中「查找」(F),发消息并收起
@@ -1197,7 +1247,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                super::ui_with_probe(ui, &keymap, &mut outbox, Some(|_, _| {}));
+                super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
             },
         );
         output.drop_without_applying_deltas();
@@ -1209,13 +1259,255 @@ mod tests {
         let edit_id = ids.iter().find(|(index, _)| *index == 1).unwrap().1;
         // 帧 4:菜单已收起(close 标记在下一帧生效为 popup 关闭)
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            super::ui_with_probe(ui, &keymap, &mut Vec::new(), Some(|_, _| {}));
+            super::ui_with_probe(ui, &keymap, &state, &mut Vec::new(), Some(|_, _| {}));
         });
         output.drop_without_applying_deltas();
         assert!(
             !egui::containers::Popup::is_id_open(&ctx, edit_id),
             "条目触发后菜单应收起"
         );
+    }
+
+    /// 「设置」菜单直达页的真实点击路径(#67 M1 抽查):「设置」不在
+    /// [`MENUS`] 表里(非命令,直达设置页),`clicking_every_menu_item…`
+    /// 不遍历它 —— 这里走完整 popup 路径:Alt+S 打开 → 展开帧定位条目
+    /// 文本矩形 → 指针逐帧点击 → 发出 [`Message::SettingsOpened`] 的
+    /// 对应页;消息再喂进 `State::apply` 落出打开的页签(点击 → 消息 →
+    /// 归约一段齐,齿轮路径的等价归约断言在 layout.rs 已有)。
+    #[test]
+    fn settings_menu_direct_tabs_click_through_and_reduce() {
+        for (needle, expected) in [
+            ("外观(", SettingsTab::Appearance),
+            ("快捷键(", SettingsTab::Keymap),
+        ] {
+            let ctx = egui::Context::default();
+            // 帧 1:Alt+S 事件帧(popup 记忆已开,闭包不执行)
+            let keymap = Keymap::builtin();
+            let state = State::default();
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![key_event(egui::Key::S, egui::Modifiers::ALT)],
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &keymap, &state, &mut outbox),
+            );
+            output.drop_without_applying_deltas();
+            assert!(outbox.is_empty(), "开菜单本身不产生消息");
+
+            // 帧 2-3:两次空帧 —— egui 0.36 的 MenuButton 从 popup 记忆
+            // 开态到闭包真正绘制隔一帧(事件帧写记忆 → 次帧菜单按钮收
+            // 到开态 → 再次帧闭包执行画出条目;与 `bare_letter…` 三帧
+            // 节奏同因,这里实证后取末帧 shapes 定位条目矩形)
+            let mut located = None;
+            for _ in 0..2 {
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(RawInput::default(), |ui| {
+                    super::ui(ui, &keymap, &state, &mut outbox);
+                });
+                let shapes = output.shapes.clone();
+                output.drop_without_applying_deltas();
+                assert!(outbox.is_empty(), "展开不点击不产生消息");
+                located = shapes.iter().find_map(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return None;
+                    };
+                    text.galley
+                        .job
+                        .text
+                        .contains(needle)
+                        .then(|| clipped.shape.visual_bounding_rect())
+                });
+                if located.is_some() {
+                    break;
+                }
+            }
+            let rect = located.unwrap_or_else(|| panic!("{needle:?} 条目未绘制"));
+
+            // 帧 4-6:moved → press → release(与 layout 的面板层点击测试
+            // 同节奏,指针停在条目中心)
+            let center = rect.center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+            ] {
+                let mut frame_outbox = std::mem::take(&mut outbox);
+                let output = ctx.run_ui(
+                    RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| super::ui(ui, &keymap, &state, &mut frame_outbox),
+                );
+                output.drop_without_applying_deltas();
+                outbox = frame_outbox;
+            }
+            assert_eq!(
+                outbox,
+                vec![Message::SettingsOpened(expected)],
+                "{needle:?} 条目点击应发出直达该页的消息"
+            );
+
+            // 归约一段:直达页消息落 State,设置窗开在对应页签
+            let mut state = crate::state::State::default();
+            state.apply(Message::SettingsOpened(expected));
+            assert!(state.settings.open, "归约后设置窗打开");
+            assert_eq!(state.settings.tab, expected, "归约后落在直达页签");
+        }
+    }
+
+    /// 开关类菜单条目的勾选态(#67 M2):`toggle_checked` 从 [`State`] 取
+    /// 真值(与设置页/标题栏按钮同一事实源),布偶开关命令全覆盖、非开关
+    /// 命令(含明暗互换的「切换主题」)`None`;勾选前缀只在开态渲染 ✓,
+    /// 关态为占位空格、非开关条目无前缀。
+    #[test]
+    fn view_menu_toggle_items_show_check_state() {
+        // 真值层:出厂默认下各开关的当前值(与 ThemeSettings/LayoutSettings
+        // 的出厂字段一致)
+        let state = State::default();
+        assert_eq!(toggle_checked(Command::ToggleSidebar, &state), Some(true));
+        assert_eq!(
+            toggle_checked(Command::ToggleRightPreview, &state),
+            Some(true)
+        );
+        assert_eq!(
+            toggle_checked(Command::ToggleLivePreview, &state),
+            Some(false),
+            "出厂源码模式,Live 未开"
+        );
+        assert_eq!(
+            toggle_checked(Command::TypewriterToggle, &state),
+            Some(false)
+        );
+        assert_eq!(
+            toggle_checked(Command::FocusModeToggle, &state),
+            Some(false)
+        );
+        assert_eq!(toggle_checked(Command::ToggleMinimap, &state), Some(true));
+        assert_eq!(toggle_checked(Command::ToggleZen, &state), Some(false));
+        // 明暗互换不是开/关,主题条目无勾选语义;非视图命令同样 None
+        assert_eq!(toggle_checked(Command::ToggleTheme, &state), None);
+        assert_eq!(toggle_checked(Command::Save, &state), None);
+
+        // 勾选态随状态翻转:minimap 关掉后,同一命令取到 Some(false)
+        let mut state = state;
+        state.apply(Message::ToggleMinimap);
+        assert_eq!(
+            toggle_checked(Command::ToggleMinimap, &state),
+            Some(false),
+            "归约翻转后勾选态立即跟随(三方一致的菜单侧)"
+        );
+
+        // 渲染层:✓ 前缀只出现在 Some(true) 的条目文本里
+        fn item_text(cmd: Command, checked: Option<bool>) -> String {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                item(ui, cmd, &Keymap::builtin(), checked, &mut Vec::new());
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return None;
+                    };
+                    Some(text.galley.job.text.clone())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            output.drop_without_applying_deltas();
+            text
+        }
+        let on = item_text(Command::ToggleMinimap, Some(true));
+        assert!(
+            on.contains("✓") && on.contains("Minimap 缩略图(M)"),
+            "开态条目应渲染 ✓ 前缀 + 带助记后缀的显示名(实际:{on:?})"
+        );
+        let off = item_text(Command::ToggleMinimap, Some(false));
+        assert!(
+            !off.contains("✓") && off.contains("Minimap 缩略图(M)"),
+            "关态条目不渲染 ✓(占位空格保持开关条目对齐;实际:{off:?})"
+        );
+        let plain = item_text(Command::ToggleTheme, None);
+        assert!(!plain.contains("✓"), "非开关条目无勾选前缀(实际:{plain:?})");
+    }
+
+    /// minimap 菜单开关的**全链路**(#67 M2):菜单条目真实点击 → 发出
+    /// 翻转消息 → `State::apply` 翻转 `theme.show_minimap` → settings.json
+    /// 即时落盘(重启 load_from 仍在)。勾选态取值与翻转后的字段一致 ——
+    /// 菜单、快捷键、设置外观页复选框三方共用同一字段同一归约。
+    #[test]
+    fn minimap_menu_item_click_flips_theme_and_persists() {
+        let dir =
+            std::env::temp_dir().join(format!("latermd-menubar-minimap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = State::default();
+        state.settings_dir = Some(dir.clone());
+        assert!(state.theme.show_minimap, "出厂默认开");
+        assert_eq!(toggle_checked(Command::ToggleMinimap, &state), Some(true));
+
+        // 两帧点击:渲染帧拿矩形,点击帧按下并抬起
+        let ctx = egui::Context::default();
+        let keymap = Keymap::builtin();
+        let mut outbox = Vec::new();
+        let rect = Cell::new(Rect::NOTHING);
+        ctx.run_ui(RawInput::default(), |ui| {
+            rect.set(
+                item(
+                    ui,
+                    Command::ToggleMinimap,
+                    &keymap,
+                    toggle_checked(Command::ToggleMinimap, &state),
+                    &mut outbox,
+                )
+                .rect,
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+        let center = rect.get().center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        ctx.run_ui(
+            RawInput {
+                events: vec![Event::PointerMoved(center), click(true), click(false)],
+                ..Default::default()
+            },
+            |ui| {
+                item(
+                    ui,
+                    Command::ToggleMinimap,
+                    &keymap,
+                    toggle_checked(Command::ToggleMinimap, &state),
+                    &mut outbox,
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(outbox, vec![Message::ToggleMinimap], "菜单点击发出翻转消息");
+
+        // 归约 + 落盘:字段翻转、勾选态跟随、settings.json 重启仍在
+        state.apply(Message::ToggleMinimap);
+        assert!(!state.theme.show_minimap, "菜单开关翻转字段");
+        assert_eq!(
+            toggle_checked(Command::ToggleMinimap, &state),
+            Some(false),
+            "翻转后勾选态一致"
+        );
+        let reloaded = crate::theme::ThemeSettings::load_from(&dir).unwrap();
+        assert!(!reloaded.show_minimap, "菜单开关即时落盘,重启后仍为关");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 排版统一(#62 M2):菜单条标题与下拉条目同走 egui `Button` 的
@@ -1242,9 +1534,10 @@ mod tests {
         }
 
         let keymap = Keymap::builtin();
+        let state = State::default();
         let ctx = egui::Context::default();
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            super::ui(ui, &keymap, &mut Vec::new());
+            super::ui(ui, &keymap, &state, &mut Vec::new());
         });
         let bar_texts = font_sizes(&output);
         output.drop_without_applying_deltas();
@@ -1256,7 +1549,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let output = ctx.run_ui(RawInput::default(), |ui| {
-            item(ui, Command::Save, &keymap, &mut Vec::new());
+            item(ui, Command::Save, &keymap, None, &mut Vec::new());
         });
         let item_texts = font_sizes(&output);
         output.drop_without_applying_deltas();
@@ -1280,7 +1573,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                super::ui(ui, &keymap, &mut Vec::new());
+                super::ui(ui, &keymap, &state, &mut Vec::new());
             },
         );
         output.drop_without_applying_deltas();
