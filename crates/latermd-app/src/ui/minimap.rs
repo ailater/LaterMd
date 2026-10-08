@@ -1548,6 +1548,157 @@ mod tests {
         );
     }
 
+    /// #68 落地语义的回归锁:从**非零 offset** 起手的纯点击落在自己的
+    /// 绝对目标上;同位置再点一次不在此之上累加。
+    ///
+    /// 为何必须单开这条:`land` 由「rect 顶 = clip.top + target×travel」改成
+    /// 「clip.top + (target×travel − metrics.offset)」,差的正是当帧 offset
+    /// 这一项 —— offset=0 时两式恒等,而既有点击测试(`clicking_minimap_…`)
+    /// 与三条端到端拖影测试全部从文档顶起步,对这次修正完全不敏感。本条
+    /// 把起点挪到非零 offset,补上这条路径的回归锁。取证读 `metrics.offset`
+    /// (ScrollArea 帧末真值),不受 `read_response` 再滞后一帧的影响。
+    ///
+    /// 三次点击的**意图数值各不相同**(第二、三次的 `scroll_ratio` 已非零,
+    /// 居中公式的输入随之变化),所以钉的断言不是「三次 offset 相等」,而是
+    /// 「每一次都落在自己当帧意图算出的绝对目标上」——期望经与生产同源的
+    /// `jump_ratio` 纯函数独立算出(输入全部取自被测 ScrollArea 同一帧
+    /// metrics 真值),不由实现自证;容差 12px。累加式实现(旧式)从第二次
+    /// 起每调用就多走一份 target,三条断言立刻红(已做反向验证:把 land
+    /// 改回旧式,本条在第二次断言处红 —— 期望 ≈1983.9、实测 3184.9)。
+    #[test]
+    fn repeated_click_from_nonzero_offset_does_not_accumulate() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+
+        let mut now = 0.0_f64;
+        let tick = |now: &mut f64| {
+            *now += 0.1;
+            *now
+        };
+        let read = |ctx: &egui::Context| {
+            ctx.data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .unwrap_or_default()
+        };
+
+        frame(&ctx, &mut editor, tick(&mut now), true, Vec::new());
+        let (shapes, _) = frame(&ctx, &mut editor, tick(&mut now), true, Vec::new());
+        // 文档顶时高亮框贴窄条顶 → 框顶即窄条顶,横向中点也即窄条中点。
+        let strip = viewport_rect(&shapes).expect("高亮框定位窄条");
+        let (click_x, map_top) = (strip.center().x, strip.top());
+        // 取样点:窄条内一处固定屏幕 y(这里 map_top = 0,屏幕 y 即窄条局部
+        // y,`pointer_local` 就是生产传给 `jump_ratio` 的那个同名量)。
+        let click = egui::pos2(click_x, 300.0);
+        let pointer_local = click.y - map_top;
+
+        // 此刻若发生一次纯点击会产生的**绝对目标 offset**:与生产同一条
+        // `jump_ratio` 纯函数(grab=None 居中语义),输入取自同一帧 metrics。
+        let intent_offset = |m: &ScrollMetrics, from: f32| {
+            let travel = (m.content_height - m.viewport_height).max(0.0);
+            let target = jump_ratio(JumpInput {
+                minimap_height: m.viewport_height,
+                total_lines: 500,
+                scroll_ratio: (from / travel).clamp(0.0, 1.0),
+                row_h: ROW_H,
+                pointer_y: pointer_local,
+                viewport_frac: (m.viewport_height / m.content_height).clamp(0.0, 1.0),
+                grab: None,
+            })
+            .expect("长文档有行程");
+            target * travel
+        };
+        // 一次完整纯点击:press 帧 → release 帧(clicked 是双帧语义)→ 空帧
+        // 补足「意图→消费→offset 生效→帧末 metrics」这条链路。
+        let click_once = |now: &mut f64, ctx: &egui::Context, editor: &mut EditorBuffer| {
+            frame(
+                ctx,
+                editor,
+                tick(now),
+                true,
+                vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            frame(
+                ctx,
+                editor,
+                tick(now),
+                true,
+                vec![egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            for _ in 0..8 {
+                frame(ctx, editor, tick(now), true, Vec::new());
+            }
+            read(ctx).offset
+        };
+
+        let base = read(&ctx);
+        assert_eq!(base.offset, 0.0, "起手势前在文档顶");
+        assert!(
+            base.content_height > base.viewport_height + 100.0,
+            "文档有足够行程(内容高 {},视口高 {})",
+            base.content_height,
+            base.viewport_height
+        );
+
+        // 第一次:与既有点击测试同一起点(文档顶),把这一次的目标也钉住
+        // —— 它是后两次断言的基准,顺手确认 click_once 这一支真在跳转。
+        let expect_first = intent_offset(&base, base.offset);
+        assert!(
+            expect_first > 100.0,
+            "第一次点击的目标是深入文档的一处(实测目标 {expect_first})"
+        );
+        let after_first = click_once(&mut now, &ctx, &mut editor);
+        assert!(
+            (after_first - expect_first).abs() < 12.0,
+            "第一次落在自己的绝对目标上(期望 ≈{expect_first},实测 {after_first})"
+        );
+
+        // 第二次:**非零 offset 起点** —— 新旧两式的分水岭。
+        let before_second = read(&ctx);
+        let expect_second = intent_offset(&before_second, after_first);
+        assert!(
+            (expect_second - after_first).abs() > 20.0,
+            "第二次的目标与当前落点拉开距离(当前 {after_first},目标 {expect_second}),才谈得上『有没有累加』"
+        );
+        let after_second = click_once(&mut now, &ctx, &mut editor);
+        assert!(
+            (after_second - expect_second).abs() < 12.0,
+            "第二次从非零 offset 起,落在自己的绝对目标上(期望 ≈{expect_second},实测 {after_second})"
+        );
+
+        // 第三次:同一支路再来一次 —— 「每次调用都再累加一遍」最露骨的一帧
+        // (旧式在这一帧会再叠一份 ≈1200px 的位移)。
+        let before_third = read(&ctx);
+        let expect_third = intent_offset(&before_third, after_second);
+        let after_third = click_once(&mut now, &ctx, &mut editor);
+        assert!(
+            (after_third - expect_third).abs() < 12.0,
+            "第三次同样落在自己的绝对目标上(期望 ≈{expect_third},实测 {after_third})"
+        );
+        // 兜底量级锁(不依赖上面的公式):三次意图都走居中、**不看反馈**,
+        // 落点应同量级;累加式实现一次比一次远,2× 余量足够把它卡住。
+        assert!(
+            after_second < after_first * 2.0 && after_third < after_second * 2.0,
+            "三次落点同量级、不逐次翻倍(第一次 {after_first},第二次 {after_second},第三次 {after_third})"
+        );
+    }
+
     /// ⑤-3 端到端:按住拖动逐帧下移 → 滚动逐帧跟随(offset 单调前进)。
     #[test]
     fn dragging_minimap_follows_continuously() {
