@@ -3,7 +3,24 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #127 为当前最新条目。历史遗留:#22/#30 各存在两条(2026-09-25/26 旧批次撞号,非 #66 引入;重编号牵连 auto-plan/README/commit 信息等跨文件引用,待专项处理)。
+> 编号 #129 为当前最新条目。历史遗留:#22/#30 各存在两条(2026-09-25/26 旧批次撞号,非 #66 引入;重编号牵连 auto-plan/README/commit 信息等跨文件引用,待专项处理)。
+
+## #129 #67 M2 minimap 视图开关的四处口径:消息=**新增无参翻转 `Message::ToggleMinimap`** 而非复用带值 `ShowMinimapToggled(bool)`(与 `ToggleTypewriter` 同构——菜单/快捷键是翻转语义,现值在 State、`Command::message()` 无 state 访问拿不到,带值消息留给设置外观页复选框专用;归约同一字段 `theme.show_minimap` 同一 `persist_theme` 通路,**未造第二份状态**)、菜单位置=「视图」第一段 FocusModeToggle 之后、ToggleTheme 之前(编辑区呈现方式开关聚组:Live/打字机/专注/minimap 连排,主题互换收段尾;禅定仍独立第二段)、勾选态口径=**布偶开关才加 ✓**:侧边栏/预览栏/Live/打字机/专注/minimap/禅定七条从 `State` 单一事实源取真值(`toggle_checked`,菜单/设置页/标题栏钮同源),开=`✓ ` 前缀、关=两半角空格占位(开关条目间文字主体对齐;✓ 与空格字宽随字体略出入,观感留真机),「切换主题」是明暗互换非开/关(哪个算「开」无自然答案)不带勾选列,非开关命令一律无前缀;快捷键=Ctrl/Cmd+Alt+M(M=Minimap 词首,Ctrl/Cmd+Alt 层既有 C/W/D/R 之外 M 空闲,菜单标题助记集 F/E/O/V/X/A/S 不含 M,#121/#122/#127 同款避让;`conflict` 断言+真按键触发+标题审计三项实测绿)(2026-10-08,#67 menu-effect-audit M2·自动拍板)
+
+- **岔路**:①翻转消息形态(新无参消息 vs 复用带值消息 vs 菜单层闭包读现值发带值消息);②菜单位置;③勾选态覆盖面(全部 Toggle 名命令 vs 仅布偶开关 vs 不加);④快捷键字母。
+- **备选**:①复用 `ShowMinimapToggled(bool)`(菜单绘制时从 state 读现值取反传入——菜单层就得读 State 且消息语义从「翻转」漂移成「设值」);②挂「编辑」或设置菜单(不对——group 归 View,`menu_placement_matches_command_group` 会红);③全部 Toggle* 命令加勾选(「切换主题」无 bool 语义,硬造勾选态误导);④Ctrl/Cmd+Alt+M 之外候选(纯 Alt+M 与标题助记层同命名空间,被审计否决;无 Alt 的 Ctrl+M 独占 M 键且偏离本组 Alt 层惯例)。
+- **自动选了**:见首行四处口径。落地:`command.rs` 全套注册 + `minimap_shortcut_is_ctrl_alt_m_and_conflict_free`;`state.rs` `ToggleMinimap` 归约 + `minimap_menu_toggle_flips_field_and_persists`;`menubar.rs` VIEW_MENU 条目 + `toggle_checked`/`check_prefix` + `view_menu_toggle_items_show_check_state`/`minimap_menu_item_click_flips_theme_and_persists`;守门红绿三验(删菜单入口→覆盖断言红、stub ✓→勾选态断言红、改默认键→键位断言红,恢复后均绿)。
+- **为什么**:①无参翻转与 #64 打字机/专注完全同构,带值/翻转双消息分立是既有先例,菜单层闭包读 state 会让消息语义依赖调用方;②菜单归属与 `Command::group()` 的一致性是守门测试钉住的现状,View 组只能挂「视图」;③「显示当前状态」只对布尔语义成立,主题互换加 ✓ 是制造假信息;占位空格是廉价的对齐手段,精确勾选列(固定列宽绘制)留给观感不足时的后续。
+- **如何改**:①想让菜单也发设值消息——改 `Command::ToggleMinimap.message()` 即可,归约双消息并存;②勾选列观感不满意——把 `check_prefix` 的字符串前缀换成固定列宽自绘,`view_menu_toggle_items_show_check_state` 断言面跟着换;③键位想换——`default_shortcut` + `minimap_shortcut…` 测试 + menu-coverage §5 清点三处同步,老档迁移照 `keymap::load_from` 既有模式。
+
+## #128 #67 M1 菜单链路核查的三处口径:核查结论=main 菜单点击链路无断链(实测 menubar 16 项+command 映射+task/InsertToc/focus 归约测试全绿,menubar outbox 由 `LaterMdApp::reduce` layout.rs:94 全量 `state.apply`,零生产代码改动,只补两处测试面缺口——`ToggleTypewriter` 无参翻转归约断言(带值消息既有测试只测 `TypewriterToggled(bool)`,菜单/键位路径用的无参翻转原本无 apply 断言,与 `ToggleFocusMode` 的既有断面对称补齐)、「设置」菜单直达条目真实点击路径(设置菜单不在 MENUS 表、`clicking_every_menu_item…` 不遍历它,齿轮路径的归约断言在 layout.rs 但 Keymap 直达页无任何断言;新增 Alt+S 开菜单→展开帧定位条目→指针点击→`SettingsOpened(tab)`→`State::apply` 落页签的完整断言,两处均红绿验证)、egui 0.36 MenuButton 展开时序事实(事件帧 `open_id` 写记忆→次帧菜单按钮收到开态→**再次帧**闭包才画出条目,无头测试须两次空帧后取 shapes 定位,实测 frame2 无条目 frame3 才有)、版本滞后口径=**实证最新发版为 v0.0.4(2026-10-04,tag 9f20d83/PR#102),非主会话背景记录的 v0.0.3**;`merge-base --is-ancestor` 逐条核验 #62 菜单栏整体优化(PR#122,2026-10-07)与 #63-#66(PR#124/#125/#126/#127,2026-10-07~08)**全部不在 v0.0.4 内**,其后 main 积压 26 个 PR/95 个 commit——「菜单没生效」按版本滞后解释成立且更精确(v0.0.3→v0.0.4 只是把滞后窗口收窄 4 天);发版建议=bump **v0.0.5**(任务书原文写「v0.0.4 发版建议」,以现状 v0.0.4 已于 2026-10-04 发布为准修正;workspace version 现为 0.0.4,下版必是 0.0.5),由坤哥拍板后走 bump PR+CHANGELOG 小节,本模块不擅自发版)(2026-10-08,#67 menu-effect-audit M1·自动拍板)
+
+- **岔路**:①发现缺口时怎么处置(补测试 vs 视为断链去修代码);②设置菜单条目无 MENUS 覆盖,断言走哪条路(真实指针点击 vs 只测消息构造);③版本滞后的事实口径(沿用主会话「最新 v0.0.3」 vs 以仓库 tag/CHANGELOG 实证为准)。
+- **备选**:①判 断链→改生产代码(但归约分支、消息映射、item() 点击三段代码逐行核验均在,红绿验证时 stub 掉归约测试立即红——链路是通的,不该动);②只写 `SettingsOpened(tab)` 构造消息的归约测试(更小,但放弃「真实点击路径抽查」的要求,popup 展开帧→闭包绘制→按钮 clicked 这段 UI 链就无人守);③沿用 v0.0.3 口径写 notes(与仓库现状矛盾,v0.0.4 tag 与 CHANGELOG 小节俱在)。
+- **自动选了**:见首行三处口径。落地:`state.rs` 既有打字机测试内补 `ToggleTypewriter` 无参翻转段;`menubar.rs` 新增 `settings_menu_direct_tabs_click_through_and_reduce`(外观/快捷键两页);均 stub 注入断链验证过红、恢复后绿。
+- **为什么**:①「菜单没生效」的可信核查必须先证明链路通,再解释为何用户看不到——直接改代码等于预设了断链结论,违背任务书「取证为主」;②点击路径抽查的价值恰在 popup 这段 MENUS 覆盖矩阵到不了的 UI 面(设置菜单独立绘制),条目文本 shapes 定位是 layout.rs `topmost_text` 同款既有手法;③发版建议写错版本号会直接误导 bump PR。
+- **如何改**:①若坤哥复核发现某真机菜单仍无响应,优先查安装版本号(关于/设置),不是代码;②要收紧 MenuButton 展开时序的依赖——egui 升级后新测试的两次空帧若 flaky,改为循环空帧直到目标文本出现(带上限);③发版拍板后:v0.0.5 bump PR 照 CHANGELOG 头部流程(version+小节同 PR,合入后 auto-tag 发布),小节需覆盖 v0.0.4 以来的 26 个 PR。
+
 
 ## #125 #65 M2 修复:HTML 导出高亮的扫描单元=相邻 Text 事件合并串(独立评审发现 `==a&amp;b==` 预览高亮而导出漏标:pulldown 把 `&amp;` 解码成独立 Text("&") 事件,一对 `==` 被拆进三条 Text,逐条扫描漏标且 `==` 原样回流正文;修法=wrap_highlights 加相邻 Text 缓冲,任何非 Text 事件即 flush,push_marked_text 改收 `Vec<CowStr>` 合并整串再扫 highlight_spans;单段无配对仍走零拷贝快路径;软换行/行内代码/脚注引用等非 Text 事件打断合并,不跨构造拼接——跨行 guard 与豁免深度门控不受影响)(2026-10-08,#65 highlight-syntax 评审修复·自动拍板)
 

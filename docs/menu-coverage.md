@@ -8,7 +8,7 @@
 > 命令列按 `Command::ALL` 的枚举顺序枚举产出(非手抄);「出厂快捷键」取
 > `Command::default_shortcut`(实际显示随用户 `keymap.json` 改绑如实变化)。
 
-## 1. 三列矩阵(43 / 43 全覆盖)
+## 1. 三列矩阵(44 / 44 全覆盖)
 
 | 命令(label) | 入口 | 出厂快捷键 |
 |---|---|---|
@@ -30,6 +30,7 @@
 | 切换 Live Preview ToggleLivePreview | **菜单「视图」(M1 补)** · 快速打开 | Ctrl/Cmd+/ |
 | 打字机模式 TypewriterToggle | **菜单「视图」(#64 M1 补)** · 外观设置页复选框 · 快速打开 | Ctrl/Cmd+Alt+W |
 | 专注模式 FocusModeToggle | **菜单「视图」(#64 M2 补)** · 外观设置页复选框 · 快速打开 | Ctrl/Cmd+Alt+D |
+| Minimap 缩略图 ToggleMinimap | **菜单「视图」(#67 M2 补,带 ✓ 勾选态)** · 外观设置页复选框(同字段) · 快速打开 | Ctrl/Cmd+Alt+M(#129) |
 | 加粗 FormatBold | **菜单「格式」(M1 补)** · 格式工具条 · 快速打开 | Ctrl/Cmd+B |
 | 斜体 FormatItalic | 同上 | Ctrl/Cmd+I |
 | 删除线 FormatStrike | 同上 | Ctrl/Cmd+Shift+X |
@@ -73,11 +74,14 @@ ToggleLivePreview + ToggleRightPreview + ToggleZen。补齐去向:
 
 近期新增命令重点核对结果:GotoLine / 替换 / 查找 / 标签三条 / AI 三条 /
 导出两条在 M1 之前已各有菜单入口,本表如实登记,无缺项;插入目录
-InsertToc(#66 M2)进「编辑」菜单,落地即覆盖。
+InsertToc(#66 M2)进「编辑」菜单,落地即覆盖;Minimap 缩略图
+ToggleMinimap(#67 M2)进「视图」第一段(专注之后、主题之前),同一
+消息翻转 `theme.show_minimap`(#55 M2 既有配置字段),菜单/快捷键/
+外观页复选框三方一致。
 
 ## 3. 豁免清单
 
-**为空。** `Command::ALL` 的 43 条全部进了菜单。原因:命令注册表当前
+**为空。** `Command::ALL` 的 44 条全部进了菜单。原因:命令注册表当前
 不含「上下文类浮标动作」—— 选区 AI 续写/润色是 `selection_ai` 浮标的
 局部动作(不经 Command 注册表,`SelectionAiActionRequested` 消息直达),
 不属于全局命令;若将来有命令确实不适合进菜单,须在本节登记理由并同步
@@ -87,6 +91,11 @@ InsertToc(#66 M2)进「编辑」菜单,落地即覆盖。
 
 - **同类聚组 + 分隔线**:菜单内按「段」分组,段间画分隔线(文件:文件
   动作 | 标签;格式:行内 | 标题 | 块 | 列表 | 插入;视图:开关 | 禅定)。
+- **开关类条目勾选态**(#67 M2):视图菜单的布偶开关(侧边栏/预览栏/
+  Live/打字机/专注/minimap/禅定)条目前置勾选列 —— 开 = `✓` 前缀,关 =
+  同宽空格占位(条目文字主体对齐);真值从 `State` 单一事实源取
+  (`toggle_checked`,与设置页/标题栏按钮同源)。「切换主题」是明暗互换
+  而非开/关,不带勾选列;非开关命令同样无前缀。
 - **常用在前**:菜单栏顺序 文件 → 编辑 → 格式 → 视图 → 导出 → AI →
   设置(高频编辑动作在前,派生动作在后);段内按使用频率排
   (新建 → 打开 → 快速打开 → 保存 → 另存为)。
@@ -107,7 +116,7 @@ InsertToc(#66 M2)进「编辑」菜单,落地即覆盖。
   `mnemonic`/`"&"` 零命中),本菜单全部标题与条目为纯中文文本,不含
   `&` 前缀 —— **当前零冲突**。若将来 egui 引入助记字母,启用前须重审:
   Windows 惯例的 Alt+<字母> 助记会与下述 Alt 系出厂键位相争。
-- **Alt 系出厂键位逐一清点**(全部含 Alt 的绑定,共六条):
+- **Alt 系出厂键位逐一清点**(全部含 Alt 的绑定,共七条):
   1. `Alt+T` = ToggleTheme(#45 K1;mac 显示 ⌥T);
   2. `Ctrl/Cmd+Alt+R` = ToggleRightPreview;
   3. `⌥⌘F` = ReplaceInDoc(仅 mac 出厂,#114);
@@ -116,8 +125,10 @@ InsertToc(#66 M2)进「编辑」菜单,落地即覆盖。
   5. `Ctrl/Cmd+Alt+W` = TypewriterToggle(#64 M1;与 Ctrl/Cmd+W 关标签
      只差一个 Alt,靠修饰键个数降序共存,#121);
   6. `Ctrl/Cmd+Alt+D` = FocusModeToggle(#64 M2;与 Ctrl/Cmd+D 复制选中
-     同款共存,避开助记集 F/E/O/V/X/A/S,#122)。
-  六条互不冲突,且 `matches_logically` 对「显式无 Ctrl/Cmd」的 Alt+T
+     同款共存,避开助记集 F/E/O/V/X/A/S,#122);
+  7. `Ctrl/Cmd+Alt+M` = ToggleMinimap(#67 M2,M = Minimap 词首;Ctrl/
+     Cmd+Alt 层 C/W/D/R 之外 M 空闲,避开助记集 F/E/O/V/X/A/S,#129)。
+  七条互不冲突,且 `matches_logically` 对「显式无 Ctrl/Cmd」的 Alt+T
   要求事件确实没按 Ctrl/Cmd(`alt_t_fires_only_toggle_theme` 钉住),
   与 Ctrl/Cmd+Alt+R / Ctrl/Cmd+Alt+C 不相抢。
 
@@ -129,7 +140,7 @@ InsertToc(#66 M2)进「编辑」菜单,落地即覆盖。
 |---|---|
 | `every_command_has_a_menu_entry` | 遍历 `Command::ALL`,每条恰好出现在一个菜单一次(豁免集当前为空) |
 | `menu_placement_matches_command_group` | 命令挂的菜单 == `Command::group()` 对应菜单(Tab 组挂「文件」是 `CommandGroup` 文档的既定豁免) |
-| `clicking_every_menu_item_sends_its_command_message` | 全部 43 个菜单条目逐个点击,发出的消息即该命令的归约入口(与快捷键触发殊途同归) |
+| `clicking_every_menu_item_sends_its_command_message` | 全部 44 个菜单条目逐个点击,发出的消息即该命令的归约入口(与快捷键触发殊途同归) |
 | `all_menu_sections_render_without_panic` | 全部菜单的分组段展开渲染(不经 `menu_button` 折叠)不 panic、纯渲染零消息 |
 | `menu_item_shortcuts_follow_keymap` | 菜单项键位文本与 keymap 同源:出厂如实显示、改绑后跟随新键位、旧键位消失 |
 | `edit_menu_lists_every_edit_command`(既有) | 编辑组命令与「编辑」菜单互为镜像 |
