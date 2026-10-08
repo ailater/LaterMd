@@ -3,7 +3,14 @@
 > 自动开发循环遇到「本该问用户」的岔路口时，在这里登记：**岔路是什么、自动选了什么、为什么、想改怎么改**。
 > 选择由循环自行做出并继续执行，不阻塞；用户事后翻此文件，按「如何改」一节操作即可推翻。
 > #30 曾是「等待型」条目（改窗口形态本身，返工成本高），2026-09-26 用户放行后已按默认全部落地（M1–M4 合入 main）。
-> 编号 #130 为当前最新条目。历史遗留:#22/#30 各存在两条(2026-09-25/26 旧批次撞号,非 #66 引入;重编号牵连 auto-plan/README/commit 信息等跨文件引用,待专项处理)。
+> 编号 #131 为当前最新条目。历史遗留:#22/#30 各存在两条(2026-09-25/26 旧批次撞号,非 #66 引入;重编号牵连 auto-plan/README/commit 信息等跨文件引用,待专项处理)。
+
+## #131 #69 Alt 误触修复方案:**`Event::WindowFocused(false)` 帧缴械 armed**(首选,最小面)而非「release 触发要求本窗口见过 Alt press 且期间未失焦」的会话完整性判定——egui 0.36.2 `Event::WindowFocused(bool)` 可达(egui-winit lib.rs:444 从 winit `WindowEvent::Focused` 推送,失焦时上游还顺带清 modifiers,同方向防御),失焦帧必然早于下一次聚焦,单 match 分支三行即切断「armed 跨会话遗留 + 孤立 Alt release 误判单击」链;会话完整性判定要多存一份「press 是否本窗口见过」的状态,防的路径完全被失焦清零覆盖(2026-10-08,#69 alt-focus-guard·自动拍板)
+
+- **岔路**:修 `single_alt_click` 的 armed 遗留,用失焦清零还是会话完整性判定。
+- **备选**:①失焦清零(本次所选)——`Event::WindowFocused(false) => armed = false` 一个 match 分支;②会话完整性——armed 拆成「本窗口 press 见过」+「期间未失焦」两个条件,多一份状态且与①防的路径完全重叠;③干脆去掉单击 Alt 聚焦功能——损失 Win/Linux 惯例,否决。
+- **如何改**:若真机(Win/mac)出现 egui-winit 不推 WindowFocused 的平台差异导致修复失效,退路是②,实现点仍在 `single_alt_click`。
+- **验证**:无头红绿双向——变异(去缴械分支)后 `alt_release_after_refocus_does_not_fire_stale_armed` 当场 FAILED(panicked 于首断言),恢复后绿;正常单击 Alt 聚焦(`single_alt_click_opens_first_menu`)与 Alt+字母/组合键污染路径零回归;Deepin Ctrl+Alt+方向真机实测留坤哥(无头测不了真 WM 时序)。
 
 ## #130 #68 拖阴影的四处口径:grab 形态=**给 `JumpInput` 加 `grab: Option<f32>` 字段而非新函数**(与居中路径共单入口、`travel`/`ve` 的 `None` 判定只写一处,「`grab=None` 逐字节等价旧行为」的锚点有直接对应物;代价是 M1 阶段 editor.rs 消费点一行编译伴生 `grab: None`)、press 帧信号=`is_pointer_button_down_on` **叠加**当帧 `pointer.primary_pressed()`(egui 0.36 `click_and_drag` 的 `dragged()` 要指针移过点击阈值才为真,按下帧无现成单次信号)、grab 通道=**独立 temp `minimap-grab`**(`Option<f32>`,press 帧判定写入、拖动序列随读不删、`drag_stopped`|`clicked` 清零)**不并入 jump temp**(两者生命周期不同:意图消费即清 vs 手势期常驻)、落地=**land 绝对化**(`scroll_to_rect` 的 TOP 是相对换算,rect 顶须写成 `clip.top + (target×travel − metrics.offset)`;旧的 `clip.top + target×travel` 在非零 offset 起手时每次调用再累加一遍行程)(2026-10-08,#68 minimap-drag-viewport M1+M2·自动拍板)
 
