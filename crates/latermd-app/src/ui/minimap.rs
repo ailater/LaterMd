@@ -349,15 +349,33 @@ pub(crate) struct JumpInput {
     pub pointer_y: f32,
     /// 编辑器视口高占内容总高的比例(视口高 / 内容高)。
     pub viewport_frac: f32,
+    /// #68 拖阴影的抓取偏移(px,相对窄条顶):按下帧指针落在高亮框内
+    /// 时记录 `pointer_y − 高亮框 top`,由调用方判定与持有(本函数只管
+    /// 几何)。`Some` = 目标阴影 top(`pointer_y − grab`)对准编辑器
+    /// **视口顶**,抓取点相对高亮框不动;`None` = 居中跳转(#55 现状,
+    /// 框外点击/非拖影路径)。
+    pub grab: Option<f32>,
 }
 
-/// 位置 → 目标滚动比例:点击处的内容对准编辑器**视口中心**。
+/// 位置 → 目标滚动比例。两条路径,同一套几何(`full`/`travel`/`ve`
+/// 与 None 口径共享):
 ///
-/// 换算两步:①指针 y 加上 minimap 当前平移(`scroll_ratio × travel`),
-/// 除以全文档高得到内容比例 `p`;②让视口中心落在 `p` →
-/// `target = (p − viewport_frac/2) / (1 − viewport_frac)`。短文档
-/// (minimap 不满一屏 → 编辑器同样滚不动)或内容不满一屏返回 `None`,
-/// 调用方原样不动。输出钳进 0..=1(点顶到顶、点底到底)。
+/// * **`grab: None`(现状,#55)**:点击处的内容对准编辑器**视口中心**。
+///   换算两步:①指针 y 加上 minimap 当前平移(`scroll_ratio × travel`),
+///   除以全文档高得到内容比例 `p`;②让视口中心落在 `p` →
+///   `target = (p − viewport_frac/2) / (1 − viewport_frac)`。
+/// * **`grab: Some`(#68 拖阴影)**:目标阴影 top(`pointer_y − grab`)
+///   对准编辑器**视口顶**,抓取点相对高亮框不动。[`viewport_highlight`]
+///   的几何里阴影 top = `ratio × 滑轨`(滑轨 = 窄条高 − 阴影高
+///   `= map_h − ve·full`),反解即 `target = (pointer_y − grab) / 滑轨`。
+///   绝对目标语义:**不含** `scroll_ratio`(平移量已被反解吸收,与
+///   居中路径同属「目标由指针唯一决定」)。滑轨退化(阴影高 ≥ 窄条高
+///   `ve·full ≥ map_h`,生产恒不发生 —— minimap 3px/行远矮于编辑器
+///   行高)返回 `None` 原样不动。
+///
+/// 短文档(minimap 不满一屏 → 编辑器同样滚不动)或内容不满一屏两条
+/// 路径都返回 `None`,调用方原样不动。输出钳进 0..=1(拖到顶到顶、
+/// 拖到底到底)。
 pub(crate) fn jump_ratio(input: JumpInput) -> Option<f32> {
     let total = input.total_lines.max(1) as f32;
     let row_h = input.row_h.max(0.5);
@@ -371,9 +389,21 @@ pub(crate) fn jump_ratio(input: JumpInput) -> Option<f32> {
     if ve >= 1.0 {
         return None; // 内容不满一屏:编辑器无行程
     }
-    let offset = input.scroll_ratio.clamp(0.0, 1.0) * travel;
-    let p = ((input.pointer_y + offset) / full).clamp(0.0, 1.0);
-    Some(((p - ve * 0.5) / (1.0 - ve)).clamp(0.0, 1.0))
+    match input.grab {
+        Some(grab) => {
+            // 滑轨 = viewport_highlight 的 top 系数 = 窄条高 − 阴影高。
+            let span = viewport - ve * full;
+            if span <= 0.0 {
+                return None; // 阴影高 ≥ 窄条高:无滑轨可拖,原样不动
+            }
+            Some(((input.pointer_y - grab) / span).clamp(0.0, 1.0))
+        }
+        None => {
+            let offset = input.scroll_ratio.clamp(0.0, 1.0) * travel;
+            let p = ((input.pointer_y + offset) / full).clamp(0.0, 1.0);
+            Some(((p - ve * 0.5) / (1.0 - ve)).clamp(0.0, 1.0))
+        }
+    }
 }
 
 /// 悬停滚轮转发(#105①)的输入:把窄条命中区截获的本帧滚轮换算成编辑器
@@ -1117,6 +1147,7 @@ mod tests {
             row_h: ROW_H,
             pointer_y: 0.0,
             viewport_frac: 600.0 / 30000.0,
+            grab: None,
         };
         // 点顶:目标钳 0
         assert_eq!(
@@ -1191,6 +1222,242 @@ mod tests {
                 ..base
             }),
             None
+        );
+    }
+
+    /// #68 M1 抓取拖动(纯函数):按下帧指针在高亮框内 → 拖动帧「指针
+    /// y − 抓取偏移」对准**视口顶**,落地后高亮框 top 恰到该处 —— 抓取
+    /// 点相对高亮框不动(与 [`viewport_highlight`] 几何对偶互证);目标
+    /// 与当帧 scroll_ratio 无关(绝对目标,平移量被滑轨反解吸收)。
+    #[test]
+    fn grab_drag_keeps_grab_point_fixed_on_highlight() {
+        // 10000 行、600px 窄条、ve=0.01:full=30000、travel=29400、
+        // 阴影高 ve·full≈300、滑轨 = 窄条高 − 阴影高 ≈ 300。
+        let ve = 0.01_f32;
+        let geometry = WindowInput {
+            minimap_height: 600.0,
+            total_lines: 10000,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+        };
+        let (top0, height0) = viewport_highlight(geometry, ve);
+        assert!(top0.abs() < 1e-3, "顶档阴影贴顶");
+        assert!(
+            (height0 - 300.0).abs() < 1e-3,
+            "阴影高 = ve·full(实测 {height0})"
+        );
+
+        // 从中部档起拖:r0=0.4 → 阴影 top≈120;按在框内中部(偏移 90)。
+        let (top_mid, _) = viewport_highlight(
+            WindowInput {
+                scroll_ratio: 0.4,
+                ..geometry
+            },
+            ve,
+        );
+        assert!((top_mid - 120.0).abs() < 1e-3, "0.4 档阴影 top≈120");
+        let grab = 90.0;
+        assert!(grab < height0, "抓取点在高亮框内");
+        let make = |scroll_ratio: f32, pointer_y: f32| JumpInput {
+            minimap_height: 600.0,
+            total_lines: 10000,
+            scroll_ratio,
+            row_h: ROW_H,
+            pointer_y,
+            viewport_frac: ve,
+            grab: Some(grab),
+        };
+
+        // 拖动 +100px:目标阴影 top = 指针 − grab = top_mid + 100。
+        let pointer = top_mid + grab + 100.0;
+        let target = jump_ratio(make(0.4, pointer)).expect("长文档有滑轨");
+        // 公式直算(同路径重算,位相等):(指针 − grab)/(窄条高 − ve·full)
+        let span = 600.0 - ve * (10000.0_f32 * ROW_H);
+        assert_eq!(target, ((pointer - grab) / span).clamp(0.0, 1.0));
+
+        // 落地对偶:target 作滚动比例,高亮框 top 恰到「指针 − grab」——
+        // 抓取点 = 指针 − top = grab 不变(两套浮点路径,容差互证)。
+        let (top1, _) = viewport_highlight(
+            WindowInput {
+                scroll_ratio: target,
+                ..geometry
+            },
+            ve,
+        );
+        assert!(
+            (top1 - (pointer - grab)).abs() < 1e-3,
+            "阴影 top 跟随指针平移(期望 ≈{},实测 {top1})",
+            pointer - grab
+        );
+        assert!(
+            (pointer - top1 - grab).abs() < 1e-3,
+            "抓取点相对高亮框不动(实测偏移 {})",
+            pointer - top1
+        );
+
+        // 反向拖回 −200px:同一把尺子量回去,不动性照旧。
+        let pointer_up = pointer - 200.0;
+        let target_up = jump_ratio(make(0.4, pointer_up)).expect("长文档有滑轨");
+        let (top_up, _) = viewport_highlight(
+            WindowInput {
+                scroll_ratio: target_up,
+                ..geometry
+            },
+            ve,
+        );
+        assert!(
+            (pointer_up - top_up - grab).abs() < 1e-3,
+            "反向拖动抓取点同样不动(实测偏移 {})",
+            pointer_up - top_up
+        );
+
+        // 绝对目标:同指针下目标与当帧 scroll_ratio 无关(逐位相等)。
+        assert_eq!(jump_ratio(make(0.0, pointer)), Some(target));
+        assert_eq!(jump_ratio(make(1.0, pointer)), Some(target));
+    }
+
+    /// #68 M1 grab=None 等价旧行为(**逐字节**):网格扫 scroll_ratio ×
+    /// pointer_y,输出与居中公式同路径独立重算位相等;居中语义抽查(点
+    /// 中部 → 视口中心,框外点击的现状回归);同位置走 grab 语义输出
+    /// 与之分叉(两条路径互不渗透)。
+    #[test]
+    fn grab_none_equals_legacy_centered_target_byte_for_byte() {
+        let ve = 0.01_f32;
+        let full = 10000.0_f32 * ROW_H;
+        let viewport = 600.0_f32;
+        let travel = (full - viewport).max(0.0);
+        let make = |scroll_ratio: f32, pointer_y: f32| JumpInput {
+            minimap_height: viewport,
+            total_lines: 10000,
+            scroll_ratio,
+            row_h: ROW_H,
+            pointer_y,
+            viewport_frac: ve,
+            grab: None,
+        };
+        for scroll_ratio in [0.0_f32, 0.3, 0.7, 1.0] {
+            for pointer_y in [-50.0_f32, 0.0, 150.0, 300.0, 450.0, 600.0, 650.0] {
+                // 旧公式同路径重算(offset → p → target,钳制同款)
+                let offset = scroll_ratio.clamp(0.0, 1.0) * travel;
+                let p = ((pointer_y + offset) / full).clamp(0.0, 1.0);
+                let expect = Some(((p - ve * 0.5) / (1.0 - ve)).clamp(0.0, 1.0));
+                assert_eq!(
+                    jump_ratio(make(scroll_ratio, pointer_y)),
+                    expect,
+                    "grab=None 逐字节等价旧行为(scroll {scroll_ratio},y {pointer_y})"
+                );
+            }
+        }
+        // 居中语义抽查:停在中部、点中部 → 目标 ≈ 中部(现状回归)。
+        let mid = jump_ratio(make(0.5, 300.0)).expect("长文档有行程");
+        assert!(
+            (mid - 0.5).abs() < 1e-3,
+            "无 grab 点击仍居中对准(实测 {mid})"
+        );
+        // 分叉:同位置走 grab 语义,输出落在滑轨公式上,与居中值不同。
+        let grabbed = jump_ratio(JumpInput {
+            grab: Some(90.0),
+            ..make(0.5, 300.0)
+        })
+        .expect("长文档有滑轨");
+        assert_ne!(grabbed, mid, "grab 语义与居中语义是两条路径");
+        assert!(
+            (grabbed - 210.0 / 300.0).abs() < 1e-3,
+            "grab 目标 = (指针−grab)/滑轨(实测 {grabbed})"
+        );
+    }
+
+    /// #68 M1 端点与钳制:抓在阴影**下缘**拖到窄条底 → 文档底(阴影贴
+    /// 底);抓在阴影顶拖到窄条顶 → 文档顶;指针越出窄条钳 0/1;grab
+    /// 固定时目标随指针单调不减。
+    #[test]
+    fn grab_edges_reach_document_endpoints_and_clamp() {
+        let ve = 0.01_f32;
+        let geometry = WindowInput {
+            minimap_height: 600.0,
+            total_lines: 10000,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+        };
+        let (_, height) = viewport_highlight(geometry, ve);
+        let make = |pointer_y: f32, grab: f32| JumpInput {
+            minimap_height: 600.0,
+            total_lines: 10000,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+            pointer_y,
+            viewport_frac: ve,
+            grab: Some(grab),
+        };
+        // 抓阴影下缘拖到窄条底:目标 = 1(文档底),高亮框贴底
+        let bottom = jump_ratio(make(600.0, height)).expect("长文档有滑轨");
+        assert_eq!(bottom, 1.0, "下缘抓到底 = 文档底");
+        let (top_at_bottom, _) = viewport_highlight(
+            WindowInput {
+                scroll_ratio: bottom,
+                ..geometry
+            },
+            ve,
+        );
+        assert!(
+            (top_at_bottom - (600.0 - height)).abs() < 1e-3,
+            "文档底时阴影贴窄条底(实测 {top_at_bottom},期望 ≈{})",
+            600.0 - height
+        );
+        // 抓阴影顶拖到窄条顶:目标 = 0(文档顶),阴影贴顶
+        assert_eq!(
+            jump_ratio(make(0.0, 0.0)).expect("长文档有滑轨"),
+            0.0,
+            "顶缘抓到顶 = 文档顶"
+        );
+        // 越端钳制:拖出窄条上下沿,目标仍钳在 0..=1
+        assert_eq!(jump_ratio(make(-50.0, 0.0)), Some(0.0), "拖出窄条顶钳 0");
+        assert_eq!(jump_ratio(make(700.0, height)), Some(1.0), "拖出窄条底钳 1");
+        // 单调:grab 固定,指针下移目标不减
+        let mut previous = f32::NEG_INFINITY;
+        for step in 0..=10 {
+            let target =
+                jump_ratio(make(f32::from(step as u16) * 60.0, 90.0)).expect("长文档有滑轨");
+            assert!(
+                target >= previous,
+                "指针下移目标单调({previous} → {target})"
+            );
+            previous = target;
+        }
+    }
+
+    /// #68 M1 None 口径不变:短文档(minimap 不满一屏)/内容不满一屏在
+    /// grab=Some 下同样 None(grab 不放宽行程判定,先于 grab 判定);滑轨
+    /// 退化(阴影高 ≥ 窄条高,生产恒不发生 —— minimap 3px/行远矮于编辑
+    /// 器行高)→ None 原样不动。
+    #[test]
+    fn grab_keeps_none_precedence_on_short_or_degenerate_inputs() {
+        let make = |total_lines: usize, viewport_frac: f32| JumpInput {
+            minimap_height: 600.0,
+            total_lines,
+            scroll_ratio: 0.0,
+            row_h: ROW_H,
+            pointer_y: 300.0,
+            viewport_frac,
+            grab: Some(90.0),
+        };
+        // 短文档:minimap 不满一屏(10 行 × 3px = 30 < 600)
+        assert_eq!(
+            jump_ratio(make(10, 0.01)),
+            None,
+            "短文档编辑器滚不动,grab 也不跳"
+        );
+        // 内容不满一屏(ve=1)
+        assert_eq!(
+            jump_ratio(make(10000, 1.0)),
+            None,
+            "内容不满一屏,grab 也不跳"
+        );
+        // 滑轨退化:ve=0.05 → 阴影高 1500 > 窄条 600,无滑轨可拖
+        assert_eq!(
+            jump_ratio(make(10000, 0.05)),
+            None,
+            "阴影高 ≥ 窄条高:无滑轨,原样不动"
         );
     }
 

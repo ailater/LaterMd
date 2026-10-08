@@ -507,6 +507,8 @@ pub fn ui(
                         row_h: minimap::ROW_H,
                         pointer_y,
                         viewport_frac,
+                        // grab 通道由 #68 M2 接线;M1 纯函数阶段恒居中现状。
+                        grab: None,
                     }) {
                         land(ui, target);
                     }
