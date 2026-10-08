@@ -996,12 +996,32 @@ mod tests {
         show_minimap: bool,
         events: Vec<egui::Event>,
     ) -> (Vec<ClippedShape>, Option<MinimapProbe>) {
+        frame_sized(
+            ctx,
+            editor,
+            now,
+            show_minimap,
+            events,
+            egui::vec2(800.0, 600.0),
+        )
+    }
+
+    /// 同 [`frame`],视口尺寸参数化(大视口回归用:真机报告小窗可拖/全屏
+    /// 不可拖,先在 editor 层排除尺寸相关)。
+    fn frame_sized(
+        ctx: &egui::Context,
+        editor: &mut EditorBuffer,
+        now: f64,
+        show_minimap: bool,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) -> (Vec<ClippedShape>, Option<MinimapProbe>) {
         let mut preview = PreviewState::new(editor);
         let mut cursor = OutlineCursor::default();
         let mut selection = None;
         let mut pending = None;
         let mut live = LiveState::default();
-        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
         let editor_id = editor::tab_editor_id(1);
         let output = ctx.run_ui(
             egui::RawInput {
@@ -1696,6 +1716,71 @@ mod tests {
         assert!(
             after_second < after_first * 2.0 && after_third < after_second * 2.0,
             "三次落点同量级、不逐次翻倍(第一次 {after_first},第二次 {after_second},第三次 {after_third})"
+        );
+    }
+
+    /// #68 尺寸回归(坤哥 2026-10-08 真机报告:小窗可拖、全屏不可拖):大视口
+    /// (1920×1008)下抓住阴影拖动,offset 逐帧跟随——与既有拖动测试同流程,
+    /// 唯一变量=视口尺寸。editor 层不复现则 bug 在 layout 层面板分配。
+    #[test]
+    fn dragging_minimap_works_at_fullscreen_viewport() {
+        let ctx = egui::Context::default();
+        let text = (0..500)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+        let big = egui::vec2(1920.0, 1008.0);
+
+        frame_sized(&ctx, &mut editor, 0.0, true, Vec::new(), big);
+        let (shapes, _) = frame_sized(&ctx, &mut editor, 0.1, true, Vec::new(), big);
+        let map = viewport_rect(&shapes).expect("大视口下高亮框仍在");
+        let press = egui::pos2(map.center().x, map.top() + 40.0);
+        frame_sized(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            big,
+        );
+
+        let mut previous = 0.0_f32;
+        let mut moved = 0;
+        for step in 0..6 {
+            let pos = egui::pos2(press.x, press.y + f32::from(step as u16) * 40.0);
+            frame_sized(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(pos)],
+                big,
+            );
+            let offset: f32 = ctx
+                .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .map_or(0.0, |m| m.offset);
+            assert!(
+                offset >= previous - 0.5,
+                "大视口拖动单调不减(第 {step} 步 {previous} → {offset})"
+            );
+            if offset > previous + 1.0 {
+                moved += 1;
+            }
+            previous = offset;
+        }
+        assert!(
+            moved >= 3,
+            "大视口拖动确实连续跟随(6 步中 {moved} 步在滚,窄条 {map:?})"
         );
     }
 
