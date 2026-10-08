@@ -320,6 +320,13 @@ fn single_alt_click(ctx: &egui::Context) -> bool {
                 } => {}
                 egui::Event::Key { pressed: true, .. } => armed = false,
                 egui::Event::Text(_) => armed = false,
+                // 失焦即缴械(#69):Alt 按下发生在本窗口、抬起却被 WM/他窗
+                // 吃掉的切窗场景里,armed 会跨会话遗留 —— 之后从别处
+                // Ctrl+Alt 切回时收到的孤立 Alt release 会被误判成单击,
+                // 炸开「文件」菜单。egui-winit 从 winit 的 WindowEvent::
+                // Focused 推送本事件(0.36.2 lib.rs:444),失焦帧必然早于
+                // 下一次聚焦,在此清零即可靠切断遗留链。
+                egui::Event::WindowFocused(false) => armed = false,
                 egui::Event::Key {
                     key: egui::Key::AltLeft | egui::Key::AltRight,
                     pressed: false,
@@ -1155,6 +1162,54 @@ mod tests {
                 && !egui::containers::Popup::is_id_open(&ctx, edit_id),
             "悬停另一标题不切换菜单(egui 顶层 MenuButton 现状:仅点击切换)"
         );
+    }
+
+    /// #69 切窗误触回归:LaterMD 内按下 Alt 武装后切走(release 被 WM/他窗
+    /// 吃掉)、再从别处 Ctrl+Alt 切回时收到的孤立 Alt release,不得触发
+    /// 单击聚焦 —— 失焦帧必须缴械。修复前 armed 跨会话遗留,孤立 release
+    /// 炸开「文件」菜单(坤哥 2026-10-08 报的实测症状:Ctrl+Alt 切窗老触
+    /// 发文件菜单)。
+    #[test]
+    fn alt_release_after_refocus_does_not_fire_stale_armed() {
+        let ctx = egui::Context::default();
+        let ids = menubar_frame(
+            &ctx,
+            vec![key_event(egui::Key::AltLeft, egui::Modifiers::NONE)],
+        );
+        // 失焦:release 没有回到本窗口(被 WM/目标窗口吃掉)
+        menubar_frame(&ctx, vec![Event::WindowFocused(false)]);
+        // 从别的应用 Ctrl+Alt 切回:聚焦 + 孤立 Alt release(无对应 press)
+        menubar_frame(&ctx, vec![Event::WindowFocused(true)]);
+        menubar_frame(
+            &ctx,
+            vec![key_release(egui::Key::AltLeft, egui::Modifiers::ALT)],
+        );
+        menubar_frame(&ctx, vec![]);
+        for (index, id) in &ids {
+            let _ = index;
+            assert!(
+                !egui::containers::Popup::is_id_open(&ctx, *id),
+                "遗留 armed + 孤立 Alt release 不触发菜单聚焦"
+            );
+        }
+
+        // 变体:未武装状态下失焦再聚焦,孤立 release 同样不触发(修复前
+        // 本就不触发,钉住防将来把 release 分支改坏)
+        let ctx = egui::Context::default();
+        let ids = menubar_frame(&ctx, vec![Event::WindowFocused(false)]);
+        menubar_frame(&ctx, vec![Event::WindowFocused(true)]);
+        menubar_frame(
+            &ctx,
+            vec![key_release(egui::Key::AltLeft, egui::Modifiers::ALT)],
+        );
+        menubar_frame(&ctx, vec![]);
+        for (index, id) in &ids {
+            let _ = index;
+            assert!(
+                !egui::containers::Popup::is_id_open(&ctx, *id),
+                "未武装的孤立 Alt release 不触发"
+            );
+        }
     }
 
     /// 单击 Alt(按下→抬起,中间无其他输入)聚焦菜单栏:打开首个菜单
