@@ -113,7 +113,9 @@ pub fn ui(
 ///
 /// 由 [`ui`] 顺手测出来返回:`view_nav` 是手绘 widget(无可读名字),要算
 /// 「第 N 枚 tab 的 x」只能靠 [`SidebarTab::ALL`] 的顺序 + `NAV_TAB_H`
-/// 自己推(见 [`nav_tab_center`])。
+/// 自己推(无头测试里的 `nav_tab_center` 就是这么算的;它是 `#[cfg(test)]`,
+/// 故此处不能用文档链接指它 —— 生产构建里没有这个 item,写了会触发
+/// `broken_intra_doc_links` 警告)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SidebarBands {
     /// 顶段:高频文件动作。
