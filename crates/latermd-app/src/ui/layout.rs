@@ -1217,53 +1217,59 @@ fn goto_bar_contents(
 /// 不影响操作的,判据是 `tokens::STATUSBAR_MIN_W`。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
     let full = ui.available_width();
-
-    // —— 左段:文件 + 行列 ——
+    // **三段必须包在同一个 `horizontal` 里**。
+    //
+    // 2026-10-08 真机复核抓到的回归:改版前是 `ui.horizontal_wrapped(...)`
+    // 一个子 Ui,三段在它内部横排;改成三个平级调用后,父 Ui 的布局是
+    // `Layout::top_down`(egui `containers/panel.rs:821` 的 Panel 默认值),
+    // 于是**每个平级调用各占一行** —— 状态栏从 22px 涨到 **75px(约三倍)**,
+    // 三段竖着摞起来。1386 个测试全绿,没有任何断言看它的几何。
+    //
+    // 教训:状态栏这类「一条窄带」的每个分区都必须与相邻分区**同属一个
+    // horizontal**,平级即换行。已补 `status_bar_is_a_single_row` 断言钉住。
     ui.horizontal(|ui| {
+        // —— 左段:文件 + 行列 ——
         ui.weak(state.tabs.current().document.display_name());
         let text = state.tabs.current().editor.text();
         if let Some(byte) = state.tabs.current().cursor.byte {
             let (line, col) = cursor_position(text, byte);
             ui.weak(format!("行 {line}:{col}"));
         }
-    });
 
-    // —— 中段:字数 ——
-    // 窗口不够宽时直接不画(见 fn 文档的取舍),而不是压缩左右两段。
-    if full >= crate::ui::tokens::STATUSBAR_MIN_W {
-        let text = state.tabs.current().editor.text();
-        let count = text.chars().count();
-        ui.horizontal(|ui| {
+        // —— 中段:字数 ——
+        // 窗口不够宽时直接不画(见 fn 文档的取舍),而不是压缩左右两段。
+        if full >= crate::ui::tokens::STATUSBAR_MIN_W {
+            let count = text.chars().count();
             ui.weak(format!("{count} 字"));
-        });
-    }
-
-    // —— 右段:主题 / AI / MCP,右对齐 ——
-    // `with_layout(Layout::right_to_left)` 让段内各项也右对齐,视觉上
-    // 贴着窗口右缘;段内顺序按「重要性倒序」排,故下面 push 的先画在更右。
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        // MCP:关闭时只写「关」,开启才展开端点(状态栏是窄条,不堆信息)
-        match &state.mcp.status {
-            crate::mcp::McpStatus::Listening(port) => {
-                ui.weak(format!("MCP: 127.0.0.1:{port}"));
-            }
-            crate::mcp::McpStatus::Failed(_) => {
-                ui.colored_label(crate::ui::tokens::WARN, "MCP: 启动失败");
-            }
-            crate::mcp::McpStatus::Starting => {
-                ui.weak("MCP: 启动中");
-            }
-            crate::mcp::McpStatus::Disabled => {
-                ui.weak("MCP: 关");
-            }
         }
-        let ai = if state.ai.is_streaming() {
-            format!("{} · 生成中", state.ai.provider_label())
-        } else {
-            state.ai.provider_label().to_owned()
-        };
-        ui.weak(ai);
-        ui.weak(state.theme.mode.label());
+
+        // —— 右段:主题 / AI / MCP,右对齐 ——
+        // `with_layout(right_to_left)` 让本段贴住窗口右缘;段内 push 顺序
+        // 即「从右到左」—— MCP 第一个 push 故画在最右,是最容易被扫到的位置。
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // MCP:关闭时只写「关」,开启才展开端点(窄条不堆信息)
+            match &state.mcp.status {
+                crate::mcp::McpStatus::Listening(port) => {
+                    ui.weak(format!("MCP: 127.0.0.1:{port}"));
+                }
+                crate::mcp::McpStatus::Failed(_) => {
+                    ui.colored_label(crate::ui::tokens::WARN, "MCP: 启动失败");
+                }
+                crate::mcp::McpStatus::Starting => {
+                    ui.weak("MCP: 启动中");
+                }
+                crate::mcp::McpStatus::Disabled => {
+                    ui.weak("MCP: 关");
+                }
+            }
+            let ai = if state.ai.is_streaming() {
+                format!("{} · 生成中", state.ai.provider_label())
+            } else {
+                state.ai.provider_label().to_owned()
+            };
+            ui.weak(ai);
+            ui.weak(state.theme.mode.label());
+        });
     });
 }
 
@@ -5037,6 +5043,53 @@ mod tests {
         // 正常路径不变
         assert_eq!(cursor_position("abc", 2), (1, 3));
         assert_eq!(cursor_position("甲乙\n丙", 7), (2, 1), "第二行行首");
+    }
+
+    /// **状态栏必须是单行**(2026-10-08 真机复核补的守门断言)。
+    ///
+    /// 这条断言的存在理由是一桩真实回归:S1-2 把状态栏改成三段时,把三个
+    /// 分区写成了三个**平级**调用(`ui.horizontal` / `ui.horizontal` /
+    /// `ui.with_layout`),而父 Ui 是 `egui::Panel::bottom` 的
+    /// `Layout::top_down`(`containers/panel.rs:821`)—— 于是每个平级调用
+    /// **各占一行**,三段竖着摞起来,状态栏从 18px 涨到 75px(截图实测)。
+    ///
+    /// 当时 1386 个测试全绿、六个门禁全绿,**没有任何断言看它的几何** ——
+    /// 是本机 X11 截图逐行量出来的。这是「断言保证不了好看」最硬的证据:
+    /// 连「有没有塌成多行」都保证不了。
+    ///
+    /// **实测的两个值**(红绿验证过,坏版本用 `git show origin/main` 取回):
+    /// 正确 **18px** / 坏版本 **800px**。坏版本不是「三倍」而是**吃满可用
+    /// 高度** —— `ui.with_layout` 在 `top_down` 父布局里会把该行剩余空间
+    /// 全部吃掉,于是状态栏几乎吞掉整个窗口底部。所以断言写成「< 30px」而
+    /// 不是「< 3×18px」:后者在坏版本面前不是一个可区分的量级。
+    #[test]
+    fn status_bar_is_a_single_row() {
+        let ctx = egui::Context::default();
+        let state = crate::state::State::default();
+        let height = Cell::new(0.0f32);
+        // `run_ui` 给的 Ui 默认就是 `top_down`,与 `Panel::bottom` 一致 ——
+        // 正是这个布局把三个平级调用摞成了三行,故这里能复现。
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                super::status_bar(ui, &state);
+                height.set(ui.min_rect().height());
+            },
+        )
+        .drop_without_applying_deltas();
+        let h = height.get();
+        assert!(
+            h > 0.0 && h < 30.0,
+            "状态栏应单行(实测 {h}px;单行基准 18px,上限 30px)—— \
+             远超 30px 说明三个分区被写成了平级调用,在 top_down 父布局里各占一行 \
+             且最后一段吃满剩余高度(S1-2 真犯过,坏版本实测 800px,见本测试文档)"
+        );
     }
 
     /// 提示行(原文件工具栏的能力,工具栏退役后迁到编辑器面板顶,
