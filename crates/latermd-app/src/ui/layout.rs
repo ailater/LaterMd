@@ -1192,26 +1192,56 @@ fn goto_bar_contents(
     (response, jump_button)
 }
 
-/// 底部状态栏:路径 · 行列 · 字数 · 主题 · AI · MCP。
+/// 底部状态栏:**三段分区**(2026-10-08,docs/ui-shell-redesign-v2.md §3)。
+///
+/// | 段 | 内容 | 理由 |
+/// |---|---|---|
+/// | 左 | 文件名 · 行:列 | 「我在哪、我写到哪」——最高频、且与文档强绑定 |
+/// | 中 | 字数 | 写作进度感,与左右两侧都无关联 |
+/// | 右 | 主题 · AI provider · MCP | 全是**全局服务状态**,彼此相关,应聚在右端一眼扫完 |
+///
+/// 改版前是单一 `horizontal_wrapped` 顺排:所有信息挤在左端,右侧
+/// 500px 长期空白,而「MCP 启动失败」这种真正要盯的告警偏在最右、要横跨
+/// 整屏才能看到。切成三段后告警恒在右下角,与视线停留点一致。
+///
+/// **实现手法**:左段、中段各一个 `ui.horizontal`(顺排,自左缘起),右段
+/// 包在 `Layout::right_to_left` 里(自右缘往左排)。右段内部的 push 顺序
+/// 即「从右到左」的顺序 —— MCP 第一个 push 所以画在最右,是状态栏里
+/// 最容易被扫到的位置。
+///
+/// **不用 `layout_to_min_x` 的原因**:它要求调用方自己算百分比 x,三段
+/// 各写一个 magic number;而「左中顺排 + 右段 right_to_left」是零参数
+/// 写法,右段自动贴边,窗口拉伸时无需同步改任何数字。
+///
+/// 窗口窄到三段挤不下时,**先牺牲中段**(字数)—— 它是三者里唯一丢了
+/// 不影响操作的,判据是 `tokens::STATUSBAR_MIN_W`。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
-    ui.horizontal_wrapped(|ui| {
+    let full = ui.available_width();
+
+    // —— 左段:文件 + 行列 ——
+    ui.horizontal(|ui| {
         ui.weak(state.tabs.current().document.display_name());
         let text = state.tabs.current().editor.text();
         if let Some(byte) = state.tabs.current().cursor.byte {
             let (line, col) = cursor_position(text, byte);
             ui.weak(format!("行 {line}:{col}"));
         }
-        ui.weak(format!("{} 字", text.chars().count()));
-        separator(ui);
-        ui.weak(state.theme.mode.label());
-        separator(ui);
-        let ai = if state.ai.is_streaming() {
-            format!("{} · 生成中", state.ai.provider_label())
-        } else {
-            state.ai.provider_label().to_owned()
-        };
-        ui.weak(ai);
-        separator(ui);
+    });
+
+    // —— 中段:字数 ——
+    // 窗口不够宽时直接不画(见 fn 文档的取舍),而不是压缩左右两段。
+    if full >= crate::ui::tokens::STATUSBAR_MIN_W {
+        let text = state.tabs.current().editor.text();
+        let count = text.chars().count();
+        ui.horizontal(|ui| {
+            ui.weak(format!("{count} 字"));
+        });
+    }
+
+    // —— 右段:主题 / AI / MCP,右对齐 ——
+    // `with_layout(Layout::right_to_left)` 让段内各项也右对齐,视觉上
+    // 贴着窗口右缘;段内顺序按「重要性倒序」排,故下面 push 的先画在更右。
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         // MCP:关闭时只写「关」,开启才展开端点(状态栏是窄条,不堆信息)
         match &state.mcp.status {
             crate::mcp::McpStatus::Listening(port) => {
@@ -1227,11 +1257,14 @@ fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
                 ui.weak("MCP: 关");
             }
         }
+        let ai = if state.ai.is_streaming() {
+            format!("{} · 生成中", state.ai.provider_label())
+        } else {
+            state.ai.provider_label().to_owned()
+        };
+        ui.weak(ai);
+        ui.weak(state.theme.mode.label());
     });
-}
-
-fn separator(ui: &mut egui::Ui) {
-    ui.weak("·");
 }
 
 /// 编辑器面板顶部的提示行(存在才显示):保存失败、撞键拒绝等需要用户
