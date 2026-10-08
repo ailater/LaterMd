@@ -1550,6 +1550,103 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    /// 全屏视口拖影回归(2026-10-08 坤哥真机报告:小窗可拖、全屏不可拖):
+    /// 完整 UI(侧栏+编辑器+预览三列)两档尺寸同流程,按住 minimap 高亮框
+    /// 拖动,编辑器 offset 必须逐帧前进。editor 层(minimap::frame_sized)同
+    /// 尺寸已绿;此测试钉 layout 层面板分配与命中注册。
+    #[test]
+    fn minimap_drag_works_small_and_fullscreen_in_full_ui() {
+        for (w, h, label) in [(900.0, 600.0, "小窗"), (1920.0, 1008.0, "全屏")] {
+            let dir = std::env::temp_dir().join(format!(
+                "latermd-minimap-fs-{}-{}",
+                label,
+                std::process::id()
+            ));
+            let mut app = LaterMdApp::default();
+            app.state.settings_dir = Some(dir.clone());
+            app.state.render_mode = crate::live::RenderMode::Source;
+            app.state.tabs.current_mut().editor.replace_all(
+                &(0..500)
+                    .map(|_| "普通的一行")
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let tab_id = app.state.tabs.current().id;
+            let editor_id = crate::ui::editor::tab_editor_id(tab_id);
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+
+            // 两空帧起步(布局/缓存就绪,高亮框出现)
+            let shapes0 = find_test_frame(&mut app, &ctx, screen, 0.0, Vec::new());
+            let shapes = find_test_frame(&mut app, &ctx, screen, 0.1, Vec::new());
+            let _ = shapes0;
+            // minimap 窄条定位:宽=MINIMAP_W、高>300 的填充矩形(高亮框横跨
+            // 整条;全帧无同宽高个数的其他矩形)
+            let map = shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(r)
+                        if r.fill != egui::Color32::TRANSPARENT
+                            && (r.rect.width() - 108.0).abs() < 0.5
+                            && r.rect.height() >= 10.0 =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{label} 视口下 minimap 高亮框未找到"));
+
+            let press = egui::Pos2::new(map.center().x, map.top() + 40.0);
+            find_test_frame(
+                &mut app,
+                &ctx,
+                screen,
+                0.2,
+                vec![
+                    Event::PointerMoved(press),
+                    Event::PointerButton {
+                        pos: press,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+            let mut previous = 0.0_f32;
+            let mut moved = 0;
+            for step in 0..6 {
+                let pos = egui::Pos2::new(press.x, press.y + step as f32 * 40.0);
+                find_test_frame(
+                    &mut app,
+                    &ctx,
+                    screen,
+                    0.3 + step as f64 * 0.1,
+                    vec![Event::PointerMoved(pos)],
+                );
+                let offset = ctx
+                    .data(|d| {
+                        d.get_temp::<crate::ui::minimap::ScrollMetrics>(
+                            crate::ui::minimap::metrics_id(editor_id),
+                        )
+                    })
+                    .map_or(0.0, |m| m.offset);
+                assert!(
+                    offset >= previous - 0.5,
+                    "{label} 拖动单调不减(第 {step} 步 {previous} → {offset})"
+                );
+                if offset > previous + 1.0 {
+                    moved += 1;
+                }
+                previous = offset;
+            }
+            assert!(
+                moved >= 3,
+                "{label} 拖动连续跟随(6 步中 {moved} 步在滚;窄条 {map:?})"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
     fn find_test_app(name: &str) -> (LaterMdApp, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("latermd-find-{name}-{}", std::process::id()));
         let mut app = LaterMdApp::default();
