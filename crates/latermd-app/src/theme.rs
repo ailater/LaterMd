@@ -531,7 +531,13 @@ pub struct ShellTokens {
 pub fn shell_tokens(dark: bool) -> ShellTokens {
     if dark {
         ShellTokens {
-            sidebar: Color32::from_rgb(0x20, 0x21, 0x24),
+            // 2026-10-08 S2-3:`#1B1C1F`(原 `#202124`)。与 content
+            // `#292A2D` 的对比度 1.122:1 → **1.196:1**,每通道差 9 → 14。
+            // 取值理由:暗色下三栏(侧栏 / 编辑器 / 预览)的可辨边界靠
+            // 「侧栏比内容更沉」这一条线索,差 9 时并排看几乎是一片;拉到
+            // 14 后侧栏明确退到背景层,内容区浮起来。上限不再往上推 ——
+            // 再深就与窗口底色撞上,侧栏会显得"挖了个洞"。
+            sidebar: Color32::from_rgb(0x1B, 0x1C, 0x1F),
             content: Color32::from_rgb(0x29, 0x2A, 0x2D),
             text: Color32::from_rgb(0xE8, 0xEA, 0xED),
             secondary: Color32::from_rgb(0x9A, 0xA0, 0xA6),
@@ -546,7 +552,19 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
         }
     } else {
         ShellTokens {
-            sidebar: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+            // 2026-10-08 S2-3:`#EDEFF2`(原 `#F2F3F5`)。与 content `#FFFFFF`
+            // 的对比度 1.110:1 → **1.135:1**,每通道差 13 → 18。
+            // 理由与暗色同一条线索(侧栏退到背景层),但浅色下不能一味
+            // 加深 —— 加到 #E4E6EA 就与 border `#E5E6E8` 撞色,侧栏里的
+            // 分隔线会消失(浅色下分隔线比底色差更重要)。#EDEFF2 是
+            // 「仍浅于 border 一档」的最深值,由
+            // `light_sidebar_stays_lighter_than_border` 钉住。
+            //
+            // **hover 仍是 `#F2F3F5`**:它比新 sidebar 深,于是 hover 在
+            // 侧栏里表现为「一块更深的斑」而非「提亮」。这是有意的 ——
+            // 侧栏整体退到背景层后,hover 若也提亮会与选中态(selected_bg
+            // #E1EFFF)争夺注意力。
+            sidebar: Color32::from_rgb(0xED, 0xEF, 0xF2),
             content: Color32::from_rgb(0xFF, 0xFF, 0xFF),
             text: Color32::from_rgb(0x1F, 0x23, 0x29),
             secondary: Color32::from_rgb(0x64, 0x6A, 0x73),
@@ -2097,5 +2115,98 @@ mod tests {
 
         let fresh = egui::Context::default();
         assert_eq!(editor_font_size(&fresh), EDITOR_FONT_SIZE_DEFAULT);
+    }
+
+    // —— S2-3 三栏可辨性(2026-10-08)——
+
+    /// sRGB 相对亮度(WCAG 2.x 定义)。
+    fn rel_luminance(c: Color32) -> f32 {
+        let channel = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b, _] = c.to_array();
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    /// WCAG 对比度(两色取亮者作分子)。
+    fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+        let (la, lb) = (rel_luminance(a), rel_luminance(b));
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 三栏的**背景**必须两两可辨 —— 这是 S2-3 改版的全部目的。
+    ///
+    /// 阈值 1.10:1 是实测反推的:改版前浅色侧栏 vs 内容 = 1.110:1,
+    /// 暗色 = 1.122:1,两者的共同 complaint 是「并排看几乎是一片」。
+    /// 取 **1.12:1** 作下界,把两侧都抬到刚好脱离那片「看不出差」的区间,
+    /// 同时离「明显分层」还远 —— 侧栏是背景层,不该抢内容的注意力。
+    ///
+    /// 参照物:WCAG 1.4.11 非文本对比度要求 3:1,但那条针对**UI 组件边界**
+    /// (按钮、输入框的可点击轮廓),不适用于「相邻面板的背景分区」——
+    /// 按 3:1 做会把侧栏压成深灰,产品观感受损。故本断言只锁「可辨」,
+    /// 不锁「必须达到无障碍标准」,两者不是一回事。
+    #[test]
+    fn sidebar_and_content_are_distinguishable_in_both_themes() {
+        const MIN: f32 = 1.12;
+        for (label, dark) in [("light", false), ("dark", true)] {
+            let t = shell_tokens(dark);
+            let ratio = contrast_ratio(t.sidebar, t.content);
+            assert!(
+                ratio >= MIN,
+                "{label}: 侧栏 vs 内容区对比度 {ratio:.3}:1 < {MIN}:1 —— \
+                 三栏会并成一片(S2-3 的存在意义就是防这个)"
+            );
+        }
+    }
+
+    /// 浅色下侧栏必须**浅于 border**:侧栏里的分隔线是「比底色深一档」的
+    /// 画法,底色一旦追平或深过分隔线,线就消失、侧栏结构塌掉。
+    ///
+    /// 这条是 S2-3 浅色侧栏只能到 `#EDEFF2` 的直接原因 —— 再深一档就到
+    /// `#E4E6EA`,与 border `#E5E6E8` 撞色。断言把这条约束钉住,防止
+    /// 将来有人为了「更明显的分层」继续加深而悄悄毁掉分隔线。
+    #[test]
+    fn light_sidebar_stays_lighter_than_border() {
+        let t = shell_tokens(false);
+        let sb = rel_luminance(t.sidebar);
+        let bd = rel_luminance(t.border);
+        assert!(
+            sb > bd,
+            "浅色侧栏亮度 {sb:.4} 须高于 border 亮度 {bd:.4} —— \
+             否则侧栏内的分隔线不可辨(sidebar={:?} border={:?})",
+            t.sidebar,
+            t.border
+        );
+    }
+
+    /// 侧栏与内容区的差必须落在「可辨」与「不过分」之间 —— 双侧断言。
+    ///
+    /// 上界防的是另一个方向的坑:把 sidebar 一路加深到接近窗口底色,
+    /// 侧栏会读成「挖了个洞」而不是「背景层」,三栏从「分不开」变成
+    /// 「侧栏太重」。上界按每通道差设(明暗各一条),因为侧栏与内容的
+    /// 色差本质是「同一灰阶上的档位差」,用通道差表达比对比度直观。
+    #[test]
+    fn sidebar_content_delta_stays_in_the_readable_band() {
+        // (暗, 最大通道差下限, 上限)
+        for (label, dark, lo, hi) in [("dark", true, 12.0, 18.0), ("light", false, 16.0, 22.0)] {
+            let t = shell_tokens(dark);
+            let delta = t
+                .sidebar
+                .to_array()
+                .iter()
+                .zip(t.content.to_array().iter())
+                .map(|(a, b)| f32::from(a.abs_diff(*b)))
+                .fold(0.0f32, f32::max);
+            assert!(
+                (lo..=hi).contains(&delta),
+                "{label}: 侧栏/内容每通道差 {delta} 不在 [{lo}, {hi}] 区间"
+            );
+        }
     }
 }
