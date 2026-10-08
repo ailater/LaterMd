@@ -51,6 +51,23 @@ pub fn ui(panel: &mut egui::Ui, keymap: &Keymap, outbox: &mut Vec<Message>) {
 /// 行演算 + 它前面的标签条/提示行共同决定,手搓必然与真实帧错位。
 /// `emoji_probe` 同理,量的是末尾那枚 Emoji 入口(不是 FormatAction,进
 /// 不了 `probe` 的载荷)。
+/// 点了某个格式动作按钮该发什么消息。
+///
+/// **图片是唯一「点了不改文档」的动作**:它要 alt 与 url 两个输入,点了
+/// 是开「图片框」对话框(发 `ImageDialogOpened`),真正的写入走
+/// `compose::insert_image`(docs/image-plan.md A 段)。
+///
+/// 直出按钮与溢出菜单里的条目**共用这一个函数** —— 两处若各写一份,
+/// 迟早会漂移出「直出的图片发格式请求、菜单里的图片发对话框」这种
+/// 方向相反的 bug(2026-10-08 S2-2 引入溢出菜单时的显式约束)。
+fn request(action: FormatAction, outbox: &mut Vec<Message>) {
+    outbox.push(if action == FormatAction::Image {
+        Message::ImageDialogOpened
+    } else {
+        Message::FormatRequested(action)
+    });
+}
+
 pub fn ui_with_probe(
     panel: &mut egui::Ui,
     keymap: &Keymap,
@@ -60,32 +77,72 @@ pub fn ui_with_probe(
 ) {
     let mut probe = probe;
     let mut emoji_probe = emoji_probe;
+    // 「直出 + 溢出」必须**恰好**覆盖全部四组,不多不少、无重复。
+    // 这条断言拦住的是「将来给 `FormatGroup` 加了第五组,却忘了放进
+    // DIRECT 或 OVERFLOW」—— 那会让第五组**静默地从工具条消失**:
+    // 不报编译错、菜单栏照常有它、只有常驻按钮不见了。
+    // `debug_assert!` 而非 `assert!`:一帧一次的 UI 绘制路径不该付
+    // 运行时检查的钱,而 debug 构建(测试与开发)已经覆盖。
+    debug_assert_eq!(
+        FormatGroup::DIRECT.len() + FormatGroup::OVERFLOW.len(),
+        FormatGroup::ALL.len(),
+        "DIRECT + OVERFLOW 必须恰好覆盖 FormatGroup::ALL(防新增组被遗忘)"
+    );
+    debug_assert!(
+        FormatGroup::DIRECT
+            .iter()
+            .chain(FormatGroup::OVERFLOW.iter())
+            .all(|g| FormatGroup::ALL.contains(g)),
+        "DIRECT / OVERFLOW 里的组必须都出自 ALL"
+    );
     panel.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
-        for group in FormatGroup::ALL {
+
+        // ① 直出组(2026-10-08 S2-2:只有行内五项,理由见
+        // `FormatGroup::DIRECT`)。
+        for group in FormatGroup::DIRECT {
             for action in group.actions() {
                 let response = button(ui, *action, keymap);
                 if let Some(probe) = probe.as_mut() {
                     probe(*action, response.rect);
                 }
                 if response.clicked() {
-                    // 图片是唯一「点了不改文档」的动作:它开对话框收 alt 与
-                    // url,插入在归约里发生
-                    outbox.push(if *action == FormatAction::Image {
-                        Message::ImageDialogOpened
-                    } else {
-                        Message::FormatRequested(*action)
-                    });
+                    request(*action, outbox);
                 }
             }
-            // 组之间是竖向分隔条,最后一组之后不画
-            if group != FormatGroup::ALL[FormatGroup::ALL.len() - 1] {
-                ui.separator();
-            }
         }
-        // Emoji 面板入口(docs/emoji-plan.md E1):第二个「对话框类动作」,
+
+        ui.separator();
+
+        // ② 溢出菜单:标题 / 块 / 列表三组十二项(低频,按语境才用)。
+        //
+        // 菜单项**走同一个 `button()`**,故 tooltip 口径、图标画法、
+        // 点击语义与直出完全一致;分段之间画分隔线(与菜单栏同款)。
+        //
+        // 「探针在菜单内也生效」是刻意的:无头测试据此在菜单打开后拿到条目
+        // 矩形,否则菜单里的动作**没有任何测试能定位** —— 等于格式动作
+        // 的点击路径在溢出后就失去覆盖。
+        ui.menu_button("更多", |ui| {
+            for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
+                if index > 0 {
+                    ui.separator();
+                }
+                for action in group.actions() {
+                    let response = button(ui, *action, keymap);
+                    if let Some(probe) = probe.as_mut() {
+                        probe(*action, response.rect);
+                    }
+                    if response.clicked() {
+                        request(*action, outbox);
+                    }
+                }
+            }
+        });
+
+        // ③ Emoji 面板入口(docs/emoji-plan.md E1):第二个「对话框类动作」,
         // 与 Image 同款 —— 点了只开面板,不进 `FormatAction` 四组(emoji
-        // 字符无法从 text+sel 推导,§6.1 的边界)。
+        // 字符无法从 text+sel 推导,§6.1 的边界)。它留在直出位:面板是
+        // 「插入一个字符」的高频动作,与低频的段落级格式不同层。
         ui.separator();
         let response = icons::icon_button(ui, Icon::Emoji, &emoji_tooltip(keymap));
         if let Some(probe) = emoji_probe.as_mut() {
@@ -336,54 +393,59 @@ mod tests {
 
     /// 点图片按钮是**开对话框**,不是发格式请求 —— 十七个动作里只有它走
     /// 这条路径(需要 alt 与 url 两个输入)。
+    ///
+    /// **2026-10-08 S2-2 改版后图片在「更多」菜单里**,故本测试比改版前
+    /// 多一段:先点开菜单,再在**菜单已展开**的帧里用探针取 Image 矩形。
+    ///
+    /// 探针在菜单内生效是刻意设计(`ui_with_probe` 的 ② 段):否则菜单里
+    /// 的动作没有任何测试能定位 —— 等于十二个低频动作的点击路径在溢出
+    /// 后彻底失去覆盖,且「探针只对直出按钮生效」这件事本身不会报错。
     #[test]
     fn clicking_image_requests_the_dialog_not_a_format() {
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
         let mut outbox = Vec::new();
-        let rect = Cell::new(Rect::NOTHING);
+        let keymap = Keymap::builtin();
 
-        // 探针帧:用**真实工具条布局**拿 Image 按钮的位置。单画一枚按钮的
-        // 矩形与整条工具条不重合(十七枚换行排布,单独画的 Image 在原点,
-        // 那个位置在整条里是 Bold —— 首版测试就栽在这里),必须经
-        // `ui_with_probe` 在同一布局里取矩形。
-        ctx.run_ui(
-            RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ui| {
-                super::ui_with_probe(
-                    ui,
-                    &Keymap::builtin(),
-                    &mut Vec::new(),
-                    Some(|action: FormatAction, button_rect: Rect| {
-                        if action == FormatAction::Image {
-                            rect.set(button_rect);
-                        }
-                    }),
-                    None::<fn(Rect)>,
-                );
-            },
-        )
-        .drop_without_applying_deltas();
-        let center = rect.get().center();
-        assert!(center.x > 0.0, "探针拿到了图片按钮的位置:{center:?}");
-        let click = |pressed| Event::PointerButton {
-            pos: center,
+        // —— 第 1 段:定位「更多」按钮并点开菜单 ——
+        // 走 shapes 文本定位而非探针:菜单按钮本身不是 FormatAction,
+        // 探针不覆盖它。菜单栏的同类测试(`menubar.rs` 设置直达页)已实证
+        // 同一手法。
+        let mut more_rect = None;
+        for _ in 0..3 {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &keymap, &mut Vec::new()),
+            );
+            let shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+            more_rect = shapes.iter().find_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                (text.galley.job.text == "更多").then(|| clipped.shape.visual_bounding_rect())
+            });
+            if more_rect.is_some() {
+                break;
+            }
+        }
+        let more_center = more_rect
+            .unwrap_or_else(|| panic!("工具条上找不到「更多」按钮"))
+            .center();
+        let click_at = |pos: egui::Pos2, pressed| Event::PointerButton {
+            pos,
             button: PointerButton::Primary,
             pressed,
             modifiers: Default::default(),
         };
-
-        // sizing pass → moved → press → release:面板层前几遍 widget 不参与
-        // 命中测试,与 ui::layout 的点击测试同一节奏
         for events in [
             Vec::new(),
-            Vec::new(),
-            vec![Event::PointerMoved(center)],
-            vec![click(true)],
-            vec![click(false)],
+            vec![Event::PointerMoved(more_center)],
+            vec![click_at(more_center, true)],
+            vec![click_at(more_center, false)],
         ] {
             ctx.run_ui(
                 RawInput {
@@ -391,11 +453,129 @@ mod tests {
                     screen_rect: Some(screen),
                     ..Default::default()
                 },
-                |ui| super::ui(ui, &Keymap::builtin(), &mut outbox),
+                |ui| super::ui(ui, &keymap, &mut Vec::new()),
+            )
+            .drop_without_applying_deltas();
+        }
+
+        // —— 第 2 段:菜单展开后取 Image 矩形 ——
+        // egui 0.36 的 MenuButton 从「popup 记忆开态」到「闭包真正绘制
+        // 条目」隔一帧(事件帧写记忆 → 次帧按钮收到开态 → 再次帧闭包执行),
+        // 故最多试三帧,拿不到就明说而不是静默跳过(与 decisions-pending
+        // #128 记录的 menubar 同款时序)。
+        let rect = Cell::new(Rect::NOTHING);
+        for _ in 0..3 {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    super::ui_with_probe(
+                        ui,
+                        &keymap,
+                        &mut Vec::new(),
+                        Some(|action: FormatAction, button_rect: Rect| {
+                            if action == FormatAction::Image {
+                                rect.set(button_rect);
+                            }
+                        }),
+                        None::<fn(Rect)>,
+                    );
+                },
+            );
+            output.drop_without_applying_deltas();
+            if rect.get() != Rect::NOTHING {
+                break;
+            }
+        }
+        let center = rect.get().center();
+        assert!(
+            rect.get() != Rect::NOTHING,
+            "菜单展开后探针应拿到 Image 条目的位置"
+        );
+
+        // —— 第 3 段:点它 ——
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click_at(center, true)],
+            vec![click_at(center, false)],
+        ] {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &keymap, &mut outbox),
             )
             .drop_without_applying_deltas();
         }
         assert_eq!(outbox, vec![Message::ImageDialogOpened]);
+    }
+
+    /// **直出 + 溢出恰好覆盖全部四组**(2026-10-08 S2-2 守门)。
+    ///
+    /// 拦的是「将来给 `FormatGroup` 加了第五组,却忘了放进 DIRECT 或
+    /// OVERFLOW」—— 那会让新组**静默从工具条消失**:不报编译错、菜单栏
+    /// 照常有它、只有常驻按钮不见了。生产路径有同款 `debug_assert!`,
+    /// 本测试是它的可读版本(且在 release 下也跑)。
+    #[test]
+    fn direct_and_overflow_cover_every_group_exactly_once() {
+        assert_eq!(
+            FormatGroup::DIRECT.len() + FormatGroup::OVERFLOW.len(),
+            FormatGroup::ALL.len(),
+            "两组之和须等于全部组数"
+        );
+        for group in FormatGroup::ALL {
+            let in_direct = FormatGroup::DIRECT.contains(&group);
+            let in_overflow = FormatGroup::OVERFLOW.contains(&group);
+            assert!(
+                in_direct ^ in_overflow,
+                "{group:?} 必须恰好属于 DIRECT / OVERFLOW 之一 \
+                 (direct={in_direct} overflow={in_overflow})"
+            );
+        }
+    }
+
+    /// 直出位是行内 + 列表两组(2026-10-08 S2-2 的**收益断言**)。
+    ///
+    /// 锁的是「工具条只留高频」这条 ui-polish §1.2 原则。列表组在列,
+    /// 不是因为它高频,而是因为 `Task` 是唯一的**多步交互**(三态循环)——
+    /// 进菜单会让「一次状态切换」从 3 次点击涨到 6 次,详见
+    /// `FormatGroup::DIRECT` 的文档。
+    ///
+    /// 哪天有人把标题 / 块组挪回直出位(看起来「更方便」),本测试变红。
+    #[test]
+    fn direct_row_is_inline_plus_list_only() {
+        // **比切片而不是定长数组**:数组长度一变(如把 Heading 挪进
+        // DIRECT),`assert_eq!([T; 3], [T; 2])` 是**编译错误**而非断言
+        // 失败 —— 守门测试若以「编不过」的方式拦回归,就不是守门测试,而是
+        // 一根会误伤正确改动的拦路桩(首版就踩了这个)。
+        assert_eq!(
+            FormatGroup::DIRECT.as_slice(),
+            &[FormatGroup::Inline, FormatGroup::List],
+            "直出组应是行内 + 列表(列表因 Task 三态循环而必须直出)"
+        );
+        assert_eq!(
+            FormatGroup::OVERFLOW.as_slice(),
+            &[FormatGroup::Heading, FormatGroup::Block],
+            "溢出组应是标题 + 块"
+        );
+        // 收益量化:17 项里 8 项直出、9 项进菜单,加「更多」与 emoji 共
+        // 10 个可见槽位(改版前 18 个)。
+        let direct: usize = FormatGroup::DIRECT.iter().map(|g| g.actions().len()).sum();
+        let overflow: usize = FormatGroup::OVERFLOW
+            .iter()
+            .map(|g| g.actions().len())
+            .sum();
+        assert_eq!(
+            direct + overflow,
+            FormatAction::ALL.len(),
+            "17 项一个不能少"
+        );
+        assert_eq!(direct, 8, "直出 8 项(行内 5 + 列表 3)");
+        assert_eq!(overflow, 9, "溢出 9 项(标题 4 + 块 5)");
     }
 
     /// 点笑脸按钮是**开 Emoji 面板**,不是发格式请求:第二个「对话框类
