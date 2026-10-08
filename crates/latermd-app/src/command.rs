@@ -197,6 +197,13 @@ pub enum Command {
     /// 测试钉住)—— 首选 F 因「文件」标题撞键被该审计否决,避让口径与
     /// 冲突审计见 decisions-pending #122。
     FocusModeToggle,
+    /// Minimap 缩略图开关(#67 M2):源码模式编辑区右缘缩略导航的显隐,
+    /// 落 `theme.show_minimap`(#55 M2 既有配置,设置外观页复选框三方
+    /// 一致)。Ctrl/Cmd+Alt+M(M = Minimap 词首):出厂表 Ctrl/Cmd+Alt
+    /// 层现有 C/W/D/R(目录/打字机/专注/预览栏)之外 M 空闲,且 M 不在
+    /// 菜单标题助记集(F/E/O/V/X/A/S)—— 避让口径与冲突审计见
+    /// decisions-pending #129。
+    ToggleMinimap,
 }
 
 impl Command {
@@ -207,7 +214,7 @@ impl Command {
     ///
     /// 顺序 = UI 上的自然归属:文件 → 视图 → AI → 标签 → 格式按工具条分组
     /// 从左到右。
-    pub const ALL: [Command; 43] = [
+    pub const ALL: [Command; 44] = [
         Self::New,
         Self::Open,
         Self::QuickOpen,
@@ -251,6 +258,7 @@ impl Command {
         Self::ToggleZen,
         Self::TypewriterToggle,
         Self::FocusModeToggle,
+        Self::ToggleMinimap,
     ];
 
     /// 格式命令 → 对应的动作,非格式命令为 `None`。
@@ -313,7 +321,8 @@ impl Command {
             | Self::ToggleLivePreview
             | Self::ToggleZen
             | Self::TypewriterToggle
-            | Self::FocusModeToggle => CommandGroup::View,
+            | Self::FocusModeToggle
+            | Self::ToggleMinimap => CommandGroup::View,
             Self::TabNext | Self::TabClose | Self::TabRestore => CommandGroup::Tab,
             Self::ExportHtml | Self::ExportPdf => CommandGroup::Export,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => CommandGroup::Ai,
@@ -367,6 +376,7 @@ impl Command {
             Self::ToggleZen => "toggle_zen",
             Self::TypewriterToggle => "toggle_typewriter",
             Self::FocusModeToggle => "toggle_focus_mode",
+            Self::ToggleMinimap => "toggle_minimap",
         }
     }
 
@@ -419,6 +429,7 @@ impl Command {
             Self::ToggleZen => "禅定模式",
             Self::TypewriterToggle => "打字机模式",
             Self::FocusModeToggle => "专注模式",
+            Self::ToggleMinimap => "Minimap 缩略图",
         }
     }
 
@@ -561,6 +572,14 @@ impl Command {
             Self::FocusModeToggle => {
                 egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::D)
             }
+            // Minimap 开关(#67 M2):Ctrl/Cmd+Alt+M。出厂表 Ctrl/Cmd+Alt 层
+            // 现有 R/W/D/C(切预览栏/打字机/专注/插入目录),M 在该层空闲
+            // (#9 口径的撞键核查在 tests);含 Alt 的绑定按保守口径避开
+            // 菜单标题助记集(F/E/O/V/X/A/S),M 不在其中(与 #121/#122/
+            // #127 同款审计,menubar 的标题审计测试共同钉住)。
+            Self::ToggleMinimap => {
+                egui::KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, egui::Key::M)
+            }
             // 无快捷键。前三条是 AI 联调入口:不抢键位,等 provider 选型
             // 定案再定;FormatDivider/FormatTable 只从工具条按钮触发
             // (插画布性质的动作,不像加粗那样高频到需要键位);ExportPdf
@@ -624,6 +643,9 @@ impl Command {
             Self::TypewriterToggle => Icon::Zen,
             // 与视图组开关同源(#64 M1 同款先例:icons 无专注专用形)
             Self::FocusModeToggle => Icon::Zen,
+            // 与视图组开关同源(#67 M2 同款先例:icons 无 minimap 专用形,
+            // 只进菜单/快捷键/快速打开,不新增工具栏按钮)
+            Self::ToggleMinimap => Icon::Zen,
         }
     }
 
@@ -655,6 +677,10 @@ impl Command {
             // 的 TypewriterToggled(bool) 归设置页复选框专用。
             Self::TypewriterToggle => Message::ToggleTypewriter,
             Self::FocusModeToggle => Message::ToggleFocusMode,
+            // 与打字机/专注同构:菜单/快捷键是「翻转」语义(现值在 State,
+            // 消息层拿不到),走无参翻转消息;带值的 ShowMinimapToggled(bool)
+            // 归设置外观页复选框专用(#55 M2 既有)。
+            Self::ToggleMinimap => Message::ToggleMinimap,
             // 十六条格式动作一条 match 收干:动作枚举已经在 cmd 里定死了,
             // 这里只把它装进消息,语义一律看 `compose::apply`
             Self::FormatBold
@@ -1249,6 +1275,61 @@ mod tests {
         assert_eq!(Command::FocusModeToggle.message(), Message::ToggleFocusMode);
     }
 
+    /// Minimap 开关(#67 M2)默认键位:Ctrl/Cmd+Alt+M,出厂表 Ctrl/Cmd+Alt
+    /// 层 M 无第二个占用者(#9 口径的撞键核查);含 Alt 的绑定按保守口径
+    /// 避开菜单标题助记集(F/E/O/V/X/A/S),M 不在其中(#121/#122/#127
+    /// 同款避让,menubar 的标题审计测试共同钉住)。三修饰组合按「修饰键
+    /// 个数降序」先被问到,与任何无 Alt 的 M 键组合(出厂表无)互不抢。
+    /// 真按键只触发这一条,消息映射到无参翻转消息,分组归「视图」。
+    #[test]
+    fn minimap_shortcut_is_ctrl_alt_m_and_conflict_free() {
+        let ctrl_alt_m = crate::keymap::Shortcut {
+            modifiers: Modifiers::COMMAND | Modifiers::ALT,
+            key: Key::M,
+        };
+        assert_eq!(
+            Command::ToggleMinimap.default_shortcut().map(|shortcut| {
+                crate::keymap::Shortcut {
+                    modifiers: shortcut.modifiers,
+                    key: shortcut.logical_key,
+                }
+            }),
+            Some(ctrl_alt_m),
+            "ToggleMinimap 出厂默认 = Ctrl/Cmd+Alt+M"
+        );
+        assert_eq!(
+            Keymap::builtin().get(Command::ToggleMinimap),
+            Some(ctrl_alt_m)
+        );
+        assert_eq!(
+            Keymap::builtin().conflict(Command::ToggleMinimap, ctrl_alt_m),
+            None,
+            "Ctrl/Cmd+Alt+M 不该撞任何出厂键位"
+        );
+        assert_eq!(
+            Command::ToggleMinimap.group(),
+            CommandGroup::View,
+            "Minimap 开关是视图命令(菜单「视图」/蒙层同一归属)"
+        );
+
+        // Alt 组合先被问到;同帧只触发本命令
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(Key::M, Modifiers::COMMAND | Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    poll_shortcuts(ui.ctx(), &Keymap::builtin()),
+                    vec![Command::ToggleMinimap]
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(Command::ToggleMinimap.message(), Message::ToggleMinimap);
+    }
+
     /// 键位改排(#45 K1,preview-typography §3.2 定案):主题出厂键 = Alt+T,
     /// 不撞任何出厂键位;Cmd/Ctrl+Shift+T 的占用者 == TabRestore(#45 K2
     /// 落地后的联动断言,浏览器「恢复关闭标签」同款),且不与任何其他
@@ -1385,7 +1466,7 @@ mod tests {
     /// 实现更新。
     #[test]
     fn all_commands_listed_exactly_once() {
-        assert_eq!(Command::ALL.len(), 43);
+        assert_eq!(Command::ALL.len(), 44);
         let mut ids: Vec<_> = Command::ALL.iter().map(|cmd| cmd.id()).collect();
         ids.sort_unstable();
         ids.dedup();

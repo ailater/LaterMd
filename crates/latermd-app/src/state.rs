@@ -958,10 +958,15 @@ pub enum Message {
     EditorFontSizeChanged(f32),
     /// 正文行距倍率变化(#23 F2):同上,钳进 1.2..=2.0。
     EditorLineHeightChanged(f32),
-    /// 源码 minimap 开关翻转(#55 M2):外观页复选框产出,落
+    /// 源码 minimap 开关设值(#55 M2):外观页复选框产出,落
     /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
     /// 全局偏好,非每标签)。
     ShowMinimapToggled(bool),
+    /// 源码 minimap 开关翻转(#67 M2):视图菜单条目/快捷键产出 —— 菜单
+    /// 与快捷键是「翻转」语义(现值在 State,消息层拿不到),与设置页的
+    /// 带值消息([`Message::ShowMinimapToggled`])分立;归约同样即时写
+    /// settings.json(与 `ToggleTypewriter` 同构)。
+    ToggleMinimap,
     /// 打字机模式开关设值(#64 M1):外观页复选框产出,落
     /// `theme.show_typewriter` 并即时写 settings.json(minimap 开关
     /// 同款通路;全局偏好,源码与 Live 两模式共用一个开关)。
@@ -1187,6 +1192,10 @@ impl State {
             }
             Message::ShowMinimapToggled(show) => {
                 self.theme.show_minimap = show;
+                self.persist_theme();
+            }
+            Message::ToggleMinimap => {
+                self.theme.show_minimap = !self.theme.show_minimap;
                 self.persist_theme();
             }
             Message::TypewriterToggled(on) => {
@@ -4888,6 +4897,35 @@ mod tests {
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(!reloaded.show_minimap, "重启后仍为关");
         assert_eq!(reloaded.editor_font_size, font_before, "排版偏好不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #67 M2:minimap 的**无参翻转**消息(视图菜单条目/快捷键路径,
+    /// `Command::ToggleMinimap.message()`)归约翻转 `theme.show_minimap`
+    /// 并即时写 settings.json;与带值消息同字段同通路 —— 菜单、快捷键、
+    /// 设置外观页复选框三方一致(打字机 `ToggleTypewriter` 的同款断面)。
+    #[test]
+    fn minimap_menu_toggle_flips_field_and_persists() {
+        let dir = temp_path("minimap-menu-toggle");
+        let mut state = State {
+            settings_dir: Some(dir.clone()),
+            ..State::default()
+        };
+        assert!(state.theme.show_minimap, "出厂默认开");
+
+        // 菜单/快捷键路径的消息 == Command::ToggleMinimap 的映射
+        assert_eq!(
+            crate::command::Command::ToggleMinimap.message(),
+            Message::ToggleMinimap
+        );
+        state.apply(Message::ToggleMinimap);
+        assert!(!state.theme.show_minimap, "开 → 翻转 → 关");
+        state.apply(Message::ToggleMinimap);
+        assert!(state.theme.show_minimap, "关 → 翻转 → 开");
+        state.apply(Message::ToggleMinimap);
+
+        let reloaded = ThemeSettings::load_from(&dir).unwrap();
+        assert!(!reloaded.show_minimap, "菜单开关即时落盘,重启后仍为关");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
