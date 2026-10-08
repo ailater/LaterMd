@@ -172,7 +172,7 @@ pub fn edge_resize_zones(ui: &mut egui::Ui) {
 
 /// 标题栏内容(挂在 `Panel::top("titlebar")` 内,定高 `TITLEBAR_H`,
 /// panel frame 内边距须为 0,命中矩形才与右缘对齐)。
-pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
+pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     let bar = ui.max_rect();
     let ctx = ui.ctx().clone();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
