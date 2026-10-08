@@ -605,7 +605,14 @@ impl Command {
             Self::QuickOpen => Icon::Search,
             Self::Save => Icon::Save,
             Self::SaveAs => Icon::SaveAs,
-            Self::ExportHtml | Self::ExportPdf => Icon::Export,
+            // 导出两项**刻意用不同图标**(2026-10-08 症状 B):左栏顶段是
+            // 6 枚纯图标无文字并排,原先两者共用 `Icon::Export` → 相邻两枚
+            // 一模一样,tooltip 是唯一区分手段,实际不可辨识。
+            // 语义也站得住:HTML = 下载一个文件(箭头入托盘),PDF = 打印
+            // (机身出纸)。共享白名单见本文件测试
+            // `intentional_icon_sharing_is_the_whole_set`。
+            Self::ExportHtml => Icon::Export,
+            Self::ExportPdf => Icon::Print,
             Self::ToggleTheme => Icon::Theme,
             Self::ToggleSidebar => Icon::Sidebar,
             Self::AiMockStream | Self::AiCommitMessage | Self::AiSummary => Icon::Ai,
@@ -1521,5 +1528,104 @@ mod tests {
             );
             output.drop_without_applying_deltas();
         }
+    }
+
+    /// **命令图标的共享集合必须恰好等于白名单**(2026-10-08 症状 B 守门)。
+    ///
+    /// 起因:左栏顶段是 6 枚**纯图标无文字**并排,而 `ExportHtml` 与
+    /// `ExportPdf` **共用 `Icon::Export`** —— 相邻两枚长得一模一样,tooltip
+    /// 是唯一区分手段,实际不可辨识。已拆开(HTML=下载/托盘,PDF=打印/出纸)。
+    ///
+    /// **为什么是「恰好等于」而不是「不许共享」**:共享本身不是错。
+    /// `Icon::Zen` 被 5 个视图开关共用、`Icon::Search` 被 3 个查找类命令
+    /// 共用 —— 它们**只出现在带文字标签的菜单里**,共用无害甚至加强一致性。
+    /// 真正有害的是**纯图标区里的相邻共用**。
+    ///
+    /// 所以本测试把「有意共享」列成**显式白名单**:将来新增命令若意外复用了
+    /// 某个图标,实际共享集合就多出一项 → 变红 → 逼作者登记「为什么这次共用
+    /// 无害」或换图标。比逐个 case 断言图标名更耐改(命令增删不会误红),
+    /// 又比不管强(新意外共用必红)。
+    ///
+    /// 比对用**命令 id 分组**而非 `Icon` 本身:`Icon` 未实现 `Ord`,排序不可用;
+    /// 而命令 id 是稳定字符串,分组后排序即可。
+    #[test]
+    fn intentional_icon_sharing_is_the_whole_set() {
+        use std::collections::BTreeMap;
+
+        // 图标 → 共享它的命令 id
+        let mut by_icon: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+        for cmd in Command::ALL {
+            by_icon
+                .entry(icon_key(cmd.icon()))
+                .or_default()
+                .push(cmd.id());
+        }
+        let mut actual: Vec<Vec<&'static str>> = by_icon
+            .into_values()
+            .filter(|cmds| cmds.len() > 1)
+            .collect();
+        actual.sort_unstable();
+
+        // 有意共享的分组。**新增共享必须先在这里登记**,否则本测试红。
+        //
+        // ⚠️ 这份白名单是**实测抄下来的**,不是推出来的 —— 首版凭印象写,
+        // 立刻被本测试打回(漏了 `Icon::Table` 的 4 个格式命令、
+        // `Icon::Search` 的 3 个查找命令,id 也猜错两处)。共享面比想象大,
+        // 但**全部只出现在带文字标签的菜单里**,故无害(见上方理由)。
+        let mut expected: Vec<Vec<&'static str>> = vec![
+            // AI 三命令同属菜单「AI」一段,共用便于识别该段归属
+            vec!["ai_mock_stream", "ai_commit_message", "ai_summary"],
+            // 七个格式命令共用一个图标;其中 B/I/S/H1-H3 在格式工具条里
+            // 走**富文本字形**(`format_bar::button` 的 rich 分支),不碰图标,
+            // 故工具条上从不出现「七枚一样」的场面
+            vec![
+                "format_bold",
+                "format_italic",
+                "format_strike",
+                "format_h1",
+                "format_h2",
+                "format_h3",
+                "format_table",
+            ],
+            // 六个查找/复制类命令共用放大镜,均在带文字的菜单与快速打开里
+            vec![
+                "quick_open",
+                "duplicate_selection",
+                "duplicate_line",
+                "find_in_doc",
+                "replace_in_doc",
+                "goto_line",
+            ],
+            // 三个标签动作共用,只在标签条(× close 是自绘)与菜单里
+            vec!["tab_next", "tab_close", "tab_restore"],
+            // 五个视图开关共用,只在带文字的「视图」菜单与快速打开里出现
+            vec![
+                "toggle_live_preview",
+                "toggle_zen",
+                "toggle_typewriter",
+                "toggle_focus_mode",
+                "toggle_minimap",
+            ],
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "命令图标的共享集合变了(见上面 actual/expected)。\
+             若是新的**有意**共享(只出现在带文字的菜单里),请把它的命令 id \
+             分组加进 expected 并注明理由;\
+             若是**意外**复用 —— 尤其当它会落到纯图标区(左栏顶段/标题栏)造成\
+             相邻两枚看起来一样 —— 请给该命令换一个专属图标。"
+        );
+    }
+
+    /// 图标的分组键:用**变体名**(`Debug`)而非整数判别式。
+    ///
+    /// 两个理由:① `Icon` 未实现 `Ord`,`BTreeMap` 排不了;② 整数判别式
+    /// 跨版本不保证稳定(`std::mem::discriminant` 文档明说),而
+    /// `transmute` 到 `u64` 在枚举大小 < 8 时是 UB —— 变体名既稳定又安全。
+    /// 键只用于**同一进程内**给哈希表定序,真正的比对在上面的命令 id 分组。
+    fn icon_key(icon: crate::ui::icons::Icon) -> String {
+        format!("{icon:?}")
     }
 }
