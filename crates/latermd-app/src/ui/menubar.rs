@@ -1218,6 +1218,100 @@ mod tests {
         );
     }
 
+    /// 「设置」菜单直达页的真实点击路径(#67 M1 抽查):「设置」不在
+    /// [`MENUS`] 表里(非命令,直达设置页),`clicking_every_menu_item…`
+    /// 不遍历它 —— 这里走完整 popup 路径:Alt+S 打开 → 展开帧定位条目
+    /// 文本矩形 → 指针逐帧点击 → 发出 [`Message::SettingsOpened`] 的
+    /// 对应页;消息再喂进 `State::apply` 落出打开的页签(点击 → 消息 →
+    /// 归约一段齐,齿轮路径的等价归约断言在 layout.rs 已有)。
+    #[test]
+    fn settings_menu_direct_tabs_click_through_and_reduce() {
+        for (needle, expected) in [
+            ("外观(", SettingsTab::Appearance),
+            ("快捷键(", SettingsTab::Keymap),
+        ] {
+            let ctx = egui::Context::default();
+            // 帧 1:Alt+S 事件帧(popup 记忆已开,闭包不执行)
+            let keymap = Keymap::builtin();
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![key_event(egui::Key::S, egui::Modifiers::ALT)],
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &keymap, &mut outbox),
+            );
+            output.drop_without_applying_deltas();
+            assert!(outbox.is_empty(), "开菜单本身不产生消息");
+
+            // 帧 2-3:两次空帧 —— egui 0.36 的 MenuButton 从 popup 记忆
+            // 开态到闭包真正绘制隔一帧(事件帧写记忆 → 次帧菜单按钮收
+            // 到开态 → 再次帧闭包执行画出条目;与 `bare_letter…` 三帧
+            // 节奏同因,这里实证后取末帧 shapes 定位条目矩形)
+            let mut located = None;
+            for _ in 0..2 {
+                let mut outbox = Vec::new();
+                let output = ctx.run_ui(RawInput::default(), |ui| {
+                    super::ui(ui, &keymap, &mut outbox);
+                });
+                let shapes = output.shapes.clone();
+                output.drop_without_applying_deltas();
+                assert!(outbox.is_empty(), "展开不点击不产生消息");
+                located = shapes.iter().find_map(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return None;
+                    };
+                    text.galley
+                        .job
+                        .text
+                        .contains(needle)
+                        .then(|| clipped.shape.visual_bounding_rect())
+                });
+                if located.is_some() {
+                    break;
+                }
+            }
+            let rect = located.unwrap_or_else(|| panic!("{needle:?} 条目未绘制"));
+
+            // 帧 4-6:moved → press → release(与 layout 的面板层点击测试
+            // 同节奏,指针停在条目中心)
+            let center = rect.center();
+            let click = |pressed| Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            for events in [
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+            ] {
+                let mut frame_outbox = std::mem::take(&mut outbox);
+                let output = ctx.run_ui(
+                    RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| super::ui(ui, &keymap, &mut frame_outbox),
+                );
+                output.drop_without_applying_deltas();
+                outbox = frame_outbox;
+            }
+            assert_eq!(
+                outbox,
+                vec![Message::SettingsOpened(expected)],
+                "{needle:?} 条目点击应发出直达该页的消息"
+            );
+
+            // 归约一段:直达页消息落 State,设置窗开在对应页签
+            let mut state = crate::state::State::default();
+            state.apply(Message::SettingsOpened(expected));
+            assert!(state.settings.open, "归约后设置窗打开");
+            assert_eq!(state.settings.tab, expected, "归约后落在直达页签");
+        }
+    }
+
     /// 排版统一(#62 M2):菜单条标题与下拉条目同走 egui `Button` 的
     /// `TextStyle::Button` 档 —— 两处 galley 字号必须一致(守门将来一侧
     /// 改字号另一侧没跟);收起态菜单条本身在窄窗口(400px)渲染不

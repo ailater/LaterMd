@@ -4891,9 +4891,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #64 M1:打字机开关消息归约落 `theme.show_typewriter` 并即时写
-    /// settings.json;重启(load_from)后值仍在。只动该字段,minimap 与
-    /// 排版偏好不受影响(#55 同款通路)。
+    /// #64 M1:打字机开关消息(带值设值 + 无参翻转)归约落
+    /// `theme.show_typewriter` 并即时写 settings.json;重启(load_from)
+    /// 后值仍在。只动该字段,minimap 与排版偏好不受影响(#55 同款通路)。
+    /// 无参翻转是「视图」菜单/键位路径的消息(#67 M1 链路断言补段,与
+    /// 专注模式 `ToggleFocusMode` 的同款断面对称)。
     #[test]
     fn show_typewriter_toggle_updates_field_and_persists() {
         let dir = temp_path("show-typewriter-toggle");
@@ -4909,6 +4911,12 @@ mod tests {
         state.apply(Message::TypewriterToggled(false));
         assert!(!state.theme.show_typewriter, "往返翻回关");
         state.apply(Message::TypewriterToggled(true));
+
+        // 菜单/快捷键无参翻转:当前为开,翻即取反,再翻回开
+        state.apply(Message::ToggleTypewriter);
+        assert!(!state.theme.show_typewriter);
+        state.apply(Message::ToggleTypewriter);
+        assert!(state.theme.show_typewriter, "再翻回开");
 
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(reloaded.show_typewriter, "重启后仍为开");
