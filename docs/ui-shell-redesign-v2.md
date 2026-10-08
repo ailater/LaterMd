@@ -242,6 +242,82 @@ decisions-pending #128）→ 探针取 Image 矩形 → 点击。
 | `zen_draw_skips_the_three_column_panels` | 三栏帧里有文本 `"H1"` | H1 已进菜单，**菜单关闭时不绘制**，取证恒失败 | 换成 `"更多"` —— 溢出按钮本体文案，只由格式条画出，且与菜单开合无关 |
 | `task_button_cycling_on_cjk_never_panics` | `format_probe` 定位 Task 按钮 | Task 进菜单时探针不触发 | 列表组改回直出（见 §5.1），探针自然恢复 |
 
+### 5.5 左缘 rail：顶部 11 枚迁入竖向图标带（2026-10-08，用户指定）
+
+治症状 B 的**下半场**。§2 把视图导航从竖排五行压到单行后，左栏顶部仍留
+着**两条**横向占用（顶段文件动作 31px + nav 段 26px，窄栏下前者换行成
+62px）。rail 把这两者一并收进左端一条**竖**带：
+
+```
+改前（180px 窄栏 88px chrome）      改后（0px）
+┌──────────────┐                  ┌────┬────────┐
+│ ▣▣▣▣▣      │ ← nav 26px        │ ▣  │ 文件树  │
+│ ⊞⊟⤓⤒⋯⋯    │ ← top_actions     │ ▚  │ （+88） │  ← 顶部零 chrome
+│ ├────────────┤                  │ ⊞  │        │
+│ 文件树        │                  │ ⊟  │        │
+└──────────────┘                  └────┴────────┘
+                                   rail   body
+```
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| rail 位置 | 画在**左栏内部**，占左端 48px | 若开第四个 `Panel::left`，左栏总占宽 240 → 288，**编辑区净损 48px** —— 省下的纵向 chrome 会以横向形式赔回去 |
+| 收录范围 | 上组五视图 + 下组六文件动作，共 11 枚 | 用户指定「文件动作也进 rail」；自此左栏顶部**无任何横向条带** |
+| 取代 relation | **完全取代** §2 的单行 `view_nav` | 并存会退化成「又一处占用」，且与减 chrome 的初衷相悖 |
+| 选中态 | 从「下缘横条」换回「**左缘竖条**」 | 竖排态下竖条的「所属行」读得出来；横排时它会指向相邻 tab —— 这正是当年改横条的原因，排布翻了，结论也翻 |
+| 禅定模式 | 不显示 | `draw_zen` 走**另一套 panel 组合**（压根不加左栏），天然满足；且禅定已有 #57 左缘悬停导航，两者并存会抢 hover 区 |
+| 旧函数 | `view_nav` / `top_actions*` / `paint_nav_tab` 保留打 `#[allow(dead_code)]` | 同 `NAV_ROW_H` 的 `git bisect` 纪律：删了旧 commit 无法复现 |
+
+#### 5.5.1 一条踩出来的 egui 事实：`allocate_rect` 不吃游标
+
+rail 用逐枚 `allocate_rect` 摆**绝对**矩形，这些方法**不推进 `Ui` 的游标**
+（不像流式布局的 `horizontal`）。故不能指望 body 的 `ScrollArea` 「顺势」
+排在 rail 之后 —— 实测它会从第 11 枚按钮下方起排（body.top = 351px）。
+正解是把 body 显式下到一个 `max_rect` 已截好的子 Ui：
+
+```rust
+let mut body = panel.new_child(UiBuilder::new().max_rect(body_rect));
+ScrollArea::vertical().show(&mut body, |ui| …);
+```
+
+与 ① 标题栏那条（子 Ui 必须限 `max_rect`，否则读到 900×600 根矩形）是同一
+类坑的两个方向。
+
+#### 5.5.2 两条测试必须从退役函数迁到 rail（否则是假绿）
+
+改完第一遍全量 893 绿，但 `clicking_every_top_action_sends_its_command`、
+`hovering_top_action_shows_shortcut_tooltip` 这两条测的仍是 **`#[allow(dead_code)]`
+保下来的 `top_actions_with_probe`** —— 函数在、测试绿，可生产路径已不再调它。
+**「测退役函数」比「没测试」更危险**：它给出虚假的安全感。两条已改写为
+`clicking_every_rail_action_sends_its_command` / `hovering_rail_action_shows_
+shortcut_tooltip`，直驱 `draw_rail`。
+
+#### 5.5.3 红绿验证抓到一个失效断言
+
+`rail_and_body_split_the_sidebar_left_to_right` 初版把 rail 宽度上界写成
+`≈ RAIL_W`。按 §2.1 的纪律这是**自我满足**的 —— 实测把 `RAIL_W` 改成 96
+模拟回退，断言照样绿（绘制与断言一起变宽）。改为硬编码 `56.0` 后当场红。
+
+| 验证 | 回退方式 | 结果 |
+|---|---|---|
+| body 与 rail 并排 | body 矩形起点从 `max_rect().top()` 改成 `strip.bottom()` | ✅ 红（差 600px） |
+| rail 宽度上限 | `RAIL_W` 48 → 96 | 初版**绿**（失效）→ 改硬编码 56 后 ✅ 红 |
+
+> **这条印证了 §2.1 不是一次性的提醒**：同一个人在同一份文档周期内，
+> 换一个场景照样会写出自我满足的断言。结论应变成肌肉记忆 —— 凡是
+> 「不超过某量」的上界，先问一句「它是不是也从同一个 token 算出来的」。
+
+#### 5.5.4 取证纪律（同一天第二次栽）
+
+前一次是**裁剪坐标按根屏宽算**（1920 宽 vs 逻辑 900）；这次是
+`--name "LaterMD"` 命中了 WorkBuddy 自己的窗口。两次同源：**先入为主地
+假定了「图上看到的就是被测实例」**。
+
+有效做法（本次采用）：`pgrep -x latermd` 拿 PID → `xdotool search --pid`
+反查窗口 → `getwindowgeometry` 确认 → **再**截图；读图之外补一段像素扫描
+（`convert … txt:-` 找色带边界）作为可复算的旁证。本次实测 rail 带宽
+**恰 48px**（x 8→56），纵向自 y=96 起。
+
 ---
 
 ## 6. 待排期
