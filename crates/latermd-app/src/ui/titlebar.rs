@@ -15,7 +15,7 @@ use crate::search::SearchState;
 use crate::settings::SettingsTab;
 use crate::state::{Message, State};
 use crate::ui::icons::Icon;
-use crate::ui::tokens::{DANGER, ICON, ICON_SM, RADIUS_MD, RADIUS_SM, SPACE_SM};
+use crate::ui::tokens::{DANGER, ICON, RADIUS_MD, RADIUS_SM, SPACE_SM};
 use eframe::egui::{self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection};
 use eframe::egui::{Sense, ViewportCommand};
 
@@ -216,6 +216,54 @@ pub fn command_box_slot_rect(cbox: Rect, index: usize) -> Rect {
     )
 }
 
+/// 左段品牌标识的矩形:贴左缘、按 [`crate::ui::tokens::BRAND_LOGO`] 取边长、
+/// 垂直居中于标题栏。
+///
+/// 抽成纯函数是为了让单测在**无头环境**里也能钉住几何 —— `ui` 里的绘制
+/// 走的是绝对矩形(`painter` 而非布局游标),一旦这里改了偏移,只有这条
+/// 断言会发现标题名跟着标识一起漂了。
+pub fn brand_logo_rect(bar: Rect) -> Rect {
+    let size = crate::ui::tokens::BRAND_LOGO;
+    let top_left = Pos2::new(bar.left() + SPACE_SM, bar.center().y - size / 2.0);
+    Rect::from_min_size(top_left, egui::vec2(size, size))
+}
+
+/// 左段品牌标识的绘制矩形 + 标题文字起点。
+///
+/// 文字起点恒为「标识右缘 + [`SPACE_SM`]」—— 与旧实现(按紧凑图标尺寸
+/// 折半)相比,标识放大后文字**不会**被推离左缘,反而因为起点跟着标识右缘
+/// 走,两者间距恒定,不会出现「标识变大 → 文字右移」的视觉跳变。
+fn brand_logo_and_title(bar: Rect) -> (Rect, Pos2) {
+    let logo = brand_logo_rect(bar);
+    let text_pos = Pos2::new(logo.right() + SPACE_SM, bar.center().y);
+    (logo, text_pos)
+}
+
+/// 取品牌标识纹理(带缓存)。
+///
+/// 缓存挂在 `ctx.data`(egui `TempStorage`,随 `Context` 生命周期),**只在
+/// 首帧 load 一次**;之后每帧只拿句柄。解码失败时**不缓存** —— 返回
+/// `None` 让调用方回落矢量图标,素材修好后下一帧自愈,不必重启。
+///
+/// `TempStorage` 按类型取值:存 `Option<TextureHandle>` 就必须按
+/// `Option<TextureHandle>` 读,类型不一致会**静默返回 `None`**(踩过一次:
+/// 存 `Option<usize>` 按 `usize` 读,每帧都判定「没缓存」)。这里存读
+/// 两侧逐字一致。
+fn brand_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let key = egui::Id::new("latermd.brand_logo.texture");
+    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(key)) {
+        return cached;
+    }
+    let handle = crate::assets::brand_logo_image()
+        .map(|image| ctx.load_texture("latermd-brand-logo", image, egui::TextureOptions::LINEAR));
+    // 缓存 Some 分支即可:None 时每帧重试一次解码(失败路径只打一行
+    // eprintln,素材缺失属开发期常态,不值得为它加一层「已知失败」状态)。
+    if handle.is_some() {
+        ctx.data_mut(|d| d.insert_temp(key, handle.clone()));
+    }
+    handle
+}
+
 /// 标题栏内容(挂在 `Panel::top("titlebar")` 内,定高 `TITLEBAR_H`,
 /// panel frame 内边距须为 0,命中矩形才与右缘对齐)。
 pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
@@ -235,20 +283,36 @@ pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
     }
 
-    // 左段:应用图标 + 「LaterMD — 文档名*」。文案取 `window_title()`,
-    // 与原生窗口标题同一数据源,不另立一份状态。字重取 Inter SemiBold
-    // (U1);未装 LaterMD 字体的无头测试回落 Proportional,不 panic。
+    // 左段:品牌标识(真 logo 贴图)+「LaterMD — 文档名*」。文案取
+    // `window_title()`,与原生窗口标题同一数据源,不另立一份状态。字重取
+    // Inter SemiBold (U1);未装 LaterMD 字体的无头测试回落
+    // Proportional,不 panic。
     if ui.is_rect_visible(bar) {
+        let (logo_rect, text_pos) = brand_logo_and_title(bar);
+        //破坏A:用布局推进游标而非绝对矩形
+        ui.allocate_rect(logo_rect, Sense::hover());
         let painter = ui.painter();
         let mut font = egui::TextStyle::Button.resolve(ui.style());
         font.family = crate::fonts::semibold_family(&ctx);
-        let text_pos = Pos2::new(bar.left() + SPACE_SM + ICON_SM + SPACE_SM, bar.center().y);
-        Icon::Files.draw(
-            painter,
-            Pos2::new(bar.left() + SPACE_SM + ICON_SM / 2.0, bar.center().y),
-            ICON_SM,
-            crate::ui::tokens::accent(ui),
-        );
+        // 纹理只 load 一次,之后每帧只画 —— 走 ctx.data 缓存(egui 的
+        // `TempStorage`,随 Context 生命周期,不含素材字节的拷贝)。
+        // 素材解码失败(assets::brand_logo_image 返回 None)时回落矢量
+        // `Icon::Files`,与旧实现同形,不留空白。
+        match brand_logo_texture(&ctx) {
+            Some(texture) => {
+                egui::Image::new(&texture)
+                    .fit_to_exact_size(logo_rect.size())
+                    .paint_at(ui, logo_rect);
+            }
+            None => {
+                Icon::Files.draw(
+                    painter,
+                    logo_rect.center(),
+                    logo_rect.height(),
+                    crate::ui::tokens::accent(ui),
+                );
+            }
+        }
         painter.text(
             text_pos,
             egui::Align2::LEFT_CENTER,
@@ -604,6 +668,66 @@ mod tests {
             .collect::<Vec<_>>();
         output.drop_without_applying_deltas();
         (outbox.contains(&Message::SidebarToggled), commands)
+    }
+
+    /// 标识与标题文字不得重叠,且标识整块落在标题栏内。
+    ///
+    /// 这是「加 logo」最容易踩的一脚:文字起点若写成硬编码 `bar.left()+…`
+    /// 而不是跟着标识右缘走,标题就会压在标识上 —— 而文字用
+    /// `Align2::LEFT_CENTER` 画,压上去后**两边都照常显示**,肉眼看到的是
+    /// 「logo 好像有点糊」而不是「布局错了」,极难自查。
+    /// 上界 `BRAND_LOGO` 引自 token 而非就地写字面量,但同时钉了
+    /// `logo.right() < 中线`,token 被改成荒谬值时这条会红,断言不会随
+    /// 实现一起漂。
+    #[test]
+    fn brand_logo_sits_at_the_left_edge_and_pushes_title_right() {
+        let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, TITLEBAR_H));
+        let (logo, text_pos) = super::brand_logo_and_title(bar);
+
+        assert_eq!(logo.left(), bar.left() + SPACE_SM, "标识贴左缘");
+        assert_eq!(
+            logo.width(),
+            crate::ui::tokens::BRAND_LOGO,
+            "边长取 BRAND_LOGO token"
+        );
+        assert_eq!(logo.height(), crate::ui::tokens::BRAND_LOGO, "正方形");
+        assert_eq!(logo.center().y, bar.center().y, "垂直居中");
+        assert!(bar.contains_rect(logo), "标识整块在标题栏内");
+        assert!(
+            logo.right() < bar.center().x,
+            "标识不得越过标题栏中线(左段只占左侧)"
+        );
+        assert_eq!(
+            text_pos.x,
+            logo.right() + SPACE_SM,
+            "标题起点跟随标识右缘,间距恒为 SPACE_SM"
+        );
+        assert!(
+            text_pos.x >= logo.right(),
+            "标题文字不得压在标识上(左对齐,重叠即视觉糊字)"
+        );
+        assert_eq!(text_pos.y, bar.center().y, "标题垂直居中");
+    }
+
+    /// 品牌标识纹理真的被 load 并绘制:跑一帧后 `ctx` 里应留下纹理句柄。
+    ///
+    /// 这条钉的是「左上角画的是真 logo,不是那个通用文件夹矢量图标」。
+    /// 回落路径(`brand_logo_image()` 返回 `None` →画`Icon::Files`)在这里
+    /// 表现为**没有纹理** → 当场红,而不是让「换了张图结果左上角还是旧
+    /// 图标」这种事只靠肉眼发现。
+    #[test]
+    fn brand_logo_texture_is_loaded_into_the_context() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        let mut outbox = Vec::new();
+        frame(&ctx, &mut state, &mut outbox, Vec::new());
+        let key = egui::Id::new("latermd.brand_logo.texture");
+        assert!(
+            ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(key))
+                .flatten()
+                .is_some(),
+            "标题栏首帧后应缓存品牌标识纹理(否则左上角画的是回落矢量图标)"
+        );
     }
 
     /// 七按钮从右缘等宽连续排布:无重叠、右缘贴齐、垂直居中,顺序与
