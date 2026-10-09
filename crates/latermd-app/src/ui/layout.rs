@@ -933,6 +933,16 @@ fn poll_capture(ctx: &egui::Context, state: &mut crate::state::State) {
     }
 }
 
+/// 查找卡/跳转卡共用的浮层 frame(#72 M1,单一真源):底色随**当前生效
+/// 主题**走 `Frame::popup(&ctx.global_style())` —— 0.36 里这就是
+/// `Window` 渲染自取的那套活动 style,由 `ThemeSettings::apply` 按解析
+/// 后的明暗切换,浅色主题下卡片即浅色。此前两处写死
+/// `style_of(Theme::Dark)`(浅色下黑窗,坤哥 2026-10-08 报),两卡从此
+/// 只在这里取 frame,不再各写一份。
+fn overlay_popup_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::popup(&ctx.global_style())
+}
+
 /// 查找条的源码区浮层:固定在源码宿主右上角,不参加正文布局。用 Window
 /// 而不是普通 horizontal,并关闭 title bar/resize/collapse,避免它变成可拖
 /// 对话框;id 稳定,位置每帧由源码 rect 重算,侧栏/窗口拖宽后不会漂走。
@@ -955,7 +965,7 @@ fn draw_find_overlay(
         .pivot(egui::Align2::RIGHT_TOP)
         .order(egui::Order::Foreground)
         .constrain_to(source_rect.shrink(margin))
-        .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)))
+        .frame(overlay_popup_frame(ctx))
         .show(ctx, |ui| find_bar_contents(ui, find, outbox));
 }
 
@@ -983,6 +993,48 @@ const FIND_BAR_EVENT_FILTER: egui::EventFilter = egui::EventFilter {
     escape: true,
 };
 
+/// 查找/替换两行行首标签的公共列宽(#72 M1):同一 Body 字体下取两词的
+/// 最大自然宽,行内标签([`bar_label`])补齐到这一宽。两行输入框列对齐
+/// 从此是结构保证 —— 改前对齐只是「查找/替换恰好都是两个汉字」的巧合
+/// (2026-10-09 无头实测 delta=0),字体偏好/回退链一变就散。
+fn bar_label_column_width(ui: &mut egui::Ui) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let width = |ui: &mut egui::Ui, text: &str| {
+        ui.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), font.clone(), color)
+                .rect
+                .width()
+        })
+    };
+    width(ui, "查找").max(width(ui, "替换"))
+}
+
+/// 行首标签:自然宽渲染后补位到公共列宽(见 [`bar_label_column_width`]),
+/// 右缘即两行共同的输入框列起点。
+fn bar_label(ui: &mut egui::Ui, text: &str, column_w: f32) {
+    let response = ui.label(text);
+    ui.add_space((column_w - response.rect.width()).max(0.0));
+}
+
+/// 命中计数着色(#72 M1):有结果弱色(不打扰),无结果警示色
+/// (`tokens::WARN`,与设置页告警同色)——「查了但一个都没有」值得一眼
+/// 看见。文字语义(无结果/N/M)与改前一致,只动颜色。
+fn hit_count_label(ui: &mut egui::Ui, total: usize, pos: usize) {
+    let text = if total == 0 {
+        "无结果".to_owned()
+    } else {
+        format!("{pos}/{total}")
+    };
+    let color = if total == 0 {
+        crate::ui::tokens::WARN
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.colored_label(color, text);
+}
+
 /// 查找卡内容与状态无关,可在 Window/无头测试中复用。替换行
 /// (`replace_open`,Ctrl+H)画在查找行之下:替换词输入只更新按钮可用性,
 /// 不自动改写文档。
@@ -993,8 +1045,9 @@ fn find_bar_contents(
 ) {
     let total = find.hits.len();
     let pos = find.hit.map(|h| h + 1).unwrap_or(0);
+    let label_col = bar_label_column_width(ui);
     ui.horizontal(|ui| {
-        ui.label("查找");
+        bar_label(ui, "查找", label_col);
         let mut query_buf = find.query.clone();
         let response = ui.add(
             egui::TextEdit::singleline(&mut query_buf)
@@ -1050,11 +1103,7 @@ fn find_bar_contents(
         if ui.button("↓").clicked() {
             outbox.push(Message::FindNext { backwards: false });
         }
-        ui.weak(if total == 0 {
-            "无结果".to_owned()
-        } else {
-            format!("{pos}/{total}")
-        });
+        hit_count_label(ui, total, pos);
         if crate::ui::icons::icon_button(ui, crate::ui::icons::Icon::Close, "关闭查找 (Esc)")
             .clicked()
         {
@@ -1075,8 +1124,9 @@ fn replace_row(
     pos: usize,
     outbox: &mut Vec<Message>,
 ) -> (egui::Response, egui::Response) {
+    let label_col = bar_label_column_width(ui);
     ui.horizontal(|ui| {
-        ui.label("替换");
+        bar_label(ui, "替换", label_col);
         let response = ui.add(
             egui::TextEdit::singleline(&mut find.replacement)
                 .id(replace_input_id())
@@ -1094,11 +1144,7 @@ fn replace_row(
         if all.clicked() {
             outbox.push(Message::ReplaceAllInDoc);
         }
-        ui.weak(if total == 0 {
-            "无结果".to_owned()
-        } else {
-            format!("{pos}/{total}")
-        });
+        hit_count_label(ui, total, pos);
         // Esc 在替换框上同样关整条(与查找框口径一致)
         if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             outbox.push(Message::FindBarToggled(false));
@@ -1131,7 +1177,7 @@ fn draw_goto_overlay(
         .pivot(egui::Align2::RIGHT_TOP)
         .order(egui::Order::Foreground)
         .constrain_to(source_rect.shrink(margin))
-        .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)))
+        .frame(overlay_popup_frame(ctx))
         .show(ctx, |ui| goto_bar_contents(ui, goto, outbox));
 }
 
@@ -1954,6 +2000,192 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         assert!(outbox.is_empty(), "禁用态不产生消息");
+    }
+
+    /// #72 M1:替换行输入框与查找行输入框左缘对齐(两行行首标签共用
+    /// 固定列宽)。取证基线:2026-10-09 改前无头实测 delta 恰为 0(两词
+    /// 都是两个汉字、恰好等宽的巧合),本断言把对齐从巧合钉成结构
+    /// 保证 —— 标签字面或字体偏好再变也不许散。
+    #[test]
+    fn find_and_replace_input_columns_align() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("label-align");
+        app.state.apply(Message::FindBarToggled(true));
+        app.state.apply(Message::ReplaceBarToggled(true));
+        for step in 0..6 {
+            find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let find_left = ctx.read_response(find_input_id()).unwrap().rect.left();
+        let replace_left = ctx.read_response(replace_input_id()).unwrap().rect.left();
+        assert!(
+            (find_left - replace_left).abs() < 0.5,
+            "查找/替换两行输入框列必须对齐: find={find_left} replace={replace_left}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #72 M1:命中计数着色 —— 无命中画警示色(`tokens::WARN`),有命中
+    /// 画弱色。取证走曲面细分后的顶点色:隔离渲染 `find_bar_contents`
+    /// (不掺全应用其它文案),无命中帧必须出现 WARN 色顶点、有命中帧
+    /// 必须一个都没有,且弱色文字在场。
+    #[test]
+    fn hit_count_warns_without_hits_and_weakens_with_hits() {
+        let ctx = egui::Context::default();
+        let mut find = crate::state::FindBarState {
+            open: true,
+            replace_open: true,
+            query: "needle".to_owned(),
+            hits: vec![std::ops::Range { start: 0, end: 6 }],
+            hit: Some(0),
+            ..Default::default()
+        };
+        let weak = ctx.global_style().visuals.weak_text_color();
+        assert_ne!(weak, crate::ui::tokens::WARN, "取证前提:两色可分");
+        let frame_vertex_colors = |find: &mut crate::state::FindBarState| -> Vec<egui::Color32> {
+            let mut colors = Vec::new();
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(RawInput::default(), |ui| {
+                    let mut outbox = Vec::new();
+                    find_bar_contents(ui, find, &mut outbox);
+                });
+                let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), 1.0);
+                for clipped in &primitives {
+                    let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+                        continue;
+                    };
+                    colors.extend(mesh.vertices.iter().map(|v| v.color));
+                }
+                output.drop_without_applying_deltas();
+            }
+            colors
+        };
+        // 有命中:只弱色计数,无警示
+        let with_hits = frame_vertex_colors(&mut find);
+        assert!(with_hits.contains(&weak), "有命中时计数应为弱色 {weak:?}");
+        assert!(
+            !with_hits.contains(&crate::ui::tokens::WARN),
+            "有命中时不得出现警示色"
+        );
+        // 无命中:警示色在场(替换行计数同款,出现即满足)
+        find.hits.clear();
+        find.hit = None;
+        let without_hits = frame_vertex_colors(&mut find);
+        assert!(
+            without_hits.contains(&crate::ui::tokens::WARN),
+            "无命中时计数应为警示色 {:?}",
+            crate::ui::tokens::WARN
+        );
+    }
+
+    /// 点是否落在三角形内(含边界);零面积三角形判外。行列式手写
+    /// (Vec2 无 cross)。与 icons.rs 测试同款手法。
+    fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+        let det = |u: egui::Vec2, v: egui::Vec2| u.x * v.y - u.y * v.x;
+        if det(b - a, c - a).abs() < 1e-9 {
+            return false;
+        }
+        let d = |u: Pos2, v: Pos2| det(v - u, p - u);
+        let (d1, d2, d3) = (d(a, b), d(b, c), d(c, a));
+        (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0) || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0)
+    }
+
+    /// 无头像素取样:一帧 shapes 曲面细分(羽化关掉,三角形即硬边),
+    /// 取**最后**覆盖采样点的颜色 —— shapes 按绘制序排列,后者盖前者,
+    /// 卡片内框底色之上不能再有别的填充盖住探针。
+    fn topmost_covered_color(
+        primitives: &[egui::ClippedPrimitive],
+        p: Pos2,
+    ) -> Option<egui::Color32> {
+        let mut color = None;
+        for clipped in primitives {
+            if !clipped.clip_rect.contains(p) {
+                continue;
+            }
+            let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+                continue;
+            };
+            for tri in mesh.indices.as_chunks::<3>().0 {
+                let v = |i: u32| mesh.vertices[i as usize].pos;
+                let (a, b, c) = (v(tri[0]), v(tri[1]), v(tri[2]));
+                if point_in_tri(p, a, b, c) {
+                    color = Some(mesh.vertices[tri[0] as usize].color);
+                }
+            }
+        }
+        color
+    }
+
+    /// #72 M1 像素验收:查找卡与跳转卡的浮层底色必须等于**当前生效主题**
+    /// 的 popup 底色(`Frame::popup(&ctx.style())`,经 shell 投影后即
+    /// `shell_tokens(dark).content`)。「写死 `Theme::Dark`」的回归(浅色
+    /// 主题下黑窗,坤哥 2026-10-08 报)在本测试直接红:浅色下探针取到的
+    /// 不是 `#FFFFFF` 就是深色 token。探针取卡片左内边距带中点
+    /// (`menu_margin` 6px 的环带,不与任何控件相交),8 帧 × 0.1s 跑过
+    /// 浮层淡入(animation_time 出厂 0.2s)。
+    #[test]
+    fn find_and_goto_cards_paint_effective_theme_popup_fill() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let light_fill = crate::theme::shell_tokens(false).content;
+        let dark_fill = crate::theme::shell_tokens(true).content;
+        assert_ne!(
+            light_fill, dark_fill,
+            "两主题 popup 底色必须可分,断言才有分辨力"
+        );
+
+        for (mode, expected_fill) in [
+            (crate::theme::ThemeMode::Light, light_fill),
+            (crate::theme::ThemeMode::Dark, dark_fill),
+        ] {
+            let ctx = egui::Context::default();
+            // 关 AA 羽化:边三角形的透明渐变会让采样读到半透明假色
+            ctx.options_mut(|o| o.tessellation_options.feathering = false);
+            let (mut app, dir) = find_test_app(&format!("popup-fill-{mode:?}"));
+            app.state.apply(Message::ThemeChanged(mode));
+
+            for (overlay_id, is_find) in [
+                (egui::Id::new("editor-find-overlay"), true),
+                (egui::Id::new("editor-goto-overlay"), false),
+            ] {
+                let (open, close) = if is_find {
+                    (
+                        Message::FindBarToggled(true),
+                        Message::FindBarToggled(false),
+                    )
+                } else {
+                    (
+                        Message::GotoBarToggled(true),
+                        Message::GotoBarToggled(false),
+                    )
+                };
+                app.state.apply(open);
+                let mut shapes = Vec::new();
+                for step in 0..8 {
+                    shapes =
+                        find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+                }
+                // 前置:style 的 popup 底色 = 该主题 shell content token
+                assert_eq!(
+                    ctx.global_style().visuals.window_fill(),
+                    expected_fill,
+                    "{mode:?} 的 style popup 底色应等于 shell content token"
+                );
+                let rect = ctx
+                    .memory(|memory| memory.area_rect(overlay_id))
+                    .unwrap_or_else(|| panic!("{mode:?} 浮卡 {overlay_id:?} 未绘制"));
+                let probe = rect.left_top() + egui::vec2(3.0, rect.height() / 2.0);
+                let primitives = ctx.tessellate(shapes, 1.0);
+                assert_eq!(
+                    topmost_covered_color(&primitives, probe),
+                    Some(expected_fill),
+                    "{mode:?} 浮卡左内边距带 {probe:?} 应是 popup 底色 {expected_fill:?} \
+                     (写死 Theme::Dark 的回归在此显形)"
+                );
+                // 换卡前先收起(两卡互斥,显式走同一条归约)
+                app.state.apply(close);
+            }
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     /// 替换键整链路(#17 M1):键盘经命令层打开查找条 + 替换行;替换词
