@@ -36,6 +36,9 @@ impl LaterMdApp {
         // 模型列表拉取收流(#58 M2):同一手法,结果只在归约落地(填下拉
         // 候选或显示错误行),后台线程不碰 UI 状态
         outbox.extend(state.poll_models());
+        // 检查更新收流(#71 M2):同一手法,结果只在归约落地(关于窗的
+        // 最新/有更新/无法判断/失败),后台线程不碰 UI 状态
+        outbox.extend(state.poll_about());
         // 剪贴板图片读取收流:同上(D 段,arboard 的阻塞 IO 在后台线程)
         outbox.extend(state.poll_clipboard());
         // 图片拖入落盘(D 段):dropped_files 由 egui-winit 汇进 raw input,
@@ -239,6 +242,11 @@ impl LaterMdApp {
         // 模型列表拉取的重绘驱动同理(#58 M2):结果到达要在下一帧收流
         // 归约;收尾清接收端后自然停。
         if state.settings.models.is_fetching() {
+            ctx.request_repaint();
+        }
+        // 检查更新的重绘驱动同理(#71 M2):结果到达要在下一帧收流归约;
+        // 收尾清接收端后自然停。
+        if state.about.update.is_checking() {
             ctx.request_repaint();
         }
         // 剪贴板图片读取的重绘驱动同理(D 段):结果到达要在下一帧收流
@@ -735,9 +743,10 @@ impl LaterMdApp {
             let _window = crate::ui::quick_open::panel(ui, &mut self.state.quick_open, outbox);
         }
 
-        // 「关于 LaterMD」(#71 M1):帮助菜单打开,内容只读;蒙层点击与
+        // 「关于 LaterMD」(#71):帮助菜单打开,内容只读;蒙层点击与
         // 窗 X 的关闭请求在此翻成消息(Esc 的关闭在 `reduce` 消费)。
-        if self.state.about.open && crate::ui::about::dialog(ui) {
+        // M2 起「检查更新」按钮点击也经 outbox 发消息(不直接起线程)。
+        if self.state.about.open && crate::ui::about::dialog(ui, &self.state.about, outbox) {
             outbox.push(Message::AboutClosed);
         }
 

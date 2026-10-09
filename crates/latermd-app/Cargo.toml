@@ -37,6 +37,10 @@ egui_markdown = { path = "../../vendor/egui_markdown", features = ["images"] }
 # (eframe → egui-winit/clipboard → arboard/image-data),此处把传递依赖
 # 提升为直接依赖,零新增编译面;登记见 ADR-004
 arboard = "3.6"
+# 检查更新(#71 M2):关于窗 GET GitHub releases/latest。3.4.2(rustls)
+# 已在依赖树(latermd-ai/latermd-bed 直依赖,ehttp 亦同版本),此处照
+# arboard 先例把传递依赖提升为直接依赖,零新增编译面
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 # 主题:开启 vendor 子 crate 自带的 serde feature(MarkdownStyle 派生,ThemeSettings 持久化)
 egui_markdown_style = { path = "../../vendor/egui_markdown/egui_markdown_style", features = ["serde"] }
 # 主题设置(ThemeSettings/ThemeMode)的序列化 derive
