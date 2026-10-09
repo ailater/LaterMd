@@ -177,13 +177,30 @@ pub const DEFAULT_STATUS_LIMIT: usize = 500;
 /// 其余 API 只认仓库根,先经本函数换算。裸仓库(只有 `.git` 内容、无
 /// 工作区)返回 Err——本 crate 的全部操作都针对工作区文件。
 pub fn discover(start: &Path) -> Result<PathBuf, String> {
-    Repository::discover(start)
+    let root = Repository::discover(start)
         .map_err(|error| format!("当前目录不是 Git 仓库: {error}"))
         .and_then(|repo| {
             repo.workdir()
                 .map(Path::to_path_buf)
                 .ok_or_else(|| "当前是裸仓库,没有工作区文件".to_owned())
-        })
+        })?;
+    // libgit2 resolves symlinks (e.g. macOS /var -> /private/var), while the
+    // file tree and open tabs retain the path selected by the user. Preserve
+    // that spelling so status badges and checkout notifications match them.
+    let absolute = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("无法读取当前目录: {error}"))?
+            .join(start)
+    };
+    let physical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    for ancestor in absolute.ancestors() {
+        if ancestor.canonicalize().ok().as_deref() == Some(physical_root.as_path()) {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+    Ok(root)
 }
 
 /// 读取仓库全部改动(含未跟踪文件),按路径排序,至多 `limit` 条,超出
@@ -222,11 +239,12 @@ pub fn status(root: &Path, limit: usize) -> Result<StatusSnapshot, String> {
 /// 提交间顺序不稳定)。
 pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitInfo>, String> {
     let repo = open_repo(root)?;
-    if repo
-        .is_empty()
-        .map_err(|error| format!("检查仓库状态失败: {error}"))?
-    {
-        return Ok(Vec::new());
+    // `is_empty` may report false for an unborn non-master branch. Inspect
+    // HEAD directly; revwalk can otherwise turn UnbornBranch into NotFound.
+    match repo.head() {
+        Ok(_) => {}
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => return Ok(Vec::new()),
+        Err(error) => return Err(format!("读取提交历史失败: {error}")),
     }
     let mut revwalk = repo
         .revwalk()
@@ -376,7 +394,13 @@ fn head_tree(repo: &Repository) -> Result<git2::Tree<'_>, String> {
     }
     repo.head()
         .and_then(|head| head.peel_to_tree())
-        .map_err(|error| format!("读取 HEAD 失败: {error}"))
+        .map_err(|error| {
+            if error.code() == git2::ErrorCode::UnbornBranch {
+                "仓库还没有任何提交,没有 HEAD 可对比".to_owned()
+            } else {
+                format!("读取 HEAD 失败: {error}")
+            }
+        })
 }
 
 /// 按 pathspec 算 HEAD tree 对 workdir(含 index)的 diff;diff_file 与
@@ -544,7 +568,10 @@ mod tests {
             std::env::temp_dir().join(format!("latermd-gitcrate-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        run_git(&dir, &["init", "-q"]);
+        // Pin the initial branch: libgit2's empty-repo detection differs for
+        // an unborn main branch, so developer-global Git settings must not
+        // decide whether the empty-history regression is exercised.
+        run_git(&dir, &["init", "-q", "--initial-branch=main"]);
         dir
     }
 
@@ -567,6 +594,30 @@ mod tests {
     fn commit_all(dir: &Path, message: &str) {
         run_git(dir, &["add", "."]);
         run_git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    /// A symlinked workspace must keep the same path spelling as the file tree.
+    #[test]
+    #[cfg(unix)]
+    fn discover_preserves_symlinked_workspace_paths() {
+        let dir = temp_repo("discover-alias");
+        let alias = dir.with_extension("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        std::fs::create_dir(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/a.md"), "before\n").unwrap();
+        commit_all(&dir, "init");
+        std::fs::write(alias.join("docs/a.md"), "after\n").unwrap();
+
+        let root = discover(&alias.join("docs")).unwrap();
+        assert_eq!(root, alias);
+        let changes = status(&root, DEFAULT_STATUS_LIMIT).unwrap();
+        assert_eq!(changes.entries.len(), 1);
+        assert_eq!(root.join(&changes.entries[0].path), alias.join("docs/a.md"));
+        assert_eq!(changes.entries[0].code, StatusKind::Modified);
+
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 四种日常状态各自成码,结果按路径排序。
