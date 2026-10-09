@@ -278,6 +278,21 @@ pub fn ui(
             ),
         });
 
+    // 面板 Ui 必须撑满分配宽度,否则「拖边距调宽」整条链路是死的:
+    // egui 0.36 的 Panel 在收尾时把**内容的 Frame 响应矩形**(而非分配的
+    // outer_rect)回写进 PanelState(panel.rs 的 `shifted_outer_rect =
+    // inner_response.response.rect`)。内容若不把自身 min_rect 撑到分配宽,
+    // 回写的就是内容宽 —— 拖拽帧分到的宽度在松手帧被内容宽吞掉,面板
+    // 永远收敛在 `size_range` 下限(2026-10-09 实测:插桩 egui 逐帧 trace,
+    // outer_size=240 进、storing_rect=180 出;坤哥真机「侧栏宽度锁死」)。
+    // rail 改版(eb80618)把 body 挪进 `new_child` 子 Ui 后,子 Ui 的分配
+    // 不外溢回父 Ui 的 min_rect,内容宽就此塌到 rail(40px)+ 下限填充
+    // —— 拖不动正是从那以后开始的。此行是「侧栏可拖宽」的成立条件:
+    // 显式把面板 Ui 扩到分配矩形,Frame 响应矩形才与 outer_rect 相等,
+    // default_size 与拖拽结果才能进 PanelState。拖拽回归测试见
+    // `nav_resizes_by_drag_in_full_ui`。
+    panel.expand_to_include_rect(panel.max_rect());
+
     SidebarBands {
         // 顶段已随 2026-10-08 改版消失(退化为零高矩形),保留字段只为
         // 不破坏既有 `SidebarBands` 的形状。
