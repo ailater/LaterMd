@@ -26,51 +26,72 @@ pub struct CjkFontCandidate {
     /// 等宽字形 face 序号(PDF 代码块;与比例同 face 的候选填相同值,
     /// 发现时不重复嵌入,见 [`discover_cjk_fonts`])。
     pub monospace_index: u32,
+    /// 同族**粗体**变体的绝对路径;`None` = 该平台/字体无粗体文件可配。
+    /// 界面侧(`fonts.rs`)用它把 CJK 粗体 face 插进 `bold` 族链 —— 否则
+    /// 中文加粗落回 Regular face、视觉零变化(2026-10-09 坤哥报告
+    /// 「Live 模式加粗 ** 不渲染」)。PDF 侧暂不消费(PDF 的粗体嵌入
+    /// 是独立工作,缺它不影响现有导出)。
+    ///
+    /// face 序号**复用 `proportional_index`**:两文件是同族平行集合
+    /// (NotoSansCJK-Bold.ttc 实测 face 2 = SC,与 Regular 同构;msyhbd
+    /// 与 msyh 同构)。非平行结构会造成粗体错 face,宁可 `None`。
+    pub bold_path: Option<&'static str>,
 }
 
 /// 系统 CJK 候选表,按序探测:Noto Sans CJK → 文泉驿微米黑 → 微软雅黑/
 /// 黑体 → PingFang/Hiragino(Windows/macOS 路径在对应平台前缀外不可达)。
 pub const CJK_SYSTEM_CANDIDATES: &[CjkFontCandidate] = &[
-    // Linux(Deepin / 常见发行版的 noto 包):同一 .ttc 内含比例与等宽两套 SC 字型
+    // Linux(Deepin / 常见发行版的 noto 包):同一 .ttc 内含比例与等宽两套 SC 字型;
+    // Bold.ttc 与 Regular.ttc face 结构平行(fc-query 实测 SC 同为 face 2)
     CjkFontCandidate {
         path: "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         proportional_index: 2,
         monospace_index: 7,
+        bold_path: Some("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
     },
-    // Linux 兜底:文泉驿微米黑,单字型集合,两个族共用 index 0
+    // Linux 兜底:文泉驿微米黑,单字型集合,无粗体变体
     CjkFontCandidate {
         path: "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         proportional_index: 0,
         monospace_index: 0,
+        bold_path: None,
     },
     // Windows 11:msyh.ttc 的 face 0 = 微软雅黑(face 1 为 UI 变体);simhei 单字型;
-    // msyhbd 为粗体集合,仅作最末兜底
+    // msyhbd 为粗体集合(msyh 同构),仅作最末兜底
     CjkFontCandidate {
         path: "C:\\Windows\\Fonts\\msyh.ttc",
         proportional_index: 0,
         monospace_index: 0,
+        bold_path: Some("C:\\Windows\\Fonts\\msyhbd.ttc"),
     },
     CjkFontCandidate {
         path: "C:\\Windows\\Fonts\\simhei.ttf",
         proportional_index: 0,
         monospace_index: 0,
+        bold_path: None,
     },
     CjkFontCandidate {
         path: "C:\\Windows\\Fonts\\msyhbd.ttc",
         proportional_index: 0,
         monospace_index: 0,
+        // 自身已是粗体集合;再指自己是浪费一次 face 查询,保持 None
+        bold_path: None,
     },
     // macOS 14:PingFang 的 index 0 为占位(任一 face 均含 CJK 可消除方块,
-    // SC Regular 确切 index 待真机枚举后修正);Hiragino Sans GB 为简体兜底
+    // SC Regular 确切 index 待真机枚举后修正);Hiragino Sans GB 为简体兜底。
+    // 两者的多字重藏在同文件多 face 里,与 Regular 文件不是平行结构,
+    // 粗体映射待真机枚举后再补(先 None,行为 = 修复前)
     CjkFontCandidate {
         path: "/System/Library/Fonts/PingFang.ttc",
         proportional_index: 0,
         monospace_index: 0,
+        bold_path: None,
     },
     CjkFontCandidate {
         path: "/System/Library/Fonts/Hiragino Sans GB.ttc",
         proportional_index: 0,
         monospace_index: 0,
+        bold_path: None,
     },
 ];
 
@@ -161,11 +182,13 @@ mod tests {
                 path: "/fake/first.ttc",
                 proportional_index: 0,
                 monospace_index: 0,
+                bold_path: None,
             },
             CjkFontCandidate {
                 path: "/fake/second.ttf",
                 proportional_index: 0,
                 monospace_index: 0,
+                bold_path: None,
             },
         ]
     }

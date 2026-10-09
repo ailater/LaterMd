@@ -316,6 +316,11 @@ pub(crate) fn override_vertical_metrics(
 /// CJK 回退在 font_data 里的两个键(比例 / 等宽 face)。
 const CJK_PROPORTIONAL: &str = "latermd-cjk-proportional";
 const CJK_MONOSPACE: &str = "latermd-cjk-monospace";
+/// CJK **粗体** face 的键:同族 Bold 变体(NotoSansCJK-Bold 等),只进
+/// `bold` 族链 —— 中文加粗有真粗字重可命中,而不是落回 Regular face
+/// 视觉零变化(2026-10-09 坤哥:「Live 模式加粗 ** 不渲染」;拉丁侧由
+/// 链头 Inter SemiBold 覆盖,不受影响)。
+const CJK_BOLD: &str = "latermd-cjk-bold";
 
 /// 系统 CJK 候选表(路径 + `.ttc` 的比例/等宽 face 序号,按序取第一个可读
 /// 文件):单一来源在 [`latermd_export::CJK_SYSTEM_CANDIDATES`],PDF 导出
@@ -347,7 +352,13 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         let cjk_metrics =
             parse_vertical_tables(&bytes, prop_idx).map(|tables| tables.vertical_metrics_em());
         let cjk = cjk_metrics.map(|metrics| (&bytes[..], prop_idx, mono_idx, metrics));
-        let defs = build_definitions(cjk);
+        // 粗体变体:同族平行集合,face 序号复用比例 face;文件缺失/不可读
+        // 静默降级(该平台无粗体 = 修复前行为)。
+        let cjk_bold = candidate
+            .bold_path
+            .and_then(|bold| std::fs::read(bold).ok())
+            .map(|bold| (bold, prop_idx));
+        let defs = build_definitions(cjk, cjk_bold.as_ref().map(|(b, i)| (b[..].as_ref(), *i)));
         let editor_mono = defs
             .families
             .contains_key(&FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO)));
@@ -362,7 +373,7 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
             }
         ));
     }
-    ctx.set_fonts(build_definitions(None));
+    ctx.set_fonts(build_definitions(None, None));
     mark_installed(ctx, None, false);
     None
 }
@@ -371,7 +382,10 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
 /// 链顺序单测由此注入假字节(字体解析发生在 set_fonts 之后的首帧,此处
 /// 只排链)。`cjk_metrics` 存在且可解析时,额外注册两个「行 metrics override
 /// 副本」并挂预览专用族(#43 M2,见模块级注释)。
-fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontDefinitions {
+fn build_definitions(
+    cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>,
+    cjk_bold: Option<(&[u8], u32)>,
+) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
     for (name, bytes) in [
         (NAME_REGULAR, INTER_REGULAR),
@@ -397,7 +411,13 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontD
         defs.families
             .insert(FontFamily::Name(Arc::from(name)), chain);
     }
+    // `bold` 族链(无 CJK 段):SemiBold 头 + 出厂尾巴;命中 CJK 时下面
+    // 在头后插 CJK 粗体 face。CJK_BOLD 数据只在 CJK 分支注册,链条目必须
+    // 与之同进退(cjk=None 而 cjk_bold=Some 会留下指向未注册数据的悬空链)。
     let mut bold_chain = vec![FAMILY_SEMIBOLD.to_owned()];
+    if cjk.is_some() && cjk_bold.is_some() {
+        bold_chain.push(CJK_BOLD.to_owned());
+    }
     bold_chain.extend(fallback_tail.iter().cloned());
     defs.families
         .insert(FontFamily::Name(Arc::from(FAMILY_BOLD)), bold_chain);
@@ -436,7 +456,19 @@ fn build_definitions(cjk: Option<(&[u8], u32, u32, VerticalMetricsEm)>) -> FontD
         );
         // `bold` 别名族链头换成 SemiBold 副本:预览标题/加粗的混排基线
         // 同样对齐;该族无 UI 消费者(格式条/标题栏走 semibold_family)。
+        // CJK 粗体 face 紧随链头(先于出厂尾巴与链尾 Regular CJK):
+        // 中文加粗命中真粗字重,拉丁仍由副本覆盖,CJK 缺字落回尾巴。
         let mut bold_chain = vec![PREVIEW_SEMIBOLD.to_owned()];
+        if let Some((bold_bytes, bold_idx)) = cjk_bold {
+            defs.font_data.insert(
+                CJK_BOLD.to_owned(),
+                Arc::new(FontData {
+                    index: bold_idx,
+                    ..FontData::from_owned(bold_bytes.to_vec())
+                }),
+            );
+            bold_chain.push(CJK_BOLD.to_owned());
+        }
         bold_chain.extend(fallback_tail.iter().cloned());
         defs.families
             .insert(FontFamily::Name(Arc::from(FAMILY_BOLD)), bold_chain);
@@ -675,7 +707,7 @@ mod tests {
             descent: -0.288,
             line_gap: 0.0,
         };
-        let defs = build_definitions(Some((&fake, 2, 7, metrics)));
+        let defs = build_definitions(Some((&fake, 2, 7, metrics)), Some((&fake, 2)));
         let chain = |family: &FontFamily| -> &[String] {
             defs.families
                 .get(family)
@@ -736,10 +768,19 @@ mod tests {
 
         // `bold` 别名族(#43 M2 起链头 = override SemiBold 副本):预览标题与
         // 加粗文本经 vendored apply_bold 切到它,链内同样不得有原生 SemiBold。
+        // CJK 粗体 face 紧随链头、先于链尾 Regular CJK(2026-10-09 修复:
+        // 中文加粗此前落 Regular face 视觉零变化):
+        //   头(SemiBold 副本,拉丁) → CJK_BOLD(中文真粗) → 出厂尾巴 → CJK Regular
         let bold = chain(&FontFamily::Name(Arc::from(FAMILY_BOLD)));
         assert_eq!(bold.first().map(String::as_str), Some(PREVIEW_SEMIBOLD));
         assert!(!bold.iter().any(|n| n == FAMILY_SEMIBOLD));
         assert_eq!(bold.last().map(String::as_str), Some(CJK_PROPORTIONAL));
+        assert_eq!(bold.get(1).map(String::as_str), Some(CJK_BOLD));
+        assert!(pos(bold, CJK_BOLD) < pos(bold, CJK_PROPORTIONAL));
+        assert!(
+            defs.font_data.get(CJK_BOLD).is_some_and(|d| d.index == 2),
+            "CJK 粗体 face 序号复用比例 face(平行集合)"
+        );
         assert!(
             defs.font_data
                 .get(PREVIEW_SEMIBOLD)
@@ -763,7 +804,7 @@ mod tests {
     /// `bold` 族链头保持原生 SemiBold —— 行为与修复前的降级完全一致。
     #[test]
     fn inter_registers_even_without_cjk() {
-        let defs = build_definitions(None);
+        let defs = build_definitions(None, None);
         assert_eq!(
             defs.families[&FontFamily::Proportional]
                 .first()
@@ -804,6 +845,38 @@ mod tests {
                 .contains_key(&FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO))),
             "无 CJK 时不应注册编辑器专用等宽族"
         );
+    }
+
+    /// CJK 粗体链位(2026-10-09 修复回归):有粗体变体时,`bold` 族链
+    /// [头=CJK_BOLD=…=链尾 Regular] 次序成立;无粗体变体时链上无
+    /// CJK_BOLD(行为 = 修复前,中文加粗回落 Regular —— 平台无粗体
+    /// 文件时的诚实降级)。两个方向都钉:链序错(粗体在 Regular 后)
+    /// 与「有文件却没挂」都当场红。
+    #[test]
+    fn cjk_bold_sits_after_head_before_regular_fallback() {
+        let fake = [0u8; 16];
+        let metrics = VerticalMetricsEm {
+            ascent: 1.16,
+            descent: -0.288,
+            line_gap: 0.0,
+        };
+        // 有粗体:链 [头=CJK_BOLD=…=链尾 Regular] 次序成立
+        let defs = build_definitions(Some((&fake, 2, 7, metrics)), Some((&fake, 2)));
+        let chain = &defs.families[&FontFamily::Name(Arc::from(FAMILY_BOLD))];
+        let pos = |name: &str| {
+            chain
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("{name} 不在 bold 链里:{chain:?}"))
+        };
+        assert!(pos(CJK_BOLD) < pos(CJK_PROPORTIONAL));
+        assert!(pos(PREVIEW_SEMIBOLD) < pos(CJK_BOLD));
+        // 无粗体(如文泉驿/macOS):链上零 CJK_BOLD,其余结构与修复前一致
+        let defs = build_definitions(Some((&fake, 0, 0, metrics)), None);
+        let chain = &defs.families[&FontFamily::Name(Arc::from(FAMILY_BOLD))];
+        assert!(!chain.iter().any(|n| n == CJK_BOLD));
+        assert_eq!(chain.last().map(String::as_str), Some(CJK_PROPORTIONAL));
+        assert!(!defs.font_data.contains_key(CJK_BOLD), "无粗体时不注册数据");
     }
 
     /// install 端到端:无论本机有无 CJK 候选,context 里 Proportional 首位
@@ -1094,7 +1167,7 @@ mod tests {
             descent: -0.288,
             line_gap: 0.0,
         };
-        let defs = build_definitions(Some((INTER_REGULAR, 0, 0, fake)));
+        let defs = build_definitions(Some((INTER_REGULAR, 0, 0, fake)), None);
         let family = FontFamily::Name(Arc::from(FAMILY_EDITOR_MONO));
         let chain = defs
             .families
