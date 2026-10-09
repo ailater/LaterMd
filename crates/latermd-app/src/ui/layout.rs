@@ -299,10 +299,9 @@ impl LaterMdApp {
         // 但**只对布局分叉,不对窗口 chrome 分叉**。规格 §7 的「全部退场」
         // 是按原生装饰窗口画的:自绘标题栏退场后,OS 那一根还在,窗口照样
         // 能拖能关。本产品的标题栏是自绘的(D1),无边框模式下 OS 不提供
-        // 任何 chrome —— 真照字面连同 chrome 一起藏,退出禅定的四条出口里
-        // 两条(标题栏 Zen 按钮、右上浮层入口所在的画布)会同时失效。D4
-        // 担心的「怎么退出」在这里会成真,故 Zen 只让三栏让位:**它是布局
-        // 态,不是窗口态**。
+        // 任何 chrome —— 真照字面连同 chrome 一起藏,退出禅定的出口里
+        // 标题栏 Zen 按钮会失效。D4 担心的「怎么退出」在这里会成真,故
+        // Zen 只让三栏让位:**它是布局态,不是窗口态**。
         if self.state.layout.zen {
             self.draw_zen(ui);
             return;
@@ -759,7 +758,8 @@ impl LaterMdApp {
 
     /// 禅定模式的整套面板组合(§7)。
     ///
-    /// 四条出口在此合流:F11 / 标题栏 Zen 按钮 / Esc / 右上角「退出禅定」。
+    /// 退出出口在此合流:F11 / 标题栏 Zen 按钮(无边框)/ Esc /
+    /// 右上角「退出禅定」浮层(**仅原生装饰路径**,见下方 gating)。
     fn draw_zen(&mut self, ui: &mut egui::Ui) {
         // Zen 是**另一套 panel 组合**而非「给三栏各加一个 if」:藏面板的最佳
         // 办法是从一开始就不添加它(侧栏宽度演算与 z 序全部让位),而不是
@@ -848,14 +848,23 @@ impl LaterMdApp {
                 });
             });
 
-        // 右上角「退出禅定」:Zen 里唯一的常驻 chrome,因此必须是最后分配
-        // 的那个 widget —— 同层命中的后来者优先(机制见
-        // `ui::titlebar::edge_resize_zones` 的文档)。
-        zen_exit_button(ui, &mut self.outbox);
+        // 右上角「退出禅定」浮层:**仅原生装饰路径**(LATERMD_NATIVE_DECORATIONS=1,
+        // 自绘标题栏不在场)才画。无边框模式下标题栏本就保留、其 Zen 键在禅定中
+        // 以强调色高亮(tooltip「退出禅定」),浮层再画一颗同款 Zen 圆环 = 右上角
+        // 两颗禅定图标,且本函数锚定根 Ui 的 right_top(**含标题栏**),矩形落在
+        // y 10..38 —— 正压在标题栏右端按钮区(2026-10-09 坤哥真机:「禅定模式
+        // 右上角 x 关闭的地方多了一个禅定模式图标」,像素取证见提交说明),还以
+        // 后分配者身份抢走最大化按钮的点击。禅定的四条出口(F11 / 标题栏 Zen 键 /
+        // Esc / 原生装饰下的浮层)不受影响;Zen 里唯一的常驻 chrome 因此改为
+        // 「无边框=标题栏、原生=浮层」,二者互斥,各自都是最后分配的 widget。
+        if !self.frameless {
+            zen_exit_button(ui, &mut self.outbox);
+        }
 
         // 禅定左缘标签导航(#57 M1 悬停唤出;M2 三态配置):悬停=鼠标移近
         // 左缘唤出、离开即隐;常显=进禅定即显示;关闭=零路径不渲染。与
-        // 退出钮同一层、其后分配(左缘与右上角不重叠,互不抢命中);
+        // 右上退出入口(浮层/标题栏 Zen 键)同一层、其后分配(左缘与右上角
+        // 不重叠,互不抢命中);
         // 感应区是纯几何判定、导航列是同层绝对摆放,均不建 Foreground 层
         // Area——机制与红线见 `ui::zen_nav` 模块文档(13a 教训)。
         #[cfg(not(test))]
@@ -891,6 +900,11 @@ impl LaterMdApp {
 }
 
 /// 禅定模式的「退出禅定」浮层(§7)。返回其矩形供测试定位。
+///
+/// **仅原生装饰路径**(`LATERMD_NATIVE_DECORATIONS=1`,无自绘标题栏)调用:
+/// 无边框模式下标题栏 Zen 键就是右上退出入口,浮层再画一颗会与标题栏按钮
+/// 叠出两颗禅定图标,且本函数锚定根 Ui 的 right_top(**含标题栏**),矩形
+/// 会压进标题栏右端按钮区 —— 调用方的 gating 见 `draw_zen` 里的浮层注释。
 ///
 /// **用 `allocate_rect` 绝对摆放而不是 widget 流式布局**:它浮在 CentralPanel
 /// 之上而不是挤占正文宽度 —— 流式布局会把这颗按钮压进 720 限宽里,正文随之
@@ -1710,6 +1724,77 @@ impl eframe::App for LaterMdApp {
 mod tests {
     use super::*;
     use crate::state;
+
+    /// 侧栏可拖宽回归(2026-10-09 坤哥真机:「左侧栏宽度似乎锁死了,不能拉伸」)。
+    ///
+    /// 根因:egui 0.36 的 `Panel` 收尾时把**内容的 Frame 响应矩形**(而非分配的
+    /// outer_rect)回写进 `PanelState`;rail 改版(eb80618)把 body 挪进 `new_child`
+    /// 子 Ui 后,子 Ui 的分配不外溢回面板 Ui 的 min_rect,侧栏内容塌到 `size_range`
+    /// 下限,拖拽分到的宽度在松手帧被内容宽吞掉 —— 面板永远 180px。
+    /// 修复:sidebar::ui 末尾 `expand_to_include_rect(max_rect)` 把面板 Ui 撑满。
+    ///
+    /// 本测试按真机手势走完整 App:首帧宽度 = `default_size`(240,不再是下限),
+    /// 在右缘按下拖到 320 松手后,`PanelState` 稳定在 320。修复前两条都红
+    /// (实测首帧 180、拖后 180)。
+    #[test]
+    fn nav_resizes_by_drag_in_full_ui() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut app = LaterMdApp::default();
+        assert!(app.state.layout.left, "默认左栏开");
+        let mut frame = |events: Vec<egui::Event>| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        };
+        let nav_width = || {
+            egui::PanelState::load(&ctx, egui::Id::new("nav"))
+                .expect("nav PanelState 存在")
+                .outer_rect
+                .width()
+        };
+
+        frame(Vec::new());
+        assert!(
+            (nav_width() - 240.0).abs() < 1.0,
+            "首帧宽度应为 default_size(240),实际 {}(内容不撑满面板时 egui 会回写下限)",
+            nav_width()
+        );
+
+        // 按下 → 逐帧拖到 320 → 松手。按位点取当前右缘(240)+1,拖拽中把手
+        // 逐帧跟随面板右缘,与真机手势一致。
+        let edge = nav_width();
+        frame(vec![Event::PointerMoved(egui::pos2(edge + 1.0, 300.0))]);
+        frame(vec![Event::PointerButton {
+            pos: egui::pos2(edge + 1.0, 300.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        for x in [260.0, 280.0, 300.0, 320.0] {
+            let track = nav_width().max(x - 40.0);
+            frame(vec![Event::PointerMoved(egui::pos2(x, 300.0))]);
+            let _ = track;
+        }
+        frame(vec![Event::PointerButton {
+            pos: egui::pos2(320.0, 300.0),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        frame(Vec::new());
+        assert!(
+            (nav_width() - 320.0).abs() < 1.0,
+            "拖到 320 松手后宽度应稳定在 320,实际 {}(拖拽被内容宽吞掉 = 侧栏锁宽回归)",
+            nav_width()
+        );
+    }
     use egui::{
         Event, FullOutput, Key, Modifiers, OutputCommand, PointerButton, Pos2, RawInput, Rect,
         ViewportCommand,
@@ -5140,8 +5225,8 @@ mod tests {
     }
 
     /// 唤出期间输入不被吞(13a 同层红线的回归):Esc 照常退禅定、F11 命令
-    /// 照常触发、文字输入不改任何状态;右上角「退出禅定」在导航列在场时
-    /// 依然点得动(跨层屏蔽会把它变成哑弹)。
+    /// 照常触发、文字输入不改任何状态;右上角的禅定退出入口(无边框 =
+    /// 标题栏 Zen 键)在导航列在场时依然点得动(跨层屏蔽会把它变成哑弹)。
     #[test]
     fn zen_hover_nav_keeps_input_and_exit_reachable() {
         let ctx = egui::Context::default();
@@ -5249,16 +5334,23 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        // 右上角退出钮:导航列在场时仍点得动(同层摆放不跨层屏蔽,13a)
+        // 右上角退出入口(标题栏 Zen 键):导航列在场时仍点得动(同层摆放
+        // 不跨层屏蔽,13a)
         {
             let (mut app, dir) = warm_up("exit-btn", &mut now);
-            let size = egui::vec2(tokens::ICON + 12.0, tokens::TOOLBAR_H);
-            let button = egui::Rect::from_min_size(
-                screen.right_top()
-                    - egui::vec2(size.x + tokens::ZEN_EXIT_MARGIN, -tokens::ZEN_EXIT_MARGIN),
-                size,
+            // 无边框禅定的右上退出入口 = 标题栏 Zen 键(2026-10-09 起浮层只在
+            // 原生装饰路径画,见 draw_zen);导航列在场时它必须照常点得动
+            // (同层摆放不跨层屏蔽,13a)。键位矩形取自 titlebar 的纯函数,
+            // 与绘制同源,不手搓坐标。
+            let bar = Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(screen.right(), tokens::TITLEBAR_H),
             );
-            let center = button.center();
+            let zen_index = crate::ui::titlebar::TITLE_BUTTONS
+                .iter()
+                .position(|b| *b == crate::ui::titlebar::TitleButton::Zen)
+                .expect("TITLE_BUTTONS 含 Zen 键");
+            let center = crate::ui::titlebar::button_rects(bar)[zen_index].center();
             let click = |pressed| Event::PointerButton {
                 pos: center,
                 button: PointerButton::Primary,
@@ -5275,10 +5367,124 @@ mod tests {
             }
             assert!(
                 app.outbox.contains(&Message::ZenToggled),
-                "退出钮不是哑弹:{:?}",
+                "标题栏 Zen 键(禅定中的右上退出入口)不是哑弹:{:?}",
                 app.outbox
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 右上角退出浮层的在场矩阵(2026-10-09 坤哥:「禅定模式右上角 x 关闭的
+    /// 地方多了一个禅定模式图标」):无边框禅定**不再画**浮层 —— 它锚定根
+    /// Ui 的 right_top(含标题栏),矩形正压在标题栏右端按钮区,与标题栏
+    /// Zen 键叠出两颗禅定图标,还抢走最大化按钮的点击;退出入口收敛为
+    /// 标题栏 Zen 键(强调色高亮)。原生装饰路径没有自绘标题栏,浮层保留,
+    /// 仍是可点的唯一可见出口。
+    ///
+    /// 断言点:同一坐标(旧浮层矩形,与最大化按钮重叠)上,无边框禅定帧
+    /// 点击**不发** [`Message::ZenToggled`](那颗点击落在标题栏按钮区),
+    /// 原生装饰禅定帧点击**发**。坐标取自 `zen_exit_button` 同款演算,
+    /// 与生产零偏差。
+    #[test]
+    fn zen_exit_overlay_is_native_decorations_only() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let size = egui::vec2(tokens::ICON + 12.0, tokens::TOOLBAR_H);
+        let overlay = egui::Rect::from_min_size(
+            screen.right_top()
+                - egui::vec2(size.x + tokens::ZEN_EXIT_MARGIN, -tokens::ZEN_EXIT_MARGIN),
+            size,
+        );
+        let center = overlay.center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        // 无边框禅定:同一点击不发 ZenToggled(浮层已退场)。
+        {
+            let ctx = egui::Context::default();
+            let mut app = LaterMdApp {
+                frameless: true,
+                ..Default::default()
+            };
+            app.state.apply(Message::ZenToggled);
+            for events in [
+                Vec::new(),
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+                Vec::new(),
+            ] {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                )
+                .drop_without_applying_deltas();
+            }
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.reduce(ui.ctx()),
+            )
+            .drop_without_applying_deltas();
+            assert!(
+                !app.outbox.contains(&Message::ZenToggled),
+                "无边框禅定不得再画退出浮层(与标题栏 Zen 键重复):{:?}",
+                app.outbox
+            );
+            assert!(app.state.layout.zen, "点击落在标题栏按钮区,不退禅定");
+        }
+
+        // 原生装饰禅定:同一点击命中浮层,发 ZenToggled,下一帧归约退出。
+        {
+            let ctx = egui::Context::default();
+            let mut app = LaterMdApp {
+                frameless: false,
+                ..Default::default()
+            };
+            app.state.apply(Message::ZenToggled);
+            // 绘制帧必须**连续**跑(中间不插 reduce 的独立 run_ui):hit_test
+            // 读的是上一 pass 的 widget 注册表,若中间夹一个不画任何东西的
+            // reduce 帧,下一帧命中测试就对着空表,什么都点不到。
+            for events in [
+                Vec::new(),
+                vec![Event::PointerMoved(center)],
+                vec![click(true)],
+                vec![click(false)],
+                Vec::new(),
+            ] {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                )
+                .drop_without_applying_deltas();
+            }
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.reduce(ui.ctx()),
+            )
+            .drop_without_applying_deltas();
+            // reduce 一次性 `mem::take(outbox)` 消费,断言落在**状态**上:
+            // 浮层点击翻成 ZenToggled 并被归约,禅定应已退出。
+            assert!(
+                !app.state.layout.zen,
+                "原生装饰下浮层仍是退出出口,点击应真退出禅定"
+            );
         }
     }
 
@@ -6456,6 +6662,10 @@ mod tests {
     /// 右上角「退出禅定」浮层在真实帧里点得动(§7 验收点)。位置由
     /// `zen_exit_button` 的返回值给出 —— 它是绝对摆放的,手搓坐标必然与真实
     /// 帧错位(M2 已经在标题栏上踩过一次)。
+    ///
+    /// 直呼 `zen_exit_button` 而不经 `draw_zen`:本测试只钉这颗 widget 自身
+    /// 的可点性(原生装饰路径的生产行为);「无边框不画浮层」的 gating 由
+    /// `zen_exit_overlay_is_native_decorations_only` 走完整帧守门。
     #[test]
     fn zen_exit_button_is_clickable_in_a_real_frame() {
         let ctx = egui::Context::default();
