@@ -36,6 +36,9 @@ impl LaterMdApp {
         // 模型列表拉取收流(#58 M2):同一手法,结果只在归约落地(填下拉
         // 候选或显示错误行),后台线程不碰 UI 状态
         outbox.extend(state.poll_models());
+        // 检查更新收流(#71 M2):同一手法,结果只在归约落地(关于窗的
+        // 最新/有更新/无法判断/失败),后台线程不碰 UI 状态
+        outbox.extend(state.poll_about());
         // 剪贴板图片读取收流:同上(D 段,arboard 的阻塞 IO 在后台线程)
         outbox.extend(state.poll_clipboard());
         // 图片拖入落盘(D 段):dropped_files 由 egui-winit 汇进 raw input,
@@ -120,6 +123,14 @@ impl LaterMdApp {
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             state.apply(Message::SelectionAiPolishDismissed);
+        }
+        // 关于窗在场的 Esc 关窗(#71 M1):与润色确认浮窗同款,裸 Esc 消费
+        // 并归约关闭;排在蒙层的 retain 之前(最顶层浮层优先)。只吃裸
+        // Esc,带修饰键的组合不受影响。
+        if state.about.open
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            state.apply(Message::AboutClosed);
         }
         // 蒙层可见帧的 Esc 归蒙层(#54 M2 关闭路径之一):蒙层的关闭本身
         // 已由 step 的「其它按键」规则完成,这里只把事件从流里移除——禅定
@@ -231,6 +242,11 @@ impl LaterMdApp {
         // 模型列表拉取的重绘驱动同理(#58 M2):结果到达要在下一帧收流
         // 归约;收尾清接收端后自然停。
         if state.settings.models.is_fetching() {
+            ctx.request_repaint();
+        }
+        // 检查更新的重绘驱动同理(#71 M2):结果到达要在下一帧收流归约;
+        // 收尾清接收端后自然停。
+        if state.about.update.is_checking() {
             ctx.request_repaint();
         }
         // 剪贴板图片读取的重绘驱动同理(D 段):结果到达要在下一帧收流
@@ -725,6 +741,13 @@ impl LaterMdApp {
         // 响应只供无头测试定位浮层矩形,生产路径忽略。
         if self.state.quick_open.open {
             let _window = crate::ui::quick_open::panel(ui, &mut self.state.quick_open, outbox);
+        }
+
+        // 「关于 LaterMD」(#71):帮助菜单打开,内容只读;蒙层点击与
+        // 窗 X 的关闭请求在此翻成消息(Esc 的关闭在 `reduce` 消费)。
+        // M2 起「检查更新」按钮点击也经 outbox 发消息(不直接起线程)。
+        if self.state.about.open && crate::ui::about::dialog(ui, &self.state.about, outbox) {
+            outbox.push(Message::AboutClosed);
         }
 
         // 长按修饰键的快捷键蒙层(#54 M2):Visible 态才画。内容源是
@@ -4256,6 +4279,52 @@ mod tests {
         app.state.settings.open = false;
         let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
         output.drop_without_applying_deltas();
+    }
+
+    /// 关于窗的接线(#71 M1):归约开窗后完整 `draw` 渲染出版本号文本
+    /// (明暗两主题);Esc 经 `reduce` 归约关窗;关闭后关于文本不再渲染
+    /// (开 → 画、Esc → 关、关 → 不画一段齐)。
+    #[test]
+    fn about_dialog_renders_when_open_and_esc_closes() {
+        let mut app = LaterMdApp::default();
+        app.state.apply(Message::AboutOpened);
+        assert!(app.state.about.open, "前置:关于窗已开");
+        let mut saw_version = false;
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(theme);
+            // 首帧预热(关于窗 Area 注册,次帧才有文本;ui::about 测试同因)
+            let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+            output.drop_without_applying_deltas();
+            let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+            saw_version |= output.shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::epaint::Shape::Text(t)
+                        if t.galley.job.text.contains(env!("CARGO_PKG_VERSION"))
+                )
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(saw_version, "关于窗开着时版本号文本应渲染");
+
+        // Esc:裸 Esc 经 reduce 归约关窗
+        reduce(&mut app, find_key(Key::Escape, Modifiers::NONE));
+        assert!(!app.state.about.open, "Esc 应经归约关掉关于窗");
+
+        // 关闭后不再渲染关于文本
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(RawInput::default(), |ui| app.draw(ui));
+        let still_there = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Text(t)
+                    if t.galley.job.text.contains("关于 LaterMD")
+                        || t.galley.job.text.contains(crate::ui::about::TAGLINE)
+            )
+        });
+        output.drop_without_applying_deltas();
+        assert!(!still_there, "关闭后关于窗文本不应再渲染(蒙层与卡片一起撤)");
     }
 
     /// 标签重命名浮窗装配(#37,**显示别名**语义):走完整归约开浮窗后,
