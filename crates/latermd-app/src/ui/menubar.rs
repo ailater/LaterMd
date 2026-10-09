@@ -1484,7 +1484,7 @@ mod tests {
         }
     }
 
-    /// 「帮助」菜单(#71 M1)的完整路径:Alt+H 打开 → 真实点击
+    /// 「帮助」菜单(#71 M1)的完整路径:打开 popup → 真实点击
     /// 「关于 LaterMD…」条目 → 发出 [`Message::AboutOpened`] → 归约后
     /// `about.open` 为真(点击 → 消息 → 归约一段齐;帮助非命令菜单,
     /// `clicking_every_menu_item…` 不遍历它,这里补齐真实 popup 路径)。
@@ -1494,16 +1494,14 @@ mod tests {
         let keymap = Keymap::builtin();
         let state = State::default();
         let mut outbox = Vec::new();
-        // 帧 1:Alt+H 事件帧(popup 记忆已开,闭包不执行)
-        let output = ctx.run_ui(
-            RawInput {
-                events: vec![key_event(egui::Key::H, egui::Modifiers::ALT)],
-                ..Default::default()
-            },
-            |ui| super::ui(ui, &keymap, &state, &mut outbox),
-        );
-        output.drop_without_applying_deltas();
-        assert!(outbox.is_empty(), "开菜单本身不产生消息");
+        // 点击测试显式展开 popup，与设置菜单测试一致，不依赖 Alt 助记键。
+        let ids = menubar_frame(&ctx, vec![]);
+        let help_id = ids
+            .iter()
+            .find(|(index, _)| *index == MENUS.len() + 1)
+            .unwrap()
+            .1;
+        egui::containers::Popup::open_id(&ctx, help_id);
 
         // 帧 2-3:两次空帧 —— MenuButton 从 popup 记忆开态到闭包画出条目
         // 隔一帧(设置菜单同款节奏),取末帧 shapes 定位条目矩形
@@ -1594,6 +1592,18 @@ mod tests {
         );
         output.drop_without_applying_deltas();
         assert!(outbox.is_empty());
+        let help_id = ids
+            .iter()
+            .find(|(index, _)| *index == MENUS.len() + 1)
+            .unwrap()
+            .1;
+        if cfg!(target_os = "macos") {
+            assert!(
+                !egui::containers::Popup::is_id_open(&ctx, help_id),
+                "macOS Alt+H 不打开帮助菜单"
+            );
+            egui::containers::Popup::open_id(&ctx, help_id);
+        }
         // 帧 2:展开帧(闭包执行,无输入)
         let output = ctx.run_ui(RawInput::default(), |ui| {
             super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
@@ -1613,12 +1623,16 @@ mod tests {
             },
         );
         output.drop_without_applying_deltas();
+        if cfg!(target_os = "macos") {
+            assert!(outbox.is_empty(), "macOS 裸字母不触发帮助菜单命令");
+            assert!(egui::containers::Popup::is_id_open(&ctx, help_id));
+            return;
+        }
         assert_eq!(
             outbox,
             vec![Message::AboutOpened],
             "展开的「帮助」菜单里按 A 应触发「关于 LaterMD…」"
         );
-        let help_id = ids.iter().find(|(index, _)| *index == 7).unwrap().1;
         // 帧 4:菜单已收起(close 标记在下一帧生效为 popup 关闭)
         let output = ctx.run_ui(RawInput::default(), |ui| {
             super::ui_with_probe(ui, &keymap, &state, &mut Vec::new(), Some(|_, _| {}));

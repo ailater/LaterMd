@@ -20,6 +20,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// (docs/mcp-plan.md §3 方案 A —— 两份清单必然漂移)。
 pub use latermd_search::MARKDOWN_EXTENSIONS;
 
+/// 判断路径是否是 LaterMD 支持直接打开的 Markdown 文件。
+///
+/// 扩展名清单与打开对话框、文件树和全文搜索共用；大小写差异按文件系统
+/// 习惯忽略，例如 `README.MD` 也应能通过拖放打开。
+pub fn is_markdown_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        let extension = extension.to_string_lossy();
+        MARKDOWN_EXTENSIONS
+            .iter()
+            .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+    })
+}
+
 /// 未落盘文档在另存为对话框里的预填文件名。
 pub const UNTITLED_FILE_NAME: &str = "未命名.md";
 
@@ -188,6 +201,14 @@ mod tests {
     /// 进程内唯一且不冲突的临时路径;测试自删。
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("latermd-file-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn markdown_path_accepts_supported_extensions_case_insensitively() {
+        assert!(is_markdown_path(Path::new("README.md")));
+        assert!(is_markdown_path(Path::new("README.MARKDOWN")));
+        assert!(!is_markdown_path(Path::new("image.png")));
+        assert!(!is_markdown_path(Path::new("README.md.bak")));
     }
 
     /// 写出→读回逐字节一致:UTF-8、CRLF、LF 混排与尾随空行都原样保留。
