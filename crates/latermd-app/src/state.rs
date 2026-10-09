@@ -373,6 +373,9 @@ pub struct State {
     pub render_mode: RenderMode,
     /// 设置对话框(外观 / 快捷键 / AI / MCP / 图片 五页)。
     pub settings: SettingsState,
+    /// 「关于 LaterMD」对话框(#71 M1):开关在归约,内容只读;M2
+    /// 「检查更新」的在途/结果状态在此扩展。
+    pub about: crate::ui::about::AboutState,
     /// 图床(docs/image-plan.md C 段):profile 列表(`beds.json`)与在途
     /// 上传的接收端;发起/收流的归约见 [`State::request_image_upload`] /
     /// [`State::finish_image_upload`]。
@@ -517,6 +520,7 @@ impl Default for State {
             render_mode: RenderMode::default(),
             keymap: Keymap::builtin(),
             settings: SettingsState::default(),
+            about: crate::ui::about::AboutState::default(),
             bed: BedState::default(),
             image_dialog: ImageDialogState::default(),
             emoji: EmojiPanelState::default(),
@@ -877,6 +881,11 @@ pub enum Message {
     ToggleLivePreview,
     /// 打开设置对话框并切到指定分页(工具栏齿轮 / 菜单「设置…」入口)。
     SettingsOpened(crate::settings::SettingsTab),
+    /// 打开「关于 LaterMD」对话框(帮助菜单入口);归约只置 `about.open`。
+    AboutOpened,
+    /// 关闭「关于 LaterMD」(窗 X / 蒙层点击 / Esc 三出口在 UI 层汇成此
+    /// 消息);归约只翻 `about.open`。
+    AboutClosed,
     /// 激活某标签(标签条点击 / 文件树与搜索跳转的已开路径)。
     TabActivate(usize),
     /// 请求关闭某标签:脏则弹确认模态,干净直接关。
@@ -1243,6 +1252,8 @@ impl State {
                 self.settings.open = true;
                 self.settings.tab = tab;
             }
+            Message::AboutOpened => self.about.open = true,
+            Message::AboutClosed => self.about.open = false,
             Message::TabActivate(index) => self.switch_active(index),
             Message::TabCloseRequested(index) => self.request_close_tab(index),
             Message::TabCloseActive => {

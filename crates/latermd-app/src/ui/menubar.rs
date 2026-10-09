@@ -4,8 +4,8 @@
 //! 菜单结构是**常量清单**([`MENUS`]:标题 + 助记字母 + 分组段):绘制与
 //! 覆盖测试共用同一事实源,新命令忘进菜单时 `every_command_has_a_menu_entry`
 //! 红。分组规范:同类聚组、段与段之间分隔线、常用在前;菜单栏顺序
-//! 文件 → 编辑 → 格式 → 视图 → 导出 → AI → 设置(高频编辑动作在前,
-//! 派生动作在后)。键位文本取自 `keymap`(用户可改,与工具栏按钮 tooltip
+//! 文件 → 编辑 → 格式 → 视图 → 导出 → AI → 设置 → 帮助(高频编辑动作
+//! 在前,派生动作在后,帮助居末位是桌面惯例)。键位文本取自 `keymap`(用户可改,与工具栏按钮 tooltip
 //! 的 decisions-pending #32 同源先例一致)—— 改键后两处同时变。
 //!
 //! #62 M2 的 Alt 助记键:egui 0.36.2 **不支持** `&X` 助记语法(egui/epaint
@@ -115,8 +115,8 @@ const AI_MENU: [&[Command]; 1] = [&[
 
 /// 菜单清单:数组顺序即菜单栏从左到右的显示顺序,段内顺序即条目顺序;
 /// 第二项是该菜单标题的助记字母(Alt 命名空间,**全局唯一**,与 keymap
-/// 全部 Alt 类绑定的冲突审计见模块测试)。「设置」不是命令(直达设置页),
-/// 不进本表,由 [`ui`] 单独绘制。
+/// 全部 Alt 类绑定的冲突审计见模块测试)。「设置」「帮助」不是命令
+/// (直达设置页 / 关于窗,照「设置」先例单独绘制),不进本表。
 const MENUS: [(&str, char, &[&[Command]]); 6] = [
     ("文件", 'F', &FILE_MENU),
     ("编辑", 'E', &EDIT_MENU),
@@ -128,6 +128,16 @@ const MENUS: [(&str, char, &[&[Command]]); 6] = [
 
 /// 「设置」菜单的标题助记字母(与 [`MENUS`] 同一 Alt 命名空间)。
 const SETTINGS_MNEMONIC: char = 'S';
+
+/// 「帮助」菜单(#71 M1)的标题助记字母(H = Help 词首;与 [`MENUS`]
+/// 的 F/E/O/V/X/A/S 及 `SETTINGS_MNEMONIC` 在 Alt 命名空间互不撞,keymap
+/// 出厂 Alt 系七条也没有 Alt+H —— 冲突审计见
+/// `title_mnemonics_unique_and_clear_of_keymap_alt_bindings`)。
+const HELP_MNEMONIC: char = 'H';
+
+/// 「帮助」菜单条目「关于 LaterMD…」的条目助记(A = About 词首;帮助
+/// 菜单内唯一)。
+const ABOUT_MNEMONIC: char = 'A';
 
 /// 「设置」菜单两个直达页的条目助记(该菜单内唯一)。
 const SETTINGS_TAB_MNEMONICS: [(SettingsTab, char); 2] =
@@ -400,6 +410,19 @@ fn fire_settings_item_letter(ui: &egui::Ui, outbox: &mut Vec<Message>) {
     }
 }
 
+/// 「帮助」菜单展开帧的条目层助记(与 [`fire_settings_item_letter`] 同
+/// 口径,目标是关于窗而非命令;#71 M1)。
+fn fire_help_item_letter(ui: &egui::Ui, outbox: &mut Vec<Message>) {
+    let Some(letter) = bare_key_letter(ui.ctx()) else {
+        return;
+    };
+    if ABOUT_MNEMONIC == letter {
+        consume_letter_events(ui.ctx(), letter);
+        outbox.push(Message::AboutOpened);
+        ui.close();
+    }
+}
+
 /// 绘制菜单栏内容(挂在 top panel 内)。开关类条目的勾选态从 `state`
 /// 取真值(与设置页/标题栏按钮同一事实源)。
 pub fn ui(bar: &mut egui::Ui, keymap: &Keymap, state: &State, outbox: &mut Vec<Message>) {
@@ -491,6 +514,32 @@ pub(crate) fn ui_with_probe(
                 egui::containers::Popup::default_response_id(&response),
             );
             consume_letter_events(ui.ctx(), SETTINGS_MNEMONIC);
+        }
+        // 帮助(#71 M1):非命令菜单(条目直达关于窗),照「设置」同款
+        // 绘制与 Alt 助记;桌面惯例居菜单栏末位
+        let response = ui
+            .menu_button(label_with_mnemonic("帮助", HELP_MNEMONIC), |ui| {
+                if ui
+                    .button(label_with_mnemonic("关于 LaterMD…", ABOUT_MNEMONIC))
+                    .clicked()
+                {
+                    outbox.push(Message::AboutOpened);
+                }
+                fire_help_item_letter(ui, outbox);
+            })
+            .response;
+        if let Some(probe) = probe.as_mut() {
+            probe(
+                MENUS.len() + 1,
+                egui::containers::Popup::default_response_id(&response),
+            );
+        }
+        if open_letter == Some(HELP_MNEMONIC) {
+            egui::containers::Popup::open_id(
+                ui.ctx(),
+                egui::containers::Popup::default_response_id(&response),
+            );
+            consume_letter_events(ui.ctx(), HELP_MNEMONIC);
         }
     });
 }
@@ -862,12 +911,12 @@ mod tests {
 
     // —— #62 M2:Alt 助记键(冲突审计 + 触发行为 + 排版统一)——
 
-    /// 全部菜单标题助记字母(含「设置」),供冲突审计与显示断言共用。
+    /// 全部菜单标题助记字母(含「设置」「帮助」),供冲突审计与显示断言共用。
     fn title_letters() -> Vec<char> {
         MENUS
             .iter()
             .map(|(_, letter, _)| *letter)
-            .chain([SETTINGS_MNEMONIC])
+            .chain([SETTINGS_MNEMONIC, HELP_MNEMONIC])
             .collect()
     }
 
@@ -999,7 +1048,8 @@ mod tests {
     }
 
     /// 无头帧跑菜单栏并收集每个菜单的 popup id(`(栏内序号, id)`,
-    /// 序号 0-5 对应 [`MENUS`],6 = 设置)。返回 popup id 表供开合断言。
+    /// 序号 0-5 对应 [`MENUS`],6 = 设置,7 = 帮助)。返回 popup id 表供
+    /// 开合断言。
     fn menubar_frame(ctx: &egui::Context, events: Vec<Event>) -> Vec<(usize, egui::Id)> {
         let keymap = Keymap::builtin();
         let state = State::default();
@@ -1416,6 +1466,152 @@ mod tests {
             assert!(state.settings.open, "归约后设置窗打开");
             assert_eq!(state.settings.tab, expected, "归约后落在直达页签");
         }
+    }
+
+    /// 「帮助」菜单(#71 M1)的完整路径:Alt+H 打开 → 真实点击
+    /// 「关于 LaterMD…」条目 → 发出 [`Message::AboutOpened`] → 归约后
+    /// `about.open` 为真(点击 → 消息 → 归约一段齐;帮助非命令菜单,
+    /// `clicking_every_menu_item…` 不遍历它,这里补齐真实 popup 路径)。
+    #[test]
+    fn help_menu_about_entry_click_through_and_reduce() {
+        let ctx = egui::Context::default();
+        let keymap = Keymap::builtin();
+        let state = State::default();
+        let mut outbox = Vec::new();
+        // 帧 1:Alt+H 事件帧(popup 记忆已开,闭包不执行)
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(egui::Key::H, egui::Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| super::ui(ui, &keymap, &state, &mut outbox),
+        );
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "开菜单本身不产生消息");
+
+        // 帧 2-3:两次空帧 —— MenuButton 从 popup 记忆开态到闭包画出条目
+        // 隔一帧(设置菜单同款节奏),取末帧 shapes 定位条目矩形
+        let mut located = None;
+        for _ in 0..2 {
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                super::ui(ui, &keymap, &state, &mut outbox);
+            });
+            let shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+            assert!(outbox.is_empty(), "展开不点击不产生消息");
+            located = shapes.iter().find_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                text.galley
+                    .job
+                    .text
+                    .contains("关于 LaterMD…")
+                    .then(|| clipped.shape.visual_bounding_rect())
+            });
+            if located.is_some() {
+                break;
+            }
+        }
+        let rect = located.expect("「关于 LaterMD…」条目未绘制");
+
+        // 帧 4-6:moved → press → release,点击条目中心
+        let center = rect.center();
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(center)],
+            vec![click(true)],
+            vec![click(false)],
+        ] {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| super::ui(ui, &keymap, &state, &mut outbox),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            outbox,
+            vec![Message::AboutOpened],
+            "「关于 LaterMD…」条目点击应发出开窗消息"
+        );
+
+        // 归约一段:消息落 State,关于窗开
+        let mut state = crate::state::State::default();
+        state.apply(Message::AboutOpened);
+        assert!(state.about.open, "归约后关于窗打开");
+    }
+
+    /// 帮助菜单展开态的裸字母触发(条目层助记):Alt+H 开「帮助」→
+    /// 展开帧按 A → 发出 [`Message::AboutOpened`],菜单收起。
+    #[test]
+    fn bare_letter_in_open_help_menu_fires_about() {
+        let ctx = egui::Context::default();
+        let keymap = Keymap::builtin();
+        let state = State::default();
+        let mut outbox = Vec::new();
+        let mut ids = Vec::new();
+        // 帧 1:Alt+H 开「帮助」
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![key_event(egui::Key::H, egui::Modifiers::ALT)],
+                ..Default::default()
+            },
+            |ui| {
+                super::ui_with_probe(
+                    ui,
+                    &keymap,
+                    &state,
+                    &mut outbox,
+                    Some(|index, id| {
+                        ids.push((index, id));
+                    }),
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty());
+        // 帧 2:展开帧(闭包执行,无输入)
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
+        });
+        output.drop_without_applying_deltas();
+        // 帧 3:裸 A → 命中「关于 LaterMD…」,发消息并收起
+        let output = ctx.run_ui(
+            RawInput {
+                events: vec![
+                    key_event(egui::Key::A, egui::Modifiers::NONE),
+                    Event::Text("a".to_owned()),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            outbox,
+            vec![Message::AboutOpened],
+            "展开的「帮助」菜单里按 A 应触发「关于 LaterMD…」"
+        );
+        let help_id = ids.iter().find(|(index, _)| *index == 7).unwrap().1;
+        // 帧 4:菜单已收起(close 标记在下一帧生效为 popup 关闭)
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            super::ui_with_probe(ui, &keymap, &state, &mut Vec::new(), Some(|_, _| {}));
+        });
+        output.drop_without_applying_deltas();
+        assert!(
+            !egui::containers::Popup::is_id_open(&ctx, help_id),
+            "条目触发后菜单应收起"
+        );
     }
 
     /// 开关类菜单条目的勾选态(#67 M2):`toggle_checked` 从 [`State`] 取

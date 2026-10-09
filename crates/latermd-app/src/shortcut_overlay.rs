@@ -163,11 +163,12 @@ const CARD_H: f32 = 560.0;
 const CARD_HEADER_H: f32 = 58.0;
 /// 暗色主题蒙层底不透明度(黑);亮色主题取 [`SCRIM_ALPHA_LIGHT`]。
 /// 两主题各从 `visuals().dark_mode` 推导,不硬编码单个色值(取舍与
-/// 观感数值见 decisions-pending #103)。
-const SCRIM_ALPHA_DARK: u8 = 160;
+/// 观感数值见 decisions-pending #103)。`pub(crate)`:`ui::about` 关于窗
+/// 的蒙层共用同一色值(单一事实源,不抄第二份)。
+pub(crate) const SCRIM_ALPHA_DARK: u8 = 160;
 /// 亮色主题蒙层底不透明度(白):亮色下正文是深字,弱化同样内容需要更
 /// 厚的白,否则底层文字透出来与卡片正文抢辨识。
-const SCRIM_ALPHA_LIGHT: u8 = 216;
+pub(crate) const SCRIM_ALPHA_LIGHT: u8 = 216;
 
 /// 蒙层一行:命令 + 当前绑定(`None` = 未绑定)。
 pub type OverlayRow = (crate::command::Command, Option<crate::keymap::Shortcut>);
