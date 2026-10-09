@@ -33,6 +33,21 @@ pub const FORMAT_BAR_H: f32 = 30.0;
 pub const TITLEBAR_H: f32 = 36.0;
 /// 标题栏右侧窗口按钮命中区(Win 风整块,mac/Linux 同款统一)。
 pub const WINDOW_BTN: egui::Vec2 = egui::Vec2::new(32.0, 24.0);
+/// 左缘图标栏(rail)宽度(2026-10-08,docs/ui-shell-redesign-v2.md
+/// §5.6)。画在**左栏内部**而非第四个 `Panel::left`:后者会让左栏总占宽
+/// 240 → 288,省下的 31px 纵向 chrome 会以 48px 横向的形式赔回去。
+///
+/// 48 的来历:`TOOLBAR_H` 的 28px 按钮 + 左右各留 10px,与标题栏
+/// `WINDOW_BTN` 的呼吸同级。取偶数便于图标在栏内 2px 级居中。
+pub const RAIL_W: f32 = 48.0;
+/// rail 内单枚按钮的边长(正方形)。径取 [`TOOLBAR_H`],档位与工具栏
+/// 按钮同宽 —— 「和别处的图标按钮一样好点」就是这条取值的全部理由。
+pub const RAIL_ITEM: f32 = TOOLBAR_H;
+/// rail 内相邻两枚按钮的纵向间隙。比 `item_spacing.y`(3px)松一档,
+/// 让上下两组之外还能读出「同一组内」的节奏。
+pub const RAIL_GAP: f32 = 4.0;
+/// rail 上下两组之间分隔线的厚度(上组五视图 / 下组六文件动作)。
+pub const RAIL_DIVIDER_H: f32 = 1.0;
 /// 左栏(导航)宽度下限(docs/ui-shell-redesign.md §11,R4):三栏旧下限
 /// 160 是二分栏时代的数字,塞进四行视图导航后不够。
 pub const SIDEBAR_MIN_W: f32 = 180.0;
@@ -131,6 +146,31 @@ pub fn accent(ui: &egui::Ui) -> Color32 {
         Color32::from_rgb(0x6C, 0x9F, 0xFF)
     } else {
         Color32::from_rgb(0x33, 0x70, 0xFF)
+    }
+}
+
+/// rail 带的底(详见 [`RAIL_W`])。比侧栏退后一档、远比内容区沉,让
+/// rail 读成「镶在外壳上的第三条纵带」而非「侧栏里的一列」。
+///
+/// 明度落在 `sidebar` 与 `content` 之间之外的一侧(比 sidebar 更沉),
+/// 约束同 `theme::ShellTokens::sidebar` 的取值口径(S2-3):暗色可以更深
+/// 但不能撞上窗口底色(否则读成「挖了个洞」),浅色不能深到与 `border`
+/// 撞色(否则侧栏里的分隔线消失)。
+pub fn rail_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(0x16, 0x17, 0x1A)
+    } else {
+        egui::Color32::from_rgb(0xE4, 0xE7, 0xEB)
+    }
+}
+
+/// rail 上下两组之间分隔线的颜色(详见 [`RAIL_DIVIDER_H`])。取 `border`
+/// 同档而不自调灰阶:它与侧栏里的分隔线是同一类装饰,两处不应对不上。
+pub fn rail_divider(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(0x3C, 0x40, 0x43)
+    } else {
+        egui::Color32::from_rgb(0xE5, 0xE6, 0xE8)
     }
 }
 
