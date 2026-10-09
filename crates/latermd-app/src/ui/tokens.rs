@@ -154,6 +154,43 @@ pub const INPUT_PAD_Y: f32 = 8.0;
 /// docs/roadmap 专题 #23,与本棒解耦)。
 pub const FONT_SM: f32 = 14.0;
 
+// —— 设置弹窗观感基线(#70 M1)——
+//
+// 设置窗三段骨架(左分页列 / 中央滚动区 / 底部按钮条)的尺寸与留白
+// 单一真源:此前 48 / 112 / 各 margin 散在 settings.rs 行内,改一处漏
+// 一处。骨架的**防尺寸反馈环结构**(`exact_size` 定形 + ScrollArea
+// `auto_shrink([false,false])`,见 settings.rs `dialog` 注释)不随观感
+// 调整改变,这里只统管数字。标题栏本身是 egui Window 的 chrome
+// (活动窗填充取 `widgets.open.weak_bg_fill`,随明暗两套 style 走),
+// 刻意不再单独配色;本组常量管的是它**下方**三段的间距/分隔/留白。
+
+/// 设置窗左分页列宽(外观/快捷键/AI/MCP/图片 五项竖排)。
+pub const SETTINGS_TABS_W: f32 = 112.0;
+/// 设置窗底部按钮条高:按钮(~24)+ 上下内边距 + 分隔线。#35 从 40
+/// 提到 48(坤哥「行高不够,看着不协调」),此后不再回 40。
+pub const SETTINGS_FOOTER_H: f32 = 48.0;
+/// 设置窗默认尺寸(首开锚定屏幕中心,可拖拽缩放)。
+pub const SETTINGS_DEFAULT_SIZE: egui::Vec2 = egui::Vec2::new(600.0, 440.0);
+/// 中央内容区的内边距。与底部按钮条的水平内边距同值(12):分隔线、
+/// 正文首行与「关闭」按钮共享同一条纵向基准线,窗内四周呼吸一致。
+pub const SETTINGS_BODY_PAD: i8 = 12;
+/// 分页列的内边距:比内容区紧一档 —— 图标+文字行的视觉密度高,
+/// 再放到 12 会让 112 的窄列显得空转。
+pub const SETTINGS_TABS_PAD: i8 = 8;
+/// 底部按钮条的内边距(水平 12 对齐 [`SETTINGS_BODY_PAD`],垂直 6
+/// 配 48 高度装下按钮 + 分隔线的呼吸)。
+pub const SETTINGS_FOOTER_MARGIN: egui::Margin = egui::Margin::symmetric(12, 6);
+/// 设置页两列行的标签列宽(#70 M2):五个分页所有配置行共用 —— 标签列
+/// 左对齐、定宽(超长截断),控件列起点 = 内容区左缘 + 此宽 + 列间隙,
+/// **跨分页钉在同一 x**。取 148:容得下最长行标签「上下文大小(KB)」
+/// (Body 13pt 下约 138px)并留 10px 呼吸。
+pub const SETTINGS_LABEL_W: f32 = 148.0;
+/// 设置页快捷键行的键位按钮最小宽(#70 M2):37 行的「键位 / 清除 /
+/// 重置」排成等宽三段,键位文字("Ctrl+Shift+S" 一档)不把按钮顶宽;
+/// 再长的捕获提示截在同宽内。与 [`SETTINGS_LABEL_W`] 同组,但只约束
+/// 快捷键页的控件列。
+pub const SETTINGS_KEY_W: f32 = 140.0;
+
 // —— 圆角 ——
 
 /// 按钮圆角(shadcn rounded-sm 档)。

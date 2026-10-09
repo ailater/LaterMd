@@ -106,11 +106,15 @@ pub(crate) fn key_editor(
         "API key 保存到系统凭据(Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service),不写入任何文件。",
     );
     ui.weak("未配置或后端不可用时,AI 命令回退环境变量 LATERMD_AI_API_KEY。");
-    ui.add(
-        egui::TextEdit::singleline(&mut key.draft)
-            .password(true)
-            .hint_text("API key"),
-    );
+    // #70 M2:输入行走设置页统一两列(标签列与其他配置行同起点)
+    crate::settings::settings_row(ui, "API key", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut key.draft)
+                .password(true)
+                .hint_text("API key")
+                .desired_width(f32::INFINITY),
+        );
+    });
     let buttons = ui.horizontal(|ui| {
         // 空白草稿/未配置时目标状态已达成,禁用防误触;归约侧仍有同款
         // 防线(BlankSecret 拒绝、删除幂等)
