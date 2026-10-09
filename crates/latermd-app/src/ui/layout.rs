@@ -986,6 +986,7 @@ fn draw_find_overlay(
         .order(egui::Order::Foreground)
         .constrain_to(source_rect.shrink(OVERLAY_MARGIN))
         .frame(overlay_popup_frame(ctx))
+        .show(ctx, |ui| find_bar_contents(ui, find, outbox));
     overlay_drag_sync(
         ctx,
         egui::Id::new("editor-find-overlay"),
@@ -1206,6 +1207,7 @@ fn draw_goto_overlay(
         .order(egui::Order::Foreground)
         .constrain_to(source_rect.shrink(OVERLAY_MARGIN))
         .frame(overlay_popup_frame(ctx))
+        .show(ctx, |ui| goto_bar_contents(ui, goto, outbox));
     overlay_drag_sync(
         ctx,
         egui::Id::new("editor-goto-overlay"),
