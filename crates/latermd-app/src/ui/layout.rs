@@ -6752,7 +6752,13 @@ mod tests {
                 "{theme}:分组名已渲染:{texts:?}"
             );
             assert!(
-                texts.iter().any(|t| t == "Ctrl+S"),
+                texts.iter().any(|t| t
+                    == &app
+                        .state
+                        .keymap
+                        .get(crate::command::Command::Save)
+                        .unwrap()
+                        .platform_text()),
                 "{theme}:键位 kbd 文本已渲染(平台化显示):{texts:?}"
             );
             // 无绑定命令照列(#54 产品决定):蒙层卡片可视高钉在 502px,

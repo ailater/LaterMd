@@ -733,45 +733,53 @@ fn full_sample_doc_elements_visible_and_spaced_in_both_visuals() {
             para_gaps.len() >= 5,
             "{theme_name} 主题:交替段段落空隙样本不足({para_gaps:?})"
         );
-        let (hg_min, hg_max) = (
-            heading_gaps.iter().cloned().fold(f32::INFINITY, f32::min),
-            heading_gaps
-                .iter()
-                .cloned()
-                .fold(f32::NEG_INFINITY, f32::max),
+        // Compare the same glyphs with one extra spacer. Absolute gaps between
+        // different fonts/headings depend on ascent and lineGap (Hiragino and
+        // Noto differ); a paired measurement isolates the spacing behavior.
+        let (_, _, _, spaced_primitives, _) = render_headless(
+            dark,
+            "f5-full-doc-extra-spacing",
+            1600.0,
+            |panel, font, screen, label| {
+                let mut child = panel.new_child(UiBuilder::new().max_rect(screen));
+                let mut spaced_style = (*style).clone();
+                spaced_style.heading_space_above += spacer_h;
+                egui_markdown::MarkdownLabel::new(label, FULL_DOC)
+                    .font(font)
+                    .style(&spaced_style)
+                    .wrap()
+                    .show(&mut child);
+            },
         );
-        let (pg_min, pg_max) = (
-            para_gaps.iter().cloned().fold(f32::INFINITY, f32::min),
-            para_gaps.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+        let spaced_layer = rasterize_final_colors(&mesh_refs(&spaced_primitives), w, h);
+        let spaced_headings = bands_from_rows(
+            &(0..h)
+                .map(|y| (0..w).any(|x| is_strong(spaced_layer[y * w + x])))
+                .collect::<Vec<_>>(),
         );
-        assert!(
-            hg_min - pg_max > spacer_h * 0.4,
-            "{theme_name} 主题:标题空隙最小 {hg_min:.1} 未明显大于段落空隙最大 {pg_max:.1}(呼吸感失效)"
+        let spaced_text = bands_from_rows(
+            &(0..h)
+                .map(|y| (8..w - 8).any(|x| is_textish(spaced_layer[y * w + x])))
+                .collect::<Vec<_>>(),
         );
-        // 像素级空隙差 = spacer + 行盒内墨迹空隙的**不对称项**(H1 行盒 45px
-        // vs 正文行盒 22.5px,墨迹在行盒内偏下/ascent 大于 descent,两侧
-        // 行盒的内空隙差不会抵消,实测总差 ≈17px 而非纯 12px)。因此这里
-        // 只做量级护栏:差值 ≥ spacer(缺失 → ≈0,退化 → ≫3×);spacer 的
-        // **精确**呼吸算术(空行行 + spacer 行,差恰 = spacer 高)由排版
-        // 文档测试的行盒层测量承担(±1.5px)。
-        let pixel_gap_diff = hg_max - pg_min;
-        assert!(
-            pixel_gap_diff >= spacer_h,
-            "{theme_name} 主题:像素空隙差 {pixel_gap_diff:.1} 应 ≥ spacer {spacer_h:.1}"
-        );
-        assert!(
-            pixel_gap_diff <= spacer_h * 3.0,
-            "{theme_name} 主题:像素空隙差 {pixel_gap_diff:.1} 异常偏大(>3×spacer,疑似双计)"
-        );
-        eprintln!(
-            "[F5 全元素 {theme_name}] 标题带上方空隙 {:.0}-{:.0}px vs 标题下正文带 {:.0}-{:.0}px,像素差 ≈ {:.1}px(= spacer {:.1} + 行盒内空隙不对称项)",
-            hg_min,
-            hg_max,
-            pg_min,
-            pg_max,
-            pixel_gap_diff,
-            spacer_h
-        );
+        assert_eq!(spaced_headings.len(), heading_bands.len());
+        let spaced_gaps: Vec<_> = spaced_headings
+            .iter()
+            .filter_map(|heading| {
+                spaced_text
+                    .iter()
+                    .rfind(|text| text.1 < heading.0)
+                    .map(|prev| (heading.0 - prev.1 - 1) as f32)
+            })
+            .collect();
+        assert_eq!(spaced_gaps.len(), heading_gaps.len());
+        for (before, after) in heading_gaps.iter().zip(spaced_gaps) {
+            assert!(*before > 0.0, "标题与前一行不重叠");
+            assert!(
+                (after - before - spacer_h).abs() <= 1.0,
+                "{theme_name}: 增加 {spacer_h}px spacer 应只增加同量空隙: {before} -> {after}"
+            );
+        }
 
         // ③ 引用竖条/表格竖线:竖直 border 色条(宽 ≤6px 的列上有 ≥16 个
         //    border 像素)在像素层可检出 —— 引用条与表格 cell 边框共用

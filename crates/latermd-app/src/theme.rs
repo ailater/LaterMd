@@ -1028,6 +1028,7 @@ mod tests {
     /// HOME 也无则给不出目录。
     /// (macOS/Windows 分支是各两行的 join,由 `cfg!` 选择,本机测不到。)
     #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn config_dir_prefers_xdg_then_home() {
         let xdg = |v: &str| Some(OsString::from(v));
         let home = || Some(OsString::from("/home/u"));
@@ -1046,6 +1047,42 @@ mod tests {
             Some(PathBuf::from("/home/u/.config/latermd"))
         );
         assert_eq!(config_dir_from(None, None, None), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn config_dir_uses_application_support_on_macos() {
+        assert_eq!(
+            config_dir_from(
+                Some("/ignored/xdg".into()),
+                Some("/Users/test".into()),
+                None
+            ),
+            Some(PathBuf::from(
+                "/Users/test/Library/Application Support/latermd"
+            ))
+        );
+        assert_eq!(
+            config_dir_from(Some("/ignored/xdg".into()), None, None),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn config_dir_uses_appdata_on_windows() {
+        assert_eq!(
+            config_dir_from(
+                Some("/ignored/xdg".into()),
+                Some("/ignored/home".into()),
+                Some("C:/Users/test/AppData/Roaming".into())
+            ),
+            Some(PathBuf::from("C:/Users/test/AppData/Roaming").join("latermd"))
+        );
+        assert_eq!(
+            config_dir_from(None, Some("/ignored/home".into()), None),
+            None
+        );
     }
 
     /// 往返:模式与 overrides(含颜色对、字号、代码语言等全部字段)逐项一致;
