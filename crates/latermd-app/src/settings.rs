@@ -299,15 +299,26 @@ pub fn dialog(
 ) -> Option<egui::Response> {
     let mut open = settings.open;
     let mut close = None;
+    // #70 M1:整窗显式随当前明暗主题取 shell 色(生产路径 `theme.apply`
+    // 每帧已把 `window_fill` 投成同一值,这里再取一次是让「不依赖投影
+    // 也在场」成为本窗自身性质,明暗各走各的 token,不写死任何一档)
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     egui::Window::new("设置")
+        // 显式 id(find/goto 浮层同款):egui 0.36 按标题文本派生 Area id,
+        // 标题一改拖动位置记忆就丢;显式 id 让窗口状态与文案解耦,测试也
+        // 能按名取 Area 矩形
+        .id(egui::Id::new("settings-dialog"))
         // 首次打开锚定屏幕中心(pivot=窗口中心对齐锚点,与窗口尺寸无关);
         // 拖动后的位置由 Area 按窗口 id 记忆,不再回中心
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ui.ctx().viewport_rect().center())
-        .default_size([600.0, 440.0])
+        .default_size(crate::ui::tokens::SETTINGS_DEFAULT_SIZE)
         .collapsible(false)
         .resizable(true)
         .open(&mut open)
+        // 观感基线(#70 M1):窗底显式取当前主题的 content 色;圆角/阴影/
+        // 窗口内边距仍走 egui 出厂 window 档(与 quick_open 等其余浮窗同源)
+        .frame(egui::Frame::window(ui.style()).fill(shell.content))
         .show(ui.ctx(), |ui| {
             // 骨架:底部按钮条 + 左分页列 + 中央滚动区,全部用 `exact_size`
             // 的 Panel 定形。此前用 `ui.horizontal` + `available_height()` +
@@ -315,11 +326,12 @@ pub fn dialog(
             // 宽,而 Window 宽又由内容决定 —— 二者互相喂,每帧把窗口撑大一
             // 圈,直到横贯全屏(2026-09-26 实测弹窗被拉成 1920x200 的扁条,
             // 分页列被挤没)。Panel 定形后各区域尺寸与内容解耦,反馈消失。
+            // 尺寸/留白数字一律出自 ui::tokens 的设置弹窗观感基线(#70 M1)。
             egui::Panel::bottom("settings-footer")
-                // 48:按钮(~24)+上下内边距+分隔线;此前 40 装下后呼吸感
-                // 全无(坤哥 2026-09-29「行高不够,看着不协调」)
-                .exact_size(48.0)
-                .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(12, 6)))
+                .exact_size(crate::ui::tokens::SETTINGS_FOOTER_H)
+                .frame(
+                    egui::Frame::default().inner_margin(crate::ui::tokens::SETTINGS_FOOTER_MARGIN),
+                )
                 .show(ui, |ui| {
                     ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -328,11 +340,11 @@ pub fn dialog(
                 });
             // 左:竖排分页(固定宽;WorkBuddy 观感 = 分页列吃侧栏灰、内容区吃窗底)
             egui::Panel::left("settings-tabs")
-                .exact_size(112.0)
+                .exact_size(crate::ui::tokens::SETTINGS_TABS_W)
                 .frame(
                     egui::Frame::default()
-                        .fill(crate::theme::shell_tokens(ui.visuals().dark_mode).sidebar)
-                        .inner_margin(egui::Margin::same(8)),
+                        .fill(shell.sidebar)
+                        .inner_margin(egui::Margin::same(crate::ui::tokens::SETTINGS_TABS_PAD)),
                 )
                 .show(ui, |ui| {
                     for tab in SettingsTab::ALL {
@@ -349,7 +361,10 @@ pub fn dialog(
             // 右:当前页内容(可滚动,长表单不被窗口裁掉;父级已有界,
             // auto_shrink([false,false]) 只作用于面板内部,不再反哺窗口尺寸)
             egui::CentralPanel::default()
-                .frame(egui::Frame::default().inner_margin(egui::Margin::same(8)))
+                .frame(
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::same(crate::ui::tokens::SETTINGS_BODY_PAD)),
+                )
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("settings-body")
@@ -1641,6 +1656,149 @@ mod tests {
                 "无拖动的渲染帧不产出消息(值只在 changed() 时发)"
             );
         }
+    }
+
+    /// #70 M1:设置窗外壳随明暗主题。明/暗两轮各走真实 `theme.apply`
+    /// 投影后渲整窗,对 tessellate 后的**最终覆盖色**做像素采样(#53
+    /// split-diff / preview_pixel_acceptance 手法,羽化关):分页列空带露
+    /// `sidebar` 色,底部按钮条露窗底 `content` 色(其 frame 透明),中央
+    /// 内容区多数采样点露 `content` 色(其余被文字/控件墨迹占据)。
+    /// 两主题的采样色互不相同 —— 钉住「不写死任何一档」。
+    #[test]
+    fn settings_shell_follows_light_and_dark_themes() {
+        use crate::preview_pixel_acceptance::{color_dist, final_covered_color};
+        use egui::epaint::Mesh;
+
+        let mut tabs_colors = Vec::new();
+        let mut footer_colors = Vec::new();
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let mut state = State::default();
+            state.settings.open = true;
+            state.theme.mode = mode;
+            let ctx = egui::Context::default();
+            // 关羽化(#41/#53 同款):透明渐变边缘会污染采样读色
+            ctx.options_mut(|o| o.tessellation_options.feathering = false);
+            state.theme.apply(&ctx, mode);
+            let system_theme_ok = state.system_theme_ok;
+            let mut now = 0.0_f64;
+            let mut last_shapes = Vec::new();
+            for _ in 0..5 {
+                now += 0.1; // Area fade-in 时钟:不给 time 首帧内容整体 noop(无头老坑)
+                let State {
+                    settings,
+                    ai_key,
+                    ai,
+                    mcp,
+                    bed,
+                    keymap,
+                    theme,
+                    skins,
+                    ..
+                } = &mut state;
+                let mut outbox = Vec::new();
+                let mut output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        time: Some(now),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        dialog(
+                            ui,
+                            settings,
+                            theme,
+                            skins,
+                            system_theme_ok,
+                            mode,
+                            keymap,
+                            ai,
+                            ai_key,
+                            mcp,
+                            bed,
+                            &mut outbox,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                last_shapes = output.shapes;
+            }
+            let window = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("settings-dialog")))
+                .expect("五帧后设置窗 Area 状态在场");
+            let primitives = ctx.tessellate(last_shapes, 1.0);
+            let meshes: Vec<&Mesh> = primitives
+                .iter()
+                .filter_map(|cp| match &cp.primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
+                    _ => None,
+                })
+                .collect();
+            let shell = crate::theme::shell_tokens(matches!(mode, ThemeMode::Dark));
+            let sample = |p: egui::Pos2| {
+                final_covered_color(&meshes, p)
+                    .unwrap_or_else(|| panic!("{mode:?}:采样点 {p:?} 无覆盖(窗体未渲染或坐标出窗)"))
+            };
+
+            // 分页列:五枚分页按钮(约 5×28+间距)以下的空带,露 sidebar 底色
+            let tabs = sample(egui::pos2(
+                window.left() + crate::ui::tokens::SETTINGS_TABS_W * 0.5,
+                window.bottom() - crate::ui::tokens::SETTINGS_FOOTER_H - 8.0,
+            ));
+            assert!(
+                color_dist(tabs, shell.sidebar) <= 2,
+                "{mode:?}:分页列应露 sidebar 底色,{tabs:?} vs {:?}",
+                shell.sidebar
+            );
+
+            // 底部按钮条:frame 透明,窗底 content 色透出;采样点取条带中部
+            // 左半(远离右缘「关闭」按钮与条带顶部的分隔线)
+            let footer = sample(egui::pos2(
+                window.left() + window.width() * 0.25,
+                window.bottom() - crate::ui::tokens::SETTINGS_FOOTER_H * 0.5,
+            ));
+            assert!(
+                color_dist(footer, shell.content) <= 2,
+                "{mode:?}:按钮条应露窗底 content 色,{footer:?} vs {:?}",
+                shell.content
+            );
+
+            // 中央内容区:6×8 网格采样,多数点露 content 色 —— 文字/控件
+            // 墨迹只占少数,若窗底没跟随主题(如写死暗色),浅色轮会大面积
+            // 偏黑,这里的多数派断言当场红
+            let left = window.left() + crate::ui::tokens::SETTINGS_TABS_W + 24.0;
+            let right = window.right() - 24.0; // 避开右缘滚动条
+            let top = window.top() + 64.0; // 避开标题栏与页头
+            let bottom = window.bottom() - crate::ui::tokens::SETTINGS_FOOTER_H - 16.0;
+            let mut hits = 0;
+            let mut total = 0;
+            for iy in 0..6 {
+                for ix in 0..8 {
+                    let t = |n: usize, max: usize| (n as f32 + 0.5) / max as f32;
+                    let p = egui::pos2(
+                        left + (right - left) * t(ix, 8),
+                        top + (bottom - top) * t(iy, 6),
+                    );
+                    if p.y < bottom {
+                        total += 1;
+                        if color_dist(sample(p), shell.content) <= 2 {
+                            hits += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                total > 0 && hits * 2 > total,
+                "{mode:?}:内容区 {hits}/{total} 点露 content 色,窗底疑似未随主题"
+            );
+
+            tabs_colors.push(tabs);
+            footer_colors.push(footer);
+        }
+        assert_ne!(tabs_colors[0], tabs_colors[1], "明暗两档分页列底色应不同");
+        assert_ne!(footer_colors[0], footer_colors[1], "明暗两档窗底色应不同");
     }
 
     /// 关闭时窗口不进入绘制路径(不 panic、不改 open 标志)。
