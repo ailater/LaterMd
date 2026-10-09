@@ -337,6 +337,19 @@ impl LaterMdApp {
             .resizable(true)
             .default_size(240.0)
             .size_range(crate::ui::tokens::SIDEBAR_MIN_W..=400.0)
+            // 2026-10-09:只把**左** margin 归零,其余照 egui 默认
+            // (`Frame::side_top_panel` = symmetric(8,2))。rail 画在本面板
+            // 内容区的左端,若保留这 8px,rail 带会与窗口左缘空出一道同底
+            // 色的缝 —— 坤哥截图反馈「距左侧边距太宽」(实测图标距窗缘
+            // 23px,VS Code 约 12px)。归零后 rail 底色一路贯到窗口边,
+            // 才是 Activity Bar 的读法。右/上/下不动:那里仍是与相邻内容
+            // 的间隔,沿用默认值以保证与标题栏等其他 panel 观感一致。
+            .frame(
+                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+                    left: 0,
+                    ..egui::Margin::symmetric(8, 2)
+                }),
+            )
             .show_collapsible(ui, left, |ui| {
                 crate::ui::sidebar::ui(
                     ui,

@@ -50,7 +50,8 @@ pub struct OutlineView<'a> {
 /// 算一遍,就把摆位规则抄成了两份 —— 改 GAP 时绘制与断言会一起漂移,
 /// 断言自我满足(docs/ui-shell-redesign-v2.md §2.1 的同款纪律)。
 ///
-/// index 自上而下、自 rail 顶缘起算;横向在栏内居中(栏宽 48、按钮 28)。
+/// index 自上而下、自 rail 顶缘起算;横向在场带宽内居中(宽自
+/// [`tokens::RAIL_W`] 读,不写死数字 —— 2026-10-09 由 48 收到 40)。
 fn rail_item_rect(rail: egui::Rect, index: usize) -> egui::Rect {
     let item = tokens::RAIL_ITEM;
     let left = rail.left() + (rail.width() - item) * 0.5;
@@ -3128,6 +3129,90 @@ mod tests {
             bands.top.height(),
             0.0,
             "顶段已随 2026-10-08 改版消失,退化为零高矩形"
+        );
+    }
+
+    /// **2026-10-09 坤哥截图反馈「距左侧边距太宽」的守卫**。
+    ///
+    /// 上面那条 `rail_and_body_split_the_sidebar_left_to_right` 直驱
+    /// `sidebar::ui`,**绕过了承载它的 `Panel::left("nav")`** —— 所以它
+    /// 只能证明「rail 贴着左栏内容区的左缘」,证明不了「贴着窗口左缘」。
+    /// 而坤哥看到的那 7px 白边,恰恰来自 panel 自己的 `inner_margin.left`:
+    /// egui `Frame::side_top_panel` 默认 `symmetric(8,2)`。
+    ///
+    /// 本测试把真实的 nav panel 组合跑一遍,断言 **rail 带左缘 == 窗口
+    /// 左缘**。这样任何人给 nav panel 加回 margin(或改回默认 frame)
+    /// 都会当场红 —— 那段白边是「让人觉得图标浮在内容里、而不是贴窗口边」
+    /// 的直接原因,必须有人守。
+    ///
+    /// 上界同样**硬编码**(3px 容差),刻意不从 `Margin` 反推:若把
+    /// margin 从 0 调回 8 而断言也跟着读同一个数,rail.left() 与 window
+    /// 左缘会一起右移,断言自我满足(2026-10-08 那次 RAIL_W 的教训)。
+    #[test]
+    fn nav_panel_has_no_left_margin_so_rail_touches_the_window_edge() {
+        let ctx = egui::Context::default();
+        let (tree, _root) = sample_tree();
+        let mut bands = None;
+        let window = Cell::new(Rect::NOTHING);
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                window.set(ui.max_rect());
+                // 复刻 layout.rs 里 nav panel 的构造。刻意**重新**写一遍
+                // 而不是调用生产函数:生产那条路径要整个 `LaterMdApp`,
+                // 拉进来会让这条断言变成集成测试,失去定位力。
+                // 两处若不同步,本测试会红 —— 这正是要的耦合。
+                let mut open = true;
+                egui::Panel::left("nav探头")
+                    .resizable(true)
+                    .default_size(240.0)
+                    .size_range(crate::ui::tokens::SIDEBAR_MIN_W..=400.0)
+                    .frame(
+                        egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+                            left: 0,
+                            ..egui::Margin::symmetric(8, 2)
+                        }),
+                    )
+                    .show_collapsible(ui, &mut open, |ui| {
+                        bands = Some(ui_whole(
+                            ui,
+                            SidebarTab::Files,
+                            &tree,
+                            &GitPanelState::default(),
+                        ));
+                    });
+            },
+        )
+        .drop_without_applying_deltas();
+        let window = window.get();
+        let bands = bands.unwrap();
+
+        // 窗口左缘是 ui.max_rect().left()(= 0)。rail 必须从这里开始。
+        const FLUSH_LIMIT_PX: f32 = 3.0;
+        assert!(
+            (bands.nav.left() - window.left()).abs() <= FLUSH_LIMIT_PX,
+            "rail 必须与窗口左缘齐平:{:?} vs 窗口 {:?}(差 {}px,须 ≤ \
+             {FLUSH_LIMIT_PX}px)。panel 的 inner_margin.left 会把 rail \
+             推离窗边、让图标看着浮在内容里",
+            bands.nav,
+            window,
+            bands.nav.left() - window.left(),
+        );
+
+        // 顺带钉住带宽:`RAIL_W` 2026-10-09 由 48 收到 40。上界硬编码,
+        // 理由同上条的 56 —— 不读 token,否则两者一起变宽就抓不到回退。
+        const RAIL_LIMIT_PX: f32 = 44.0;
+        assert!(
+            bands.nav.width() <= RAIL_LIMIT_PX,
+            "rail 宽 {}px 须 ≤ {RAIL_LIMIT_PX}px(贴边图标带不该再宽):{:?}",
+            bands.nav.width(),
+            bands.nav
         );
     }
 
