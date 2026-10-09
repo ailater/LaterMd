@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/logo/deliverables/png/icon-256.png" alt="LaterMD" width="128" height="128">
+</div>
+
 # LaterMD
 
 [![Rust](https://github.com/ailater/LaterMd/actions/workflows/rust.yml/badge.svg)](https://github.com/ailater/LaterMd/actions/workflows/rust.yml)
