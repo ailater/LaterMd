@@ -10,10 +10,12 @@
 //! 同一批纯函数,测试与绘制零偏差。
 
 use crate::command::Command;
+use crate::live::RenderMode;
+use crate::search::SearchState;
 use crate::settings::SettingsTab;
 use crate::state::{Message, State};
 use crate::ui::icons::Icon;
-use crate::ui::tokens::{DANGER, ICON, ICON_SM, RADIUS_SM, SPACE_SM};
+use crate::ui::tokens::{DANGER, ICON, ICON_SM, RADIUS_MD, RADIUS_SM, SPACE_SM};
 use eframe::egui::{self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection};
 use eframe::egui::{Sense, ViewportCommand};
 
@@ -170,9 +172,53 @@ pub fn edge_resize_zones(ui: &mut egui::Ui) {
     }
 }
 
+/// 命令箱右缘的 x:紧贴最左那枚窗口按钮再往左留一个 gap。
+///
+/// 与 [`button_rects`] 共用同一基准(两者必须同步;PTC_%s 断言在
+/// `tests::command_box_does_not_overlap_window_buttons`)。
+pub fn command_box_right_edge(bar: Rect) -> f32 {
+    button_rects(bar)[0].left() - crate::ui::tokens::TITLE_CMD_TO_BTN
+}
+
+/// 是否绘制命令箱。
+///
+/// 窄窗口下命令箱会挤掉左段标题 —— 与其画一个 346px 的控件再去挤标题,
+/// 不如**整体不画**:搜索能力经左栏 Search 页签 / Ctrl+P 仍在,不丢。
+pub fn shows_command_box(bar: Rect) -> bool {
+    bar.width() >= crate::ui::tokens::TITLE_CMD_MAX_W
+}
+
+/// 命令箱整体矩形(纵向铺满标题栏,高度回调方裁到 TITLE_CMD_H)。
+pub fn command_box_rect(bar: Rect) -> Rect {
+    let right = command_box_right_edge(bar);
+    Rect::from_min_max(
+        Pos2::new(right - crate::ui::tokens::TITLE_CMD_W, bar.top()),
+        Pos2::new(right, bar.bottom()),
+    )
+}
+
+/// 命令箱内第 `index` 个槽位的矩形(垂直居中,高 `TITLE_CMD_H`)。
+///
+/// **自右往左排**:0 = 搜索胶囊(贴右缘),1 = 源码/Live 切换。理由是 ego
+/// 的焦点链按注册顺序推进 —— 从右往左读是中文 UI 的常态,Tab 也应如此。
+pub fn command_box_slot_rect(cbox: Rect, index: usize) -> Rect {
+    const SLOTS: usize = 2;
+    debug_assert!(index < SLOTS, "命令箱只有 {SLOTS} 个槽位");
+    let search_w = crate::ui::tokens::TITLE_SEARCH_W;
+    let view_w = crate::ui::tokens::TITLE_VIEW_W;
+    let gap = crate::ui::tokens::TITLE_CMD_GAP;
+    let inset_y = (cbox.height() - crate::ui::tokens::TITLE_CMD_H) / 2.0;
+    let right = cbox.right() - index as f32 * (search_w + gap);
+    let width = if index == 0 { search_w } else { view_w };
+    Rect::from_min_max(
+        Pos2::new(right - width, cbox.top() + inset_y),
+        Pos2::new(right, cbox.bottom() - inset_y),
+    )
+}
+
 /// 标题栏内容(挂在 `Panel::top("titlebar")` 内,定高 `TITLEBAR_H`,
 /// panel frame 内边距须为 0,命中矩形才与右缘对齐)。
-pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
+pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     let bar = ui.max_rect();
     let ctx = ui.ctx().clone();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -213,6 +259,9 @@ pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
     }
 
     let rects = button_rects(bar);
+    if shows_command_box(bar) {
+        command_box(ui, &ctx, state, command_box_rect(bar), outbox);
+    }
     let toggle_shortcut = shortcut_of(state, &ctx, Command::ToggleSidebar);
     let zen_shortcut = shortcut_of(state, &ctx, Command::ToggleZen);
     for (button, rect) in TITLE_BUTTONS.into_iter().zip(rects) {
@@ -229,6 +278,120 @@ pub fn ui(ui: &mut egui::Ui, state: &State, outbox: &mut Vec<Message>) {
             outbox,
         );
     }
+}
+
+/// 命令箱内的**搜索胶囊**(槽位 0,贴右缘)。
+///
+/// 它是**真实可输入的 `TextEdit`**,不是「点一下弹到别处」的假控件:
+/// `search.query` 由这里直接改写并通过 [`Message::SearchQueryChanged`]
+/// 触发 300ms 去抖搜索。
+///
+/// 本轮只把**入口**挪到标题栏,结果列表仍在左栏「搜索」页 —— 结果浮层
+/// 是第二批(docs/ui-shell-redesign-v2.md §5.6 待办)。
+fn search_capsule(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    search: &mut SearchState,
+    outbox: &mut Vec<Message>,
+) {
+    let radius = RADIUS_MD * 2.0; // 完全圆角胶囊
+    let frame_margin = egui::Margin::symmetric(10, 0);
+    let inner = rect.shrink2(egui::vec2(10.0, 0.0));
+
+    let frame = egui::Frame::NONE
+        .inner_margin(frame_margin)
+        .corner_radius(radius)
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(egui::Stroke::new(
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ));
+
+    let edit = egui::TextEdit::singleline(&mut search.query)
+        .id_salt("titlebar-search")
+        .font(egui::TextStyle::Small)
+        .hint_text(crate::ui::tokens::TITLE_SEARCH_HINT)
+        .frame(frame)
+        .desired_width(inner.width())
+        .min_size(inner.size());
+    // `Ui::put` 把 widget 摆到绝对矩形(垂直 within 恰当):命令箱是先顺序
+    // 算矩形再塞 widget,不可能跟 `horizontal` 的自然流走,put 是这里唯一
+    // 能把 TextEdit 放到指定 rect 的办法。
+    let response = ui.put(rect, edit);
+    if response.changed() {
+        outbox.push(Message::SearchQueryChanged);
+    }
+    response.on_hover_text("全文搜索(结果在左栏「搜索」页)");
+}
+
+/// 标题栏右端命令箱(docs/ui-shell-redesign-v2.md §5.6):搜索胶囊 +
+/// 源码/Live 两段切换。调用方须先用 [`shows_command_box`] 判过宽度。
+fn command_box(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    state: &mut State,
+    cbox: Rect,
+    outbox: &mut Vec<Message>,
+) {
+    let _ = ctx;
+    let slot0 = command_box_slot_rect(cbox, 0);
+    search_capsule(ui, slot0, &mut state.search, outbox);
+    let slot1 = command_box_slot_rect(cbox, 1);
+    view_switch(ui, slot1, state, outbox);
+}
+
+/// 源码 / Live 两段切换(槽位 1)。
+///
+/// 分段开关(VS Code / Zed 同款):**选中段有一层实心底**,非选中段
+/// 只有文字;点击任一段 → [`Message::ToggleLivePreview`]
+/// (与菜单栏「视图 → 切换 Live Preview」同一命令,不另开入口)。
+fn view_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
+    let live = state.render_mode == RenderMode::Live;
+    let half_w = rect.width() / 2.0;
+    let response = ui.allocate_rect(rect, Sense::click());
+    let painter = ui.painter();
+
+    painter.rect_filled(rect, RADIUS_MD, ui.visuals().extreme_bg_color);
+    // 选中段:实心底下压在胶囊底与 border 之上
+    let selected_x = if live {
+        rect.left() + half_w
+    } else {
+        rect.left()
+    };
+    let selected = Rect::from_min_size(
+        Pos2::new(selected_x, rect.top()),
+        egui::vec2(half_w, rect.height()),
+    );
+    painter.rect_filled(selected, RADIUS_MD, ui.visuals().selection.bg_fill);
+
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    painter.text(
+        Pos2::new(rect.left() + half_w / 2.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "源码",
+        font.clone(),
+        if live {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().strong_text_color()
+        },
+    );
+    painter.text(
+        Pos2::new(rect.left() + half_w + half_w / 2.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "Live",
+        font,
+        if live {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().text_color()
+        },
+    );
+
+    if response.clicked() {
+        outbox.push(Message::ToggleLivePreview);
+    }
+    response.on_hover_text("切换源码 / Live Preview");
 }
 
 /// 某条命令当前绑的键位(用户可改,与 settings 快捷键页同源)。
@@ -351,6 +514,7 @@ fn window_button(
 mod tests {
     use super::*;
     use crate::state::State;
+    use crate::ui::tokens::TITLEBAR_H;
     use egui::{Event, RawInput, ViewportCommand};
 
     const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(900.0, 600.0));
@@ -367,7 +531,7 @@ mod tests {
     /// 跑一帧标题栏,返回视口命令(标题命令不在本模块,应为空)。
     fn frame(
         ctx: &egui::Context,
-        state: &State,
+        state: &mut State,
         outbox: &mut Vec<Message>,
         events: Vec<Event>,
     ) -> Vec<ViewportCommand> {
@@ -412,7 +576,7 @@ mod tests {
     /// 复刻 `draw` 的骨架顺序跑一帧:标题栏 panel 在前、边缘命令区最后
     /// (与生产同序),返回该帧是否产出 `SidebarToggled`。
     fn shell_frame(ctx: &egui::Context, events: Vec<Event>) -> (bool, Vec<ViewportCommand>) {
-        let state = State::default();
+        let mut state = State::default();
         let mut outbox = Vec::new();
         let output = ctx.run_ui(
             RawInput {
@@ -428,7 +592,7 @@ mod tests {
                             .inner_margin(egui::Margin::ZERO)
                             .fill(ui.visuals().panel_fill),
                     )
-                    .show(ui, |ui| super::ui(ui, &state, &mut outbox));
+                    .show(ui, |ui| super::ui(ui, &mut state, &mut outbox));
                 edge_resize_zones(ui);
             },
         );
@@ -539,11 +703,11 @@ mod tests {
     #[test]
     fn titlebar_interactions_send_commands_and_messages() {
         let ctx = egui::Context::default();
-        let state = State::default();
+        let mut state = State::default();
         let mut outbox = Vec::new();
 
         // 纯渲染帧:除首帧 egui 自发的主题同步外,不发任何视口命令
-        let first = frame(&ctx, &state, &mut outbox, Vec::new());
+        let first = frame(&ctx, &mut state, &mut outbox, Vec::new());
         assert!(
             first
                 .iter()
@@ -554,11 +718,16 @@ mod tests {
         // 拖拽:标题区(避开右端按钮排)按下并拖过点击容差(6px)后,
         // 开拖帧发 StartDrag;静按压仍是 click(双击最大化的前提)
         let grab = Pos2::new(SCREEN.center().x, 18.0);
-        frame(&ctx, &state, &mut outbox, vec![Event::PointerMoved(grab)]);
-        frame(&ctx, &state, &mut outbox, vec![click(grab, true)]);
+        frame(
+            &ctx,
+            &mut state,
+            &mut outbox,
+            vec![Event::PointerMoved(grab)],
+        );
+        frame(&ctx, &mut state, &mut outbox, vec![click(grab, true)]);
         let commands = frame(
             &ctx,
-            &state,
+            &mut state,
             &mut outbox,
             vec![Event::PointerMoved(grab + egui::vec2(12.0, 0.0))],
         );
@@ -568,7 +737,7 @@ mod tests {
         );
         frame(
             &ctx,
-            &state,
+            &mut state,
             &mut outbox,
             vec![click(grab + egui::vec2(12.0, 0.0), false)],
         );
@@ -579,7 +748,7 @@ mod tests {
         for pressed in [true, false, true, false] {
             double_click_commands.extend(frame(
                 &ctx,
-                &state,
+                &mut state,
                 &mut outbox,
                 vec![click(grab, pressed)],
             ));
@@ -591,16 +760,16 @@ mod tests {
 
         // 六按钮逐个点击:命中矩形即纯函数给出的划分(绘制同源)
         let rects = button_rects(SCREEN);
-        let press = |i: usize, state: &State, outbox: &mut Vec<Message>| {
+        let press = |i: usize, state: &mut State, outbox: &mut Vec<Message>| {
             let center = rects[i].center();
             frame(&ctx, state, outbox, vec![Event::PointerMoved(center)]);
             frame(&ctx, state, outbox, vec![click(center, true)]);
             frame(&ctx, state, outbox, vec![click(center, false)])
         };
 
-        press(0, &state, &mut outbox); // 关闭左栏 → 消息
+        press(0, &mut state, &mut outbox); // 关闭左栏 → 消息
         assert_eq!(outbox, vec![Message::SidebarToggled]);
-        press(1, &state, &mut outbox); // 关闭右栏 → 消息
+        press(1, &mut state, &mut outbox); // 关闭右栏 → 消息
         assert_eq!(
             outbox,
             vec![Message::SidebarToggled, Message::RightPanelToggled]
@@ -608,10 +777,10 @@ mod tests {
         // 禅定键(M4 实装):与左右两栏那两颗同为「布局入口」——产消息而非
         // 视口命令。区别在于进/出的快照怎么存怎么还原由 `LayoutSettings`
         // 自己裁决,本模块连左右两栏当前是什么状态都不必知道。
-        let commands = press(2, &state, &mut outbox);
+        let commands = press(2, &mut state, &mut outbox);
         assert!(commands.is_empty(), "禅定键不发视口命令");
         // 齿轮(2026-09-27 迁自左栏底段设置行):左键开默认页,不发视口命令
-        let commands = press(3, &state, &mut outbox);
+        let commands = press(3, &mut state, &mut outbox);
         assert!(commands.is_empty(), "齿轮不发视口命令");
         assert_eq!(
             outbox,
@@ -622,9 +791,9 @@ mod tests {
                 Message::SettingsOpened(crate::settings::SettingsTab::Appearance)
             ]
         );
-        assert!(press(4, &state, &mut outbox).contains(&ViewportCommand::Minimized(true)));
-        assert!(press(5, &state, &mut outbox).contains(&ViewportCommand::Maximized(true)));
-        assert!(press(6, &state, &mut outbox).contains(&ViewportCommand::Close));
+        assert!(press(4, &mut state, &mut outbox).contains(&ViewportCommand::Minimized(true)));
+        assert!(press(5, &mut state, &mut outbox).contains(&ViewportCommand::Maximized(true)));
+        assert!(press(6, &mut state, &mut outbox).contains(&ViewportCommand::Close));
     }
 
     /// 八个边缘命令区:命中即发对应方向的 BeginResize。
@@ -671,6 +840,150 @@ mod tests {
         assert!(
             commands.contains(&ViewportCommand::BeginResize(ResizeDirection::North)),
             "北边条按下应发 BeginResize(North),实际 {commands:?}"
+        );
+    }
+    // —— 标题栏命令箱(docs/ui-shell-redesign-v2.md §5.6)——
+
+    /// 宽 / 窄两条样本上的几何:命令箱不与七枚窗口按钮重叠、两槽位不
+    /// 重叠、都落在标题栏高度内。
+    ///
+    /// **断言用的期待值取硬编码/分量组合,不读 `TITLE_CMD_W` 反推 ——
+    /// 否则改 token 时绘制与断言一起变,断言自我满足。
+    #[test]
+    fn command_box_does_not_overlap_window_buttons() {
+        // 900px 是 M0 的默认窗口宽,也是真机截图那一档
+        let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, TITLEBAR_H));
+        let buttons = button_rects(bar);
+        let cbox = command_box_rect(bar);
+        let slot0 = command_box_slot_rect(cbox, 0);
+        let slot1 = command_box_slot_rect(cbox, 1);
+
+        // 命令箱整体在七枚按钮之左,且留了间隙
+        assert!(shows_command_box(bar), "900px 应有命令箱");
+        assert!(
+            cbox.right() <= buttons[0].left(),
+            "命令箱右缘 {:?} 不得越过最左按钮 {:?}",
+            cbox.right(),
+            buttons[0].left()
+        );
+        assert_eq!(
+            buttons[0].left() - cbox.right(),
+            crate::ui::tokens::TITLE_CMD_TO_BTN,
+            "间隙固定为 TITLE_CMD_TO_BTN"
+        );
+
+        // 两槽位:0 贴右缘(搜索),1 在其左;互不重叠
+        assert_eq!(slot0.right(), cbox.right(), "槽位 0 贴命令箱右缘");
+        assert_eq!(slot0.width(), crate::ui::tokens::TITLE_SEARCH_W);
+        assert_eq!(slot1.width(), crate::ui::tokens::TITLE_VIEW_W);
+        assert!(
+            slot1.right() <= slot0.left(),
+            "槽位 1({slot1:?}) 须在槽位 0 左侧"
+        );
+
+        // 高度:两槽位等高 = TITLE_CMD_H,且垂直居中于这条 36px 标题栏
+        assert_eq!(slot0.height(), crate::ui::tokens::TITLE_CMD_H);
+        assert_eq!(slot1.height(), crate::ui::tokens::TITLE_CMD_H);
+        let expected_top = (TITLEBAR_H - crate::ui::tokens::TITLE_CMD_H) / 2.0;
+        assert!((slot0.top() - expected_top).abs() < 0.01, "{slot0:?}");
+        assert!((slot1.top() - expected_top).abs() < 0.01, "{slot1:?}");
+    }
+
+    /// 命令箱总宽 = 搜索 + 间隙 + 切换;任何一个分量改了必须同步改这条。
+    #[test]
+    fn command_box_total_width_is_the_sum_of_its_parts() {
+        assert_eq!(crate::ui::tokens::TITLE_CMD_W, 342.0, "实例值钉死");
+        assert_eq!(
+            crate::ui::tokens::TITLE_CMD_W,
+            crate::ui::tokens::TITLE_SEARCH_W
+                + crate::ui::tokens::TITLE_CMD_GAP
+                + crate::ui::tokens::TITLE_VIEW_W
+        );
+    }
+
+    /// 窄窗口整体不画命令箱 —— 与其挤掉左段标题,不如留着这份空间给标题
+    /// (搜索能力经左栏 Search 页 / Ctrl+P 仍在,不丢)。
+    #[test]
+    fn command_box_is_dropped_on_narrow_windows() {
+        let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, TITLEBAR_H));
+        let narrow = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, TITLEBAR_H));
+        assert!(shows_command_box(wide));
+        assert!(!shows_command_box(narrow), "500px 窗口不该画命令箱");
+        // 阈值处的行为:-1px 不画,0px 画(边界选一边,不含糊)
+        let at = Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(crate::ui::tokens::TITLE_CMD_MAX_W, TITLEBAR_H),
+        );
+        let below = Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(crate::ui::tokens::TITLE_CMD_MAX_W - 1.0, TITLEBAR_H),
+        );
+        assert!(shows_command_box(at), "正好等于阈值 → 画");
+        assert!(!shows_command_box(below));
+    }
+
+    /// 无头跑命令箱:点 Live 段发 ToggleLivePreview,搜索框输入落到
+    /// 变化发 SearchQueryChanged。
+    #[test]
+    fn titlebar_view_switch_and_search_are_wired() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        let mut outbox = Vec::new();
+        let bar = Rect::from_min_max(Pos2::ZERO, Pos2::new(900.0, TITLEBAR_H));
+        let cbox = command_box_rect(bar);
+        let switch = command_box_slot_rect(cbox, 1);
+        let capsule = command_box_slot_rect(cbox, 0);
+        // `super::ui` 读 `ui.max_rect()` 当整条标题栏,直接挂在根 Ui 上会
+        // 拿到 900×600 —— 这里必须先把 max_rect 限到 36px 那条,坐标才与
+        // `command_box_rect(bar)` 同源。
+        let frame_fn = |state: &mut State, outbox: &mut Vec<Message>, events: Vec<Event>| {
+            let output = ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(SCREEN),
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+                    super::ui(&mut child, state, outbox);
+                },
+            );
+            output.drop_without_applying_deltas();
+        };
+
+        frame_fn(&mut state, &mut outbox, Vec::new());
+        // 点 Live 段(右半)→ ToggleLivePreview
+        let live_center = egui::pos2(switch.left() + switch.width() * 0.75, switch.center().y);
+        frame_fn(
+            &mut state,
+            &mut outbox,
+            vec![Event::PointerMoved(live_center)],
+        );
+        frame_fn(&mut state, &mut outbox, vec![click(live_center, true)]);
+        frame_fn(&mut state, &mut outbox, vec![click(live_center, false)]);
+        assert!(
+            outbox.contains(&Message::ToggleLivePreview),
+            "点 Live 段应发 ToggleLivePreview,实际 {outbox:?}"
+        );
+
+        // 打字进搜索胶囊:先把焦点给 TextEdit(点它),再 Event::Text
+        outbox.clear();
+        let cap_center = capsule.center();
+        frame_fn(
+            &mut state,
+            &mut outbox,
+            vec![Event::PointerMoved(cap_center)],
+        );
+        frame_fn(&mut state, &mut outbox, vec![click(cap_center, true)]);
+        frame_fn(&mut state, &mut outbox, vec![click(cap_center, false)]);
+        for ch in ["l", "a", "t"] {
+            frame_fn(&mut state, &mut outbox, vec![Event::Text(ch.to_owned())]);
+            frame_fn(&mut state, &mut outbox, Vec::new());
+        }
+        assert_eq!(state.search.query, "lat", "输入应落到 search.query");
+        assert!(
+            outbox.contains(&Message::SearchQueryChanged),
+            "输入变化应发 SearchQueryChanged,实际 {outbox:?}"
         );
     }
 }

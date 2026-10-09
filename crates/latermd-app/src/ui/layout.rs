@@ -304,7 +304,7 @@ impl LaterMdApp {
                         .fill(ui.visuals().panel_fill),
                 )
                 .show(ui, |ui| {
-                    crate::ui::titlebar::ui(ui, &self.state, &mut self.outbox);
+                    crate::ui::titlebar::ui(ui, &mut self.state, &mut self.outbox);
                 });
         }
 
@@ -737,7 +737,7 @@ impl LaterMdApp {
                         .fill(ui.visuals().panel_fill),
                 )
                 .show(ui, |ui| {
-                    crate::ui::titlebar::ui(ui, &self.state, &mut self.outbox);
+                    crate::ui::titlebar::ui(ui, &mut self.state, &mut self.outbox);
                 });
         }
 

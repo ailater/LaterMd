@@ -31,10 +31,41 @@ pub const TOOLBAR_H: f32 = 28.0;
 pub const FORMAT_BAR_H: f32 = 30.0;
 /// 自绘标题栏高度(docs/ui-shell-redesign.md §11,无边框模式才有)。
 pub const TITLEBAR_H: f32 = 36.0;
+// —— 标题栏命令箱(docs/ui-shell-redesign-v2.md §5.6,2026-10-08 新增)——
+
+/// 标题栏右端窗口按钮枚数(与 [`crate::ui::titlebar::TITLE_BUTTONS`] 同
+/// 源;`WINDOW_BTN.x` 乘它得整排宽。两者不同步时有断言钉住,见
+/// `titlebar::tests::button_rects_tile_from_the_right_edge`)。
+pub const TITLE_BUTTON_N: usize = 7;
 /// 标题栏右侧窗口按钮命中区(Win 风整块,mac/Linux 同款统一)。
 pub const WINDOW_BTN: egui::Vec2 = egui::Vec2::new(32.0, 24.0);
+/// 标题栏右端「命令箱」的横向几何(docs/ui-shell-redesign-v2.md §5.6):
+/// 搜索胶囊 + 源码/Live 切换,居中最右一组窗口按钮之左。
+pub const TITLE_SEARCH_W: f32 = 260.0;
+/// 源码/Live 两段切换的总宽(两段各 38)。
+pub const TITLE_VIEW_W: f32 = 76.0;
+/// 搜索胶囊与切换控件之间的间隙。
+pub const TITLE_CMD_GAP: f32 = 6.0;
+/// 命令箱总宽:= [`TITLE_SEARCH_W`] + [`TITLE_CMD_GAP`] + [`TITLE_VIEW_W`]
+/// (346)。有断言钉住这个等式,改分量必须一起改。
+pub const TITLE_CMD_W: f32 = TITLE_SEARCH_W + TITLE_CMD_GAP + TITLE_VIEW_W;
+/// 标题栏搜索胶囊的占位提示。
+pub const TITLE_SEARCH_HINT: &str = "搜索 / 跳转…";
+/// 命令箱到最左那枚窗口按钮的留白(不与按钮贴死)。
+pub const TITLE_CMD_TO_BTN: f32 = 8.0;
+/// 命令箱控件的高度(胶囊 / 切换同高,垂直居中于 36px 标题栏)。
+pub const TITLE_CMD_H: f32 = 24.0;
+/// 七枚窗口按钮的总宽(= 7 × [`WINDOW_BTN`].x = 224)。
+pub const TITLE_BUTTONS_W: f32 = TITLE_BUTTON_N as f32 * WINDOW_BTN.x;
+/// 左段窗口标题的最小可见宽;窄于此则标题给命令箱让位(先截断 ellipsis,
+/// 再整段不画)。264 的来历见 docs/ui-shell-redesign-v2.md §5.6。
+pub const TITLE_TEXT_MIN_W: f32 = 264.0;
+/// 窗口不再画命令箱的宽度阈值(docs/ui-shell-redesign-v2.md §5.6):
+/// 命令箱 346 + 到七枚按钮 8 + 7×32 + 标题 await 264 = 842。
+pub const TITLE_CMD_MAX_W: f32 =
+    TITLE_CMD_W + TITLE_CMD_TO_BTN + TITLE_BUTTONS_W + TITLE_TEXT_MIN_W;
 /// 左缘图标栏(rail)宽度(2026-10-08,docs/ui-shell-redesign-v2.md
-/// §5.6)。画在**左栏内部**而非第四个 `Panel::left`:后者会让左栏总占宽
+/// §5.5)。画在**左栏内部**而非第四个 `Panel::left`:后者会让左栏总占宽
 /// 240 → 288,省下的 31px 纵向 chrome 会以 48px 横向的形式赔回去。
 ///
 /// 48 的来历:`TOOLBAR_H` 的 28px 按钮 + 左右各留 10px,与标题栏
