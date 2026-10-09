@@ -295,6 +295,9 @@ pub struct FindBarState {
     /// [`State::refresh_stale_find_hits`])。crate 内可见只因 UI 无头
     /// 测试要用 struct 字面量构造本结构,外部无消费者。
     pub(crate) scanned_for: Option<(u64, u64)>,
+    /// 卡片相对右上锚点的用户拖动偏移(#72 M2,把手累计):`(0,0)` = 原
+    /// 锚点(与改前逐字节一致)。会话内保持(关了再开不重置),**不持久化**。
+    pub drag_offset: eframe::egui::Vec2,
 }
 
 /// 「跳转到行」浮条状态(#60 M1,Ctrl+G):全局一条(与查找条同款,不随
@@ -306,6 +309,9 @@ pub struct GotoBarState {
     pub open: bool,
     /// 行号输入草稿;打开时清空,非数字回车在 UI 侧拦下(不发消息)。
     pub input: String,
+    /// 卡片相对右上锚点的用户拖动偏移(#72 M2,与 [`FindBarState`] 的
+    /// `drag_offset` 同款):会话内保持,不持久化。
+    pub drag_offset: eframe::egui::Vec2,
 }
 
 pub struct State {

@@ -943,30 +943,57 @@ fn overlay_popup_frame(ctx: &egui::Context) -> egui::Frame {
     egui::Frame::popup(&ctx.global_style())
 }
 
-/// 查找条的源码区浮层:固定在源码宿主右上角,不参加正文布局。用 Window
-/// 而不是普通 horizontal,并关闭 title bar/resize/collapse,避免它变成可拖
-/// 对话框;id 稳定,位置每帧由源码 rect 重算,侧栏/窗口拖宽后不会漂走。
+/// 浮卡与源码区边缘的留白(#72 M2 抽常量:锚点偏移与 `constrain_to`
+/// 的 shrink 共用,两卡一处定义)。
+const OVERLAY_MARGIN: f32 = 8.0;
+
+/// 查找卡/跳转卡共用的右上锚点(#72 M2 抽出单一真源:两卡同锚点,
+/// 偏移与钳制回写都要再算它,不再各写一份公式)。source_rect 从可换行
+/// 的工具条之后开始,不能用包含工具条的面板 min_rect。
+fn overlay_anchor(source_rect: egui::Rect) -> egui::Pos2 {
+    source_rect.right_top()
+        + egui::vec2(
+            -OVERLAY_MARGIN,
+            crate::ui::tokens::TOOLBAR_H + OVERLAY_MARGIN * 2.0,
+        )
+}
+
+/// 查找条的源码区浮层:锚定源码宿主右上角,不参加正文布局;id 稳定,
+/// 锚点每帧由源码 rect 重算,侧栏/窗口拖宽后不会漂走。#72 M2 起可拖:
+/// 位置 = 锚点 + `FindBarState::drag_offset`(顶部把手累计,见
+/// [`overlay_drag_handle`]),拖出源码区由 `constrain_to` 钳回(改前
+/// 「避免它变成可拖对话框」的口径按坤哥 2026-10-08 新诉求推翻,
+/// decisions-pending #134)。
 fn draw_find_overlay(
     ctx: &egui::Context,
     source_rect: egui::Rect,
     find: &mut crate::state::FindBarState,
     outbox: &mut Vec<Message>,
 ) {
-    let margin = 8.0;
-    // source_rect 从可换行的工具条之后开始,不能用包含工具条的面板 min_rect。
-    let anchor =
-        source_rect.right_top() + egui::vec2(-margin, crate::ui::tokens::TOOLBAR_H + margin * 2.0);
+    let anchor = overlay_anchor(source_rect);
+    let offset_at_frame_start = find.drag_offset;
     egui::Window::new("文档内查找")
         .id(egui::Id::new("editor-find-overlay"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .fixed_pos(anchor)
+        // 拖动只认把手:关掉无标题栏 Window 的 drag-anywhere 兜底
+        // (egui 0.36 对 title_bar(false) 静默回落「拖任意处」,
+        // 与 fixed_pos 每帧重设相拼会闪跳,见 window.rs effective_drag)。
+        .movable(false)
+        .fixed_pos(anchor + find.drag_offset)
         .pivot(egui::Align2::RIGHT_TOP)
         .order(egui::Order::Foreground)
-        .constrain_to(source_rect.shrink(margin))
+        .constrain_to(source_rect.shrink(OVERLAY_MARGIN))
         .frame(overlay_popup_frame(ctx))
         .show(ctx, |ui| find_bar_contents(ui, find, outbox));
+    overlay_drag_sync(
+        ctx,
+        egui::Id::new("editor-find-overlay"),
+        anchor,
+        offset_at_frame_start,
+        &mut find.drag_offset,
+    );
 }
 
 fn find_input_id() -> egui::Id {
@@ -1035,14 +1062,15 @@ fn hit_count_label(ui: &mut egui::Ui, total: usize, pos: usize) {
     ui.colored_label(color, text);
 }
 
-/// 查找卡内容与状态无关,可在 Window/无头测试中复用。替换行
-/// (`replace_open`,Ctrl+H)画在查找行之下:替换词输入只更新按钮可用性,
-/// 不自动改写文档。
+/// 查找卡内容与状态无关,可在 Window/无头测试中复用。顶部是拖动把手
+/// (#72 M2,`overlay_drag_handle`);替换行(`replace_open`,Ctrl+H)画在
+/// 查找行之下:替换词输入只更新按钮可用性,不自动改写文档。
 fn find_bar_contents(
     ui: &mut egui::Ui,
     find: &mut crate::state::FindBarState,
     outbox: &mut Vec<Message>,
 ) {
+    overlay_drag_handle(ui, &mut find.drag_offset);
     let total = find.hits.len();
     let pos = find.hit.map(|h| h + 1).unwrap_or(0);
     let label_col = bar_label_column_width(ui);
@@ -1155,8 +1183,8 @@ fn replace_row(
 }
 
 /// 「跳转到行」浮条(#60 M1)的源码区浮层:#17 查找卡同款 Window(无标题
-/// 栏、不可拖、位置每帧由源码 rect 重算),同一右上锚点 —— 两者互斥
-/// (decisions-pending #113),同帧至多一个在场,锚点复用不冲突。
+/// 栏、可拖同款把手、锚点每帧由源码 rect 重算),同一右上锚点 —— 两者
+/// 互斥(decisions-pending #113),同帧至多一个在场,锚点复用不冲突。
 /// 源码与 Live 两模式都画:跳转在 Live 侧走块路由(`cursor.jump_to`
 /// 同一入口),不像查找条那样只限源码。
 fn draw_goto_overlay(
@@ -1165,20 +1193,76 @@ fn draw_goto_overlay(
     goto: &mut crate::state::GotoBarState,
     outbox: &mut Vec<Message>,
 ) {
-    let margin = 8.0;
-    let anchor =
-        source_rect.right_top() + egui::vec2(-margin, crate::ui::tokens::TOOLBAR_H + margin * 2.0);
+    let anchor = overlay_anchor(source_rect);
+    let offset_at_frame_start = goto.drag_offset;
     egui::Window::new("跳转到行")
         .id(egui::Id::new("editor-goto-overlay"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .fixed_pos(anchor)
+        // 拖动只认把手(与查找卡同款,见 draw_find_overlay 注释)
+        .movable(false)
+        .fixed_pos(anchor + goto.drag_offset)
         .pivot(egui::Align2::RIGHT_TOP)
         .order(egui::Order::Foreground)
-        .constrain_to(source_rect.shrink(margin))
+        .constrain_to(source_rect.shrink(OVERLAY_MARGIN))
         .frame(overlay_popup_frame(ctx))
         .show(ctx, |ui| goto_bar_contents(ui, goto, outbox));
+    overlay_drag_sync(
+        ctx,
+        egui::Id::new("editor-goto-overlay"),
+        anchor,
+        offset_at_frame_start,
+        &mut goto.drag_offset,
+    );
+}
+
+/// 浮卡顶部的拖动把手条(#72 M2):全宽窄条,`click_and_drag` 命中,拖动
+/// 每帧的 [`egui::Response::drag_delta`] 累计进卡片状态的 `drag_offset`
+/// (会话内保持)。中央一枚短圆角胶囊给可视抓手提示 —— 纯 shape 自绘,
+/// 不依赖字体 glyph 覆盖(icons.rs 无 Grip/Handle 变体,#133 同款不新增)。
+/// 独立命中区,不与输入框/按钮相交,也不进 Tab 焦点链(非可聚焦控件)。
+fn overlay_drag_handle(ui: &mut egui::Ui, offset: &mut egui::Vec2) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), OVERLAY_DRAG_STRIP_H),
+        egui::Sense::click_and_drag(),
+    );
+    let pill = egui::Rect::from_center_size(rect.center(), egui::vec2(28.0, 3.0));
+    let color = if response.hovered() || response.dragged() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().rect_filled(pill, 1.5, color);
+    *offset += response.drag_delta();
+    response.on_hover_cursor(egui::CursorIcon::Grab);
+}
+
+/// 把手条高度:够按住又不把窄卡撑高(抓手胶囊 3px + 上下各 ~3.5px 呼吸)。
+const OVERLAY_DRAG_STRIP_H: f32 = 10.0;
+
+/// 把手偏移回写(#72 M2):`constrain_to` 的钳制与整像素取整发生在 Window
+/// 内部,状态里的 `drag_offset` 看不见。每帧画完把**实际**落点(锚点 =
+/// Area 的 RIGHT_TOP pivot)与「锚点 + **帧初**偏移」比对 —— 帧初值是
+/// 本帧渲染真正用过的偏移(把手 delta 在内容闭包里累计,要下一帧才进
+/// `fixed_pos`,拿帧末累计值对账会把刚累计的增量当漂移抹掉)。差超过
+/// 半像素(真实钳制,非取整噪声)才把偏移回写到实际值,同时丢弃越界
+/// 段的超出量 —— 否则卡片贴边拖过头后再往回拖,累计值要先「走回」
+/// 越界段,卡片原地不动(空程)。
+fn overlay_drag_sync(
+    ctx: &egui::Context,
+    id: egui::Id,
+    anchor: egui::Pos2,
+    offset_at_frame_start: egui::Vec2,
+    offset: &mut egui::Vec2,
+) {
+    let Some(rect) = ctx.memory(|memory| memory.area_rect(id)) else {
+        return;
+    };
+    let drift = rect.right_top() - (anchor + offset_at_frame_start);
+    if drift.x.abs() > 0.5 || drift.y.abs() > 0.5 {
+        *offset = rect.right_top() - anchor;
+    }
 }
 
 /// 跳转浮条内容:行号输入 + 「跳转」+ ✕。返回(输入框, 跳转钮)响应供
@@ -1196,6 +1280,7 @@ fn goto_bar_contents(
         ui.ctx()
             .memory_mut(|memory| memory.request_focus(goto_input_id()));
     }
+    overlay_drag_handle(ui, &mut goto.drag_offset);
     let mut input = goto.input.clone();
     let (response, jump_button) = ui
         .horizontal(|ui| {
@@ -2424,6 +2509,427 @@ mod tests {
             tops["on"], tops["off"],
             "minimap 开关不改变正文顶边(浮层不参与布局,无挤压推低)"
         );
+    }
+
+    // —— #72 M2:浮卡把手拖动 ——
+
+    /// 无头定位把手:卡片矩形内 ~28×3 的圆角胶囊(把手条唯一自绘
+    /// shape,尺寸签名在全帧唯一)。
+    fn overlay_drag_pill(shapes: &[egui::epaint::ClippedShape], card: Rect) -> Rect {
+        shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(r)
+                    if r.fill != egui::Color32::TRANSPARENT
+                        && (r.rect.width() - 28.0).abs() < 0.5
+                        && (r.rect.height() - 3.0).abs() < 0.5
+                        && card.contains(r.rect.center()) =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("浮卡把手胶囊未找到")
+    }
+
+    /// 把手拖动序列:press → 三帧累计位移到 `total` → release → 两空帧。
+    /// 尾部空帧必需:偏移在内容闭包里累计,经 `fixed_pos` 下一帧才落位。
+    fn drag_overlay_by_pill(
+        app: &mut LaterMdApp,
+        ctx: &egui::Context,
+        screen: Rect,
+        pill_center: Pos2,
+        total: egui::Vec2,
+        start_time: f64,
+    ) {
+        let click = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        find_test_frame(
+            app,
+            ctx,
+            screen,
+            start_time,
+            vec![Event::PointerMoved(pill_center), click(pill_center, true)],
+        );
+        for step in 1..=3 {
+            let pos = pill_center + total * (step as f32 / 3.0);
+            find_test_frame(
+                app,
+                ctx,
+                screen,
+                start_time + f64::from(step) * 0.1,
+                vec![Event::PointerMoved(pos)],
+            );
+        }
+        find_test_frame(
+            app,
+            ctx,
+            screen,
+            start_time + 0.4,
+            vec![click(pill_center + total, false)],
+        );
+        for step in 0..2 {
+            find_test_frame(
+                app,
+                ctx,
+                screen,
+                start_time + 0.5 + f64::from(step) * 0.1,
+                Vec::new(),
+            );
+        }
+    }
+
+    /// #72 M2:两卡把手拖动 —— 位置随动、精确等于累计位移、跨帧不动、
+    /// 关了再开仍在拖后处(会话内保持)、拖回原点后与改前锚点逐字节一致
+    /// (偏移回零 ⇒ `fixed_pos` 输入与改前相同,同一条钳制/取整管线)。
+    #[test]
+    fn find_and_goto_cards_drag_by_handle_and_hold_offset_across_frames() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        for (name, is_find) in [("find", true), ("goto", false)] {
+            let ctx = egui::Context::default();
+            let (mut app, dir) = find_test_app(&format!("drag-{name}"));
+            let (open, close) = if is_find {
+                (
+                    Message::FindBarToggled(true),
+                    Message::FindBarToggled(false),
+                )
+            } else {
+                (
+                    Message::GotoBarToggled(true),
+                    Message::GotoBarToggled(false),
+                )
+            };
+            app.state.apply(open.clone());
+            let overlay = if is_find {
+                egui::Id::new("editor-find-overlay")
+            } else {
+                egui::Id::new("editor-goto-overlay")
+            };
+            let mut shapes = Vec::new();
+            for step in 0..8 {
+                shapes = find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+            }
+            let initial = ctx
+                .memory(|memory| memory.area_rect(overlay))
+                .expect("浮卡已绘制");
+            let offset = |app: &LaterMdApp| {
+                if is_find {
+                    app.state.find.drag_offset
+                } else {
+                    app.state.goto.drag_offset
+                }
+            };
+            // 前置:未拖动偏移恰为零 ⇒ 位置与改前逐字节同源
+            assert_eq!(offset(&app), egui::Vec2::ZERO, "{name}:未拖动偏移为零");
+            let pill = overlay_drag_pill(&shapes, initial);
+
+            // 拖动 −70,+40(远离源码区边界,不触发钳制)
+            let total = egui::vec2(-70.0, 40.0);
+            drag_overlay_by_pill(&mut app, &ctx, screen, pill.center(), total, 1.0);
+            let moved = ctx.memory(|memory| memory.area_rect(overlay)).unwrap();
+            for (got, want, axis) in [
+                (moved.right_top().x - initial.right_top().x, total.x, "x"),
+                (moved.right_top().y - initial.right_top().y, total.y, "y"),
+            ] {
+                assert!(
+                    (got - want).abs() <= 0.5,
+                    "{name} 卡随动:{axis} 轴位移 {got} ≈ {want}"
+                );
+            }
+            let dragged_offset = offset(&app);
+            assert!(
+                (dragged_offset.x - total.x).abs() <= 0.5
+                    && (dragged_offset.y - total.y).abs() <= 0.5,
+                "{name} 偏移字段随动:{dragged_offset:?} ≈ {total:?}"
+            );
+
+            // 跨帧保持:五个空帧位置与偏移都冻结
+            for step in 0..5 {
+                find_test_frame(
+                    &mut app,
+                    &ctx,
+                    screen,
+                    2.0 + f64::from(step) * 0.1,
+                    Vec::new(),
+                );
+            }
+            let frozen = ctx.memory(|memory| memory.area_rect(overlay)).unwrap();
+            assert_eq!(frozen, moved, "{name}:空帧后位置不动");
+            assert_eq!(offset(&app), dragged_offset, "{name}:空帧后偏移不动");
+
+            // 会话内保持:关 → 开,位置仍在拖后处(不重置、不持久化之外的第二状态)
+            app.state.apply(close);
+            find_test_frame(&mut app, &ctx, screen, 3.0, Vec::new());
+            app.state.apply(open);
+            for step in 0..8 {
+                find_test_frame(
+                    &mut app,
+                    &ctx,
+                    screen,
+                    3.1 + f64::from(step) * 0.1,
+                    Vec::new(),
+                );
+            }
+            assert_eq!(
+                ctx.memory(|memory| memory.area_rect(overlay)).unwrap(),
+                frozen,
+                "{name}:重开后偏移保持"
+            );
+
+            // 拖回原点:位置与改前锚点逐字节一致
+            let shapes = find_test_frame(&mut app, &ctx, screen, 4.0, Vec::new());
+            let pill = overlay_drag_pill(&shapes, frozen);
+            drag_overlay_by_pill(&mut app, &ctx, screen, pill.center(), -total, 5.0);
+            assert_eq!(
+                ctx.memory(|memory| memory.area_rect(overlay)).unwrap(),
+                initial,
+                "{name}:拖回原点后与改前锚点逐字节一致"
+            );
+            let back = offset(&app);
+            assert!(
+                back.x.abs() <= 0.01 && back.y.abs() <= 0.01,
+                "{name}:拖回后偏移归零:{back:?}"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// #72 M2:钳制 —— 拖出源码区被 `constrain_to` 钳回,且偏移回写
+    /// (`overlay_drag_sync`)保证贴边拖过头后往回拖**立即**跟手(无空程)。
+    /// 上缘/右缘的钳制量可从锚点公式精确推导:锚点 y 等于「源码区顶
+    /// 加 TOOLBAR_H 加 2×margin」,而钳制顶等于「源码区顶加 margin」,
+    /// 故上拖钳制量恰为 TOOLBAR_H+margin;右缘即初始位置(anchor.x
+    /// 即源码区右减 margin)。
+    #[test]
+    fn overlay_drag_clamps_inside_source_area_and_returns_without_dead_zone() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("drag-clamp");
+        app.state.apply(Message::FindBarToggled(true));
+        let overlay = egui::Id::new("editor-find-overlay");
+        let mut shapes = Vec::new();
+        for step in 0..8 {
+            shapes = find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let initial = ctx.memory(|memory| memory.area_rect(overlay)).unwrap();
+        let pill = overlay_drag_pill(&shapes, initial);
+        let card = |ctx: &egui::Context| ctx.memory(|memory| memory.area_rect(overlay)).unwrap();
+
+        // ① 上拖过头:恰被钳到源码区上缘(锚点公式推导,见 fn 文档)
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(0.0, -3000.0),
+            1.0,
+        );
+        let risen = initial.top() - card(&ctx).top();
+        let expected = crate::ui::tokens::TOOLBAR_H + OVERLAY_MARGIN;
+        assert!(
+            (risen - expected).abs() <= 0.5,
+            "上拖钳制量 {risen} ≈ TOOLBAR_H+margin = {expected}"
+        );
+
+        // ② 右拖过头:初始即贴右缘,卡片不动且偏移被回写为 0(空程消除)
+        let shapes = find_test_frame(&mut app, &ctx, screen, 2.0, Vec::new());
+        let pill = overlay_drag_pill(&shapes, card(&ctx));
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(3000.0, 0.0),
+            3.0,
+        );
+        let clamped = card(&ctx);
+        assert!(
+            (clamped.right() - initial.right()).abs() <= 0.5,
+            "右拖过头仍钳在源码区右缘"
+        );
+        assert!(
+            app.state.find.drag_offset.x.abs() <= 0.5,
+            "贴缘越界段被回写吸收,偏移归零:{:?}",
+            app.state.find.drag_offset
+        );
+
+        // ③ 无空程:贴右缘后往回拖 60,卡片立即移动 60
+        let shapes = find_test_frame(&mut app, &ctx, screen, 4.0, Vec::new());
+        let pill = overlay_drag_pill(&shapes, clamped);
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(-60.0, 0.0),
+            5.0,
+        );
+        let pulled = card(&ctx);
+        assert!(
+            ((pulled.right() - clamped.right()) + 60.0).abs() <= 0.5,
+            "贴缘回拖立即跟手:{:?} → {:?}",
+            clamped,
+            pulled
+        );
+
+        // ④ 左下同时拖出天际:整卡仍完整落在窗口内(源码区在侧栏/预览/
+        // 状态栏之内,比窗口更紧)
+        let shapes = find_test_frame(&mut app, &ctx, screen, 6.0, Vec::new());
+        let pill = overlay_drag_pill(&shapes, pulled);
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(-3000.0, 3000.0),
+            7.0,
+        );
+        let corner = card(&ctx);
+        assert!(
+            corner.left() >= 0.0
+                && corner.right() <= screen.right()
+                && corner.top() >= 0.0
+                && corner.bottom() <= screen.bottom() - 15.0,
+            "拖出天际后整卡钳在源码区内:{corner:?}(状态栏 bottom panel 先占位,源码区下界离屏底 ≥15px)"
+        );
+        // 偏移定义式:实际右上角 − 锚点,钳制后仍精确成立
+        let anchor = initial.right_top();
+        let off = app.state.find.drag_offset;
+        let actual = corner.right_top();
+        assert!(
+            (actual.x - (anchor.x + off.x)).abs() <= 0.5
+                && (actual.y - (anchor.y + off.y)).abs() <= 0.5,
+            "钳制后「位置 = 锚点 + 偏移」仍成立:{actual:?} vs {anchor:?}+{off:?}"
+        );
+
+        // ⑤ 左缘同样无空程:贴左缘往回拖 40,立即移动
+        let shapes = find_test_frame(&mut app, &ctx, screen, 9.0, Vec::new());
+        let pill = overlay_drag_pill(&shapes, corner);
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(40.0, 0.0),
+            10.0,
+        );
+        let back = card(&ctx);
+        assert!(
+            ((back.left() - corner.left()) - 40.0).abs() <= 0.5,
+            "左缘回拖立即跟手:{corner:?} → {back:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #72 M2:把手与输入框井水不犯河水 —— 把手条命中区与查找输入框
+    /// 不相交;把手上点击(press+release)不抢输入框焦点;把手拖动后
+    /// 输入框**首击**仍能聚焦并接收打字(拖动不吞点击)。
+    #[test]
+    fn overlay_handle_drag_and_click_do_not_swallow_find_input_first_click() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1500.0, 850.0));
+        let (mut app, dir) = find_test_app("drag-click");
+        app.state.apply(Message::FindBarToggled(true));
+        let mut shapes = Vec::new();
+        for step in 0..8 {
+            shapes = find_test_frame(&mut app, &ctx, screen, f64::from(step) * 0.1, Vec::new());
+        }
+        let card = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("editor-find-overlay")))
+            .unwrap();
+        let input = ctx
+            .read_response(find_input_id())
+            .expect("查找输入框已绘制")
+            .rect;
+        // 把手条(卡片顶条,取 frame 内边距之后的 sensed 区)与输入框不相交
+        let m = ctx.global_style().spacing.menu_margin;
+        let strip = Rect::from_min_max(
+            Pos2::new(
+                card.left() + f32::from(m.left),
+                card.top() + f32::from(m.top),
+            ),
+            Pos2::new(
+                card.right() - f32::from(m.right),
+                card.top() + f32::from(m.top) + OVERLAY_DRAG_STRIP_H,
+            ),
+        );
+        assert!(
+            !strip.intersects(input),
+            "把手条 {strip:?} 与输入框 {input:?} 命中区不相交"
+        );
+        let pill = overlay_drag_pill(&shapes, card);
+
+        // 把手上点击(press+release,不移动)不聚焦输入框、不动状态
+        let click = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.0,
+            vec![
+                Event::PointerMoved(pill.center()),
+                click(pill.center(), true),
+            ],
+        );
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            1.1,
+            vec![click(pill.center(), false)],
+        );
+        assert!(
+            !ctx.memory(|memory| memory.has_focus(find_input_id())),
+            "点击把手不抢输入框焦点"
+        );
+        assert_eq!(app.state.find.query, "");
+
+        // 把手拖动一段,再首击输入框:聚焦 + 打字直落(首击不被吞)
+        drag_overlay_by_pill(
+            &mut app,
+            &ctx,
+            screen,
+            pill.center(),
+            egui::vec2(-40.0, 12.0),
+            2.0,
+        );
+        let input = ctx
+            .read_response(find_input_id())
+            .expect("拖动后输入框仍在")
+            .rect;
+        let center = input.center();
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            3.0,
+            vec![Event::PointerMoved(center), click(center, true)],
+        );
+        find_test_frame(&mut app, &ctx, screen, 3.1, vec![click(center, false)]);
+        find_test_frame(&mut app, &ctx, screen, 3.2, Vec::new());
+        assert!(
+            ctx.memory(|memory| memory.has_focus(find_input_id())),
+            "把手拖动后输入框首击仍能聚焦"
+        );
+        find_test_frame(
+            &mut app,
+            &ctx,
+            screen,
+            3.3,
+            vec![Event::Text("z".to_owned())],
+        );
+        find_test_frame(&mut app, &ctx, screen, 3.4, Vec::new());
+        assert_eq!(app.state.find.query, "z", "首击聚焦后打字直落");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // —— 「跳转到行」浮条(#60 M1)——
