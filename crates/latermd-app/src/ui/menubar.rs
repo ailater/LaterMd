@@ -857,13 +857,13 @@ mod tests {
             .keyboard();
 
         let ctx = egui::Context::default();
-        let expected_save = ctx.format_shortcut(&save_key);
-        let expected_goto = ctx.format_shortcut(&goto_key);
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |ui| {
             item(ui, Command::Save, &keymap, None, &mut outbox);
             item(ui, Command::GotoLine, &keymap, None, &mut outbox);
         });
+        let expected_save = ctx.format_shortcut(&save_key);
+        let expected_goto = ctx.format_shortcut(&goto_key);
         let text = shape_text(&output);
         output.drop_without_applying_deltas();
         assert!(
@@ -886,12 +886,12 @@ mod tests {
         );
         let new_key = rebound.get(Command::Save).expect("改绑后有绑定").keyboard();
         let ctx = egui::Context::default();
-        let expected_new = ctx.format_shortcut(&new_key);
         let old_text = expected_save.clone();
         let mut outbox = Vec::new();
         let output = ctx.run_ui(RawInput::default(), |ui| {
             item(ui, Command::Save, &rebound, None, &mut outbox);
         });
+        let expected_new = ctx.format_shortcut(&new_key);
         let text = shape_text(&output);
         output.drop_without_applying_deltas();
         assert!(
@@ -1086,9 +1086,10 @@ mod tests {
         let ids = menubar_frame(&ctx, vec![key_event(egui::Key::F, egui::Modifiers::ALT)]);
         menubar_frame(&ctx, vec![]);
         let file_id = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
-        assert!(
+        assert_eq!(
             egui::containers::Popup::is_id_open(&ctx, file_id),
-            "Alt+F 应打开「文件」菜单"
+            !cfg!(target_os = "macos"),
+            "Alt+F 仅在非 macOS 平台打开菜单"
         );
         for (index, id) in &ids {
             if *index != 0 {
@@ -1142,7 +1143,9 @@ mod tests {
     fn open_menu_closes_on_escape_and_outside_click() {
         // Esc 关闭
         let ctx = egui::Context::default();
-        let ids = menubar_frame(&ctx, vec![key_event(egui::Key::F, egui::Modifiers::ALT)]);
+        let ids = menubar_frame(&ctx, vec![]);
+        let file = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
+        egui::containers::Popup::open_id(&ctx, file);
         menubar_frame(&ctx, vec![]);
         let file_id = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
         assert!(
@@ -1161,7 +1164,9 @@ mod tests {
 
         // 点击菜单外区域关闭
         let ctx = egui::Context::default();
-        let ids = menubar_frame(&ctx, vec![key_event(egui::Key::F, egui::Modifiers::ALT)]);
+        let ids = menubar_frame(&ctx, vec![]);
+        let file = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
+        egui::containers::Popup::open_id(&ctx, file);
         menubar_frame(&ctx, vec![]);
         let file_id = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
         assert!(
@@ -1188,7 +1193,9 @@ mod tests {
         // 悬停切换现状:菜单开着,指针移到另一标题上悬停 —— 顶层 MenuButton
         // 只点击切换,悬停不开新菜单、原菜单保持(现状即如此,核验记录)
         let ctx = egui::Context::default();
-        let ids = menubar_frame(&ctx, vec![key_event(egui::Key::F, egui::Modifiers::ALT)]);
+        let ids = menubar_frame(&ctx, vec![]);
+        let file = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
+        egui::containers::Popup::open_id(&ctx, file);
         menubar_frame(&ctx, vec![]);
         let (file_id, edit_id) = (
             ids.iter().find(|(index, _)| *index == 0).unwrap().1,
@@ -1279,9 +1286,10 @@ mod tests {
         assert_eq!(ids, ids2, "两帧的 popup id 稳定");
         menubar_frame(&ctx, vec![]);
         let file_id = ids.iter().find(|(index, _)| *index == 0).unwrap().1;
-        assert!(
+        assert_eq!(
             egui::containers::Popup::is_id_open(&ctx, file_id),
-            "单击 Alt 应打开首个菜单「文件」"
+            !cfg!(target_os = "macos"),
+            "单击 Alt 仅在非 macOS 平台聚焦菜单"
         );
 
         // 对照:Alt+字母组合不触发单击语义(那由 Alt+字母助记负责)
@@ -1337,6 +1345,10 @@ mod tests {
         );
         output.drop_without_applying_deltas();
         assert!(outbox.is_empty());
+        if cfg!(target_os = "macos") {
+            let edit_id = ids.iter().find(|(index, _)| *index == 1).unwrap().1;
+            egui::containers::Popup::open_id(&ctx, edit_id);
+        }
         // 帧 2:展开帧(闭包执行,无输入)
         let output = ctx.run_ui(RawInput::default(), |ui| {
             super::ui_with_probe(ui, &keymap, &state, &mut outbox, Some(|_, _| {}));
@@ -1356,6 +1368,12 @@ mod tests {
             },
         );
         output.drop_without_applying_deltas();
+        if cfg!(target_os = "macos") {
+            assert!(outbox.is_empty(), "macOS 裸字母不触发菜单命令");
+            let edit_id = ids.iter().find(|(index, _)| *index == 1).unwrap().1;
+            assert!(egui::containers::Popup::is_id_open(&ctx, edit_id));
+            return;
+        }
         assert_eq!(
             outbox,
             vec![Message::FindBarToggled(true)],
@@ -1382,23 +1400,21 @@ mod tests {
     #[test]
     fn settings_menu_direct_tabs_click_through_and_reduce() {
         for (needle, expected) in [
-            ("外观(", SettingsTab::Appearance),
-            ("快捷键(", SettingsTab::Keymap),
+            ("外观", SettingsTab::Appearance),
+            ("快捷键", SettingsTab::Keymap),
         ] {
             let ctx = egui::Context::default();
-            // 帧 1:Alt+S 事件帧(popup 记忆已开,闭包不执行)
+            // 显式打开 popup，让点击测试在没有 Alt 助记层的 macOS 也执行。
             let keymap = Keymap::builtin();
             let state = State::default();
             let mut outbox = Vec::new();
-            let output = ctx.run_ui(
-                RawInput {
-                    events: vec![key_event(egui::Key::S, egui::Modifiers::ALT)],
-                    ..Default::default()
-                },
-                |ui| super::ui(ui, &keymap, &state, &mut outbox),
-            );
-            output.drop_without_applying_deltas();
-            assert!(outbox.is_empty(), "开菜单本身不产生消息");
+            let ids = menubar_frame(&ctx, vec![]);
+            let settings_id = ids
+                .iter()
+                .find(|(index, _)| *index == MENUS.len())
+                .unwrap()
+                .1;
+            egui::containers::Popup::open_id(&ctx, settings_id);
 
             // 帧 2-3:两次空帧 —— egui 0.36 的 MenuButton 从 popup 记忆
             // 开态到闭包真正绘制隔一帧(事件帧写记忆 → 次帧菜单按钮收
@@ -1678,12 +1694,12 @@ mod tests {
         }
         let on = item_text(Command::ToggleMinimap, Some(true));
         assert!(
-            on.contains("✓") && on.contains("Minimap 缩略图(M)"),
+            on.contains("✓") && on.contains(&label_with_mnemonic("Minimap 缩略图", 'M')),
             "开态条目应渲染 ✓ 前缀 + 带助记后缀的显示名(实际:{on:?})"
         );
         let off = item_text(Command::ToggleMinimap, Some(false));
         assert!(
-            !off.contains("✓") && off.contains("Minimap 缩略图(M)"),
+            !off.contains("✓") && off.contains(&label_with_mnemonic("Minimap 缩略图", 'M')),
             "关态条目不渲染 ✓(占位空格保持开关条目对齐;实际:{off:?})"
         );
         let plain = item_text(Command::ToggleTheme, None);
@@ -1794,7 +1810,7 @@ mod tests {
         output.drop_without_applying_deltas();
         let title = bar_texts
             .iter()
-            .find(|(text, _)| text.starts_with("文件("))
+            .find(|(text, _)| text.starts_with(&label_with_mnemonic("文件", 'F')))
             .expect("菜单条渲染出带助记后缀的标题");
         let bar_size = title.1;
 
@@ -1806,7 +1822,7 @@ mod tests {
         output.drop_without_applying_deltas();
         let entry = item_texts
             .iter()
-            .find(|(text, _)| text.starts_with("保存("))
+            .find(|(text, _)| text.starts_with(&label_with_mnemonic("保存", 'S')))
             .expect("菜单条目渲染出带助记后缀的显示名");
         assert_eq!(
             bar_size, entry.1,

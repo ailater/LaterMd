@@ -87,3 +87,8 @@ jobs:
 
     - name: cargo build --release
       run: cargo build --release --target ${{ matrix.target }}
+
+    # Native macOS tests cover Cmd/menu behavior, system fonts and BSD sockets.
+    - name: macOS tests
+      if: runner.os == 'macOS'
+      run: cargo test --workspace --all-features --target ${{ matrix.target }}

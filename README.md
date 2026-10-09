@@ -122,6 +122,17 @@ cargo run --release -p latermd-app     # 编译并直接运行
 三平台命令一致(Windows 需 MSVC 生成工具),产物不能跨平台拷贝。
 CJK 字体(微软雅黑 / 苹方 / Noto Sans CJK)已按平台内置候选,中文开箱可用。
 
+macOS 开发建议通过 `.app` 启动，与发布版使用相同的应用包结构：
+
+```bash
+bash packaging/macos/build.sh --open                  # 本机架构 debug .app
+bash packaging/macos/build.sh --release --universal --dmg  # 双架构 .app 与 dmg
+```
+
+产物位于 Cargo target 目录的 `macos/` 下。脚本复用现有图标和 Info.plist，
+执行 ad-hoc 签名及校验；不安装到 `/Applications`，不发布 Release。
+环境要求及验证记录见 [macOS 开发文档](docs/macos-development.md)。
+
 ## 开发
 
 分支与推送规则、vendor 改动三类拆分、三条铁律与合入门禁,见 [AGENTS.md](AGENTS.md)(所有贡献者与 Agent 必读)。

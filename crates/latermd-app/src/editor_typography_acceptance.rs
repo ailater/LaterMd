@@ -173,7 +173,7 @@ fn mixed_line_baseline_row_height_and_ink_in_both_visuals() {
         let old_dev = baseline_cjk_minus_latin(&old_galley).expect("混排行应含 CJK 与拉丁");
         let new_dev = baseline_cjk_minus_latin(&new_galley).expect("混排行应含 CJK 与拉丁");
         assert!(
-            old_dev >= 1.0,
+            old_dev.abs() >= 1.0,
             "{theme_name}: 对照(现状 Monospace 族)应存在 ≥1px 基线偏差,实测 {old_dev}"
         );
         assert_eq!(

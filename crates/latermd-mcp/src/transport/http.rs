@@ -63,6 +63,9 @@ pub fn serve(server: Server, port: u16, stop: Arc<AtomicBool>) -> io::Result<()>
 
 /// 处理单个连接:读一个 HTTP 请求 → 交给 server → 写一个响应 → 关闭。
 fn handle_connection(mut stream: TcpStream, server: &Server) -> io::Result<()> {
+    // On macOS/BSD, accepted sockets inherit the listener's nonblocking mode.
+    // Request parsing below uses blocking IO with timeouts, not readiness polling.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = io::BufReader::new(stream.try_clone()?);
@@ -179,6 +182,46 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    /// 延迟发送数据时，继承非阻塞状态的连接仍应等待请求并正常响应。
+    #[test]
+    fn accepted_nonblocking_socket_waits_for_request() {
+        let listener = bind(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Force the macOS/BSD inheritance behavior on every test platform.
+            stream.set_nonblocking(true).unwrap();
+            ready_tx.send(()).unwrap();
+            let result = handle_connection(stream, &Server::new(None, McpConfig::default()));
+            done_tx.send(result).unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the handler must wait for data instead of returning WouldBlock"
+        );
+        client
+            .write_all(b"GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 
     /// 端到端:initialize 走 HTTP 拿到协议版本;响应体是合法 JSON。
