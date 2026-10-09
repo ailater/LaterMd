@@ -308,7 +308,12 @@ fn chip(
         let painter = ui.painter();
         // WorkBuddy 风活动页签:浅蓝底 + 蓝字 + 底部 2px 蓝条;未选中悬停浅灰
         let accent = crate::ui::tokens::accent(ui);
-        let selected_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).selected_bg;
+        let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+        let selected_bg = if cfg!(target_os = "macos") {
+            shell.code_bg
+        } else {
+            shell.selected_bg
+        };
         let hover_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).hover;
         let bg = if selected {
             selected_bg
@@ -318,7 +323,11 @@ fn chip(
             egui::Color32::TRANSPARENT
         };
         painter.rect_filled(rect, RADIUS_SM, bg);
-        let text_color = if selected { accent } else { text_color };
+        let text_color = if selected && !cfg!(target_os = "macos") {
+            accent
+        } else {
+            text_color
+        };
         painter.text(
             egui::pos2(rect.left() + SPACE_SM, rect.center().y),
             Align2::LEFT_CENTER,
@@ -326,7 +335,7 @@ fn chip(
             font,
             text_color,
         );
-        if selected {
+        if selected && !cfg!(target_os = "macos") {
             // 底部 2px 强调条:WorkBuddy 标签的视觉锚点
             let bar = egui::Rect::from_min_max(
                 egui::pos2(rect.left() + SPACE_SM, rect.bottom() - 2.0),

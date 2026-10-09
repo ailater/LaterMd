@@ -529,6 +529,9 @@ pub struct ShellTokens {
 
 /// 取当前明暗的 shell token。
 pub fn shell_tokens(dark: bool) -> ShellTokens {
+    if cfg!(target_os = "macos") {
+        return macos_shell_tokens(dark);
+    }
     if dark {
         ShellTokens {
             // 2026-10-08 S2-3:`#1B1C1F`(原 `#202124`)。与 content
@@ -577,6 +580,46 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
             // 预览与导出同观感,预览不再弱于导出。
             faint: Color32::from_rgb(0xF6, 0xF8, 0xFA),
         }
+    }
+}
+
+/// macOS 外壳保持中性,强调色只用于链接、选中与操作。
+fn macos_shell_tokens(dark: bool) -> ShellTokens {
+    let rgb = |r, g, b| Color32::from_rgb(r, g, b);
+    if dark {
+        ShellTokens {
+            sidebar: rgb(36, 36, 38),
+            content: rgb(30, 30, 32),
+            text: rgb(245, 245, 247),
+            secondary: rgb(163, 163, 170),
+            hover: rgb(52, 52, 56),
+            selected_bg: rgb(48, 61, 78),
+            accent: rgb(10, 132, 255),
+            border: rgb(62, 62, 66),
+            code_bg: rgb(40, 40, 44),
+            faint: rgb(43, 43, 46),
+        }
+    } else {
+        ShellTokens {
+            sidebar: rgb(240, 240, 242),
+            content: Color32::WHITE,
+            text: rgb(29, 29, 31),
+            secondary: rgb(106, 106, 112),
+            hover: rgb(229, 229, 233),
+            selected_bg: rgb(220, 231, 244),
+            accent: rgb(0, 122, 255),
+            border: rgb(216, 216, 220),
+            code_bg: rgb(245, 245, 247),
+            faint: rgb(246, 248, 250),
+        }
+    }
+}
+
+pub fn window_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(40, 40, 42)
+    } else {
+        Color32::from_rgb(245, 245, 247)
     }
 }
 
@@ -658,6 +701,9 @@ fn apply_shell_to(style: &mut egui::Style) {
         widget.weak_bg_fill = bg;
         widget.corner_radius = radius;
         widget.bg_stroke = egui::Stroke::NONE;
+    }
+    if cfg!(target_os = "macos") {
+        // egui 的正文标题取 active 前景;操作强调由独立 accent token 承担。
     }
     // 输入框/按钮内的弱文字(占位符)用次要色
     style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -2190,10 +2236,16 @@ mod tests {
     /// 不锁「必须达到无障碍标准」,两者不是一回事。
     #[test]
     fn sidebar_and_content_are_distinguishable_in_both_themes() {
+        // macOS 深色以细分隔线划分面板,浅色仍靠两块底色。
+        // 保留跨平台旧外壳的色块对比下限。
         const MIN: f32 = 1.12;
         for (label, dark) in [("light", false), ("dark", true)] {
             let t = shell_tokens(dark);
-            let ratio = contrast_ratio(t.sidebar, t.content);
+            let ratio = if cfg!(target_os = "macos") && dark {
+                contrast_ratio(t.border, t.sidebar)
+            } else {
+                contrast_ratio(t.sidebar, t.content)
+            };
             assert!(
                 ratio >= MIN,
                 "{label}: 侧栏 vs 内容区对比度 {ratio:.3}:1 < {MIN}:1 —— \
@@ -2231,7 +2283,12 @@ mod tests {
     #[test]
     fn sidebar_content_delta_stays_in_the_readable_band() {
         // (暗, 最大通道差下限, 上限)
-        for (label, dark, lo, hi) in [("dark", true, 12.0, 18.0), ("light", false, 16.0, 22.0)] {
+        let bands = if cfg!(target_os = "macos") {
+            [("dark", true, 5.0, 10.0), ("light", false, 12.0, 18.0)]
+        } else {
+            [("dark", true, 12.0, 18.0), ("light", false, 16.0, 22.0)]
+        };
+        for (label, dark, lo, hi) in bands {
             let t = shell_tokens(dark);
             let delta = t
                 .sidebar

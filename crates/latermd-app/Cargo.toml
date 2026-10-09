@@ -101,3 +101,8 @@ harness = false
 # 逃生后端:默认产物只带 wgpu(AGENTS.md §5)。开启本 feature 的构建才能响应
 # LATERMD_RENDERER=glow;CI 用 `--features glow` 编一条额外产线验证可编译。
 glow = ["eframe/glow"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo", "NSString"] }

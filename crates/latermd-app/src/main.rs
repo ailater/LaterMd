@@ -35,6 +35,8 @@ mod git_split_diff;
 mod keymap;
 mod layout;
 mod live;
+#[cfg(target_os = "macos")]
+mod mac_menu;
 mod mcp;
 #[cfg(test)]
 mod preview_pixel_acceptance;
@@ -111,6 +113,8 @@ fn main() -> eframe::Result<()> {
         "LaterMD",
         opts,
         Box::new(|cc| {
+            #[cfg(target_os = "macos")]
+            mac_menu::install();
             if fonts::install(&cc.egui_ctx).is_none() {
                 // M0 验证 UI 已退役,字体失配只在终端告警,不静默吞掉
                 eprintln!("LaterMD: 未找到候选 CJK 字体,中文将显示为方块");
@@ -185,10 +189,9 @@ pub(crate) fn renderer_label(env: Option<&str>) -> &'static str {
     }
 }
 
-/// 原生装饰逃生口的判定(与 `main` 的启动选择同源):变量**精确**为 `1`
-/// 才回落系统标题栏,未设/其余值一律自绘。`env` 由调用方传入以便无头测试。
+/// macOS 默认使用系统窗口按钮;其它平台仍支持原生装饰逃生口。
 fn native_decorations(env: Option<&str>) -> bool {
-    env == Some("1")
+    cfg!(target_os = "macos") || env == Some("1")
 }
 
 /// 视口构建(与 `main` 的启动选择同源):窗口图标仅在解码成功(`Some`)时
@@ -204,6 +207,16 @@ fn viewport_builder(
         .with_min_inner_size([900.0, 600.0])
         .with_decorations(native_chrome)
         .with_maximized(maximized);
+    let builder = if cfg!(target_os = "macos") && native_chrome {
+        builder
+            .with_fullsize_content_view(true)
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_titlebar_buttons_shown(true)
+            .with_movable_by_background(false)
+    } else {
+        builder
+    };
     match icon {
         Some(icon) => builder.with_icon(icon),
         None => builder,
@@ -286,9 +299,9 @@ mod tests {
     #[test]
     fn native_decorations_requires_exact_env_value() {
         assert!(native_decorations(Some("1")));
-        assert!(!native_decorations(Some("0")));
-        assert!(!native_decorations(Some("true")));
-        assert!(!native_decorations(None));
+        for value in [Some("0"), Some("true"), None] {
+            assert_eq!(native_decorations(value), cfg!(target_os = "macos"));
+        }
     }
 
     /// `--mcp-stdio` 只在精确匹配时生效(其它参数照常进 GUI);参数常量与

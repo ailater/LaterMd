@@ -1936,6 +1936,11 @@ impl State {
     /// 翻转右栏(只读预览)可见性;写盘同上由帧末统一负责。
     fn toggle_right_panel(&mut self) {
         self.layout.right = !self.layout.right;
+        // Live 下用户明确点了预览按钮，以当前选择为准，不再在切回源码时
+        // 覆盖它。
+        if self.render_mode == RenderMode::Live {
+            self.layout.pre_live_right = None;
+        }
     }
 
     /// 进/出禅定(§7)。进出各走 `LayoutSettings` 上那两个同名方法 —— 快照
@@ -2726,9 +2731,13 @@ impl State {
     fn toggle_live_preview(&mut self) {
         self.render_mode = self.render_mode.opposite();
         if self.render_mode == RenderMode::Live {
+            self.layout.pre_live_right = Some(self.layout.right);
+            self.layout.right = false;
             let tab = self.tabs.current_mut();
             let byte = tab.cursor.byte;
             tab.live.sync(&tab.editor, byte);
+        } else if let Some(previous) = self.layout.pre_live_right.take() {
+            self.layout.right = previous;
         }
     }
 

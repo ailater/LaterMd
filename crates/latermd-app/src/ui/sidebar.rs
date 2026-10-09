@@ -260,11 +260,86 @@ pub fn ui(
         egui::pos2(right, panel.max_rect().bottom()),
     );
     let mut body = panel.new_child(egui::UiBuilder::new().max_rect(body_rect));
+    draw_body(
+        &mut body,
+        active_tab,
+        file_tree,
+        current_file,
+        outline,
+        search,
+        git,
+        backlinks,
+        outbox,
+    );
+
+    // 子 Ui 不会撑开父面板，保留 main 的拖宽修复。
+    panel.expand_to_include_rect(panel.max_rect());
+
+    SidebarBands {
+        // 顶段已随 2026-10-08 改版消失(退化为零高矩形),保留字段只为
+        // 不破坏既有 `SidebarBands` 的形状。
+        top: egui::Rect::from_min_size(strip.left_top(), egui::vec2(0.0, 0.0)),
+        // nav 字段在新版里承载 rail 带(纵贯到底,不再是横向条带)。
+        nav: strip,
+        body: body_rect,
+    }
+}
+
+/// macOS 文字导航与视图内容,不占用独立图标轨道。
+#[allow(clippy::too_many_arguments)]
+pub fn workbench_ui(
+    panel: &mut egui::Ui,
+    active_tab: &mut SidebarTab,
+    file_tree: &FileTreeState,
+    current_file: Option<&Path>,
+    outline: OutlineView<'_>,
+    search: &mut SearchState,
+    git: &GitPanelState,
+    backlinks: &BacklinkState,
+    outbox: &mut Vec<Message>,
+) -> SidebarBands {
+    let top = egui::Rect::from_min_size(panel.cursor().min, egui::Vec2::ZERO);
+    let nav = crate::ui::workbench::navigation(panel, *active_tab, outbox);
+    // 导航与内容使用两个明确的子 Ui。直接复用父 Ui 会让纵向滚动区域
+    // 从面板顶端重新计算可视区，切到搜索/反向链接时首行被标题栏裁切。
+    let body = panel.available_rect_before_wrap();
+    let body_rect = egui::Rect::from_min_max(
+        body.left_top(),
+        egui::pos2(body.right(), panel.max_rect().bottom()),
+    );
+    let mut body_ui = panel.new_child(egui::UiBuilder::new().max_rect(body_rect));
+    draw_body(
+        &mut body_ui,
+        active_tab,
+        file_tree,
+        current_file,
+        outline,
+        search,
+        git,
+        backlinks,
+        outbox,
+    );
+    panel.expand_to_include_rect(panel.max_rect());
+    SidebarBands { top, nav, body }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_body(
+    panel: &mut egui::Ui,
+    active_tab: &mut SidebarTab,
+    file_tree: &FileTreeState,
+    current_file: Option<&Path>,
+    outline: OutlineView<'_>,
+    search: &mut SearchState,
+    git: &GitPanelState,
+    backlinks: &BacklinkState,
+    outbox: &mut Vec<Message>,
+) {
     egui::ScrollArea::vertical()
         .id_salt("nav-body")
         .auto_shrink([false, false])
-        .max_height(body.available_height())
-        .show(&mut body, |ui| match *active_tab {
+        .max_height(panel.available_height())
+        .show(panel, |ui| match *active_tab {
             SidebarTab::Files => files_panel(ui, file_tree, current_file, git, outbox),
             SidebarTab::Search => search_panel(ui, search, file_tree.root.as_deref(), outbox),
             SidebarTab::Outline => outline_panel(ui, outline, outbox),
@@ -277,30 +352,6 @@ pub fn ui(
                 outbox,
             ),
         });
-
-    // 面板 Ui 必须撑满分配宽度,否则「拖边距调宽」整条链路是死的:
-    // egui 0.36 的 Panel 在收尾时把**内容的 Frame 响应矩形**(而非分配的
-    // outer_rect)回写进 PanelState(panel.rs 的 `shifted_outer_rect =
-    // inner_response.response.rect`)。内容若不把自身 min_rect 撑到分配宽,
-    // 回写的就是内容宽 —— 拖拽帧分到的宽度在松手帧被内容宽吞掉,面板
-    // 永远收敛在 `size_range` 下限(2026-10-09 实测:插桩 egui 逐帧 trace,
-    // outer_size=240 进、storing_rect=180 出;坤哥真机「侧栏宽度锁死」)。
-    // rail 改版(eb80618)把 body 挪进 `new_child` 子 Ui 后,子 Ui 的分配
-    // 不外溢回父 Ui 的 min_rect,内容宽就此塌到 rail(40px)+ 下限填充
-    // —— 拖不动正是从那以后开始的。此行是「侧栏可拖宽」的成立条件:
-    // 显式把面板 Ui 扩到分配矩形,Frame 响应矩形才与 outer_rect 相等,
-    // default_size 与拖拽结果才能进 PanelState。拖拽回归测试见
-    // `nav_resizes_by_drag_in_full_ui`。
-    panel.expand_to_include_rect(panel.max_rect());
-
-    SidebarBands {
-        // 顶段已随 2026-10-08 改版消失(退化为零高矩形),保留字段只为
-        // 不破坏既有 `SidebarBands` 的形状。
-        top: egui::Rect::from_min_size(strip.left_top(), egui::vec2(0.0, 0.0)),
-        // nav 字段在新版里承载 rail 带(纵贯到底,不再是横向条带)。
-        nav: strip,
-        body: body_rect,
-    }
 }
 
 /// 左栏三段各自的竖直区间,自上而下互不重叠。

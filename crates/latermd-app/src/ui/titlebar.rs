@@ -352,7 +352,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
 ///
 /// 本轮只把**入口**挪到标题栏,结果列表仍在左栏「搜索」页 —— 结果浮层
 /// 是第二批(docs/ui-shell-redesign-v2.md §5.6 待办)。
-fn search_capsule(
+pub(super) fn search_capsule(
     ui: &mut egui::Ui,
     rect: Rect,
     search: &mut SearchState,
@@ -409,7 +409,7 @@ fn command_box(
 /// 分段开关(VS Code / Zed 同款):**选中段有一层实心底**,非选中段
 /// 只有文字;点击任一段 → [`Message::ToggleLivePreview`]
 /// (与菜单栏「视图 → 切换 Live Preview」同一命令,不另开入口)。
-fn view_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
+pub(super) fn view_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
     let live = state.render_mode == RenderMode::Live;
     let half_w = rect.width() / 2.0;
     let response = ui.allocate_rect(rect, Sense::click());
