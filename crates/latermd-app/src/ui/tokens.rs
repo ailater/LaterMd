@@ -180,6 +180,16 @@ pub const SETTINGS_TABS_PAD: i8 = 8;
 /// 底部按钮条的内边距(水平 12 对齐 [`SETTINGS_BODY_PAD`],垂直 6
 /// 配 48 高度装下按钮 + 分隔线的呼吸)。
 pub const SETTINGS_FOOTER_MARGIN: egui::Margin = egui::Margin::symmetric(12, 6);
+/// 设置页两列行的标签列宽(#70 M2):五个分页所有配置行共用 —— 标签列
+/// 左对齐、定宽(超长截断),控件列起点 = 内容区左缘 + 此宽 + 列间隙,
+/// **跨分页钉在同一 x**。取 148:容得下最长行标签「上下文大小(KB)」
+/// (Body 13pt 下约 138px)并留 10px 呼吸。
+pub const SETTINGS_LABEL_W: f32 = 148.0;
+/// 设置页快捷键行的键位按钮最小宽(#70 M2):37 行的「键位 / 清除 /
+/// 重置」排成等宽三段,键位文字("Ctrl+Shift+S" 一档)不把按钮顶宽;
+/// 再长的捕获提示截在同宽内。与 [`SETTINGS_LABEL_W`] 同组,但只约束
+/// 快捷键页的控件列。
+pub const SETTINGS_KEY_W: f32 = 140.0;
 
 // —— 圆角 ——
 
