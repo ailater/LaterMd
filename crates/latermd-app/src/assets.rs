@@ -259,6 +259,33 @@ pub fn window_icon() -> Option<egui::IconData> {
     })
 }
 
+// —— 标题栏左上角品牌标识(#74)——
+// 与窗口图标同源不同用:窗口图标要小(64,任务栏/Alt-Tab 缩略),
+// 标题栏标识按 2x 上采样到 256 存,缩到 18px 绘制时纹理不过采样。
+
+/// 品牌标识素材字节:`assets/logo/deliverables/png/icon-256.png`。
+/// 路径由 `include_bytes!` 编译期校验 —— 素材被挪走即编译红。
+const BRAND_LOGO_PNG: &[u8] = include_bytes!("../../../assets/logo/deliverables/png/icon-256.png");
+
+/// 解码品牌标识为 `egui::ColorImage`(256×256),供 `ctx.load_texture` 用。
+///
+/// 与 [`window_icon`] 同一失败口径:任一步失败返回 `None` + 终端告警,
+/// 调用方(`ui::titlebar`)回落矢量 `Icon::Files`,绝不 panic 拦启动。
+pub fn brand_logo_image() -> Option<egui::ColorImage> {
+    let image = match image::load_from_memory(BRAND_LOGO_PNG) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("LaterMD: 品牌标识解码失败,回落默认图标: {error}");
+            return None;
+        }
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &image.to_rgba8().into_raw(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +476,20 @@ mod tests {
         assert_eq!(icon.width, 64);
         assert_eq!(icon.height, 64);
         assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+    }
+
+    /// 品牌标识解码:256×256(2x 上采样,缩到 18px 绘制时不过采样)、
+    /// 且**不是纯色** —— 纯色断言独立于被断言的绘制实现,素材误换成
+    /// 一张 1×1 占位图 / 全透明图时这里当场红,而不是让标题栏默默画出
+    /// 一个空方块。
+    #[test]
+    fn brand_logo_decodes_to_256_and_is_not_flat() {
+        let image = brand_logo_image().expect("品牌标识素材应能解码");
+        assert_eq!(image.size, [256, 256]);
+        let first = &image.pixels[..image.pixels.len().min(4)];
+        assert!(
+            image.pixels.iter().any(|p| *p != first[0]),
+            "品牌标识不应是纯色(素材误换占位图?)"
+        );
     }
 }

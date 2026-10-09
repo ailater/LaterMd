@@ -29,6 +29,17 @@
   <string>6.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <!--
+    应用图标。指向 Contents/Resources/AppIcon.icns(由 iconutil 从
+    assets/logo/deliverables/macOS/AppIcon.iconset 合成,见 bundle.sh 与
+    macos-dmg.yml)。**缺这一行时.app 仍能跑,但 Dock / Finder / 访达
+    全部显示通用毛坯图标** —— 这是「图标改了没生效」最常见的原因:
+    图标文件在包里,只是没人被告知去读它。
+    CFBundleIconFile 按惯例写无扩展名的基名(有些老工具要求带 .icns,
+    但 Cocoa 两种都认,无扩展名是Apple 官方示例的写法)。
+  -->
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

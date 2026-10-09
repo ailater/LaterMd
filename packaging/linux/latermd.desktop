@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LaterMD
+GenericName=Markdown Editor
+Comment=跨平台、版本化、可对话、可演化的 Markdown 知识工作台
+#启动命令走绝对路径 /usr/bin/latermd:本包只往 /usr/bin 装二进制,
+#不经 PATH 查找,免得用户自定义 PATH 时桌面项点不开。
+Exec=/usr/bin/latermd %F
+#Icon= 的值不带扩展名与目录,规范要求写「图标名」由 icon-theme 去
+# /usr/share/icons/hicolor/<尺寸>/apps/ 下查;写绝对路径虽被接受但
+# 跨主题(hicolor 之外的深色/高对比主题)会失效。
+Icon=latermd
+Terminal=false
+# Categories 只列一个 main category(Utility)。规范:列两个及以上 main
+# category(如 Utility;TextEditor)会让本应用**在应用菜单里出现两次** ——
+# desktop-file-validate 只报 hint 不报 error,但菜单重复是真实可见的
+# 副作用。编辑器的细分归位看 MimeType,细分场景归Additional 时才加。
+Categories=Utility;
+# Markdown 文件关联:启动器双击 .md 时以现有窗口打开,不开新窗口。
+MimeType=text/markdown;text/x-markdown;
+Keywords=Markdown;MD;Editor;Note;Notes;笔记;文档;
+StartupNotify=true
+StartupWMClass=latermd
