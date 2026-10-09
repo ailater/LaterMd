@@ -81,16 +81,8 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          APP="LaterMD.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          install -m 755 latermd-universal "$APP/Contents/MacOS/latermd"
-          # Info.plist 作为仓库文件维护(packaging/macos/Info.plist),此处只替换版本:
-          # YAML block scalar 里的 heredoc 结束标记必然带缩进,shell 认不出来,别用 heredoc
-          sed "s/__VERSION__/${VERSION}/g" \
-            packaging/macos/Info.plist > "$APP/Contents/Info.plist"
-          # ad-hoc 签名:不解决 Gatekeeper(quarantine 由 cask postflight 移除),
-          # 但避免无签名 bundle 在部分系统上的启动异常
-          codesign --force --deep --sign - "$APP" || true
+          # 与本地开发包共用 plist、图标与签名验证，失败时阻止发布坏包。
+          bash packaging/macos/bundle.sh latermd-universal LaterMD.app "$VERSION"
 
       - name: 合成 dmg
         id: dmg

@@ -36,6 +36,17 @@ jobs:
   deb:
     runs-on: ubuntu-22.04
     steps:
+      # 取仓库文件:应用图标(assets/logo/deliverables/png)与 .desktop 条目
+      # (packaging/linux/)都只在仓库里 —— dist 产的 tar.xz 只含二进制与
+      # 文档,不带这些。**没有这一步,deb 装出来的应用在启动器里是无名
+      # 条目**(无 .desktop 就根本不出现),这正是本轮要修的。
+      # ref 口径与 macos-dmg.yml 一致:dispatch 走 tag 入参,release 事件走
+      # tag 对应提交,两者内容一致。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
       - name: 取版本号
         id: ver
         run: |
@@ -67,6 +78,21 @@ jobs:
             latermd-x86_64-unknown-linux-gnu/CHANGELOG.md \
             latermd-x86_64-unknown-linux-gnu/LICENSE \
             "$PKG/usr/share/doc/latermd/"
+
+          # --- 桌面集成(本轮新增,缺这两项 deb 装出来在启动器里是无名条目)---
+          # .desktop 进 /usr/share/applications;它是「应用能不能被列出、
+          # 能不能被拖到面板」的前提,二进制本身不提供任何入口。
+          install -Dm 644 packaging/linux/latermd.desktop \
+            "$PKG/usr/share/applications/latermd.desktop"
+          # 图标按 hicolor 主题的尺寸目录铺开(16…512)。.desktop 里的
+          # Icon=latermd 是**不带路径不带扩展名**的名字,由 icon-theme
+          # 在这些目录里查;只放一个尺寸的话,高 DPI 屏与启动器会拿到
+          # 放大糊图。48 是 XDG 规定的最小推荐档,512 给大图标模式。
+          for SIZE in 16 24 32 48 64 128 256 512; do
+            install -Dm 644 "assets/logo/deliverables/png/icon-${SIZE}.png" \
+              "$PKG/usr/share/icons/hicolor/${SIZE}x${SIZE}/apps/latermd.png"
+          done
+
           # control 不用 heredoc 的理由同 macos-dmg.yml:YAML block scalar
           # 里的结束标记必然带缩进,shell 认不出来
           {
@@ -81,6 +107,15 @@ jobs:
             echo " Cross-platform, versioned, AI-ready Markdown workbench."
             echo " GUI app on egui/wgpu; needs a Vulkan/GL driver stack at runtime."
           } > "$PKG/DEBIAN/control"
+          # 桌面文件必须过 desktop-file-validate:不合规的 .desktop 会被
+          # 启动器**静默丢弃**,症状与「文件没装进去」一模一样。这里让它
+          # 在 CI 当场红,而不是等用户装完才发现应用列表里没有。
+          # 该工具来自 desktop-file-utils,ubuntu-22.04 runner 已预装。
+          if command -v desktop-file-validate >/dev/null; then
+            desktop-file-validate "$PKG/usr/share/applications/latermd.desktop"
+          else
+            echo "::warning::desktop-file-validate 不可用,跳过 .desktop 校验"
+          fi
 
       - name: 打 deb 并回传 Release
         env:

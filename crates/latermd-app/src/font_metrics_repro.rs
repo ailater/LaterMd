@@ -869,7 +869,7 @@ fn mixed_script_galley_metrics_forensics() {
 ///   吸附决定);em 盒本身又是 Noto 对全脚本堆叠的超配度量(CJK 实墨只占
 ///   ≈0.85em)。「显示不全」的可裁决口径是 S3b(实墨)与 wrap 净空,
 ///   修复后实墨在行盒内有 3px 以上余量)。
-/// - S3b:实墨(uv_rect)不越出行盒 —— 「显示不全」的最终裁决(严格 0.01px)。
+/// - S3b:实墨(atlas 中非透明像素，不含 uv_rect 透明留白)不越出行盒 —— 「显示不全」的最终裁决(严格 0.01px)。
 /// - wrap:相邻行实墨净空 ≥ 0(不粘连/不互相遮挡)。
 #[test]
 fn mixed_script_strict_regression_target() {
@@ -888,7 +888,12 @@ fn mixed_script_strict_regression_target() {
     for case in CASES {
         let galley = render_case(&ctx, &format!("m1-strict-{}", case.name), case.md);
         let rows = collect_row_forensics(&galley);
-        for row in rows.iter().filter(|r| !r.glyphs.is_empty()) {
+        let atlas = ctx.fonts(|fonts| fonts.image());
+        for (row, placed) in rows
+            .iter()
+            .zip(&galley.rows)
+            .filter(|(r, _)| !r.glyphs.is_empty())
+        {
             checked_rows += 1;
             // S2:同一视觉行内拉丁与 CJK 基线偏差 ≤ 0.5px。
             if let Some(dev) = row.baseline_cjk_minus_latin {
@@ -933,9 +938,22 @@ fn mixed_script_strict_regression_target() {
                     STRICT_EM_BOX_SNAP_TOLERANCE
                 ));
             }
-            // S3b:实墨(uv_rect)不越出行盒——「显示不全」的最终裁决。
-            for g in &row.glyphs {
-                if let Some((ink_top, ink_bottom)) = g.ink {
+            // S3b:实墨(atlas 中非透明像素)不越出行盒——「显示不全」的最终裁决。
+            for (g, glyph) in row.glyphs.iter().zip(&placed.row.glyphs) {
+                // The UV quad may include transparent rasterizer padding. Measure
+                // actual coverage, rather than treating that padding as clipped ink.
+                let uv = &glyph.uv_rect;
+                let covered: Vec<_> = (usize::from(uv.min[1])..usize::from(uv.max[1]))
+                    .filter(|&y| {
+                        (usize::from(uv.min[0])..usize::from(uv.max[0]))
+                            .any(|x| atlas[(x, y)].a() != 0)
+                    })
+                    .collect();
+                if let (Some(&first), Some(&last)) = (covered.first(), covered.last()) {
+                    let scale = uv.size.y / f32::from(uv.max[1] - uv.min[1]);
+                    let top = g.baseline + uv.offset.y;
+                    let ink_top = top + (first - usize::from(uv.min[1])) as f32 * scale;
+                    let ink_bottom = top + (last + 1 - usize::from(uv.min[1])) as f32 * scale;
                     if row.top - ink_top > STRICT_INK_EPSILON {
                         failures.push(format!(
                             "[{}「{}」字符 {}] 实墨越出行盒顶 {:+.3}px",

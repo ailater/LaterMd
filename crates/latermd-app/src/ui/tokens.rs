@@ -31,6 +31,12 @@ pub const TOOLBAR_H: f32 = 28.0;
 pub const FORMAT_BAR_H: f32 = 30.0;
 /// 自绘标题栏高度(docs/ui-shell-redesign.md §11,无边框模式才有)。
 pub const TITLEBAR_H: f32 = 36.0;
+/// 标题栏左上角品牌标识边长(#74)。
+///
+/// 比 [`ICON`] 略大(16→18):方角彩色标识在 16px 下「MD」两字母糊成一条,
+/// 18px 是 smallest size 下仍能读出的档位(素材按 2x 上采样到 256 存,
+/// 缩到这里不过采样)。标题栏 36px 高,18px 上下各留 9px,呼吸仍够。
+pub const BRAND_LOGO: f32 = 18.0;
 // —— 标题栏命令箱(docs/ui-shell-redesign-v2.md §5.6,2026-10-08 新增)——
 
 /// 标题栏右端窗口按钮枚数(与 [`crate::ui::titlebar::TITLE_BUTTONS`] 同

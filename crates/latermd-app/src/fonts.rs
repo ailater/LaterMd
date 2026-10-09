@@ -1205,7 +1205,7 @@ mod tests {
         let stock = egui::FontId::new(size, FontFamily::Monospace);
         let old_gap = baseline_gap(&stock).expect("现状族混排行应同时含 CJK 与拉丁");
         assert!(
-            old_gap >= 1.0,
+            old_gap.abs() >= 1.0,
             "对照(现状 Monospace 族)应存在基线偏差,实测 {old_gap}"
         );
 

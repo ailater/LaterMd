@@ -1,11 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaterMD.app 的 bundle 描述。由 .github/workflows/macos-dmg.yml 在组装 .app 时
-  用 sed 把 __VERSION__ 替换为实际版本号后拷入 Contents/。
-
-  放在仓库文件里而不是 heredoc 写进 workflow:YAML block scalar 中的 heredoc
-  结束标记必然带缩进,shell 认不出来,会静默吃掉整段脚本。
+  LaterMD.app 的 bundle 描述。packaging/macos/bundle.sh 组装 .app 时替换
+  __VERSION__，并生成 CFBundleIconFile 指定的图标。本地开发与发布 workflow 共用。
 
   LSMinimumSystemVersion 14.0 —— 平台基线 macOS 14 Sonoma
   (AGENTS.md §5:显式不支持 macOS 13 及以下)。
@@ -20,6 +17,8 @@
   <string>cn.ailater.LaterMD</string>
   <key>CFBundleExecutable</key>
   <string>latermd</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon.icns</string>
   <key>CFBundleVersion</key>
   <string>__VERSION__</string>
   <key>CFBundleShortVersionString</key>
@@ -30,6 +29,17 @@
   <string>6.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <!--
+    应用图标。指向 Contents/Resources/AppIcon.icns(由 iconutil 从
+    assets/logo/deliverables/macOS/AppIcon.iconset 合成,见 bundle.sh 与
+    macos-dmg.yml)。**缺这一行时.app 仍能跑,但 Dock / Finder / 访达
+    全部显示通用毛坯图标** —— 这是「图标改了没生效」最常见的原因:
+    图标文件在包里,只是没人被告知去读它。
+    CFBundleIconFile 按惯例写无扩展名的基名(有些老工具要求带 .icns,
+    但 Cocoa 两种都认,无扩展名是Apple 官方示例的写法)。
+  -->
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

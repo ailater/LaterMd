@@ -41,23 +41,23 @@ impl LaterMdApp {
         outbox.extend(state.poll_about());
         // 剪贴板图片读取收流:同上(D 段,arboard 的阻塞 IO 在后台线程)
         outbox.extend(state.poll_clipboard());
-        // 图片拖入落盘(D 段):dropped_files 由 egui-winit 汇进 raw input,
-        // `RawInput::take` 每帧清空,这里取走即消费。白名单外的不进归约
-        // (egui 全窗口收文件,非图片文件的拖入不该弹图片提示);大小上限
-        // 在归约里读文件后才判。读文件与落盘是本地磁盘(毫秒级),同步在
-        // 归约做 —— 与文件树打开文件同口径。
+        // 文件拖入由 egui-winit 汇进 raw input,`RawInput::take` 每帧清空,
+        // 这里取走即消费。Markdown 文件走与文件树相同的 `FileSelected`
+        // 打开流程；图片文件走资源导入流程；其它文件忽略。读文件与落盘
+        // 是本地磁盘(毫秒级),同步在归约做 —— 与文件树打开文件同口径。
         let dropped: Vec<std::path::PathBuf> = ctx
             .input_mut(|input| std::mem::take(&mut input.raw.dropped_files))
             .iter()
-            .filter(|file| {
-                file.path().extension().is_some_and(|ext| {
-                    crate::assets::is_allowed_extension(&ext.to_string_lossy().to_lowercase())
-                })
-            })
             .map(|file| file.path().to_path_buf())
             .collect();
         for path in dropped {
-            state.apply(Message::ImageFileDropped(path));
+            if crate::file::is_markdown_path(&path) {
+                state.apply(Message::FileSelected(path));
+            } else if path.extension().is_some_and(|ext| {
+                crate::assets::is_allowed_extension(&ext.to_string_lossy().to_lowercase())
+            }) {
+                state.apply(Message::ImageFileDropped(path));
+            }
         }
         // Ctrl+V 的图片兑底(D 段):egui-winit 在 Ctrl+V 时同步读**文本**
         // 剪贴板,有文本才有 Event::Paste(egui-winit/lib.rs 的
@@ -3446,12 +3446,11 @@ mod tests {
             .collect()
     }
 
-    /// 拖入图片文件的**帧级**链路(D 段):`raw.dropped_files` 里白名单内的
-    /// 图片进归约(`ImageFileDropped`),白名单外的(.md)不进 —— egui 是
-    /// 全窗口收文件,拖 .md 的语义是「打开文件」而不是插图,过滤发生在
-    /// layout 侧。归约之后的落盘与插入由 state::tests 钉住。
+    /// 拖入文件的**帧级**链路:`.md`/`.markdown` 走 `FileSelected` 打开,
+    /// 白名单内的图片走 `ImageFileDropped` 插入资源,其它文件忽略。归约
+    /// 之后的打开与落盘分别由 state 测试钉住。
     #[test]
-    fn dropped_whitelisted_image_enters_reduction_others_do_not() {
+    fn dropped_markdown_opens_and_image_enters_reduction() {
         let dir = std::env::temp_dir().join(format!("latermd-drop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3461,18 +3460,10 @@ mod tests {
         std::fs::write(&image, b"png").unwrap();
         let markdown = dir.join("别的.md");
         std::fs::write(&markdown, b"# y").unwrap();
+        let unsupported = dir.join("别的.txt");
+        std::fs::write(&unsupported, b"ignored").unwrap();
         let mut app = LaterMdApp::default();
         app.state.tabs.current_mut().document.path = Some(doc.clone());
-
-        // 白名单外的 .md:被 layout 过滤,文档不动(拖 .md 开文件属
-        // 将来的拖开标签,不是本段语义)
-        reduce_with_dropped(&mut app, vec![markdown]);
-        assert_eq!(
-            app.state.tabs.current().editor.text(),
-            state::State::default().tabs.current().editor.text(),
-            "非图片不进归约"
-        );
-        assert_eq!(app.state.tabs.current().document.notice, None);
 
         // 白名单内的图片:进归约 → 落盘 → 插相对引用
         reduce_with_dropped(&mut app, vec![image]);
@@ -3484,6 +3475,18 @@ mod tests {
                 .text()
                 .contains("![](./笔记.assets/图.png)"),
             "插入相对引用"
+        );
+
+        // Markdown:进 FileSelected → 打开新标签并激活
+        reduce_with_dropped(&mut app, vec![markdown.clone()]);
+        assert_eq!(app.state.tabs.current().document.path, Some(markdown));
+        assert_eq!(app.state.tabs.current().editor.text(), "# y");
+
+        // 其它文件不进归约
+        reduce_with_dropped(&mut app, vec![unsupported]);
+        assert_eq!(
+            app.state.tabs.current().document.path,
+            Some(dir.join("别的.md"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6962,7 +6965,13 @@ mod tests {
                 "{theme}:分组名已渲染:{texts:?}"
             );
             assert!(
-                texts.iter().any(|t| t == "Ctrl+S"),
+                texts.iter().any(|t| t
+                    == &app
+                        .state
+                        .keymap
+                        .get(crate::command::Command::Save)
+                        .unwrap()
+                        .platform_text()),
                 "{theme}:键位 kbd 文本已渲染(平台化显示):{texts:?}"
             );
             // 无绑定命令照列(#54 产品决定):蒙层卡片可视高钉在 502px,

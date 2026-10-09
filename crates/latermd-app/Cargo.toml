@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "LaterMD desktop application (the only GUI crate)"
 repository.workspace = true
+# 应用图标嵌入 Windows exe 资源段(#74)。用target 条件而非普通
+# build-dependencies:winresource 调的是 Windows 资源编译器,别的平台
+# 既用不上也不该编进依赖树。build.rs 本体也用 `#[cfg(windows)]` 圈死。
+# 详见 build.rs 顶部注释(为什么与 eframe 的运行时窗口图标是两件事)。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # 发布二进制名统一 latermd(crate 名不动,资产名由 dist.toml shadow 对齐);
 # 显式声明 [[bin]] 会关闭该 target 的路径自动发现,故必须写 path
