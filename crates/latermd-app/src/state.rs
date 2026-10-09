@@ -6064,14 +6064,8 @@ mod tests {
         let origin_base = state.tabs.current_mut().editor.text().to_owned();
 
         // 前置:流确实在产块(此时的块经归约落进发起标签)
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        assert!(
-            state
-                .poll_ai()
-                .iter()
-                .any(|m| matches!(m, Message::AiChunk { .. })),
-            "前置:开新标签前已产出正文块"
-        );
+        let first_chunk = poll_until_first_ai_chunk(&mut state);
+        assert!(!first_chunk.is_empty(), "前置:开新标签前已产出正文块");
 
         // 开新标签:当前缓冲换走,流不中断、写入目标不改道
         state.apply(Message::FileCommand(FileCmd::New));
@@ -7646,6 +7640,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 轮询等首个 `AiChunk` 落地(把该块**归约进文档**后返回)。
+    ///
+    /// [`MockProvider`](latermd_ai::MockProvider) 的 `stream_complete` 是
+    /// **真线程 + `thread::sleep(interval)`**,块是异步送达的。「睡固定
+    /// 60ms 然后断言有块」等于赌 runner 的线程调度:CI runner 负载高时
+    /// 首块可能晚于 60ms 才到,测试就红在与被测行为无关的地方
+    /// (实测 macOS runner 上 `closing_stream_origin_tab_aborts_stream`
+    /// 与 `ai_stream_writes_to_origin_tab_not_active` 连续两轮都红在
+    /// 这个前置上,而本地 Linux 931 条全绿)。
+    ///
+    /// 改为「轮询到块为止,deadline 兜底」:赌的是**最终会来块**这件
+    /// 事实(那是 Mock 的契约),不是它在哪一毫秒来。返回首块内容供
+    /// 调用方进一步断言。
+    fn poll_until_first_ai_chunk(state: &mut State) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut first = None;
+            for message in state.poll_ai() {
+                if let Message::AiChunk { delta } = &message {
+                    first = first.or_else(|| Some(delta.clone()));
+                }
+                state.apply(message);
+            }
+            if let Some(delta) = first {
+                return delta;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "10s 内未收到首个 AiChunk(Mock 契约破裂,非时序问题)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// 把在途流收干净(收流到结束块并逐条归约),供摘要链路测试复用;
     /// 超时退出循环后断言流式标志已清。
     fn drain_ai_stream(state: &mut State) {
@@ -8610,14 +8638,8 @@ mod tests {
         ));
         state.apply(Message::AiStart);
         assert!(state.ai.is_streaming());
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        assert!(
-            state
-                .poll_ai()
-                .iter()
-                .any(|m| matches!(m, Message::AiChunk { .. })),
-            "前置:流在产块"
-        );
+        let first_chunk = poll_until_first_ai_chunk(&mut state);
+        assert!(!first_chunk.is_empty(), "前置:流在产块");
 
         // AI 写入已置 dirty → 关闭走确认模态
         state.apply(Message::TabCloseRequested(0));
