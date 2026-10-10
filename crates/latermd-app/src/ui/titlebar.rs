@@ -405,7 +405,7 @@ pub(super) fn search_capsule(
         if focused {
             egui::Stroke::new(1.0, colors.accent.gamma_multiply(0.65))
         } else {
-            egui::Stroke::new(1.0, colors.border)
+            egui::Stroke::new(1.0, colors.border.gamma_multiply(0.45))
         },
         egui::StrokeKind::Inside,
     );

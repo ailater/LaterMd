@@ -205,13 +205,41 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
     }
 }
 
-/// 单物理像素分隔线；与面板原生拖拽高亮共存。
+/// 分隔线只在鼠标靠近可拖动边界时显形；平时让面板靠底色和留白自然
+/// 分组，避免三栏被硬线切碎。命中区域仍由 egui Panel 保持不变。
 pub fn separator(ui: &egui::Ui) -> egui::Stroke {
     let colors = crate::theme::shell(ui);
+    let visible = divider_is_hot(ui);
     egui::Stroke::new(
         1.0 / ui.ctx().pixels_per_point(),
-        colors.border.gamma_multiply(0.52),
+        colors
+            .border
+            .gamma_multiply(if visible { 0.72 } else { 0.06 }),
     )
+}
+
+fn divider_is_hot(ui: &egui::Ui) -> bool {
+    let resizing = ["nav", "preview"].into_iter().any(|name| {
+        ui.read_response(egui::Id::new(name).with("__resize"))
+            .is_some_and(|response| response.dragged() || response.drag_stopped())
+    });
+    if resizing {
+        return true;
+    }
+
+    let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos()) else {
+        return false;
+    };
+    const SLOP: f32 = 7.0;
+    ["nav", "preview"].into_iter().any(|name| {
+        let Some(panel) = egui::PanelState::load(ui.ctx(), egui::Id::new(name)) else {
+            return false;
+        };
+        let rect = panel.outer_rect;
+        let near_vertical_edge =
+            (pointer.x - rect.left()).abs() <= SLOP || (pointer.x - rect.right()).abs() <= SLOP;
+        near_vertical_edge && pointer.y >= rect.top() - SLOP && pointer.y <= rect.bottom() + SLOP
+    })
 }
 
 /// 浮窗统一的 macOS 风格卡片：柔和边界、内容色底和充足内距。

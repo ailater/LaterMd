@@ -326,7 +326,7 @@ fn card<R>(
 ) -> R {
     egui::Frame::NONE
         .fill(shell.faint)
-        .stroke(egui::Stroke::new(1.0, shell.border))
+        .stroke(egui::Stroke::new(1.0, shell.border.gamma_multiply(0.45)))
         .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_LG as u8))
         .inner_margin(egui::Margin::same(crate::ui::tokens::SETTINGS_CARD_PAD))
         .outer_margin(egui::Margin {
@@ -844,7 +844,7 @@ fn theme_previews(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mes
                 if selected {
                     egui::Stroke::new(2.0, shell.accent)
                 } else {
-                    egui::Stroke::new(1.0, shell.border)
+                    egui::Stroke::new(1.0, shell.border.gamma_multiply(0.45))
                 },
                 egui::StrokeKind::Outside,
             );

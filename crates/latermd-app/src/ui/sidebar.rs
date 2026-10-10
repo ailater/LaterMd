@@ -120,7 +120,10 @@ fn draw_rail(
     panel.painter().hline(
         egui::Rangef::new(rail.left() + inset, rail.right() - inset),
         y,
-        egui::Stroke::new(tokens::RAIL_DIVIDER_H, crate::theme::shell(panel).border),
+        egui::Stroke::new(
+            tokens::RAIL_DIVIDER_H,
+            crate::theme::shell(panel).border.gamma_multiply(0.28),
+        ),
     );
 
     // ③ 下组:文件动作六枚(Command::FILE + 导出 HTML / PDF)

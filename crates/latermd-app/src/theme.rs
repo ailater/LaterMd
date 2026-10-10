@@ -734,6 +734,10 @@ fn apply_shell_to(style: &mut egui::Style, c: ShellTokens) {
     v.weak_text_color = Some(c.secondary);
 
     v.extreme_bg_color = c.code_bg;
+    // Markdown code blocks read this dedicated visual instead of
+    // `extreme_bg_color`; keep it on the same semantic token so a skin switch
+    // cannot leave the code surface behind in egui's default gray.
+    v.code_bg_color = c.code_bg;
     v.faint_bg_color = c.faint;
     v.hyperlink_color = c.accent;
     // 选区:浅蓝底、正文色文字。egui 0.36 里 `selection.stroke` 兼任
@@ -761,7 +765,7 @@ fn apply_shell_to(style: &mut egui::Style, c: ShellTokens) {
     style.spacing.scroll.bar_inner_margin = 4.0;
     style.spacing.scroll.bar_outer_margin = 2.0;
     // 分隔线弱化:panel 之间靠底色分区,线只在必要时出现
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border.gamma_multiply(0.58));
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, c.text);
     v.widgets.noninteractive.corner_radius = radius;
     let widgets = [
