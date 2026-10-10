@@ -55,8 +55,10 @@ pub const TITLE_CMD_GAP: f32 = 6.0;
 /// 命令箱总宽:= [`TITLE_SEARCH_W`] + [`TITLE_CMD_GAP`] + [`TITLE_VIEW_W`]
 /// (346)。有断言钉住这个等式,改分量必须一起改。
 pub const TITLE_CMD_W: f32 = TITLE_SEARCH_W + TITLE_CMD_GAP + TITLE_VIEW_W;
-/// 标题栏搜索胶囊的占位提示。
-pub const TITLE_SEARCH_HINT: &str = "搜索 / 跳转…";
+/// 标题栏搜索胶囊的占位提示。旧值「搜索 / 跳转…」名不副实(胶囊只做
+/// 全文搜索,跳转另有 Ctrl+G/查找浮层),2026-10-10 随 mac 精修改为
+/// 实际用途(mac 工作台同款文案)。
+pub const TITLE_SEARCH_HINT: &str = "搜索文档…";
 /// 命令箱到最左那枚窗口按钮的留白(不与按钮贴死)。
 pub const TITLE_CMD_TO_BTN: f32 = 8.0;
 /// 命令箱控件的高度(胶囊 / 切换同高,垂直居中于 36px 标题栏)。
