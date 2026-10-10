@@ -444,29 +444,30 @@ fn mixed_script_galley_metrics_forensics() {
     let cjk_bytes = std::fs::read(cjk_path).expect("CJK 候选读取失败");
     let noto = parse_vertical_tables(&cjk_bytes, cjk_prop_idx).expect("Noto 表解析失败");
     let target = noto.vertical_metrics_em();
+    let native_bytes = if cfg!(target_os = "macos") {
+        std::fs::read("/System/Library/Fonts/SFNS.ttf").expect("macOS system font")
+    } else {
+        include_bytes!("../../../assets/fonts/Inter-Regular.ttf").to_vec()
+    };
+    let bold_bytes = if cfg!(target_os = "macos") {
+        native_bytes.clone()
+    } else {
+        include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf").to_vec()
+    };
     let inter = parse_vertical_tables(
-        &override_vertical_metrics(
-            include_bytes!("../../../assets/fonts/Inter-Regular.ttf"),
-            0,
-            target,
-        )
-        .expect("Inter-Regular override patch 失败"),
+        &override_vertical_metrics(&native_bytes, 0, target)
+            .expect("Inter-Regular override patch 失败"),
         0,
     )
     .expect("override Inter-Regular 表解析失败");
     let semibold = parse_vertical_tables(
-        &override_vertical_metrics(
-            include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") as &[u8],
-            0,
-            target,
-        )
-        .expect("Inter-SemiBold override patch 失败"),
+        &override_vertical_metrics(&bold_bytes, 0, target)
+            .expect("Inter-SemiBold override patch 失败"),
         0,
     )
     .expect("override Inter-SemiBold 表解析失败");
     let native_inter =
-        parse_vertical_tables(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"), 0)
-            .expect("原生 Inter-Regular 表解析失败");
+        parse_vertical_tables(&native_bytes, 0).expect("原生 Inter-Regular 表解析失败");
 
     // 行高下限(生产注入值):fonts::install 存的本机 CJK face 实际行高。
     let floor_em = fonts::line_height_floor_em(&ctx).expect("有 CJK 时行高下限应存在");

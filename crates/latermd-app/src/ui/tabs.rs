@@ -20,12 +20,17 @@ use crate::ui::tokens::{RADIUS_SM, SPACE_SM, SPACE_XS};
 use eframe::egui::{self, Align2, Sense};
 
 /// chip 高度(比工具栏矮一档:标签条更密集)。
-const CHIP_H: f32 = 24.0;
+const CHIP_H: f32 = if cfg!(target_os = "macos") {
+    28.0
+} else {
+    24.0
+};
 /// 关闭 × 的方框边长。
 const CLOSE: f32 = 12.0;
 /// chip 里文字之外的固定开销:左右内边距 + 文字与关闭钮的间隙 + 关闭钮。
 /// chip 总宽减它就是文本可用宽(省略号截断的预算)。
-const CHIP_CHROME: f32 = SPACE_SM + SPACE_XS + CLOSE + SPACE_SM;
+const CHIP_CHROME: f32 =
+    SPACE_SM + SPACE_XS + CLOSE + SPACE_SM + if cfg!(target_os = "macos") { 22.0 } else { 0.0 };
 /// 缩短模式下单个 chip 的最小宽(#37):装得下「…」+ 关闭按钮,还给
 /// 一两个汉字的辨识余量。预算再紧也不收窄到它之下 —— 保不住最小宽,
 /// 关闭按钮就会被挤到点不中;溢出交给既有单行水平滚动。
@@ -59,6 +64,9 @@ pub fn ui(
         .show(panel, |ui| {
             let widths = plan_widths(ui, tabs, mode, budget);
             ui.horizontal(|ui| {
+                if cfg!(target_os = "macos") {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                }
                 for (index, width) in widths.iter().enumerate() {
                     chip(ui, tabs, index, mode, *width, outbox);
                 }
@@ -80,7 +88,7 @@ fn text_width(ui: &mut egui::Ui, text: &str, font: &egui::FontId) -> f32 {
 /// 每个标签 chip 的绘制宽(#37 标题宽度模式)。Full = 完整标题实测宽
 /// (`CHIP_CHROME` + 全名宽);Short = [`share_widths`] 在预算内分配。
 fn plan_widths(ui: &mut egui::Ui, tabs: &TabsState, mode: TitleWidthMode, budget: f32) -> Vec<f32> {
-    let font = egui::TextStyle::Button.resolve(ui.style());
+    let font = tab_font(ui);
     let full: Vec<f32> = tabs
         .tabs
         .iter()
@@ -121,6 +129,14 @@ fn share_widths(full: &[f32], budget: f32) -> Vec<f32> {
         left -= 1.0;
     }
     widths
+}
+
+fn tab_font(ui: &egui::Ui) -> egui::FontId {
+    if cfg!(target_os = "macos") {
+        egui::FontId::proportional(12.0)
+    } else {
+        egui::TextStyle::Button.resolve(ui.style())
+    }
 }
 
 /// 按实测宽截断文本并补省略号(#37 缩短模式):在 **Unicode 字符(char)
@@ -279,7 +295,7 @@ fn chip(
     } else {
         ui.visuals().weak_text_color()
     };
-    let font = egui::TextStyle::Button.resolve(ui.style());
+    let font = tab_font(ui);
     // 缩短模式按预算截断;完整模式 width 即完整宽,elide 必然原样返回
     // (两模式统一走这里,免得完整模式再留一条不经测宽的旁路)。
     let shown = if mode == TitleWidthMode::Short {
@@ -322,19 +338,46 @@ fn chip(
         } else {
             egui::Color32::TRANSPARENT
         };
-        painter.rect_filled(rect, RADIUS_SM, bg);
+        painter.rect_filled(
+            rect,
+            if cfg!(target_os = "macos") {
+                6.0
+            } else {
+                RADIUS_SM
+            },
+            bg,
+        );
         let text_color = if selected && !cfg!(target_os = "macos") {
             accent
         } else {
             text_color
         };
-        painter.text(
-            egui::pos2(rect.left() + SPACE_SM, rect.center().y),
-            Align2::LEFT_CENTER,
-            &shown,
-            font,
-            text_color,
-        );
+        if cfg!(target_os = "macos") {
+            crate::ui::icons::Icon::File.draw(
+                painter,
+                egui::pos2(rect.left() + 14.0, rect.center().y),
+                13.0,
+                shell.secondary,
+            );
+            let galley =
+                painter.layout_no_wrap(shown.clone(), egui::FontId::proportional(12.0), text_color);
+            painter.galley(
+                egui::pos2(
+                    rect.left() + 26.0,
+                    rect.center().y - galley.mesh_bounds.center().y,
+                ),
+                galley,
+                text_color,
+            );
+        } else {
+            painter.text(
+                egui::pos2(rect.left() + SPACE_SM, rect.center().y),
+                Align2::LEFT_CENTER,
+                &shown,
+                font,
+                text_color,
+            );
+        }
         if selected && !cfg!(target_os = "macos") {
             // 底部 2px 强调条:WorkBuddy 标签的视觉锚点
             let bar = egui::Rect::from_min_max(
@@ -349,21 +392,29 @@ fn chip(
         } else {
             ui.visuals().weak_text_color()
         };
-        let stroke = egui::Stroke::new(1.2, cross);
-        painter.line_segment(
-            [
-                egui::pos2(close_rect.left(), close_rect.top()),
-                egui::pos2(close_rect.right(), close_rect.bottom()),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(close_rect.right(), close_rect.top()),
-                egui::pos2(close_rect.left(), close_rect.bottom()),
-            ],
-            stroke,
-        );
+        if cfg!(target_os = "macos") {
+            if response.hovered() || selected {
+                crate::ui::icons::Icon::Close.draw(painter, close_rect.center(), 14.0, cross);
+            } else if tab.editor.is_dirty() {
+                painter.circle_filled(close_rect.center(), 2.5, cross);
+            }
+        } else {
+            let stroke = egui::Stroke::new(1.2, cross);
+            painter.line_segment(
+                [
+                    egui::pos2(close_rect.left(), close_rect.top()),
+                    egui::pos2(close_rect.right(), close_rect.bottom()),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(close_rect.right(), close_rect.top()),
+                    egui::pos2(close_rect.left(), close_rect.bottom()),
+                ],
+                stroke,
+            );
+        }
     }
 
     if response.clicked() {

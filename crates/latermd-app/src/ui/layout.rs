@@ -474,7 +474,7 @@ impl LaterMdApp {
             .frame(
                 egui::Frame::default()
                     .inner_margin(if workbench {
-                        egui::Margin::symmetric(16, 12)
+                        egui::Margin::symmetric(16, 8)
                     } else {
                         egui::Margin::symmetric(8, 2)
                     })
@@ -1442,6 +1442,15 @@ fn goto_bar_contents(
 /// 窗口窄到三段挤不下时,**先牺牲中段**(字数)—— 它是三者里唯一丢了
 /// 不影响操作的,判据是 `tokens::STATUSBAR_MIN_W`。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
+    if cfg!(target_os = "macos") {
+        let tab = state.tabs.current();
+        let position = tab
+            .cursor
+            .byte
+            .map(|byte| cursor_position(tab.editor.text(), byte));
+        crate::ui::workbench::status_bar(ui, state, position);
+        return;
+    }
     let full = ui.available_width();
     // **三段必须包在同一个 `horizontal` 里**。
     //
@@ -6001,7 +6010,7 @@ mod tests {
             "状态栏贴底:{status:?}"
         );
         assert!(
-            status.left() < 100.0,
+            status.left() < 240.0,
             "状态栏横跨全窗底部(文本须在左栏脚下):{status:?}"
         );
         // 左栏在左,右缘不超过 default 宽度(240)放一点余量

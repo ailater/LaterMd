@@ -265,14 +265,19 @@ pub fn ui(
                     } else {
                         f32::INFINITY
                     };
-                    let output = egui::TextEdit::multiline(&mut buffer)
+                    let edit = egui::TextEdit::multiline(&mut buffer)
                         // 稳定 id:光标/undo 状态跨帧保持;同样绝不能含内容长度或 hash
                         .id(editor_id)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(desired_width)
                         .desired_rows(rows)
-                        .lock_focus(true)
-                        .show(row);
+                        .lock_focus(true);
+                    let edit = if cfg!(target_os = "macos") {
+                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
+                    } else {
+                        edit
+                    };
+                    let output = edit.show(row);
                     (slot, output)
                 })
                 .inner;

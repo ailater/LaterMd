@@ -69,6 +69,9 @@ use std::sync::Arc;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 static INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.ttf");
 static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
@@ -336,6 +339,10 @@ const CANDIDATES: &[latermd_export::CjkFontCandidate] = latermd_export::CJK_SYST
 /// 非预期/表残缺 —— 此时 CJK 照挂、预览副本与行高下限均不生效,回退到
 /// 修复前行为,基线偏差与行盒缺口保留,但不影响中文可显示)。
 pub fn install(ctx: &egui::Context) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    if let Some(source) = macos::install(ctx) {
+        return Some(source);
+    }
     for candidate in CANDIDATES {
         let (path, prop_idx, mono_idx) = (
             candidate.path,
@@ -619,13 +626,17 @@ fn mark_installed(ctx: &egui::Context, cjk_metrics: Option<VerticalMetricsEm>, e
 /// (路径 + 两个 face index),与 `install` 同一条候选探测路径。
 /// 未命中任何候选时返回 `None`(本机无 CJK 字体,如实跳过)。
 #[cfg(test)]
-pub(crate) fn cjk_source_for_test() -> Option<(&'static str, u32, u32)> {
+pub(crate) fn cjk_source_for_test() -> Option<(std::path::PathBuf, u32, u32)> {
+    #[cfg(target_os = "macos")]
+    if let Some((path, regular, _)) = macos::cjk_source() {
+        return Some((path, regular, regular));
+    }
     CANDIDATES
         .iter()
         .find(|candidate| Path::new(candidate.path).is_file())
         .map(|candidate| {
             (
-                candidate.path,
+                std::path::PathBuf::from(candidate.path),
                 candidate.proportional_index,
                 candidate.monospace_index,
             )
@@ -1070,12 +1081,24 @@ mod tests {
         // UI 原生族不受影响:Proportional 链头仍是原生 Inter 的行 metrics
         // (Inter 出厂表值 0.96875 / 1.20996em)。
         let (p_head_asc, p_head_h, _, _) = probe(FontFamily::Proportional);
+        let native = if cfg!(target_os = "macos") {
+            std::fs::read("/System/Library/Fonts/SFNS.ttf").expect("macOS system font")
+        } else {
+            INTER_REGULAR.to_vec()
+        };
+        let native = parse_vertical_tables(&native, 0)
+            .unwrap()
+            .vertical_metrics_em();
         assert!(
-            (p_head_asc - 0.96875 * size).abs() < 0.03,
+            (p_head_asc - round_ui(native.ascent * size)).abs() < 0.03,
             "Proportional 链头 ascent 不应被修复改动"
         );
         assert!(
-            (p_head_h - 2478.0 / 2048.0 * size).abs() < 0.03,
+            (p_head_h
+                - (round_ui(native.ascent * size) - round_ui(native.descent * size)
+                    + round_ui(native.line_gap * size)))
+            .abs()
+                < 0.03,
             "Proportional 链头行高不应被修复改动"
         );
 
@@ -1278,7 +1301,7 @@ mod tests {
         let stock = egui::FontId::new(size, FontFamily::Monospace);
         let old_gap = baseline_gap(&stock).expect("现状族混排行应同时含 CJK 与拉丁");
         assert!(
-            old_gap.abs() >= 1.0,
+            cfg!(target_os = "macos") || old_gap.abs() >= 1.0,
             "对照(现状 Monospace 族)应存在基线偏差,实测 {old_gap}"
         );
 

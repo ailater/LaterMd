@@ -30,6 +30,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+mod macos;
+
 /// 设置页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
@@ -331,6 +333,16 @@ pub fn dialog(
     // 每帧已把 `window_fill` 投成同一值,这里再取一次是让「不依赖投影
     // 也在场」成为本窗自身性质,明暗各走各的 token,不写死任何一档)
     let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let mac = cfg!(target_os = "macos");
+    let frame = if mac {
+        egui::Frame::window(ui.style())
+            .fill(shell.content)
+            .inner_margin(0)
+            .corner_radius(12)
+            .stroke(crate::ui::workbench::separator(ui))
+    } else {
+        egui::Frame::window(ui.style()).fill(shell.content)
+    };
     egui::Window::new("设置")
         // 显式 id(find/goto 浮层同款):egui 0.36 按标题文本派生 Area id,
         // 标题一改拖动位置记忆就丢;显式 id 让窗口状态与文案解耦,测试也
@@ -341,13 +353,53 @@ pub fn dialog(
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ui.ctx().viewport_rect().center())
         .default_size(crate::ui::tokens::SETTINGS_DEFAULT_SIZE)
+        .min_size(if mac {
+            egui::vec2(640.0, 420.0)
+        } else {
+            egui::Vec2::ZERO
+        })
+        .title_bar(!mac)
         .collapsible(false)
         .resizable(true)
         .open(&mut open)
         // 观感基线(#70 M1):窗底显式取当前主题的 content 色;圆角/阴影/
         // 窗口内边距仍走 egui 出厂 window 档(与 quick_open 等其余浮窗同源)
-        .frame(egui::Frame::window(ui.style()).fill(shell.content))
+        .frame(frame)
         .show(ui.ctx(), |ui| {
+            if mac {
+                macos::style(ui);
+                egui::Panel::top("settings-heading")
+                    .exact_size(44.0)
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 8)))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(80.0, 28.0), egui::Sense::hover());
+                            crate::ui::workbench::label_at(
+                                ui,
+                                rect.left(),
+                                rect.center().y,
+                                "设置",
+                                14.0,
+                                shell.text,
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if crate::ui::workbench::small_icon(
+                                        ui,
+                                        icons::Icon::Close,
+                                        "关闭设置",
+                                    )
+                                    .clicked()
+                                    {
+                                        settings.open = false;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
             // 骨架:底部按钮条 + 左分页列 + 中央滚动区,全部用 `exact_size`
             // 的 Panel 定形。此前用 `ui.horizontal` + `available_height()` +
             // `auto_shrink([false,false])` 的组合,ScrollArea 会请求全部可用
@@ -358,12 +410,28 @@ pub fn dialog(
             egui::Panel::bottom("settings-footer")
                 .exact_size(crate::ui::tokens::SETTINGS_FOOTER_H)
                 .frame(
-                    egui::Frame::default().inner_margin(crate::ui::tokens::SETTINGS_FOOTER_MARGIN),
+                    egui::Frame::default()
+                        .fill(shell.content)
+                        .corner_radius(if mac {
+                            egui::CornerRadius {
+                                sw: 12,
+                                se: 12,
+                                ..egui::CornerRadius::ZERO
+                            }
+                        } else {
+                            egui::CornerRadius::ZERO
+                        })
+                        .inner_margin(crate::ui::tokens::SETTINGS_FOOTER_MARGIN),
                 )
                 .show(ui, |ui| {
-                    ui.separator();
+                    if !mac {
+                        ui.separator();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         close = Some(ui.button("关闭"));
+                        if mac && settings.tab == SettingsTab::Appearance {
+                            ui.weak(egui::RichText::new("更改即时生效").size(11.0));
+                        }
                     });
                 });
             // 左:竖排分页(固定宽;WorkBuddy 观感 = 分页列吃侧栏灰、内容区吃窗底)
@@ -376,8 +444,12 @@ pub fn dialog(
                 )
                 .show(ui, |ui| {
                     for tab in SettingsTab::ALL {
-                        if icons::icon_tab(ui, tab.icon(), tab.label(), settings.tab == tab)
-                            .clicked()
+                        if (if mac {
+                            macos::navigation(ui, tab, settings.tab == tab)
+                        } else {
+                            icons::icon_tab(ui, tab.icon(), tab.label(), settings.tab == tab)
+                        })
+                        .clicked()
                         {
                             settings.tab = tab;
                             // 换页清空上一页的残留提示与捕获状态
@@ -414,12 +486,44 @@ pub fn dialog(
                         });
                 });
         });
-    settings.open = open;
+    settings.open &= open;
     close
 }
 
 /// 外观页:主题三态 + 皮肤 + 密度 + 渲染后端只读。
 fn appearance(
+    ui: &mut egui::Ui,
+    settings: &mut SettingsState,
+    theme: &ThemeSettings,
+    skins: &SkinCatalog,
+    system_theme_ok: bool,
+    resolved: ThemeMode,
+    outbox: &mut Vec<Message>,
+) {
+    if cfg!(target_os = "macos") {
+        macos::appearance(
+            ui,
+            settings,
+            theme,
+            skins,
+            system_theme_ok,
+            resolved,
+            outbox,
+        );
+        return;
+    }
+    appearance_legacy(
+        ui,
+        settings,
+        theme,
+        skins,
+        system_theme_ok,
+        resolved,
+        outbox,
+    );
+}
+
+fn appearance_legacy(
     ui: &mut egui::Ui,
     settings: &mut SettingsState,
     theme: &ThemeSettings,
@@ -1303,6 +1407,8 @@ mod tests {
         );
     }
 
+    /// Legacy appearance and the four shared form pages keep their columns.
+    /// The grouped macOS appearance page is covered in settings::macos::tests.
     /// #70 M2:五分页全部配置行两列对齐。四层断言:
     /// ①每页所有行标签的文本 x 全等(标签列左对齐);
     /// ②同类控件的文本 x 全等(selectable 选项 / 复选框文字 / 输入框
@@ -1325,7 +1431,7 @@ mod tests {
                 settings, theme, ..
             } = &mut state;
             collect_page_texts(&ctx, |ui| {
-                appearance(
+                appearance_legacy(
                     ui,
                     settings,
                     theme,
@@ -2149,15 +2255,18 @@ mod tests {
                 .memory(|memory| memory.area_rect(egui::Id::new("settings-dialog")))
                 .expect("五帧后设置窗 Area 状态在场");
             let primitives = ctx.tessellate(last_shapes, 1.0);
-            let meshes: Vec<&Mesh> = primitives
-                .iter()
-                .filter_map(|cp| match &cp.primitive {
-                    egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
-                    _ => None,
-                })
-                .collect();
             let shell = crate::theme::shell_tokens(matches!(mode, ThemeMode::Dark));
             let sample = |p: egui::Pos2| {
+                // ScrollArea meshes extend outside its viewport. Sample only
+                // the primitives whose scissor includes the point, like wgpu.
+                let meshes: Vec<&Mesh> = primitives
+                    .iter()
+                    .filter(|cp| cp.clip_rect.contains(p))
+                    .filter_map(|cp| match &cp.primitive {
+                        egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
+                        _ => None,
+                    })
+                    .collect();
                 final_covered_color(&meshes, p)
                     .unwrap_or_else(|| panic!("{mode:?}:采样点 {p:?} 无覆盖(窗体未渲染或坐标出窗)"))
             };
@@ -2203,7 +2312,13 @@ mod tests {
                     );
                     if p.y < bottom {
                         total += 1;
-                        if color_dist(sample(p), shell.content) <= 2 {
+                        if color_dist(sample(p), shell.content) <= 2
+                            || (cfg!(target_os = "macos")
+                                && color_dist(
+                                    sample(p),
+                                    crate::theme::window_fill(matches!(mode, ThemeMode::Dark)),
+                                ) <= 2)
+                        {
                             hits += 1;
                         }
                     }
@@ -2287,7 +2402,11 @@ mod tests {
                 })
                 .collect();
             assert!(
-                texts.contains(&"Minimap"),
+                texts.contains(&if cfg!(target_os = "macos") {
+                    "缩略导航"
+                } else {
+                    "Minimap"
+                }),
                 "show={show}: 两列行标签「Minimap」未渲出,文本形状:{texts:?}"
             );
             assert!(last_outbox.is_empty(), "show={show}: 无交互帧不产出消息");

@@ -110,8 +110,17 @@ pub fn ui_with_probe(
         .id_salt("format-bar")
         .auto_shrink([false, true])
         .show(panel, |ui| {
+            if cfg!(target_os = "macos") {
+                ui.spacing_mut().interact_size.y = 28.0;
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+                ui.spacing_mut().extra_text_line_spacing = 0.0;
+            }
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+                ui.spacing_mut().item_spacing.x = if cfg!(target_os = "macos") {
+                    2.0
+                } else {
+                    tokens::SPACE_XS
+                };
 
                 // ① 直出组(2026-10-08 S2-2:只有行内五项,理由见
                 // `FormatGroup::DIRECT`)。
@@ -127,7 +136,7 @@ pub fn ui_with_probe(
                     }
                 }
 
-                ui.separator();
+                separator(ui);
 
                 // ② 溢出菜单:标题 / 块 / 列表三组十二项(低频,按语境才用)。
                 //
@@ -137,7 +146,14 @@ pub fn ui_with_probe(
                 // 「探针在菜单内也生效」是刻意的:无头测试据此在菜单打开后拿到条目
                 // 矩形,否则菜单里的动作**没有任何测试能定位** —— 等于格式动作
                 // 的点击路径在溢出后就失去覆盖。
-                ui.menu_button("更多", |ui| {
+                let menu = if cfg!(target_os = "macos") {
+                    egui::RichText::new("更多")
+                        .size(12.0)
+                        .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary)
+                } else {
+                    egui::RichText::new("更多")
+                };
+                ui.menu_button(menu, |ui| {
                     for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
                         if index > 0 {
                             ui.separator();
@@ -158,8 +174,8 @@ pub fn ui_with_probe(
                 // 与 Image 同款 —— 点了只开面板,不进 `FormatAction` 四组(emoji
                 // 字符无法从 text+sel 推导,§6.1 的边界)。它留在直出位:面板是
                 // 「插入一个字符」的高频动作,与低频的段落级格式不同层。
-                ui.separator();
-                let response = icons::icon_button(ui, Icon::Emoji, &emoji_tooltip(keymap));
+                separator(ui);
+                let response = compact_icon(ui, Icon::Emoji, &emoji_tooltip(keymap));
                 if let Some(probe) = emoji_probe.as_mut() {
                     probe(response.rect);
                 }
@@ -168,6 +184,29 @@ pub fn ui_with_probe(
                 }
             });
         });
+}
+
+fn separator(ui: &mut egui::Ui) {
+    if cfg!(target_os = "macos") {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 28.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [
+                rect.center() - egui::vec2(0.0, 6.0),
+                rect.center() + egui::vec2(0.0, 6.0),
+            ],
+            crate::ui::workbench::separator(ui),
+        );
+    } else {
+        ui.separator();
+    }
+}
+
+fn compact_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
+    if cfg!(target_os = "macos") {
+        crate::ui::workbench::small_icon(ui, icon, tip)
+    } else {
+        icons::icon_button(ui, icon, tip)
+    }
 }
 
 /// Emoji 按钮 tooltip(带当前键位,与动作按钮的 tooltip 同款口径)。
@@ -212,8 +251,19 @@ fn rich(ui: &mut egui::Ui, action: FormatAction, glyph: &str, shape: Glyph) -> e
     // 后者只该作用于按钮高度 —— 高度这排恒取 FORMAT_BAR_H,本就与
     // interact_size 无关。改成只按排版宽度取值,U0 的高度投影不再外溢成
     // 宽度副作用。
-    let width = tokens::ICON + 8.0;
-    let size = egui::vec2(width, tokens::FORMAT_BAR_H);
+    let width = if cfg!(target_os = "macos") {
+        28.0
+    } else {
+        tokens::ICON + 8.0
+    };
+    let size = egui::vec2(
+        width,
+        if cfg!(target_os = "macos") {
+            28.0
+        } else {
+            tokens::FORMAT_BAR_H
+        },
+    );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let enabled = ui.is_enabled();
     if ui.is_rect_visible(rect) {
@@ -230,8 +280,15 @@ fn rich(ui: &mut egui::Ui, action: FormatAction, glyph: &str, shape: Glyph) -> e
         // 删除线在这一个转换里全丢 —— 加粗按钮于是长得跟普通按钮没两
         // 样,删除线干脆看不见。
         let mut text = egui::RichText::new(glyph)
-            .size(tokens::ICON_SM)
+            .size(if cfg!(target_os = "macos") {
+                14.0
+            } else {
+                tokens::ICON_SM
+            })
             .family(crate::fonts::semibold_family(ui.ctx()));
+        if cfg!(target_os = "macos") {
+            text = text.color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary);
+        }
         match shape {
             Glyph::Weight => {}
             Glyph::Italic => text = text.italics(),
@@ -246,8 +303,17 @@ fn rich(ui: &mut egui::Ui, action: FormatAction, glyph: &str, shape: Glyph) -> e
             f32::INFINITY,
             egui::TextStyle::Body,
         );
-        let rect = egui::Align2::CENTER_CENTER.anchor_size(rect.center(), galley.size());
-        painter.galley(rect.min, galley, ui.visuals().text_color());
+        let pos = if cfg!(target_os = "macos") {
+            egui::pos2(
+                rect.center().x - galley.size().x / 2.0,
+                rect.center().y - galley.mesh_bounds.center().y,
+            )
+        } else {
+            egui::Align2::CENTER_CENTER
+                .anchor_size(rect.center(), galley.size())
+                .min
+        };
+        painter.galley(pos, galley, ui.visuals().text_color());
     }
     response.on_hover_text(command_tooltip(action))
 }
@@ -260,7 +326,7 @@ fn icon_button(ui: &mut egui::Ui, action: FormatAction, keymap: &Keymap) -> egui
         Some(shortcut) => format!("{label}({})", shortcut.platform_text()),
         None => label.to_owned(),
     };
-    icons::icon_button(ui, icon_of(action), &tooltip)
+    compact_icon(ui, icon_of(action), &tooltip)
 }
 
 /// 动作 → 自绘图标。放 `ui` 层而不是 `compose`:后者发誓不碰 egui。

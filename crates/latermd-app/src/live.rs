@@ -425,12 +425,17 @@ pub fn ui(
                     };
                     // 稳定 id:按块序号(不带长度/hash),AGENTS §6.7 的红线
                     let response_id = editor_id.with(("live-block", index));
-                    let output = egui::TextEdit::multiline(&mut buffer)
+                    let edit = egui::TextEdit::multiline(&mut buffer)
                         .id(response_id)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(lines.clamp(1, 40))
-                        .show(ui);
+                        .desired_rows(lines.clamp(1, 40));
+                    let edit = if cfg!(target_os = "macos") {
+                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
+                    } else {
+                        edit
+                    };
+                    let output = edit.show(ui);
 
                     // 光标(块内字符偏移):跨块路由判定、键盘跟随与回填共用
                     let caret = output
