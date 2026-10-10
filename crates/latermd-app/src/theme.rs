@@ -350,7 +350,11 @@ impl Default for ThemeSettings {
 /// `widgets.noninteractive.bg_stroke.color`,表头/隔行底色取
 /// `visuals.faint_bg_color`,明暗两套 visuals 自动适配,app 不另配颜色。
 pub fn default_markdown_style() -> MarkdownStyle {
-    let mut style = MarkdownStyle::default();
+    // 代码块默认与正文同级可读字号；10pt 在中文和高 DPI 屏上过细。
+    let mut style = MarkdownStyle {
+        code_font_size: 13.0,
+        ..MarkdownStyle::default()
+    };
     // 代码块采用 macOS 风格的宽松内距与圆角，避免代码贴边、边框过硬。
     style.code_block.padding = [12.0, 10.0, 12.0, 10.0];
     style.code_block.corner_radius = tokens::RADIUS_MD;
@@ -369,6 +373,14 @@ pub fn default_markdown_style() -> MarkdownStyle {
 /// 字形的行高需求,越界墨迹被相邻行/后续块背景遮挡(「显示不全」)。
 /// 本机无 CJK 候选(或表值解析失败)时原样返回,行为与修复前一致。
 pub fn effective_markdown_style(ctx: &egui::Context, mut style: MarkdownStyle) -> MarkdownStyle {
+    // 旧皮肤文件保留颜色和自定义值；只迁移原先过小的出厂代码样式。
+    if style.code_font_size == 10.0 {
+        style.code_font_size = 13.0;
+    }
+    if style.code_block.padding == [4.0, 6.0, 12.0, 6.0] {
+        style.code_block.padding = [12.0, 10.0, 12.0, 10.0];
+        style.code_block.corner_radius = tokens::RADIUS_MD;
+    }
     if let Some(floor) = crate::fonts::line_height_floor_em(ctx) {
         style.min_line_height_em = style.min_line_height_em.max(floor);
     }

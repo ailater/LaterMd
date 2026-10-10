@@ -65,6 +65,7 @@ pub fn dialog(
         .default_pos(ui.ctx().viewport_rect().center())
         .collapsible(false)
         .resizable(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
             ui.label("替代文字(alt)");
             ui.text_edit_singleline(&mut draft.alt)

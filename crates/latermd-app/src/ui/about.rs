@@ -301,9 +301,7 @@ pub fn dialog(ui: &mut egui::Ui, about: &AboutState, outbox: &mut Vec<Message>) 
         });
 
     let mut open = true;
-    // 窗底显式取当前主题 shell 色(#70 M1 同款:不依赖投影也在场,明暗
-    // 各走各的 token);圆角/阴影/内边距仍走 egui 出厂 window 档。
-    let shell = crate::theme::shell(ui);
+    // 窗底、边界和内距统一走工作台浮窗卡片样式。
     egui::Window::new("关于 LaterMD")
         // 显式 id(设置窗同款):窗口拖动位置记忆与文案解耦
         .id(egui::Id::new("about-dialog"))
@@ -313,7 +311,7 @@ pub fn dialog(ui: &mut egui::Ui, about: &AboutState, outbox: &mut Vec<Message>) 
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
-        .frame(egui::Frame::window(ui.style()).fill(shell.content))
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(&ctx, |ui| {
             ui.add_space(crate::ui::tokens::SPACE_SM);
             // 应用名 + 版本居中成组(关于窗惯例:身份信息居中,数据行两列)

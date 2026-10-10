@@ -73,6 +73,7 @@ pub fn install_to(dir: &std::path::Path) -> Vec<String> {
 /// 微调;交叉断言见 `builtins_ship_heading_typography_matching_factory`。
 fn base() -> MarkdownStyle {
     let mut style = MarkdownStyle::default();
+    style.code_font_size = 13.0;
     style.heading_space_above = 4.0;
     style.code_block = CodeBlockStyle {
         corner_radius: 4.0,

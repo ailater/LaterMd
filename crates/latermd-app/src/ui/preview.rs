@@ -1046,6 +1046,9 @@ pub fn ui(
             MarkdownLabel::new(label_id, rendered.as_ref())
                 .font(font)
                 .wrap()
+                .scroll_code_blocks(true)
+                .shrink_code_blocks(true)
+                .code_block_min_width(Some(200.0))
                 .overflow_wrap(egui_markdown::OverflowWrap::BreakAll)
                 .heal(heal)
                 // 视口外代码块高亮延迟(#59/#60 首切卡顿,vendor ①类配套):
@@ -2953,17 +2956,20 @@ mod tests {
         let doc = code_copy_doc();
         let (_, texts, _) = render_copy_frame(&ctx, &doc, Vec::new());
 
-        let body = texts
+        let body_shapes: Vec<&String> = texts
             .iter()
-            .find(|t| t.contains("fn hello()"))
-            .expect("代码正文应仍在文本层");
+            .filter(|t| t.contains("fn hello()") || t.contains("裸围栏,没有语言。"))
+            .collect();
+        assert!(!body_shapes.is_empty(), "代码正文应仍在文本层:{texts:?}");
         assert!(
-            !body.contains("zzprobe"),
-            "语言标签不得回流正文 galley:{body:?}"
+            body_shapes.iter().all(|body| !body.contains("zzprobe")),
+            "语言标签不得回流正文 galley:{body_shapes:?}"
         );
         assert!(
-            body.contains("裸围栏,没有语言。"),
-            "裸围栏块的正文原样在 galley:{body:?}"
+            body_shapes
+                .iter()
+                .any(|body| body.contains("裸围栏,没有语言。")),
+            "裸围栏块的正文原样在 galley:{body_shapes:?}"
         );
         let label_shapes = texts.iter().filter(|t| t.as_str() == "zzprobe").count();
         assert_eq!(label_shapes, 1, "语言标签恰一枚独立 Text shape:{texts:?}");

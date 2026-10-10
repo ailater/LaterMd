@@ -384,6 +384,9 @@ fn paint_fallback(ui: &mut egui::Ui, index: usize, text: &str, err: &str) -> egu
     MarkdownLabel::new(mermaid_widget_id(ui, index).with("fallback"), &fenced)
         .font(diagram_font(ui))
         .wrap()
+        .scroll_code_blocks(true)
+        .shrink_code_blocks(true)
+        .code_block_min_width(Some(200.0))
         .code_block_buttons(&crate::ui::preview::code_copy_buttons)
         .show(ui);
     write_probe(
