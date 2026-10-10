@@ -436,6 +436,12 @@ pub(super) fn search_capsule(
     if response.changed() {
         outbox.push(Message::SearchQueryChanged);
     }
+    // 聚焦即展开左栏 Search 页:点进胶囊还没输入的场合也「在搜索」,
+    // 结果面板应当就位(输入变化由 `SearchQueryChanged` 的归约兜底)。
+    // 禅定模式在归约内豁免,这里无条件发。
+    if response.gained_focus() {
+        outbox.push(Message::SearchPanelRevealed);
+    }
     response.on_hover_text("全文搜索(结果在左栏「搜索」页)");
     if has_query {
         let clear_rect = Rect::from_center_size(
@@ -1135,6 +1141,10 @@ mod tests {
         );
         frame_fn(&mut state, &mut outbox, vec![click(cap_center, true)]);
         frame_fn(&mut state, &mut outbox, vec![click(cap_center, false)]);
+        assert!(
+            outbox.contains(&Message::SearchPanelRevealed),
+            "标题栏搜索框获得焦点应展开左侧搜索页,实际 {outbox:?}"
+        );
         for ch in ["l", "a", "t"] {
             frame_fn(&mut state, &mut outbox, vec![Event::Text(ch.to_owned())]);
             frame_fn(&mut state, &mut outbox, Vec::new());

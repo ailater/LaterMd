@@ -655,7 +655,16 @@ fn outline_row(
     response
 }
 
-/// Search 页:输入行(正则 + 大小写开关)+ 状态行 + 结果列表。
+/// Search 页:搜索行(折叠箭头 + 输入)+ 三开关行 + 可选替换行 + 状态行
+/// + 按文件分组的结果列表。
+///
+/// 开关对齐 VS Code:「Aa」区分大小写、「ab」全字匹配、正则 `.*`;三者
+/// 都是选中态实底的 `selectable_label` 小片,翻转即重发
+/// [`Message::SearchQueryChanged`](去抖 300ms 重搜,不用按回车)。
+///
+/// 「全部替换」是跨文件写盘的破坏性操作:按钮只发
+/// [`Message::SearchReplaceAllRequested`],归约挂起确认浮窗
+/// (`ui::layout` 绘制),确认后逐文件替换并产出回执(状态行)。
 ///
 /// 无根目录时只显示引导(搜索范围复用文件树的根,不另设第二份)。
 fn search_panel(
@@ -669,30 +678,126 @@ fn search_panel(
         return;
     };
 
+    // 搜索行:左端折叠箭头(展开替换行,VS Code 同位),右端输入占满
     panel.horizontal(|ui| {
+        let (rect, chevron) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+        if chevron.hovered() || chevron.has_focus() {
+            ui.painter()
+                .rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
+        }
+        ui.painter().add(egui::Shape::convex_polygon(
+            arrow_vertices(rect.center(), 3.5, search.replace_open).to_vec(),
+            ui.visuals().text_color(),
+            egui::Stroke::NONE,
+        ));
+        chevron
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "展开替换"));
+        let chevron = chevron.on_hover_text(if search.replace_open {
+            "收起替换"
+        } else {
+            "展开替换"
+        });
+        if chevron.clicked() {
+            search.replace_open = !search.replace_open;
+        }
         let edited = egui::TextEdit::singleline(&mut search.query)
             .id_salt("search-input")
-            .hint_text("正则表达式…")
+            .hint_text(if search.regex {
+                "正则表达式…"
+            } else {
+                "搜索…"
+            })
             .desired_width(f32::INFINITY)
             .show(ui)
             .response
             .changed();
-        let toggled = ui.checkbox(&mut search.case_insensitive, "Aa").changed();
-        if edited || toggled {
+        if edited {
             outbox.push(Message::SearchQueryChanged);
         }
     });
+    // 开关行:三片与 VS Code 检索视图同款;「Aa」语义取反(片亮 = 区分
+    // 大小写 = case_insensitive 关)
+    panel.horizontal(|ui| {
+        let case = ui
+            .selectable_label(!search.case_insensitive, "Aa")
+            .on_hover_text("区分大小写");
+        if case.clicked() {
+            search.case_insensitive = !search.case_insensitive;
+            outbox.push(Message::SearchQueryChanged);
+        }
+        let word = ui
+            .selectable_label(search.whole_word, "ab")
+            .on_hover_text("全字匹配");
+        if word.clicked() {
+            search.whole_word = !search.whole_word;
+            outbox.push(Message::SearchQueryChanged);
+        }
+        let regex = ui
+            .selectable_label(search.regex, ".*")
+            .on_hover_text("使用正则表达式");
+        if regex.clicked() {
+            search.regex = !search.regex;
+            outbox.push(Message::SearchQueryChanged);
+        }
+    });
+    // 替换行:替换词草稿不触发任何事,消费只在「全部替换」;零命中禁用
+    if search.replace_open {
+        panel.horizontal(|ui| {
+            if egui::TextEdit::singleline(&mut search.replace_with)
+                .id_salt("search-replace-input")
+                .hint_text(if search.regex {
+                    "替换为…($1 引用捕获组)"
+                } else {
+                    "替换为…"
+                })
+                .desired_width(f32::INFINITY)
+                .show(ui)
+                .response
+                .changed()
+            {
+                search.confirm_replace = None;
+            }
+        });
+        panel.horizontal(|ui| {
+            let replace_enabled = search.can_replace_all();
+            let button = ui.add_enabled(replace_enabled, egui::Button::new("全部替换"));
+            if button.clicked() {
+                outbox.push(Message::SearchReplaceAllRequested);
+            }
+            button.on_hover_text(format!(
+                "对当前 {} 条命中的所在文件执行替换(有确认浮窗)",
+                search.hits.len()
+            ));
+        });
+    }
     match &search.status {
         SearchStatus::Running => {
             panel.weak(format!("搜索中…(已 {} 条)", search.hits.len()));
         }
         SearchStatus::Finished if search.hits.is_empty() => {
-            panel.weak("无命中");
+            panel.weak("无结果");
+        }
+        SearchStatus::Finished => {
+            let files = hit_groups(&search.hits).len();
+            panel.weak(format!("{files} 个文件中 {} 条结果", search.hits.len()));
         }
         SearchStatus::Invalid(msg) => {
             panel.weak(format!("⚠ {msg}"));
         }
-        SearchStatus::Idle | SearchStatus::Finished => {}
+        SearchStatus::Idle => {}
+    }
+    // 替换回执:成功计数 + 逐文件失败原因(读/写盘失败、非 UTF-8 跳过)
+    if let Some(report) = &search.last_replace {
+        panel.weak(format!(
+            "已替换 {} 个文件中的 {} 处匹配",
+            report.files, report.replacements
+        ));
+        if !report.failed.is_empty() {
+            panel.weak(format!("✕ {} 个文件未替换:", report.failed.len()));
+            for (path, reason) in &report.failed {
+                panel.weak(format!("  {path}:{reason}"));
+            }
+        }
     }
 
     egui::ScrollArea::vertical()
@@ -702,8 +807,20 @@ fn search_panel(
             if search.hits.is_empty() && matches!(search.status, SearchStatus::Idle) {
                 ui.weak("输入搜索词,回车不必按——300ms 停顿后自动搜索");
             }
-            for hit in &search.hits {
-                search_row(ui, hit, root, outbox);
+            // 按文件分组(VS Code 同款):文件头带命中数、可折叠,行内
+            // 只剩「行号 + 摘要」。命中快照按文件连续,分组是 O(n) 一遍扫。
+            for (path, group) in hit_groups(&search.hits) {
+                let relative = path.strip_prefix(root).unwrap_or(path);
+                let header =
+                    egui::WidgetText::from(format!("{} ({})", relative.display(), group.len()));
+                egui::CollapsingHeader::new(header)
+                    .id_salt(relative)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for hit in group {
+                            search_row(ui, hit, outbox);
+                        }
+                    });
             }
             if search.truncated {
                 ui.weak(format!(
@@ -714,22 +831,29 @@ fn search_panel(
         });
 }
 
-/// 单条结果:第一行「相对根的路径:行号」,第二行命中行摘要;整块一个
-/// SelectableLabel,点击发消息(打开 + 跳行在 `logic` 归约)。
+/// 命中按文件分组:返回(路径, 该文件的命中切片)序列。后台扫描按文件
+/// 整读整发,同一文件的命中在快照里天然连续;防御性的 `contains` 去重
+/// 不需要 —— 分组只依赖连续性,即使将来乱序也只是多几个文件头。
+fn hit_groups(hits: &[SearchResult]) -> Vec<(&Path, &[SearchResult])> {
+    let mut groups: Vec<(&Path, &[SearchResult])> = Vec::new();
+    let mut start = 0;
+    while start < hits.len() {
+        let path = hits[start].path.as_path();
+        let mut end = start + 1;
+        while end < hits.len() && hits[end].path == hits[start].path {
+            end += 1;
+        }
+        groups.push((path, &hits[start..end]));
+        start = end;
+    }
+    groups
+}
+
+/// 单条命中:「行号 + 命中行摘要」;路径与命中数在文件头(分组视图)。
+/// 整块一个 SelectableLabel,点击发消息(打开 + 跳行在 `logic` 归约)。
 /// 返回行响应,独立成函数便于点击测试定位。
-fn search_row(
-    ui: &mut egui::Ui,
-    hit: &SearchResult,
-    root: &Path,
-    outbox: &mut Vec<Message>,
-) -> egui::Response {
-    let relative = hit.path.strip_prefix(root).unwrap_or(hit.path.as_path());
-    let text = format!(
-        "{}:{}\n{}",
-        relative.display(),
-        hit.line_no,
-        snippet(&hit.line_text)
-    );
+fn search_row(ui: &mut egui::Ui, hit: &SearchResult, outbox: &mut Vec<Message>) -> egui::Response {
+    let text = format!("{}  {}", hit.line_no, snippet(&hit.line_text));
     let response = ui.selectable_label(false, text);
     if response.clicked() {
         outbox.push(Message::SearchResultClicked(hit.path.clone(), hit.line_no));
@@ -2044,7 +2168,7 @@ mod tests {
 
         // 第一帧只渲染,拿行位置
         ctx.run_ui(RawInput::default(), |ui| {
-            rect.set(search_row(ui, &hit, &root, &mut outbox).rect);
+            rect.set(search_row(ui, &hit, &mut outbox).rect);
         })
         .drop_without_applying_deltas();
         assert!(outbox.is_empty());
@@ -2062,7 +2186,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                search_row(ui, &hit, &root, &mut outbox);
+                search_row(ui, &hit, &mut outbox);
             },
         )
         .drop_without_applying_deltas();
@@ -2072,7 +2196,142 @@ mod tests {
         );
     }
 
-    /// 反向链接面板渲染矩阵(#15):无根/未落盘/扫描中(进行中与防抖排程)/
+    /// 命中按文件分组:连续段归一组,路径切换即开新组;空列表零组。
+    /// (分组是结果列表文件头的数据源,乱序快照只会多几个文件头。)
+    #[test]
+    fn hit_groups_split_on_path_change() {
+        let a = PathBuf::from("a.md");
+        let b = PathBuf::from("b.md");
+        let hit = |path: &Path, line_no: usize| SearchResult {
+            path: path.to_path_buf(),
+            line_no,
+            line_text: String::new(),
+        };
+        let hits = vec![hit(&a, 1), hit(&a, 3), hit(&b, 2), hit(&a, 5)];
+        let groups = hit_groups(&hits);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(path, group)| (*path, group.len()))
+                .collect::<Vec<_>>(),
+            vec![(&*a, 2), (&*b, 1), (&*a, 1)],
+            "分组按连续段切,乱序回落只是多几个文件头"
+        );
+        assert!(hit_groups(&[]).is_empty());
+    }
+
+    /// 侧栏搜索页一次完整渲染包含 VS Code 对齐的三个模式片、替换输入与
+    ///「全部替换」动作入口;交互消息的归约链路由 state 测试覆盖。
+    #[test]
+    fn search_panel_renders_modes_and_replace_controls() {
+        let ctx = egui::Context::default();
+        let root = PathBuf::from("/vault");
+        let mut search = SearchState {
+            query: "needle".into(),
+            replace_open: true,
+            replace_with: "pin".into(),
+            hits: vec![SearchResult {
+                path: root.join("note.md"),
+                line_no: 1,
+                line_text: "needle".into(),
+            }],
+            status: SearchStatus::Finished,
+            ..SearchState::default()
+        };
+        let mut outbox = Vec::new();
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            search_panel(ui, &mut search, Some(&root), &mut outbox);
+        });
+        let texts = shape_texts(&output);
+        output.drop_without_applying_deltas();
+        assert!(outbox.is_empty(), "仅渲染不产生消息");
+        for expected in ["needle", "Aa", "ab", ".*", "pin", "全部替换"] {
+            assert!(
+                texts.iter().any(|text| text.contains(expected)),
+                "搜索页应渲染 {expected:?}, 实际文本:{texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_panel_clicks_toggle_modes_and_request_replace() {
+        let ctx = egui::Context::default();
+        let root = PathBuf::from("/vault");
+        let mut search = SearchState {
+            query: "needle".into(),
+            replace_open: true,
+            hits: vec![SearchResult {
+                path: root.join("note.md"),
+                line_no: 1,
+                line_text: "needle".into(),
+            }],
+            status: SearchStatus::Finished,
+            ..SearchState::default()
+        };
+        let mut outbox = Vec::new();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 600.0));
+        for label in ["Aa", "ab", ".*", "全部替换"] {
+            let mut center = None;
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        search_panel(ui, &mut search, Some(&root), &mut outbox);
+                    },
+                );
+                center = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                });
+                output.drop_without_applying_deltas();
+            }
+            let center = center.expect("按钮文本可见");
+            let events = vec![
+                Event::PointerMoved(center),
+                Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    search_panel(ui, &mut search, Some(&root), &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(
+                outbox,
+                vec![if label == "全部替换" {
+                    Message::SearchReplaceAllRequested
+                } else {
+                    Message::SearchQueryChanged
+                }]
+            );
+            outbox.clear();
+        }
+        assert!(!search.case_insensitive);
+        assert!(search.whole_word);
+        assert!(search.regex);
+    }
+
     /// 无引用/失败各渲染一帧不 panic,弱提示进文本层;有结果时来源文件名、
     /// 行号与摘要可见,超长摘要按字符截断加省略号。
     #[test]

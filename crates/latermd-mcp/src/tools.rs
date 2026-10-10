@@ -222,6 +222,10 @@ fn search_docs(ctx: &ToolContext, params: &Value) -> Result<Value, String> {
             root: root.clone(),
             pattern: query.to_owned(),
             case_insensitive,
+            // MCP 契约维持正则语义:pattern 按正则解释、无整词开关
+            // (docs/mcp-plan.md 的 search_docs 参数表未变)
+            whole_word: false,
+            literal: false,
         },
         max_hits.max(1),
     )

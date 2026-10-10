@@ -716,6 +716,19 @@ impl LaterMdApp {
             }
         }
 
+        // 侧边栏「全部替换」确认(跨文件写盘,与 Git 回滚同一套确认纪律):
+        // 受影响文件数由归约在挂起时折算(search.confirm_replace);真正的
+        // 替换在「全部替换」点击之后的归约里执行,确认后命中列表重收敛。
+        if let Some(plan) = &self.state.search.confirm_replace {
+            let (confirm, cancel) = search_replace_dialog(ui, plan.paths.len());
+            if confirm.clicked() {
+                outbox.push(Message::SearchReplaceAllConfirmed);
+            }
+            if cancel.clicked() {
+                outbox.push(Message::SearchReplaceAllCancelled);
+            }
+        }
+
         // 脏标签关闭确认(标签条 × / Ctrl+W 触发):目标按稳定 id 存
         // (`TabsState::confirm_close`),打开期间其他关闭入口会使索引漂移;
         // 目标被别的路径关掉时 `TabsState::remove` 已撤下确认,这里自然
@@ -1771,6 +1784,23 @@ fn checkout_dialog(
     )
 }
 
+/// 侧边栏「全部替换」确认浮窗;返回(全部替换, 取消)按钮的响应,测试
+/// 定位用(与 `checkout_dialog` 同款手法;真正的替换在归约)。附加行
+/// 告知打开中文件的差异行为(缓冲替换 vs 直接写盘,见归约注释)。
+fn search_replace_dialog(ui: &mut egui::Ui, files: usize) -> (egui::Response, egui::Response) {
+    destructive_confirm_dialog(
+        ui,
+        "搜索: 全部替换",
+        &format!("把替换词写入 {files} 个文件。"),
+        "未打开的文件直接改写磁盘,此操作不走编辑器撤销。",
+        "全部替换",
+        Some((
+            "已在编辑器中打开的文件只替换进缓冲(未保存修改保留,保存时落盘)。",
+            false,
+        )),
+    )
+}
+
 /// 回滚目标恰是编辑器当前文档时的追加警示;`None` = 目标不在编辑器中,
 /// 只有常规不可逆警示。文案与归约侧行为(`State::after_git_checkout`)
 /// 一一对应:dirty 保留未保存稿、非 dirty 重载为 HEAD。
@@ -1807,6 +1837,60 @@ impl eframe::App for LaterMdApp {
 mod tests {
     use super::*;
     use crate::state;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn search_replace_dialog_buttons_send_confirmation_messages() {
+        for confirm in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = LaterMdApp::default();
+            app.state.search.confirm_replace = Some(crate::search::ReplacePlan {
+                query: app.state.search.to_query(Path::new("/vault")),
+                replacement: "pin".into(),
+                paths: vec![PathBuf::from("/vault/note.md")],
+                generation: app.state.search.generation,
+            });
+            let mut rect = Rect::NOTHING;
+            for _ in 0..4 {
+                ctx.run_ui(RawInput::default(), |ui| {
+                    let (yes, no) = search_replace_dialog(ui, 1);
+                    rect = if confirm { yes.rect } else { no.rect };
+                })
+                .drop_without_applying_deltas();
+            }
+            let pos = rect.center();
+            ctx.run_ui(
+                RawInput {
+                    events: vec![
+                        Event::PointerMoved(pos),
+                        Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                        Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| app.draw_overlay_dialogs(ui),
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(
+                app.outbox,
+                vec![if confirm {
+                    Message::SearchReplaceAllConfirmed
+                } else {
+                    Message::SearchReplaceAllCancelled
+                }]
+            );
+        }
+    }
 
     /// 侧栏可拖宽回归(2026-10-09 坤哥真机:「左侧栏宽度似乎锁死了,不能拉伸」)。
     ///

@@ -18,6 +18,25 @@ pub use latermd_search::{
     SearchError, SearchEvent, SearchQuery, SearchResult, SearchService, MAX_HITS,
 };
 
+/// 一次「全部替换」的回执(状态行数据源):替换了几个文件几处,以及
+/// 没替换成的文件与原因(非 UTF-8、读/写盘失败)。失败不回滚已成功的
+/// 文件 —— 逐文件独立落盘,报告如实分列,由用户决定下一步。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplaceReport {
+    pub files: usize,
+    pub replacements: usize,
+    /// (相对根的展示路径, 原因),按处理顺序。
+    pub failed: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacePlan {
+    pub query: SearchQuery,
+    pub replacement: String,
+    pub paths: Vec<std::path::PathBuf>,
+    pub generation: u64,
+}
+
 /// 搜索面板状态机的当前档位。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchStatus {
@@ -32,24 +51,43 @@ pub enum SearchStatus {
     Invalid(String),
 }
 
-/// 搜索面板状态:服务句柄 + 输入镜像 + 去抖计时 + 结果缓存。
+/// 搜索面板状态:服务句柄 + 输入镜像 + 去抖计时 + 结果缓存 + 替换工作区。
 ///
-/// 输入文本(`query` / `case_insensitive`)由 `ui` 层的 TextEdit/checkbox
-/// 原地改写(同编辑器缓冲的例外:这类控件必须拿 `&mut`),变更当帧发
-/// `Message::SearchQueryChanged`;归约里取消旧搜索并把 `debounce_due`
-/// 顺延 300ms,到点由归约侧(`layout.rs` 的 reduce,每帧必跑、不看
-/// Search 页是否可见)发 `Message::SearchRequested`,归约再调
-/// [`SearchState::start`]。
+/// 输入文本(`query` / `case_insensitive` / `whole_word` / `regex`)由
+/// `ui` 层的 TextEdit/开关原地改写(同编辑器缓冲的例外:这类控件必须拿
+/// `&mut`),变更当帧发 `Message::SearchQueryChanged`;归约里取消旧搜索
+/// 并把 `debounce_due` 顺延 300ms,到点由归约侧(`layout.rs` 的 reduce,
+/// 每帧必跑、不看 Search 页是否可见)发 `Message::SearchRequested`,归约
+/// 再调 [`SearchState::start`]。
+///
+/// 替换工作区(`replace_open` / `replace_with`)同属 UI 原地草稿;「全部
+/// 替换」走两段确认:`confirm_replace = Some(计划)` 挂起确认浮窗,
+/// 归约的 `SearchReplaceAllConfirmed` 消费并产出 [`ReplaceReport`]。
 #[derive(Debug)]
 pub struct SearchState {
     /// 后台搜索服务(单线程持有,见 [`SearchService`] 文档)。
     pub service: SearchService,
-    /// 输入框文本(正则模式)。
+    /// 输入框文本(`regex = false` 时按字面文本解释,`true` 按正则)。
     pub query: String,
-    /// 大小写不敏感开关。
+    /// 大小写不敏感开关(VS Code 的「Aa」取反;默认开,与 VS Code 对齐)。
     pub case_insensitive: bool,
+    /// 完整匹配开关(VS Code 的「ab」):只命中独立词。
+    pub whole_word: bool,
+    /// 正则开关(VS Code 的「.*」):`false` = 字面文本模式。
+    pub regex: bool,
+    /// 替换行是否展开(与文档内查找条的 `replace_open` 同款分工)。
+    pub replace_open: bool,
+    /// 替换词草稿。支持 `$1` 捕获引用(latermd-search 同款展开)。
+    pub replace_with: String,
+    /// 待确认的「全部替换」:确认时冻结根目录、查询、替换词和目标路径。
+    /// (layout.rs 绘制,确认/取消都经消息归约,浮窗不直接改状态)。
+    pub confirm_replace: Option<ReplacePlan>,
+    /// 最近一次全部替换的回执;输入变化即清(旧回执对应的查询已失效)。
+    pub last_replace: Option<ReplaceReport>,
     /// 去抖到点时刻;输入每次变化顺延,发起成功或取消时清空。
     pub debounce_due: Option<Instant>,
+    /// 当前搜索代际;任何输入/换根都会递增,确认计划只对同一代有效。
+    pub generation: u64,
     /// 已收到的命中(上限 [`MAX_HITS`])。
     pub hits: Vec<SearchResult>,
     /// 命中数到达上限被截断(提示行数据源)。
@@ -62,8 +100,15 @@ impl Default for SearchState {
         Self {
             service: SearchService::new(),
             query: String::new(),
-            case_insensitive: false,
+            case_insensitive: true,
+            whole_word: false,
+            regex: false,
+            replace_open: false,
+            replace_with: String::new(),
+            confirm_replace: None,
+            last_replace: None,
             debounce_due: None,
+            generation: 0,
             hits: Vec::new(),
             truncated: false,
             status: SearchStatus::Idle,
@@ -73,12 +118,16 @@ impl Default for SearchState {
 
 impl SearchState {
     /// 输入变化(`Message::SearchQueryChanged` 的归约):取消旧搜索、
-    /// 丢弃其结果,并把去抖计时顺延 `delay`。
+    /// 丢弃其结果,并把去抖计时顺延 `delay`;替换回执与待确认一并失效
+    /// (旧回执描述的是旧查询的结果,挂着只会误导)。
     pub fn input_changed(&mut self, delay: std::time::Duration) {
         self.service.cancel();
+        self.generation = self.generation.wrapping_add(1);
         self.hits.clear();
         self.truncated = false;
         self.status = SearchStatus::Idle;
+        self.confirm_replace = None;
+        self.last_replace = None;
         self.debounce_due = Some(Instant::now() + delay);
     }
 
@@ -87,15 +136,20 @@ impl SearchState {
     /// 用户重新输入发起,旧根的结果相对路径已失真,不该留着。
     pub fn reset(&mut self) {
         self.service.cancel();
+        self.generation = self.generation.wrapping_add(1);
         self.hits.clear();
         self.truncated = false;
         self.status = SearchStatus::Idle;
+        self.confirm_replace = None;
+        self.last_replace = None;
         self.debounce_due = None;
     }
 
     /// 去抖到点发起(`Message::SearchRequested` 的归约)。空模式与非法
     /// 正则同步处理,不进后台线程。
     pub fn start(&mut self, root: &Path) {
+        self.generation = self.generation.wrapping_add(1);
+        self.confirm_replace = None;
         self.debounce_due = None;
         if self.query.is_empty() {
             return;
@@ -104,6 +158,8 @@ impl SearchState {
             root: root.to_path_buf(),
             pattern: self.query.clone(),
             case_insensitive: self.case_insensitive,
+            whole_word: self.whole_word,
+            literal: !self.regex,
         };
         self.hits.clear();
         self.truncated = false;
@@ -111,6 +167,18 @@ impl SearchState {
             Ok(()) => self.status = SearchStatus::Running,
             Err(SearchError::InvalidPattern(msg)) => self.status = SearchStatus::Invalid(msg),
             Err(error) => self.status = SearchStatus::Invalid(error.to_string()),
+        }
+    }
+
+    /// 搜索词、三个开关与根目录折算成 [`SearchQuery`](替换归约直接消费,
+    /// 与 `start` 同一份数据源 —— 不会出现「搜的是 A 换的是 B」)。
+    pub fn to_query(&self, root: &Path) -> SearchQuery {
+        SearchQuery {
+            root: root.to_path_buf(),
+            pattern: self.query.clone(),
+            case_insensitive: self.case_insensitive,
+            whole_word: self.whole_word,
+            literal: !self.regex,
         }
     }
 
@@ -134,6 +202,14 @@ impl SearchState {
                 }
             }
         }
+    }
+
+    pub fn can_replace_all(&self) -> bool {
+        self.status == SearchStatus::Finished
+            && !self.truncated
+            && self.debounce_due.is_none()
+            && !self.query.is_empty()
+            && !self.hits.is_empty()
     }
 
     /// 结果是否仍在流入(驱动下一帧重绘的判据)。
@@ -189,6 +265,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 三个开关折算进 [`SearchState::to_query`](regex 取反成 literal),
+    /// 与 `start` 同源;输入变化清替换回执与待确认,但保留 `replace_with`
+    /// 草稿(与查找词同款的 UI 原地草稿,换词不换稿)。
+    #[test]
+    fn search_flags_flow_into_query_and_replace_workspace_lifecycle() {
+        let root = temp_vault("flags");
+        let mut search = SearchState {
+            regex: true,
+            whole_word: true,
+            case_insensitive: false,
+            replace_with: "x".into(),
+            last_replace: Some(ReplaceReport {
+                files: 1,
+                replacements: 2,
+                failed: Vec::new(),
+            }),
+            confirm_replace: Some(ReplacePlan {
+                query: SearchState::default().to_query(&root),
+                replacement: "x".into(),
+                paths: vec![root.join("a.md")],
+                generation: 0,
+            }),
+            ..SearchState::default()
+        };
+        let query = search.to_query(&root);
+        assert!(query.whole_word);
+        assert!(!query.literal, "regex 开 = 正则语义");
+        assert!(!query.case_insensitive);
+        search.input_changed(Duration::from_millis(300));
+        assert_eq!(search.confirm_replace, None, "换词即撤销待确认");
+        assert_eq!(search.last_replace, None, "旧回执不跨查询");
+        assert_eq!(search.replace_with, "x", "替换词草稿保留");
+    }
+
     /// 面板状态机:输入变化取消旧搜索并顺延去抖;空模式不发起;非法
     /// 正则同步落 Invalid 且不产生事件。
     #[test]
@@ -208,7 +318,9 @@ mod tests {
         assert_eq!(search.status, SearchStatus::Idle);
         assert!(search.hits.is_empty());
 
-        // 非法正则:同步 Invalid,不进后台
+        // 非法正则:开 regex 开关后同步 Invalid,不进后台(默认字面模式
+        // 下任何输入都合法,非法模式只在正则档存在)
+        search.regex = true;
         search.query = "(".into();
         search.input_changed(Duration::from_millis(300));
         search.start(&root);

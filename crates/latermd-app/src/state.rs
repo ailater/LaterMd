@@ -34,7 +34,7 @@ use crate::keymap::{Keymap, Shortcut};
 use crate::layout::LayoutSettings;
 use crate::live::RenderMode;
 use crate::mcp::McpState;
-use crate::search::SearchState;
+use crate::search::{ReplacePlan, ReplaceReport, SearchState};
 use crate::settings::SettingsState;
 use crate::shortcut_overlay::ShortcutOverlayState;
 use crate::tabs::{DraftRecovery, TabState, TabsState};
@@ -763,6 +763,20 @@ pub enum Message {
     /// decisions-pending #127);无可收录标题只落提示行,文档不动。
     InsertToc,
     SearchQueryChanged,
+    /// 左栏自动展开并停 Search 页(标题栏搜索胶囊聚焦/输入变化时由
+    /// `ui` 发):对齐 VS Code「唤起搜索即见结果」的动线。归约在禅定
+    /// 模式下忽略 —— 禅定期间 `left=false` 是被 `enter_zen` 借走的临时
+    /// 态,擅自翻开既破坏沉浸,还会被落盘快照悄悄还原。
+    SearchPanelRevealed,
+    /// 侧边栏「全部替换」按钮:归约里按当前命中折算受影响文件数,挂起
+    /// 确认浮窗(`search.confirm_replace`)。跨文件写盘属破坏性操作,
+    /// 与关脏标签 / Git 回滚同一套确认纪律。
+    SearchReplaceAllRequested,
+    /// 确认浮窗「全部替换」:归约逐文件执行替换并产出回执
+    /// (`search.last_replace`),随后重发一次搜索让命中列表收敛。
+    SearchReplaceAllConfirmed,
+    /// 确认浮窗「取消」:只撤浮窗,不动任何文件。
+    SearchReplaceAllCancelled,
     /// 去抖到点,按当前输入与根目录发起搜索。
     SearchRequested,
     /// 反向链接防抖到点(#15):按当前(根, 文档)发起后台扫描。归约侧
@@ -1030,6 +1044,20 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
+/// 命中列表里的去重文件路径(保序):替换按文件粒度执行,一次替换覆盖
+/// 该文件当前文本上的全部命中。后台扫描按文件整读整发,命中天然按文件
+/// 连续,`contains` 去重只是防御(上限 [`crate::search::MAX_HITS`],平方
+/// 量级无虞)。
+fn unique_search_files(hits: &[crate::search::SearchResult]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for hit in hits {
+        if !paths.contains(&hit.path) {
+            paths.push(hit.path.clone());
+        }
+    }
+    paths
+}
+
 /// 按配置草稿装配模型列表来源(`request_ai_models` 的纯映射,单测不出网):
 /// Mock 不联网返回 `None`;需要 key 的 provider 带上凭据(缺失给空串,
 /// 由后台线程回「未配置 API key」文案);Ollama 本地无鉴权。base_url
@@ -1108,7 +1136,17 @@ impl State {
             Message::FileSelected(path) => {
                 self.open_path(&path);
             }
-            Message::SearchQueryChanged => self.search.input_changed(DEBOUNCE),
+            Message::SearchQueryChanged => {
+                self.search.input_changed(DEBOUNCE);
+                // 搜索词有变化即视为「在搜索」:左栏自动展开到 Search 页
+                // (禅定模式在归约内豁免)。侧边栏输入框触发的同一条消息
+                // 在此是幂等无操作。
+                self.reveal_search_panel();
+            }
+            Message::SearchPanelRevealed => self.reveal_search_panel(),
+            Message::SearchReplaceAllRequested => self.request_search_replace_all(),
+            Message::SearchReplaceAllConfirmed => self.run_search_replace_all(),
+            Message::SearchReplaceAllCancelled => self.search.confirm_replace = None,
             Message::SearchRequested => self.start_search(),
             Message::BacklinksRequested => {
                 self.backlinks.start(
@@ -1966,7 +2004,7 @@ impl State {
 
     /// 请求一次 Markdown 格式动作(§6.4 链路)。
     ///
-    /// Live 模式走 [`Self::apply_format_live`]（块内定点写回）;源码模式:
+    /// Live 模式走 `Self::apply_format_live`(块内定点写回);源码模式:
     /// 语义全在 [`crate::compose::apply`],这里负责三件事:取当前选区 →
     /// 调用 → 把新文本写回缓冲并把新选区挂 `pending_selection`。选区为
     /// `None`(UI 还没回填过)时按纯光标(0,0)处理。
@@ -3432,6 +3470,130 @@ impl State {
         } else {
             self.search.reset();
         }
+    }
+
+    /// 左栏自动展开并停 Search 页([`Message::SearchPanelRevealed`] 与
+    /// [`Message::SearchQueryChanged`] 的公共归约)。禅定模式例外:
+    /// `left=false` 是被 `enter_zen` 借走的临时态,擅自翻开既破坏沉浸,
+    /// 又会被 `save_to` 的快照还原悄悄吞掉 —— 静默不展开。
+    fn reveal_search_panel(&mut self) {
+        if self.layout.zen {
+            return;
+        }
+        self.layout.left = true;
+        self.layout.left_view = SidebarTab::Search;
+    }
+
+    /// 「全部替换」请求([`Message::SearchReplaceAllRequested`] 的归约):
+    /// 按当前命中折算受影响文件数挂起确认浮窗。零命中/无根短路(UI 侧
+    /// 按钮已禁用,这里防御一致)。
+    fn request_search_replace_all(&mut self) {
+        if self.file_tree.root.is_none() || !self.search.can_replace_all() {
+            return;
+        }
+        let root = self.file_tree.root.clone().expect("checked above");
+        let paths = unique_search_files(&self.search.hits);
+        if paths.is_empty() {
+            return;
+        }
+        self.search.confirm_replace = Some(ReplacePlan {
+            query: self.search.to_query(&root),
+            replacement: self.search.replace_with.clone(),
+            paths,
+            generation: self.search.generation,
+        });
+    }
+
+    /// 确认后的「全部替换」([`Message::SearchReplaceAllConfirmed`] 的归约):
+    /// 对命中涉及的每个文件执行替换。
+    ///
+    /// - **已打开的标签改缓冲**:脏稿在替换后保持脏(用户未保存的修改
+    ///   原样保留,落盘交给用户自己保存,盘上此刻**没有**该文件的新态);
+    ///   原本干净的标签发生内容变更后同样置脏,关闭与草稿恢复才不会丢失替换。
+    /// - **未打开的直接改盘**:仅接受合法 UTF-8(替换基于 Unicode 语义,
+    ///   lossy 转换会把坏字节 U+FFFD 写回磁盘);读/写失败逐文件记账,
+    ///   不回滚已成功的文件 —— 回执如实分列,由用户决定下一步。
+    /// - 零命中的文件(命中快照过期)一个字节都不动。
+    ///
+    /// 完成后重发一次搜索(VS Code 同款):命中列表即时收敛,替干净的
+    /// 文件从列表消失 —— 回执与列表互证。回执挂在 `last_replace` 供
+    /// 状态行展示,下次输入变化才清。
+    fn run_search_replace_all(&mut self) {
+        let Some(plan) = self.search.confirm_replace.take() else {
+            return;
+        };
+        let Some(root) = self.file_tree.root.clone() else {
+            return;
+        };
+        if !self.search.can_replace_all()
+            || plan.generation != self.search.generation
+            || plan.query != self.search.to_query(&root)
+            || plan.replacement != self.search.replace_with
+        {
+            return;
+        }
+        let query = plan.query;
+        let replacement = plan.replacement;
+        let paths = plan.paths;
+        let mut report = ReplaceReport::default();
+        for path in paths {
+            let display = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            match self.tabs.find_by_path(&path) {
+                Some(index) => {
+                    let text = self.tabs.tabs[index].editor.text().to_owned();
+                    match latermd_search::replace_in_text(&query, &replacement, &text) {
+                        Ok((new_text, count)) if count > 0 => {
+                            {
+                                let tab = &mut self.tabs.tabs[index];
+                                tab.editor.replace_all(&new_text);
+                                // 整篇替换改变长度,旧字节光标可能漂出字符
+                                // 边界(replace_all_in_doc 同款钳制)
+                                if let Some(byte) = tab.cursor.byte {
+                                    tab.cursor.byte = Some(
+                                        tab.editor.char_to_byte(tab.editor.byte_to_char(byte)),
+                                    );
+                                }
+                            }
+                            report.files += 1;
+                            report.replacements += count;
+                        }
+                        Ok(_) => {} // 命中快照过期:该文件当前文本零命中
+                        Err(error) => report.failed.push((display, error.to_string())),
+                    }
+                }
+                None => {
+                    let outcome = std::fs::read(&path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).map_err(|_| "非 UTF-8 文档,已跳过".to_owned())
+                        })
+                        .and_then(|text| {
+                            latermd_search::replace_in_text(&query, &replacement, &text)
+                                .map_err(|error| error.to_string())
+                                .map(|(new_text, count)| (new_text, count, text))
+                        });
+                    match outcome {
+                        Ok((new_text, count, _)) if count > 0 => {
+                            match file::write_as("替换", &path, &new_text) {
+                                Ok(()) => {
+                                    report.files += 1;
+                                    report.replacements += count;
+                                }
+                                Err(error) => report.failed.push((display, error.to_string())),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(reason) => report.failed.push((display, reason)),
+                    }
+                }
+            }
+        }
+        self.search.last_replace = Some(report);
+        self.start_search();
     }
 
     /// 反向链接的触发判定(#15):「(文件树根, 当前文档路径)」与面板的
@@ -5938,6 +6100,298 @@ mod tests {
             "缓冲未被触碰"
         );
         assert_eq!(state.tabs.current_mut().cursor.jump_to, None, "不设跳转");
+    }
+
+    /// 搜索唤起左栏:输入变化(SearchQueryChanged)与胶囊聚焦
+    /// (SearchPanelRevealed)都把左栏展开并停 Search 页;禅定模式豁免
+    /// (left 是被 enter_zen 借走的临时态,不擅自翻开)。
+    #[test]
+    fn search_input_reveals_sidebar_and_zen_is_exempt() {
+        let mut state = State::default();
+        assert_eq!(state.layout.left_view, SidebarTab::Files);
+        state.apply(Message::SearchQueryChanged);
+        assert!(state.layout.left, "输入搜索词左栏必须展开");
+        assert_eq!(state.layout.left_view, SidebarTab::Search);
+
+        // 收起后再聚焦同样展开(点进胶囊但还没输入的场合)
+        state.layout.left = false;
+        state.apply(Message::SearchPanelRevealed);
+        assert!(state.layout.left);
+
+        // 禅定豁免:两种消息都不动左栏
+        state.layout.left = false;
+        state.apply(Message::ZenToggled);
+        assert!(state.layout.zen);
+        state.apply(Message::SearchQueryChanged);
+        state.apply(Message::SearchPanelRevealed);
+        assert!(!state.layout.left, "禅定下不展开左栏");
+        assert_eq!(state.layout.left_view, SidebarTab::Search, "目标页不回退");
+    }
+
+    /// 全部替换链路(未打开的文件走磁盘):请求挂确认浮窗(文件数按命中
+    /// 路径去重折算)→ 取消只撤浮窗一字不改 → 确认后逐文件落盘、零命中
+    /// 文件原样、回执记账、重发搜索(命中清空待流式回填)。
+    #[test]
+    fn search_replace_all_flow_over_disk_files() {
+        let dir = temp_path("search-replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "foo bar\nfoo again\n").unwrap();
+        let other = dir.join("other.md");
+        std::fs::write(&other, "没有命中\n").unwrap();
+
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.search.query = "foo".into();
+        state.search.replace_with = "baz".into();
+        state.search.status = crate::search::SearchStatus::Finished;
+        // 命中快照直接注填(后台流式收流不在单测里等);other.md 入列但
+        // 内容零命中 —— 替换时它一个字节都不动
+        state.search.hits = vec![
+            crate::search::SearchResult {
+                path: note.clone(),
+                line_no: 1,
+                line_text: "foo bar".into(),
+            },
+            crate::search::SearchResult {
+                path: note.clone(),
+                line_no: 2,
+                line_text: "foo again".into(),
+            },
+            crate::search::SearchResult {
+                path: other.clone(),
+                line_no: 1,
+                line_text: "没有命中".into(),
+            },
+        ];
+
+        state.apply(Message::SearchReplaceAllRequested);
+        assert_eq!(
+            state.search.confirm_replace.as_ref().unwrap().paths.len(),
+            2,
+            "按路径去重折算"
+        );
+
+        state.apply(Message::SearchReplaceAllCancelled);
+        assert_eq!(state.search.confirm_replace, None);
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "foo bar\nfoo again\n",
+            "取消不落盘"
+        );
+
+        state.apply(Message::SearchReplaceAllRequested);
+        state.apply(Message::SearchReplaceAllConfirmed);
+        assert_eq!(state.search.confirm_replace, None);
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "baz bar\nbaz again\n"
+        );
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "没有命中\n");
+        let report = state.search.last_replace.as_ref().unwrap();
+        assert_eq!((report.files, report.replacements), (1, 2));
+        assert!(report.failed.is_empty());
+        assert!(
+            state.search.hits.is_empty()
+                || state.search.status == crate::search::SearchStatus::Running,
+            "确认后重发搜索,命中清空待流式回填"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 打开中的标签改缓冲不直接写盘:脏稿替换后保持脏(用户未保存修改
+    /// 原样保留,磁盘不动);干净稿发生替换后必须变脏。
+    #[test]
+    fn search_replace_respects_open_tabs_dirty_state() {
+        let dir = temp_path("search-replace-tabs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clean = dir.join("clean.md");
+        std::fs::write(&clean, "alpha beta\n").unwrap();
+        let dirty = dir.join("dirty.md");
+        std::fs::write(&dirty, "beta 原稿\n").unwrap();
+
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.apply(Message::SearchResultClicked(clean.clone(), 1));
+        state.apply(Message::SearchResultClicked(dirty.clone(), 1));
+        // 当前标签(dirty.md)制造未保存修改
+        state.tabs.current_mut().editor.insert_chars(0, "用户改动 ");
+        assert!(state.tabs.current().editor.is_dirty());
+
+        state.search.query = "beta".into();
+        state.search.replace_with = "gamma".into();
+        state.search.status = crate::search::SearchStatus::Finished;
+        state.search.hits = vec![
+            crate::search::SearchResult {
+                path: clean.clone(),
+                line_no: 1,
+                line_text: "alpha beta".into(),
+            },
+            crate::search::SearchResult {
+                path: dirty.clone(),
+                line_no: 1,
+                line_text: "beta 原稿".into(),
+            },
+        ];
+        state.apply(Message::SearchReplaceAllRequested);
+        state.apply(Message::SearchReplaceAllConfirmed);
+
+        // 磁盘:两个文件都未写(替换发生在缓冲)
+        assert_eq!(
+            std::fs::read_to_string(&clean).unwrap(),
+            "alpha beta\n",
+            "干净标签的落盘交给用户保存链路"
+        );
+        assert_eq!(std::fs::read_to_string(&dirty).unwrap(), "beta 原稿\n");
+        // 原本干净的标签:替换在缓冲,尚未保存。
+        let clean_index = state.tabs.find_by_path(&clean).unwrap();
+        assert_eq!(state.tabs.tabs[clean_index].editor.text(), "alpha gamma\n");
+        assert!(
+            state.tabs.tabs[clean_index].editor.is_dirty(),
+            "缓冲尚未保存,替换后必须变脏"
+        );
+        // 脏标签(当前):用户改动保留 + 替换落进缓冲 + 仍脏
+        assert_eq!(state.tabs.current().editor.text(), "用户改动 gamma 原稿\n");
+        assert!(state.tabs.current().editor.is_dirty(), "脏稿保持脏");
+        let report = state.search.last_replace.as_ref().unwrap();
+        assert_eq!((report.files, report.replacements), (2, 2));
+        state.apply(Message::TabCloseRequested(clean_index));
+        assert!(
+            state.tabs.confirm_close.is_some(),
+            "替换后关闭必须确认未保存修改"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非 UTF-8 文档跳过不写盘(替换基于 Unicode 语义,lossy 会把坏字节
+    /// 写回磁盘),回执逐文件记因;UTF-8 邻居照常替换。
+    #[test]
+    fn search_replace_skips_non_utf8_with_report() {
+        let dir = temp_path("search-replace-utf8");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.md");
+        std::fs::write(&good, "foo\n").unwrap();
+        let bin = dir.join("bin.md");
+        std::fs::write(&bin, b"foo \xff\xfe tail\n").unwrap();
+
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.search.query = "foo".into();
+        state.search.replace_with = "baz".into();
+        state.search.status = crate::search::SearchStatus::Finished;
+        state.search.hits = vec![
+            crate::search::SearchResult {
+                path: good.clone(),
+                line_no: 1,
+                line_text: "foo".into(),
+            },
+            crate::search::SearchResult {
+                path: bin.clone(),
+                line_no: 1,
+                line_text: "foo …".into(),
+            },
+        ];
+        state.apply(Message::SearchReplaceAllRequested);
+        assert_eq!(
+            state.search.confirm_replace.as_ref().unwrap().paths.len(),
+            2
+        );
+        state.apply(Message::SearchReplaceAllConfirmed);
+
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "baz\n");
+        assert_eq!(
+            std::fs::read(&bin).unwrap(),
+            b"foo \xff\xfe tail\n",
+            "非 UTF-8 一个字节不动"
+        );
+        let report = state.search.last_replace.as_ref().unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "bin.md");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_replace_rejects_incomplete_or_stale_confirmation() {
+        let dir = temp_path("search-replace-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, "foo\n").unwrap();
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.search.query = "foo".into();
+        state.search.replace_with = "bar".into();
+        state.search.hits = vec![crate::search::SearchResult {
+            path: path.clone(),
+            line_no: 1,
+            line_text: "foo".into(),
+        }];
+        for status in [
+            crate::search::SearchStatus::Idle,
+            crate::search::SearchStatus::Running,
+        ] {
+            state.search.status = status;
+            state.apply(Message::SearchReplaceAllRequested);
+            assert!(state.search.confirm_replace.is_none());
+            state.apply(Message::SearchReplaceAllConfirmed);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\n");
+        }
+        state.search.status = crate::search::SearchStatus::Finished;
+        state.search.truncated = true;
+        state.apply(Message::SearchReplaceAllRequested);
+        assert!(state.search.confirm_replace.is_none());
+        state.search.truncated = false;
+        for change in 0..5 {
+            state.apply(Message::SearchReplaceAllRequested);
+            assert!(state.search.confirm_replace.is_some());
+            match change {
+                0 => state.search.replace_with = "changed".into(),
+                1 => state.search.query = "other".into(),
+                2 => state.search.generation += 1,
+                3 => state.file_tree.root = Some(dir.join("other")),
+                _ => state.search.truncated = true,
+            }
+            state.apply(Message::SearchReplaceAllConfirmed);
+            assert!(state.search.confirm_replace.is_none());
+            assert!(state.search.last_replace.is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\n");
+            state.search.query = "foo".into();
+            state.search.replace_with = "bar".into();
+            state.search.truncated = false;
+            state.file_tree.root = Some(dir.clone());
+        }
+        state.apply(Message::SearchReplaceAllRequested);
+        state.apply(Message::SearchQueryChanged);
+        state.apply(Message::SearchReplaceAllConfirmed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_replace_uses_frozen_target_paths() {
+        let dir = temp_path("search-replace-frozen");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.md");
+        let b = dir.join("b.md");
+        std::fs::write(&a, "foo\n").unwrap();
+        std::fs::write(&b, "foo\n").unwrap();
+        let mut state = State::default();
+        state.file_tree.root = Some(dir.clone());
+        state.search.query = "foo".into();
+        state.search.replace_with = "bar".into();
+        state.search.status = crate::search::SearchStatus::Finished;
+        let hit = |path: PathBuf| crate::search::SearchResult {
+            path,
+            line_no: 1,
+            line_text: "foo".into(),
+        };
+        state.search.hits = vec![hit(a.clone())];
+        state.apply(Message::SearchReplaceAllRequested);
+        state.search.hits.push(hit(b.clone()));
+        state.apply(Message::SearchReplaceAllConfirmed);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "bar\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "foo\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 多标签:dirty 时点击搜索结果不再拦截,而是另开新标签跳转;
