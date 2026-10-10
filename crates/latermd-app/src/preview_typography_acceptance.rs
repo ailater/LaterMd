@@ -680,8 +680,13 @@ fn full_sample_doc_elements_visible_and_spaced_in_both_visuals() {
         );
         for (level, &heading) in heading_bands.iter().enumerate().skip(1) {
             let ratio = h1_h / band_h(heading);
+            // 容差 0.3:像素带高是**墨水外沿**的度量,CJK 粗体笔画的墨水
+            // 比常规字重外扩 ~1px(2026-10-09 bold 族链接入 NotoSansCJK-Bold
+            // 后 H6 带高 16→17px,H1/H6 比 1.875→1.765,阶梯本身未动)。
+            // 精确分级比由排版文档测试的 galley 层探针承担(见下方正文比
+            // 断言的注释,同款「±1-2px em 覆盖率噪声」口径)。
             assert!(
-                (ratio - scales[0] / scales[level]).abs() <= 0.2,
+                (ratio - scales[0] / scales[level]).abs() <= 0.3,
                 "{theme_name} 主题:H1/H{} 带高比 {:.3} 应 ≈ {:.3}(出厂分级之比)",
                 level + 1,
                 ratio,
