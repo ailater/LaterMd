@@ -32,7 +32,7 @@ pub fn builtins() -> &'static [BuiltinSkin] {
     BUILTINS.get_or_init(skins)
 }
 
-/// 把九套预设铺进皮肤目录:**文件不存在才写**,已存在(含用户改过的)
+/// 把内置预设铺进皮肤目录:**文件不存在才写**,已存在(含用户改过的)
 /// 一律不动。目录不存在则创建。返回实际写入的皮肤名(空 = 全部已在)。
 ///
 /// 失败不 panic:预设缺失只是「少几套可选皮肤」,不该挡启动;调用方自行
@@ -69,7 +69,7 @@ pub fn install_to(dir: &std::path::Path) -> Vec<String> {
 /// 标题排版(#23 F4/F5,preview-typography §2 待办 A)与 vendored 出厂值
 /// 一致:`heading.scales` 用 vendored 新分级 [2.0,…,1.0](`MarkdownStyle::
 /// default()` 自带,不在此重复写死),`heading_space_above` 显式钉 4.0
-/// —— 九套预设只在**颜色**上不同,标题节奏是全局一致性属性,不按皮肤
+/// —— 内置预设只在**颜色**上不同,标题节奏是全局一致性属性,不按皮肤
 /// 微调;交叉断言见 `builtins_ship_heading_typography_matching_factory`。
 fn base() -> MarkdownStyle {
     let mut style = MarkdownStyle::default();
@@ -124,7 +124,7 @@ fn skin(
     BuiltinSkin { name, style }
 }
 
-/// 九套色板。暗色侧数值抄自 egui-thematic 0.1.1 `config.rs` 的各 preset
+/// 原九套色板加「青竹护眼」。原预设暗色侧数值抄自 egui-thematic 0.1.1 `config.rs` 的各 preset
 /// (text_color → 文字色、code_bg/panel_fill → 底色);亮色侧是同色板的
 /// 公开浅色变体配对(egui-thematic 对 Dracula 等 8 套只给了暗色一套值,
 /// `MarkdownStyle` 的成对字段要求两边都给)。
@@ -133,6 +133,13 @@ fn skin(
 /// 与该 crate 的九套并非同一集合。
 fn skins() -> Vec<BuiltinSkin> {
     vec![
+        skin(
+            "青竹护眼",
+            [0xC6, 0xDE, 0xCA],
+            [0x29, 0x4B, 0x35],
+            [0x27, 0x3C, 0x2E],
+            [0xC2, 0xD9, 0xC7],
+        ),
         skin(
             "Dracula",
             // 正文 F8F8F2 / panel 44475A / 极底 15161E
@@ -214,6 +221,11 @@ fn skins() -> Vec<BuiltinSkin> {
 /// 每行依次是内容、导航、文字、次文字、强调色；状态色统一按表面混合。
 pub fn shell_palette(name: &str) -> Option<crate::theme::ShellPalette> {
     let (light, dark) = match name {
+        // 低饱和绿纸面与森林绿暗色；三平台共享，不依赖系统强调色。
+        "青竹护眼" => (
+            [0xdcebdc, 0xcbdccb, 0x263e2d, 0x485f4e, 0x2a6440],
+            [0x1c2b23, 0x16231c, 0xd8e8db, 0xa4bdaa, 0x8ec7a0],
+        ),
         "Dracula" => (
             [0xf8f8fa, 0xeeeef4, 0x282a36, 0x656579, 0x7952b3],
             [0x282a36, 0x21222c, 0xf8f8f2, 0xb3b1c6, 0xbd93f9],
@@ -324,11 +336,11 @@ mod tests {
         }
     }
 
-    /// #23 F4/F5:标题排版新字段随九套预设出厂 —— `heading_space_above`
+    /// #23 F4/F5:标题排版新字段随十套预设出厂 —— `heading_space_above`
     /// 显式钉在 vendored 出厂值(4.0),`heading.scales` 走 vendored 新分级
     /// [2.0,1.55,1.30,1.15,1.08,1.0]。两边都交叉对照
     /// [`crate::theme::default_markdown_style`](未选皮肤时的出厂正文样式):
-    /// 九套皮肤与「无皮肤默认」在标题节奏上必须完全一致,否则切皮肤会
+    /// 十套皮肤与「无皮肤默认」在标题节奏上必须完全一致,否则切皮肤会
     /// 意外改变标题观感(preview-typography §2.2「注意 skinsPresets 也要
     /// 同步」的防线)。vendored 默认将来再变时,此测试红 = 强制一次显式
     /// 的三处同步(base()/default_markdown_style/vendored default)。
@@ -358,8 +370,8 @@ mod tests {
         }
     }
 
-    /// #23 F5:铺盘落档的九套 `.ron` 里新字段真实存在且可读回 ——
-    /// 「九套预设与新字段一致」不仅断言内存里的 `base()`,还钉
+    /// #23 F5:铺盘落档的十套 `.ron` 里新字段真实存在且可读回 ——
+    /// 「十套预设与新字段一致」不仅断言内存里的 `base()`,还钉
     /// 序列化落盘(皮肤文件里写有 `heading_space_above`)与皮肤扫描
     /// 载入(`SkinCatalog` 读回的生效样式仍带着新字段,老安装里
     /// 没有该字段的旧 ron 走 serde default 4.0 兜底,不在此路径)。
@@ -370,7 +382,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let written = install_to(&dir);
-        assert_eq!(written.len(), 9, "首次全量铺盘");
+        assert_eq!(written.len(), 10, "首次全量铺盘");
         for skin in builtins() {
             let path = dir.join("themes").join(format!("{}.ron", skin.name));
             let text = std::fs::read_to_string(&path)
@@ -389,8 +401,14 @@ mod tests {
         }
 
         let catalog = crate::theme::SkinCatalog::load_from(&dir);
-        assert_eq!(catalog.skins.len(), 9, "九套都能被皮肤扫描载入");
+        assert_eq!(catalog.skins.len(), 10, "十套都能被皮肤扫描载入");
         for skin in catalog.skins.iter() {
+            assert_eq!(
+                skin.shell,
+                shell_palette(&skin.name),
+                "{}: 完整色板经 RON 原样恢复",
+                skin.name
+            );
             assert_eq!(
                 skin.style.heading_space_above, 4.0,
                 "{}: 载入后新字段保持",
@@ -401,7 +419,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #30 回归防线:九套预设的表格边框与底色可见(stroke_width ≥ 0.5 且
+    /// #30 回归防线:十套预设的表格边框与底色可见(stroke_width ≥ 0.5 且
     /// 两底色开关开;被 reset 回 vendored 默认(0.0 / false × 2)时此测试红)。
     #[test]
     fn builtins_draw_table_borders() {
@@ -421,14 +439,14 @@ mod tests {
         }
     }
 
-    /// 九套预设,名字互不重复,行内代码四色全部不透明。
+    /// 十套预设,名字互不重复,行内代码四色全部不透明。
     #[test]
-    fn nine_builtins_with_distinct_names() {
+    fn builtins_with_distinct_names() {
         let skins = builtins();
         assert_eq!(
             skins.len(),
-            9,
-            "任务点名九套:Dracula/Nord/Gruvbox/Solarized×2/Tokyo Night/One×2/Rosé Pine"
+            10,
+            "十套预设:Dracula/Nord/Gruvbox/Solarized×2/Tokyo Night/One×2/Rosé Pine/青竹护眼"
         );
         let mut names: Vec<&str> = skins.iter().map(|skin| skin.name).collect();
         names.sort();
@@ -447,7 +465,7 @@ mod tests {
         }
     }
 
-    /// 铺盘:首次写入九个 .ron;再次调用零写入(不覆盖用户改动);
+    /// 铺盘:首次写入十个 .ron;再次调用零写入(不覆盖用户改动);
     /// 写出的文件能被皮肤扫描(`SkinCatalog`,即 #8 既有路径)载入。
     #[test]
     fn install_writes_once_and_files_load_as_skins() {
@@ -455,7 +473,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let written = install_to(&dir);
-        assert_eq!(written.len(), 9, "首次全量铺盘");
+        assert_eq!(written.len(), 10, "首次全量铺盘");
         assert!(dir.join("themes").join("Nord.ron").exists());
 
         // 用户改过的同名文件必须被尊重:第二次铺盘零写入
@@ -471,7 +489,7 @@ mod tests {
         assert!(install_to(&dir).is_empty(), "已存在的文件不覆盖");
 
         let catalog = crate::theme::SkinCatalog::load_from(&dir);
-        assert_eq!(catalog.skins.len(), 9, "九套都能被皮肤扫描载入");
+        assert_eq!(catalog.skins.len(), 10, "十套都能被皮肤扫描载入");
         let nord = catalog.find("Nord").expect("Nord 在目录里");
         assert_eq!(nord.style.block_spacing, 23.0, "用户改动未被顶掉");
 
