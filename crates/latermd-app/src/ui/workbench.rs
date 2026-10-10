@@ -346,7 +346,11 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
         ui,
         slot(right - 64.0, 28.0),
         Icon::PanelRight,
-        "显示 / 隐藏预览",
+        if state.render_mode == crate::live::RenderMode::Live {
+            "切到源码并打开对照预览"
+        } else {
+            "显示 / 隐藏对照预览（只读）"
+        },
         state.layout.right,
     ) {
         outbox.push(Command::ToggleRightPreview.message());
@@ -356,17 +360,17 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     }
 }
 
-fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
+pub(super) fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
     let colors = crate::theme::shell(ui);
     let live = state.render_mode == crate::live::RenderMode::Live;
     ui.painter().rect_filled(rect, 7.0, colors.hover);
-    for (index, label) in ["源码", "Live"].into_iter().enumerate() {
+    for (index, label) in ["写作", "源码"].into_iter().enumerate() {
         let part = Rect::from_min_size(
             rect.min + egui::vec2(index as f32 * rect.width() / 2.0, 0.0),
             egui::vec2(rect.width() / 2.0, rect.height()),
         )
         .shrink(2.0);
-        let selected = (index == 1) == live;
+        let selected = (index == 0) == live;
         let response = ui.allocate_rect(part, Sense::click());
         if selected {
             ui.painter().rect_filled(part, 5.0, colors.content);
@@ -391,6 +395,11 @@ fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Me
         });
         if response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if index == 0 {
+                "写作：直接编辑正文，当前段落显示 Markdown"
+            } else {
+                "源码：编辑 Markdown，可按需打开对照预览"
+            })
             .clicked()
             && !selected
         {
@@ -808,7 +817,7 @@ mod tests {
                 let rect = Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 28.0));
                 for events in [
                     vec![],
-                    click(egui::pos2(if live { 95.0 } else { 45.0 }, 34.0)),
+                    click(egui::pos2(if !live { 95.0 } else { 45.0 }, 34.0)),
                 ] {
                     ctx.run_ui(
                         egui::RawInput {
@@ -822,7 +831,7 @@ mod tests {
                 assert!(outbox.is_empty(), "点击当前模式不能反转");
                 ctx.run_ui(
                     egui::RawInput {
-                        events: click(egui::pos2(if live { 45.0 } else { 95.0 }, 34.0)),
+                        events: click(egui::pos2(if !live { 45.0 } else { 95.0 }, 34.0)),
                         ..Default::default()
                     },
                     |ui| mode_switch(ui, rect, &state, &mut outbox),
@@ -948,7 +957,8 @@ mod tests {
                             inspect(shape, centers);
                         }
                     }
-                    egui::Shape::Text(text) if ["源码", "Live"].contains(&text.galley.text()) => {
+                    egui::Shape::Text(text) if ["写作", "源码"].contains(&text.galley.text()) =>
+                    {
                         let mut bounds = Rect::NOTHING;
                         for row in &text.galley.rows {
                             for glyph in &row.glyphs {

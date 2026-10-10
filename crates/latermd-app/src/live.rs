@@ -40,7 +40,8 @@ use crate::state::{Message, OutlineCursor, PreviewState};
 /// 源码模式与 Live Preview 共用同一个 rope buffer、同一套撤销语义,区别仅
 /// 在于是否应用「光标所在块显示源码」这条规则 —— 所以切换不该有任何恢复
 /// 逻辑(roadmap 阶段 5 的原则)。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RenderMode {
     /// 整篇源码。
     #[default]

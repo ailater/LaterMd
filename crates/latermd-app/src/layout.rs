@@ -40,6 +40,8 @@ pub struct LayoutSettings {
     pub left: bool,
     /// 右栏(预览)是否展开。
     pub right: bool,
+    /// 上次主动选择的编辑模式；旧配置/首次启动进入写作。
+    pub render_mode: Option<crate::live::RenderMode>,
     /// 禅定模式(§7):三栏让位、预览占满内容区。
     ///
     /// **`skip`(读写两端都跳过)而不是 `default`**:它是**当前会话的临时
@@ -80,6 +82,7 @@ impl Default for LayoutSettings {
         Self {
             left: true,
             right: true,
+            render_mode: None,
             zen: false,
             left_view: SidebarTab::Files,
             pre_zen: None,
@@ -92,17 +95,25 @@ impl Default for LayoutSettings {
 }
 
 impl LayoutSettings {
+    /// 新安装按需打开对照；Default 保留旧配置缺项的兼容口径。
+    pub fn fresh_install() -> Self {
+        Self {
+            right: false,
+            ..Self::default()
+        }
+    }
+
     /// 启动装载:无文件/坏文件都回落默认(坏件终端告警,挡启动不值得)。
     pub fn load() -> Self {
         let Some(dir) = theme::config_dir() else {
-            return Self::default();
+            return Self::fresh_install();
         };
         match Self::load_from(&dir) {
             Ok(settings) => settings,
-            Err(LoadError::Missing) => Self::default(),
+            Err(LoadError::Missing) => Self::fresh_install(),
             Err(LoadError::Corrupt(source)) => {
                 eprintln!("LaterMD: 布局设置解析失败,已回落默认: {source}");
-                Self::default()
+                Self::fresh_install()
             }
         }
     }
@@ -125,6 +136,10 @@ impl LayoutSettings {
         let mut saved = self.clone();
         if let Some((left, right)) = saved.pre_zen {
             saved.left = left;
+            saved.right = right;
+        }
+        // 写作期间的右栏隐藏是临时状态，保存源码模式的对照偏好。
+        if let Some(right) = saved.pre_live_right {
             saved.right = right;
         }
         let json = serde_json::to_string_pretty(&saved).map_err(|source| SaveError {
@@ -270,6 +285,7 @@ mod tests {
         let settings = LayoutSettings {
             left: false,
             right: true,
+            render_mode: None,
             zen: false,
             left_view: SidebarTab::Outline,
             ..Default::default()
