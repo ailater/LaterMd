@@ -47,7 +47,7 @@ fn native_traffic_light_center(ctx: &egui::Context) -> Option<f32> {
 
 /// 仅用于独立工具栏标签：按字形墨迹居中，避开中英文字体不同的行盒留白。
 /// 不修改正文的排版、基线或字体度量。
-fn centered_label(ui: &egui::Ui, rect: Rect, label: &str, color: egui::Color32) {
+pub(crate) fn centered_label(ui: &egui::Ui, rect: Rect, label: &str, color: egui::Color32) {
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), egui::FontId::proportional(12.0), color);
@@ -56,6 +56,119 @@ fn centered_label(ui: &egui::Ui, rect: Rect, label: &str, color: egui::Color32) 
         rect.center().y - galley.mesh_bounds.center().y,
     );
     ui.painter().galley(pos, galley, color);
+}
+
+/// UI chrome uses visible glyph bounds; document text keeps its normal baseline.
+pub(crate) fn label_at(
+    ui: &egui::Ui,
+    left: f32,
+    center_y: f32,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+) -> Rect {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color);
+    let pos = egui::pos2(left, center_y - galley.mesh_bounds.center().y);
+    let rect = Rect::from_min_size(pos, galley.size());
+    ui.painter().galley(pos, galley, color);
+    rect
+}
+
+pub(crate) fn small_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
+    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 5.0, colors.hover);
+    }
+    icon.draw(ui.painter(), rect.center(), 15.0, colors.secondary);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    response
+        .on_hover_text(tip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usize, usize)>) {
+    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+    let y = rect.center().y;
+    let tab = state.tabs.current();
+    let (mcp, mcp_color) = match &state.mcp.status {
+        crate::mcp::McpStatus::Listening(port) => (format!("MCP · {port}"), colors.secondary),
+        crate::mcp::McpStatus::Failed(_) => ("MCP · 启动失败".into(), crate::ui::tokens::WARN),
+        crate::mcp::McpStatus::Starting => ("MCP · 启动中".into(), colors.secondary),
+        crate::mcp::McpStatus::Disabled => ("MCP 关闭".into(), colors.secondary),
+    };
+    let ai = if state.ai.is_streaming() {
+        format!("{} · 生成中", state.ai.provider_label())
+    } else {
+        state.ai.provider_label().to_owned()
+    };
+    let mut right = rect.right() - 4.0;
+    for (index, (text, color)) in [
+        (mcp.as_str(), mcp_color),
+        (ai.as_str(), colors.secondary),
+        (state.theme.mode.label(), colors.secondary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 && rect.width() < 640.0 {
+            break;
+        }
+        let text = crate::ui::tabs::elide_text(ui, text, &egui::FontId::proportional(11.0), 150.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text, egui::FontId::proportional(11.0), color);
+        right -= galley.size().x;
+        ui.painter().galley(
+            egui::pos2(right, y - galley.mesh_bounds.center().y),
+            galley,
+            color,
+        );
+        right -= 18.0;
+    }
+    let left = rect.left() + 4.0;
+    let name = crate::ui::tabs::elide_text(
+        ui,
+        &tab.document.display_name(),
+        &egui::FontId::proportional(11.0),
+        (right - left).clamp(0.0, 160.0),
+    );
+    let name_rect = label_at(ui, left, y, &name, 11.0, colors.secondary);
+    let mut x = name_rect.right() + 16.0;
+    let saved = if tab.document.path.is_none() {
+        "未存储"
+    } else if tab.editor.is_dirty() {
+        "未保存"
+    } else {
+        "已保存"
+    };
+    let mut details = vec![saved.to_owned()];
+    if let Some((line, col)) = position {
+        details.push(format!("行 {line} · 列 {col}"));
+    }
+    details.push(format!("{} 字", tab.editor.text().chars().count()));
+    for text in details {
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text, egui::FontId::proportional(11.0), colors.secondary);
+        if x + galley.size().x > right {
+            break;
+        }
+        ui.painter().line_segment(
+            [egui::pos2(x - 8.0, y - 4.0), egui::pos2(x - 8.0, y + 4.0)],
+            separator(ui),
+        );
+        let width = galley.size().x;
+        ui.painter().galley(
+            egui::pos2(x, y - galley.mesh_bounds.center().y),
+            galley,
+            colors.secondary,
+        );
+        x += width + 16.0;
+    }
 }
 
 /// 单物理像素分隔线；与面板原生拖拽高亮共存。
@@ -577,6 +690,68 @@ mod tests {
             2
         );
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_glyphs_stay_centered_and_do_not_overlap_when_resized() {
+        for scale in [1.0, 1.5, 2.0] {
+            for width in [360.0, 900.0] {
+                let ctx = egui::Context::default();
+                crate::fonts::install(&ctx).expect("macOS fonts");
+                ctx.set_pixels_per_point(scale);
+                // Apply egui's pending zoom before measuring viewport geometry.
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 100.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .drop_without_applying_deltas();
+                let mut state = State::default();
+                state.tabs.current_mut().document.path = Some(std::path::PathBuf::from(
+                    "这是一个很长的文件名称-system-font-alignment.md",
+                ));
+                let mut center = 0.0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 100.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        center = ui.cursor().top() + 12.0;
+                        status_bar(ui, &state, Some((12, 8)));
+                    },
+                );
+                output.textures_delta.clear();
+                let mut bounds = Vec::new();
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        let r = text.galley.mesh_bounds.translate(text.pos.to_vec2());
+                        assert!((r.center().y - center).abs() * scale <= 0.5);
+                        assert!(
+                            r.left() >= 0.0 && r.right() <= width,
+                            "{}: {r:?}, width={width}, scale={scale}",
+                            text.galley.text()
+                        );
+                        bounds.push(r);
+                    }
+                }
+                output.textures_delta.clear();
+                assert!(bounds.len() >= 2);
+                bounds.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                for pair in bounds.windows(2) {
+                    assert!(pair[0].right() < pair[1].left());
+                }
+            }
+        }
+    }
+
     // 验证 macOS 的实际中英文字体；其他平台 CI 不要求预装 CJK 系统字体。
     #[cfg(target_os = "macos")]
     #[test]

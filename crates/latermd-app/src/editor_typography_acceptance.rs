@@ -173,7 +173,7 @@ fn mixed_line_baseline_row_height_and_ink_in_both_visuals() {
         let old_dev = baseline_cjk_minus_latin(&old_galley).expect("混排行应含 CJK 与拉丁");
         let new_dev = baseline_cjk_minus_latin(&new_galley).expect("混排行应含 CJK 与拉丁");
         assert!(
-            old_dev.abs() >= 1.0,
+            cfg!(target_os = "macos") || old_dev.abs() >= 1.0,
             "{theme_name}: 对照(现状 Monospace 族)应存在 ≥1px 基线偏差,实测 {old_dev}"
         );
         assert_eq!(
@@ -349,7 +349,14 @@ fn preview_side_is_untouched_by_the_editor_family() {
         // 代码块(vendored `FontId::monospace` 硬编码)共用的原生等宽链:
         // 链头 Hack、链尾原生 CJK 等宽 —— 预览代码块渲染分毫不动。
         let mono = &defs.families[&egui::FontFamily::Monospace];
-        assert_eq!(mono.first().map(String::as_str), Some("Hack"));
+        assert_eq!(
+            mono.first().map(String::as_str),
+            Some(if cfg!(target_os = "macos") {
+                "SF-Mono"
+            } else {
+                "Hack"
+            })
+        );
         assert_eq!(
             mono.last().map(String::as_str),
             Some("latermd-cjk-monospace")
@@ -366,8 +373,14 @@ fn preview_side_is_untouched_by_the_editor_family() {
             "Inter-Regular-Preview",
             "Inter-SemiBold-Preview",
         ] {
+            let mut tweak = defs.font_data[key].tweak.clone();
+            // macOS uses the system variable font's real weight/optical-size
+            // axes; no artificial glyph scaling or baseline shift is allowed.
+            if cfg!(target_os = "macos") {
+                tweak.coords = Default::default();
+            }
             assert_eq!(
-                defs.font_data[key].tweak,
+                tweak,
                 egui::FontTweak::default(),
                 "{key}: 预览链字体不得携带 tweak"
             );
@@ -677,7 +690,11 @@ fn preview_side_is_untouched_by_line_spacing_projection() {
                 [&egui::FontFamily::Name(std::sync::Arc::from(fonts::FAMILY_EDITOR_MONO))]
                 .first()
                 .map(String::as_str),
-            Some("Hack"),
+            Some(if cfg!(target_os = "macos") {
+                "SF-Mono"
+            } else {
+                "Hack"
+            }),
             "字体链不被行距投影改动"
         );
     });

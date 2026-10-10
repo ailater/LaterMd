@@ -266,15 +266,27 @@ pub mod inset {
 // 刻意不再单独配色;本组常量管的是它**下方**三段的间距/分隔/留白。
 
 /// 设置窗左分页列宽(外观/快捷键/AI/MCP/图片 五项竖排)。
-pub const SETTINGS_TABS_W: f32 = 112.0;
+pub const SETTINGS_TABS_W: f32 = if cfg!(target_os = "macos") {
+    144.0
+} else {
+    112.0
+};
 /// 设置窗底部按钮条高:按钮(~24)+ 上下内边距 + 分隔线。#35 从 40
 /// 提到 48(坤哥「行高不够,看着不协调」),此后不再回 40。
-pub const SETTINGS_FOOTER_H: f32 = 48.0;
+pub const SETTINGS_FOOTER_H: f32 = if cfg!(target_os = "macos") {
+    40.0
+} else {
+    48.0
+};
 /// 设置窗默认尺寸(首开锚定屏幕中心,可拖拽缩放)。
-pub const SETTINGS_DEFAULT_SIZE: egui::Vec2 = egui::Vec2::new(600.0, 440.0);
+pub const SETTINGS_DEFAULT_SIZE: egui::Vec2 = if cfg!(target_os = "macos") {
+    egui::vec2(720.0, 500.0)
+} else {
+    egui::vec2(600.0, 440.0)
+};
 /// 中央内容区的内边距。与底部按钮条的水平内边距同值(12):分隔线、
 /// 正文首行与「关闭」按钮共享同一条纵向基准线,窗内四周呼吸一致。
-pub const SETTINGS_BODY_PAD: i8 = 12;
+pub const SETTINGS_BODY_PAD: i8 = if cfg!(target_os = "macos") { 20 } else { 12 };
 /// 分页列的内边距:比内容区紧一档 —— 图标+文字行的视觉密度高,
 /// 再放到 12 会让 112 的窄列显得空转。
 pub const SETTINGS_TABS_PAD: i8 = 8;
