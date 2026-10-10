@@ -182,7 +182,7 @@ mod tests {
         for width in [320.0, 540.0] {
             let ctx = egui::Context::default();
             let mut theme = ThemeSettings::default();
-            for target in ["Nord", "系统默认"] {
+            for target in ["Nord", "青竹护眼", "系统默认"] {
                 theme.apply(&ctx, ThemeMode::Dark);
                 let mut positions = Vec::new();
                 for _ in 0..2 {
