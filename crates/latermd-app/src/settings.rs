@@ -705,6 +705,18 @@ fn appearance_legacy(
                 outbox.push(Message::ShowMinimapToggled(show_minimap));
             }
         });
+        settings_row(ui, "自动适应", |ui| {
+            let mut auto = theme.minimap_auto;
+            if ui
+                .add_enabled(
+                    theme.show_minimap,
+                    egui::Checkbox::new(&mut auto, "短文或窄栏时收起缩略图"),
+                )
+                .changed()
+            {
+                outbox.push(Message::MinimapAutoChanged(auto));
+            }
+        });
         // #64 M1:打字机模式开关(#55 同款「回显副本 + changed() 即时发消息」
         // 模式)。全局偏好,源码与 Live 两模式共用;默认关(改变滚动行为的
         // 功能出厂不替用户决定,取舍见 decisions-pending #121)。

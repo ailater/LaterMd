@@ -991,6 +991,7 @@ pub enum Message {
     /// `theme.show_minimap` 并即时写 settings.json(与排版偏好同款通路;
     /// 全局偏好,非每标签)。
     ShowMinimapToggled(bool),
+    MinimapAutoChanged(bool),
     /// 源码 minimap 开关翻转(#67 M2):视图菜单条目/快捷键产出 —— 菜单
     /// 与快捷键是「翻转」语义(现值在 State,消息层拿不到),与设置页的
     /// 带值消息([`Message::ShowMinimapToggled`])分立;归约同样即时写
@@ -1221,6 +1222,10 @@ impl State {
             }
             Message::ShowMinimapToggled(show) => {
                 self.theme.show_minimap = show;
+                self.persist_theme();
+            }
+            Message::MinimapAutoChanged(auto) => {
+                self.theme.minimap_auto = auto;
                 self.persist_theme();
             }
             Message::ToggleMinimap => {
@@ -5026,6 +5031,15 @@ mod tests {
 
         let reloaded = ThemeSettings::load_from(&dir).unwrap();
         assert!(!reloaded.show_minimap, "菜单开关即时落盘,重启后仍为关");
+        state.apply(Message::MinimapAutoChanged(false));
+        let manual = ThemeSettings::load_from(&dir).unwrap();
+        assert!(!manual.minimap_auto && !manual.show_minimap);
+        state.apply(Message::ShowMinimapToggled(true));
+        let enabled = ThemeSettings::load_from(&dir).unwrap();
+        assert!(
+            enabled.show_minimap && !enabled.minimap_auto,
+            "总开关不覆盖手动常显选择"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -23,7 +23,7 @@ use eframe::egui::{self, Sense};
 /// (#166/#169)全平台化,原非 mac 24pt 退役)。
 const CHIP_H: f32 = 28.0;
 /// 关闭 × 的方框边长。
-const CLOSE: f32 = 12.0;
+const CLOSE: f32 = 18.0;
 /// chip 里文字之外的固定开销:左内边距、文档图标位(图标 13 加两侧余量)、
 /// 文字与关闭钮的间隙、关闭钮、右内边距之和。chip 总宽减它就是文本可用宽,
 /// 即省略号截断的预算。
@@ -32,6 +32,10 @@ const CHIP_CHROME: f32 = SPACE_SM + 22.0 + SPACE_XS + CLOSE + SPACE_SM;
 /// 一两个汉字的辨识余量。预算再紧也不收窄到它之下 —— 保不住最小宽,
 /// 关闭按钮就会被挤到点不中;溢出交给既有单行水平滚动。
 const CHIP_MIN_W: f32 = 56.0;
+
+pub(crate) fn visible(tabs: &TabsState) -> bool {
+    tabs.tabs.len() > 1 || tabs.tabs[0].document.path.is_some() || tabs.current().editor.is_dirty()
+}
 
 /// 绘制标签条;返回是否实际绘制(单个未命名空标签不画,测试据此断言)。
 /// `mode` 是标题宽度模式(#37):Full 按完整标题测宽,Short 按可用空间
@@ -42,10 +46,7 @@ pub fn ui(
     mode: TitleWidthMode,
     outbox: &mut Vec<Message>,
 ) -> bool {
-    let hide = tabs.tabs.len() == 1
-        && tabs.tabs[0].document.path.is_none()
-        && !tabs.current().editor.is_dirty();
-    if hide {
+    if !visible(tabs) {
         return false;
     }
     // 预算(标签条视口宽)必须在 ScrollArea 外取:横向滚动的内部 ui 可用
@@ -322,7 +323,7 @@ fn chip(
         let shell = crate::theme::shell(ui);
         let hover_bg = shell.hover;
         let bg = if selected {
-            shell.code_bg
+            shell.content
         } else if response.hovered() {
             hover_bg
         } else {

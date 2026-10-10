@@ -279,6 +279,8 @@ pub struct ThemeSettings {
     /// 一致,取舍登记 decisions-pending #105);关闭时编辑器走与从前
     /// 逐字节相同的路径(零 minimap 元素,ui::editor 的否决线)。
     pub show_minimap: bool,
+    /// 短文或窄栏自动隐藏缩略图；关闭此项可始终显示。
+    pub minimap_auto: bool,
     /// 打字机模式开关(#64 M1):开启后光标所在行滚动保持视口 1/3 线
     /// (源码与 Live 两模式;全局偏好,照 #55 minimap 开关同款通路落
     /// settings.json,旧档缺字段由 struct 级 `#[serde(default)]` 兜底)。
@@ -328,6 +330,7 @@ impl Default for ThemeSettings {
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             line_height: LINE_HEIGHT_DEFAULT,
             show_minimap: true,
+            minimap_auto: true,
             show_typewriter: false,
             show_focus_mode: false,
             zen_nav: ZenNavMode::default(),
@@ -1320,6 +1323,19 @@ mod tests {
     /// #55 M2:minimap 开关随 settings.json 往返;默认开(与 VS Code 等
     /// 编辑器出厂一致,取舍见 decisions-pending #105);旧文件缺该项由
     /// serde(default) 兜底回开。
+    #[test]
+    fn minimap_auto_defaults_and_explicit_override_survive_settings() {
+        let old: ThemeSettings = serde_json::from_str(r#"{"show_minimap":false}"#).unwrap();
+        assert!(!old.show_minimap && old.minimap_auto);
+        let manual = ThemeSettings {
+            minimap_auto: false,
+            ..Default::default()
+        };
+        let restored: ThemeSettings =
+            serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
+        assert!(!restored.minimap_auto && restored.show_minimap);
+    }
+
     #[test]
     fn show_minimap_round_trips_and_old_settings_default_on() {
         assert!(ThemeSettings::default().show_minimap, "出厂默认开");

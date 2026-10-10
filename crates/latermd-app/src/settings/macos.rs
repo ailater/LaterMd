@@ -376,6 +376,16 @@ pub(super) fn appearance(
         ) {
             outbox.push(Message::ShowMinimapToggled(!theme.show_minimap));
         }
+        ui.add_enabled_ui(theme.show_minimap, |ui| {
+            if toggle(
+                ui,
+                "自动适应",
+                "短文或窄栏时收起缩略图，给正文更多空间",
+                theme.minimap_auto,
+            ) {
+                outbox.push(Message::MinimapAutoChanged(!theme.minimap_auto));
+            }
+        });
         rule(ui);
         if toggle(
             ui,

@@ -297,6 +297,8 @@ pub fn workbench_ui(
     outbox: &mut Vec<Message>,
 ) -> SidebarBands {
     let top = egui::Rect::from_min_size(panel.cursor().min, egui::Vec2::ZERO);
+    panel.add_space(8.0);
+    crate::ui::workbench::workspace_picker(panel, file_tree, outbox);
     let nav = crate::ui::workbench::navigation(panel, *active_tab, outbox);
     // 导航与内容使用两个明确的子 Ui。直接复用父 Ui 会让纵向滚动区域
     // 从面板顶端重新计算可视区，切到搜索/反向链接时首行被标题栏裁切。
@@ -828,9 +830,7 @@ fn files_panel(
 ) {
     // 根目录行:最近列表下拉(有历史才有)+ 选新目录按钮
     let root_hover = tree.root.as_deref().map(|path| path.display().to_string());
-    if workbench {
-        crate::ui::workbench::workspace_picker(panel, tree, outbox);
-    } else {
+    if !workbench {
         panel.horizontal(|ui| {
             let selected = root_label(tree);
             if tree.recents.is_empty() {
