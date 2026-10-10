@@ -607,16 +607,7 @@ fn appearance_legacy(
     // 起点);原「整句标签 + 下一行控件」的区块说明拆出的文字保留在行下
     // weak 行,信息零丢失。2026-10-10 起按卡片点样分区再归入卡片。
     card(ui, &shell, "主题与皮肤", |ui| {
-        settings_row(ui, "主题", |ui| {
-            for mode in ThemeMode::ALL {
-                if ui
-                    .selectable_label(theme.mode == mode, mode.label())
-                    .clicked()
-                {
-                    outbox.push(Message::ThemeChanged(mode));
-                }
-            }
-        });
+        settings_row(ui, "主题", |ui| theme_previews(ui, theme, outbox));
         ui.weak("外壳与正文、代码块同帧联动。");
         if theme.mode == ThemeMode::System {
             // #33:跟随系统时明暗来自系统检测,把解析值显出来——否则用户以为
@@ -776,6 +767,117 @@ fn appearance_legacy(
                 std::env::var("LATERMD_RENDERER").ok().as_deref(),
             ));
         });
+    });
+}
+
+/// 主题三态的**可点击小预览图**(形态对齐 macOS 设置页 `settings/macos.rs`
+/// 的 `theme_choices`,#169 精修移植):纸面 + 侧栏条 + 三行文本的迷你工作台,
+/// 选中态强调色描边。「跟随系统」用明暗对半表达。与 mac 版的差异:预览色
+/// 直接取 [`crate::theme::shell_tokens`] 真实 token(mac 版是固定灰阶近似),
+/// 换皮肤/调色后缩略图跟着走。
+fn theme_previews(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Message>) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    ui.horizontal(|ui| {
+        for mode in ThemeMode::ALL {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(84.0, 72.0), egui::Sense::click());
+            let selected = mode == theme.mode;
+            let thumb =
+                egui::Rect::from_min_size(rect.min + egui::vec2(2.0, 2.0), egui::vec2(80.0, 48.0));
+            let painter = ui.painter();
+            // 纸面:跟随系统 = 左浅右暗对半;浅/深各取真实 shell 底
+            let dark_paper = crate::theme::shell_tokens(true);
+            let light_paper = crate::theme::shell_tokens(false);
+            let paper = |r: egui::Rect, dark: bool| {
+                painter.rect_filled(
+                    r,
+                    5.0,
+                    if dark {
+                        dark_paper.content
+                    } else {
+                        light_paper.content
+                    },
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(r.min, egui::pos2(r.left() + 22.0, r.bottom())),
+                    5.0,
+                    if dark {
+                        dark_paper.sidebar
+                    } else {
+                        light_paper.sidebar
+                    },
+                );
+            };
+            paper(thumb, false);
+            if mode == ThemeMode::System {
+                let right =
+                    egui::Rect::from_min_max(egui::pos2(thumb.center().x, thumb.top()), thumb.max);
+                painter.rect_filled(right, 5.0, dark_paper.content);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        right.min,
+                        egui::pos2(right.left() + 11.0, right.bottom()),
+                    ),
+                    5.0,
+                    dark_paper.sidebar,
+                );
+            }
+            // 三行正文示意
+            for (line, width) in [(0.0, 32.0), (1.0, 40.0), (2.0, 26.0)] {
+                let pos = thumb.min + egui::vec2(29.0, 13.0 + line * 8.0);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(pos, egui::vec2(width, 2.0)),
+                    1.0,
+                    shell.border,
+                );
+            }
+            painter.rect_stroke(
+                thumb,
+                5.0,
+                if selected {
+                    egui::Stroke::new(2.0, shell.accent)
+                } else {
+                    egui::Stroke::new(1.0, shell.border)
+                },
+                egui::StrokeKind::Outside,
+            );
+            // 题注:缩略图下居中
+            let label_rect =
+                egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 52.0), rect.max);
+            let ink = if selected {
+                shell.text
+            } else {
+                shell.secondary
+            };
+            let galley = painter.layout_no_wrap(
+                mode.label().to_owned(),
+                egui::FontId::proportional(12.0),
+                ink,
+            );
+            painter.galley(
+                egui::pos2(
+                    label_rect.center().x - galley.size().x / 2.0,
+                    label_rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                ink,
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    true,
+                    selected,
+                    mode.label(),
+                )
+            });
+            if response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+                && !selected
+            {
+                outbox.push(Message::ThemeChanged(mode));
+            }
+        }
     });
 }
 
@@ -1549,8 +1651,10 @@ mod tests {
         // 控件在场(逐项):三态选项与复选框文字全部真实渲出。
         // 「控件列同起点」取**每行首控件**(主题=浅色 / 密度=宽松 /
         // 禅定=悬停唤出):行内后续选项天然右排,不参与同列断言
-        let first_selectable = ["浅色", "宽松", "悬停唤出"];
-        for opt in ["深色", "跟随系统", "标准", "常显", "关闭"] {
+        // 主题行已换「可点击小预览图」(题注居中在缩略图下,不再参与列
+        // 对齐);密度/禅定仍是 selectable 首选项,继续钉同一起点
+        let first_selectable = ["宽松", "悬停唤出"];
+        for opt in ["浅色", "深色", "跟随系统", "标准", "常显", "关闭"] {
             pos_of(&texts, opt);
         }
         assert_same_x(
@@ -1571,9 +1675,11 @@ mod tests {
             "复选框文字",
             checkbox_texts.iter().map(|l| pos_of(&texts, l).x).collect(),
         );
+        // 主题行是小预览图:题注在缩略图下方(行内偏下),标签行垂直居中
+        // 于行 —— 二者天然不共线,改断「题注在标签行之下、同行不漂移」
         assert!(
-            (pos_of(&texts, "主题").y - pos_of(&texts, "浅色").y).abs() <= 2.0,
-            "「主题」行标签与选项文本基线差 >2px"
+            pos_of(&texts, "浅色").y > pos_of(&texts, "主题").y,
+            "主题预览图题注应落在行标签下方"
         );
         assert!(
             (pos_of(&texts, "Minimap").y - pos_of(&texts, checkbox_texts[0]).y).abs() <= 2.0,
