@@ -2810,7 +2810,11 @@ impl State {
             self.layout.right = false;
             let tab = self.tabs.current_mut();
             let byte = tab.cursor.byte;
-            tab.live.sync(&tab.editor, byte);
+            // 小文档立即定位可编辑块；大文档把解析留给 Live 首帧，避免
+            // 状态归约与模式动画同帧阻塞 UI。
+            if tab.editor.text().len() <= 64 * 1024 {
+                tab.live.sync(&tab.editor, byte);
+            }
         } else if let Some(previous) = self.layout.pre_live_right.take() {
             self.layout.right = previous;
         }
