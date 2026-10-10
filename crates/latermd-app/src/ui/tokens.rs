@@ -238,15 +238,20 @@ pub mod gap {
 /// 贴边距:一侧是内容、另一侧是窗口/容器边界,用于区域内边距。比
 /// 同名 `gap` 紧一档——边界不需要对称留白(`inset::MD < gap::MD` 是
 /// §4.3 的刻意关系,有守门测试钉住)。
-// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
-// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
-#[cfg_attr(not(test), expect(dead_code))]
+// T2b 起 `MD` 已有生产消费者(layout 的预览面板贴边与查找/跳转浮卡
+// 留白),模块整体不再 expect;`SM`/`LG` 仍暂无生产消费者,逐常量挂
+// expect,接线后各自摘除(clippy 的 unfulfilled 会提醒)。not(test):
+// 守门测试本身就是消费方,cfg(test) 下裸 expect 会 unfulfilled。
 pub mod inset {
     /// 控件内容到自身边框的贴边:盒子最里面的一圈。
+    // 暂无生产消费者;接线后摘除。
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const SM: f32 = 4.0;
     /// 内容区到分组/面板边界的贴边。
     pub const MD: f32 = 8.0;
     /// 大区域到窗口边界的贴边。
+    // 暂无生产消费者;接线后摘除。
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const LG: f32 = 12.0;
 }
 

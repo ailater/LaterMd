@@ -417,6 +417,10 @@ impl LaterMdApp {
             .size_range(crate::ui::tokens::PREVIEW_MIN_W..=880.0)
             .frame(
                 egui::Frame::default()
+                    // 预览正文到面板边界的贴边:workbench 16 / 经典 8(main 的
+                    // workbench 外观分支)。16 无 inset 档(SM4/MD8/LG12),一半换
+                    // 一半留更乱 → 与 nav 的 Margin::symmetric(8,2) 同判,整处
+                    // 保留字面量(设计系统 T2b 判例;inset::MD 另有 OVERLAY_MARGIN 消费)。
                     .inner_margin(egui::Margin::same(if workbench { 16 } else { 8 }))
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
@@ -1028,8 +1032,9 @@ fn overlay_popup_frame(ctx: &egui::Context) -> egui::Frame {
 }
 
 /// 浮卡与源码区边缘的留白(#72 M2 抽常量:锚点偏移与 `constrain_to`
-/// 的 shrink 共用,两卡一处定义)。
-const OVERLAY_MARGIN: f32 = 8.0;
+/// 的 shrink 共用,两卡一处定义)。一侧是浮卡内容、另一侧是源码区
+/// 边界 → 贴边距档(设计系统 T2b 归流,值不变)。
+const OVERLAY_MARGIN: f32 = tokens::inset::MD;
 
 /// 查找卡/跳转卡共用的右上锚点(#72 M2 抽出单一真源:两卡同锚点,
 /// 偏移与钳制回写都要再算它,不再各写一份公式)。source_rect 从可换行
