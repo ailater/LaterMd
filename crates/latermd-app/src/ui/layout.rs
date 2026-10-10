@@ -1630,28 +1630,104 @@ fn selection_ai_polish_dialog(
     buttons.expect("浮窗必然绘制按钮")
 }
 
-/// 脏标签关闭确认浮窗;返回(确认关闭, 取消)按钮的响应,测试定位用
-/// (与 `checkout_dialog` 同款手法;真正的移除在归约)。
-fn tab_close_dialog(ui: &mut egui::Ui, name: &str) -> (egui::Response, egui::Response) {
+/// 破坏性确认浮窗骨架(「关闭标签」与「Git:回滚」共用,2026-10-10 观感
+/// 改版:裸 Window + 默认按钮 → DANGER 警示横幅 + 右对齐按钮行):
+///
+/// * 说明行(默认前景,各弹窗自己的 lead);
+/// * 警示横幅:淡红底 + 红描边圆角条(与设置页 card 的左侧强调条同款
+///   语言,强调色换 DANGER),不可逆警示居中其上;
+/// * 可选附加警示行(checkout 的针对性行为告知,`escalate` 升黄);
+/// * 按钮右对齐:中性「取消」+ 危险实心确认钮([`danger_button`])。
+///
+/// 返回(确认, 取消)按钮的响应,测试定位用;真正的动作都在归约。
+fn destructive_confirm_dialog(
+    ui: &mut egui::Ui,
+    title: &str,
+    lead: &str,
+    warning: &str,
+    confirm_text: &str,
+    extra: Option<(&str, bool)>,
+) -> (egui::Response, egui::Response) {
     let mut buttons = None;
-    egui::Window::new("关闭标签")
+    let danger = crate::ui::tokens::DANGER;
+    egui::Window::new(title)
         .default_pos([80.0, 120.0])
         .collapsible(false)
         .resizable(false)
         .show(ui.ctx(), |ui| {
-            ui.label(format!("「{name}」有未保存的修改。"));
-            ui.label(
-                egui::RichText::new("关闭将丢弃这些修改,此操作不可撤销。")
-                    .strong()
-                    .color(crate::ui::tokens::DANGER),
-            );
+            ui.label(lead);
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgba_unmultiplied(
+                    danger.r(),
+                    danger.g(),
+                    danger.b(),
+                    16,
+                ))
+                .stroke(egui::Stroke::new(1.0, danger.gamma_multiply(0.45)))
+                .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_MD as u8))
+                .inner_margin(egui::Margin::same(8))
+                .outer_margin(egui::Margin::symmetric(0, 6))
+                .show(ui, |ui| {
+                    // 不 set_width:Window 是内容定宽(设置页 card 的
+                    // available_width 在浮窗里近无界,会把窗撑出屏幕)
+                    ui.horizontal(|ui| {
+                        // 左侧强调条:与设置页 card 同款语言,强调色换 DANGER
+                        let (rect, _) = ui.allocate_exact_size(
+                            crate::ui::tokens::SETTINGS_CARD_BAR,
+                            egui::Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::same(2), danger);
+                        ui.label(egui::RichText::new(warning).strong().color(danger));
+                    });
+                });
+            if let Some((text, escalate)) = extra {
+                let text = egui::RichText::new(text);
+                ui.label(if escalate {
+                    text.color(egui::Color32::from_rgb(235, 180, 60))
+                } else {
+                    text
+                });
+            }
+            ui.add_space(crate::ui::tokens::SPACE_XS);
+            // 按钮行用普通 horizontal(取消在左、危险确认在右):不用
+            // right_to_left —— 它的 cross-center 子 Ui 在 Window 里会申领
+            // 整块剩余高度,窗被撑高、按钮跨帧漂移(无头测试当场抓到:
+            // 采点帧 y=231、点击帧 y=374,点击落空)。
             ui.horizontal(|ui| {
-                let confirm = ui.button("关闭并丢弃");
                 let cancel = ui.button("取消");
+                let confirm = danger_button(ui, confirm_text);
                 buttons = Some((confirm, cancel));
             });
         });
     buttons.expect("浮窗必然绘制按钮")
+}
+
+/// 危险操作按钮:与 [`crate::settings::primary_button`] 同构(实心底 +
+/// 反色加粗字 + 同一圆角档),填色换 DANGER —— 破坏性确认的视觉权重
+/// 与「保存」同级,颜色语义相反。
+fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let button = egui::Button::new(
+        egui::RichText::new(text)
+            .color(egui::Color32::WHITE)
+            .strong(),
+    )
+    .fill(crate::ui::tokens::DANGER)
+    .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_SM as u8));
+    ui.add(button)
+}
+
+/// 脏标签关闭确认浮窗;返回(确认关闭, 取消)按钮的响应,测试定位用
+/// (与 `checkout_dialog` 同款手法;真正的移除在归约)。
+fn tab_close_dialog(ui: &mut egui::Ui, name: &str) -> (egui::Response, egui::Response) {
+    destructive_confirm_dialog(
+        ui,
+        "关闭标签",
+        &format!("「{name}」有未保存的修改。"),
+        "关闭将丢弃这些修改,此操作不可撤销。",
+        "关闭并丢弃",
+        None,
+    )
 }
 
 /// 回滚确认浮窗;返回(回滚, 取消)按钮的响应,测试定位用(与
@@ -1664,36 +1740,14 @@ fn checkout_dialog(
     open_in_editor: bool,
     dirty: bool,
 ) -> (egui::Response, egui::Response) {
-    let mut buttons = None;
-    egui::Window::new("Git: 回滚文件")
-        .default_pos([80.0, 120.0])
-        .collapsible(false)
-        .resizable(false)
-        .show(ui.ctx(), |ui| {
-            ui.label(format!("把 {path} 恢复到 HEAD 版本。"));
-            ui.label(
-                egui::RichText::new("未提交的改动将被丢弃,此操作不可撤销。")
-                    .strong()
-                    .color(crate::ui::tokens::DANGER),
-            );
-            if let Some(warning) = checkout_extra_warning(open_in_editor, dirty) {
-                let text = egui::RichText::new(warning);
-                // dirty 分支有真实损失(保存会反转回滚),黄色升级警示;
-                // 非 dirty 只是行为告知,走默认前景
-                let text = if dirty {
-                    text.color(egui::Color32::from_rgb(235, 180, 60))
-                } else {
-                    text
-                };
-                ui.label(text);
-            }
-            ui.horizontal(|ui| {
-                let confirm = ui.button("回滚");
-                let cancel = ui.button("取消");
-                buttons = Some((confirm, cancel));
-            });
-        });
-    buttons.expect("浮窗必然绘制按钮")
+    destructive_confirm_dialog(
+        ui,
+        "Git: 回滚文件",
+        &format!("把 {path} 恢复到 HEAD 版本。"),
+        "未提交的改动将被丢弃,此操作不可撤销。",
+        "回滚",
+        checkout_extra_warning(open_in_editor, dirty).map(|warning| (warning, dirty)),
+    )
 }
 
 /// 回滚目标恰是编辑器当前文档时的追加警示;`None` = 目标不在编辑器中,
