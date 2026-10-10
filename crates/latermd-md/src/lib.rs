@@ -99,7 +99,10 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
     let md = egui_markdown::parser::parse(text);
     // ① 先按 token 划出「内容段」(记录内容起点与 span 终点),Newline 单独
     //    处理 —— 它的字节在 ② 里随边界分配。
-    let mut segments: Vec<(usize, usize)> = Vec::new();
+    // 每段记 (内容起点, 内容终点, 首个 token 的 span 终点):第三元用于
+    // ①′ 的构造归属 —— span 会吸收前一块尾部的空行(起点可能落在前一个
+    // 构造的区间里),而 span 终点恒在本构造内。
+    let mut segments: Vec<(usize, usize, usize)> = Vec::new();
     let mut i = 0;
     while i < md.tokens.len() {
         match &md.tokens[i] {
@@ -111,12 +114,12 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
             // 凭空空出一段
             Token::CodeBlock { .. } | Token::Table(_) | Token::HorizontalRule => {
                 let span = &md.spans[i];
-                segments.push((skip_newlines(text, span.start), span.end));
+                segments.push((skip_newlines(text, span.start), span.end, span.end));
                 i += 1;
             }
             Token::Text { style, .. } if style.heading.is_some() => {
                 let span = &md.spans[i];
-                segments.push((content_start(text, span, &md.tokens[i]), span.end));
+                segments.push((content_start(text, span, &md.tokens[i]), span.end, span.end));
                 i += 1;
             }
             // 其余:连续的非块级 token 合并成一段(列表项与它的文本同段)
@@ -128,7 +131,7 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
                     end = md.spans[j].end;
                     j += 1;
                 }
-                segments.push((start, end));
+                segments.push((start, end, md.spans[i].end));
                 i = j;
             }
         }
@@ -143,6 +146,51 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
             std::iter::once(0..text.len()).collect()
         };
     }
+    // ①′ 标记字节归属(vendored span 的缺口):Start/End 内联事件(如
+    //    `**`/`_`/`~~`)在 vendored 解析里只翻样式、**不产生 token**,
+    //    它们的字节落进任何 token span 之外 —— ② 的连续化会把这类孤儿
+    //    字节整段归给**前一块**(块尾吞到下一块内容起点),于是
+    //    「**粗体**、…」段被切成「…\n\n**」+「粗体**、…」:Live 富渲染
+    //    丢开标记(** 变字面星号)、点击标题进编辑丢 `#`(2026-10-10
+    //    坤哥报告的两个症状,默认示例文档即复现)。
+    //    补救:原生 pulldown 再走一遍,取每个**块级构造**(标题/段落/
+    //    列表项/代码块/表格/分隔线)的完整区间 —— 构造 span 天然包含
+    //    自己的行内标记;同一构造的内容段统一吸附到该构造的起/终,
+    //    让每个 Live 编辑块都能独立解析。
+    let constructs = construct_spans(text);
+    let mut snapped: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
+    let mut seg_index = 0_usize;
+    while seg_index < segments.len() {
+        let (start, end, _) = segments[seg_index];
+        // 归属按**首个 token 的 span 终点**判:span 起点可能吸收了前一块
+        // 尾部的空行而落在上一个构造的区间里(span 终点恒在本构造内)。
+        let first_span_end = segments[seg_index].2;
+        let construct_index = constructs.partition_point(|c| c.end < first_span_end);
+        let containing = constructs
+            .get(construct_index)
+            .filter(|c| first_span_end > c.start && first_span_end <= c.end);
+        let Some(construct) = containing else {
+            snapped.push((start, end));
+            seg_index += 1;
+            continue;
+        };
+        // 本构造名下的连续内容段(按同一判据)
+        let mut last = seg_index;
+        while last + 1 < segments.len() {
+            let next_span_end = segments[last + 1].2;
+            let in_same = next_span_end > construct.start && next_span_end <= construct.end;
+            if !in_same {
+                break;
+            }
+            last += 1;
+        }
+        // 块内容区间 = 构造区间本身:标题/段落的行内标记(`#`/`**`)都在
+        // 构造 span 里,构造起点即内容起点(pulldown 的容器 span 不含前导
+        // 空行);构造内多段(软换行拆行)同属一个区间,天然合并。
+        snapped.push((construct.start, construct.end));
+        seg_index = last + 1;
+    }
+    let segments = snapped.as_slice();
     // ② 连续化:每块**吃到下一块的内容起点**(块间空行归前一块),最后一块
     //    到文末。
     let mut blocks = Vec::with_capacity(segments.len());
@@ -162,6 +210,127 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
     blocks
 }
 
+/// 原生 pulldown 视角的**块级构造**区间(标题/段落/列表项/代码块/表格/
+/// 分隔线/引用),按文档序升序。构造 span 含自己的行内标记(`**`/`#`),
+/// 正是 ①′ 要补的归属真相。列表按**项**切(与既有分块口径一致:每项
+/// 可独立进 Live 编辑);引用块整块一段。任务标记、嵌套构造都在所属
+/// 项/段内,不单列。
+///
+/// 事件区间口径(0.13 实测):容器 Start 事件区间可能为空或只指首字节,
+/// 故对构造内**所有事件**取 min(start)/max(end) 累计。
+fn construct_spans(text: &str) -> Vec<Range<usize>> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    // 列表项、引用和脚注定义包含嵌套块,必须保留外层构造的源码标记。
+    struct Open {
+        start: usize,
+        end: usize,
+    }
+    let mut stack: Vec<Open> = Vec::new();
+    let mut in_paragraph = false;
+    let mut para = (usize::MAX, 0_usize);
+    let mut code_start: Option<usize> = None;
+
+    let push_block = |start: usize, end: usize, spans: &mut Vec<Range<usize>>| {
+        if end > start {
+            spans.push(start..end);
+        }
+    };
+
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        // 内层构造闭合时向父层传递范围,避免每个事件扫描所有祖先。
+        if let Some(open) = stack.last_mut() {
+            open.start = open.start.min(range.start);
+            open.end = open.end.max(range.end);
+        }
+        if in_paragraph {
+            para.0 = para.0.min(range.start);
+            para.1 = para.1.max(range.end);
+        }
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    in_paragraph = true;
+                    para = (usize::MAX, 0);
+                }
+                Tag::Item | Tag::BlockQuote(_) | Tag::FootnoteDefinition(_) => {
+                    stack.push(Open {
+                        start: range.start,
+                        end: range.end,
+                    });
+                }
+                Tag::CodeBlock(kind) => {
+                    code_start = Some(if kind.is_indented() {
+                        physical_line_start(text, range.start)
+                    } else {
+                        range.start
+                    });
+                }
+                Tag::List(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => {
+                    if in_paragraph && para.1 > para.0 {
+                        push_block(para.0, para.1, &mut spans);
+                    }
+                    in_paragraph = false;
+                }
+                TagEnd::Item | TagEnd::BlockQuote(_) | TagEnd::FootnoteDefinition => {
+                    if let Some(open) = stack.pop() {
+                        if let Some(parent) = stack.last_mut() {
+                            parent.start = parent.start.min(open.start);
+                            parent.end = parent.end.max(open.end);
+                        }
+                        push_block(open.start, open.end.max(range.end), &mut spans);
+                    }
+                }
+                TagEnd::Heading(_) => {
+                    push_block(range.start, range.end, &mut spans);
+                }
+                TagEnd::CodeBlock => {
+                    let start = code_start.take().unwrap_or(range.start);
+                    push_block(start, range.end, &mut spans);
+                }
+                TagEnd::Table => {
+                    push_block(range.start, range.end, &mut spans);
+                }
+                _ => {}
+            },
+            Event::Rule => {
+                push_block(range.start, range.end, &mut spans);
+            }
+            _ => {}
+        }
+    }
+    spans.sort_by_key(|r| r.start);
+    // 只合并**真重叠**(引用块与其内列表项:两套构造各记一遍);相邻留
+    // 缝的(标题/段落/项)保持独立 —— 缝里是块间空行,归前一块(②)。
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+    for r in spans {
+        match merged.last_mut() {
+            Some(last) if r.start < last.end => {
+                last.end = last.end.max(r.end);
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// 从 `pos` 定位到所在物理行起点;缩进代码的 pulldown 起始 span
+/// 从首行内容开始,独立重解析必须保留行首四个空格。
+fn physical_line_start(text: &str, pos: usize) -> usize {
+    text[..pos.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1)
+}
 /// 从 `pos` 起跳过连续的换行与回车(CRLF 的 `\r` 也算分隔符的一部分)。
 fn skip_newlines(text: &str, mut pos: usize) -> usize {
     let bytes = text.as_bytes();
@@ -2192,6 +2361,82 @@ mod tests {
         let slices: Vec<&str> = list_blocks.iter().map(|b| &list[b.start..b.end]).collect();
         assert_eq!(slices, vec!["- 一\n", "- 二\n\n", "尾\n"]);
         assert_covers_text(list, &list_blocks);
+    }
+
+    /// 行内/标题标记归属回归(2026-10-10 坤哥两个真机症状):
+    /// 「**粗体**、…」段的 `**` 与「## 常用元素」的 `##` 必须在**自己的
+    /// 块**里。修复前 vendored span 不含 Start/End 内联事件的字节,孤儿
+    /// 标记被连续化整段归给**前一块** —— Live 富渲染丢开标记(字面
+    /// `**`)、点标题进编辑丢 `#`(在上一块尾渲染成字面 `##`,即
+    /// 「# 号在上面,不在当前的框里面」)。默认示例文档即复现。
+    #[test]
+    fn blocks_keep_inline_and_heading_markers_in_their_own_block() {
+        let text = "## 常用元素\n\n- 列表 item\n\n**粗体**、*斜体*。\n";
+        let blocks = blocks(text);
+        let slices: Vec<&str> = blocks.iter().map(|b| &text[b.start..b.end]).collect();
+        assert_eq!(
+            slices,
+            vec!["## 常用元素\n\n", "- 列表 item\n\n", "**粗体**、*斜体*。\n"],
+            "标记必须随自己的块"
+        );
+        assert_covers_text(text, &blocks);
+    }
+
+    #[test]
+    fn blocks_keep_indented_code_syntax() {
+        for code in ["    x\n    y\n\n", "\tx\n\ty\n\n"] {
+            let text = format!("intro\n\n{code}tail\n");
+            let ranges = blocks(&text);
+            let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+            assert_eq!(slices, vec!["intro\n\n", code, "tail\n"]);
+            assert_covers_text(&text, &ranges);
+            let parsed = egui_markdown::parser::parse(slices[1]);
+            assert!(parsed
+                .tokens
+                .iter()
+                .any(|t| matches!(t, Token::CodeBlock { .. })));
+        }
+    }
+
+    #[test]
+    fn blocks_keep_footnote_definitions_atomic() {
+        for definition in [
+            "[^1]: **bold**",
+            "[^1]: a\n\n    **last**",
+            "[^1]: first\n\n    - a\n      - nested\n    - b",
+        ] {
+            for suffix in ["", "\n\ntail\n"] {
+                let text = format!("intro\n\n{definition}{suffix}");
+                let ranges = blocks(&text);
+                let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+                let complete = if suffix.is_empty() {
+                    definition.to_owned()
+                } else {
+                    format!("{definition}\n\n")
+                };
+                let mut expected = vec!["intro\n\n", complete.as_str()];
+                if !suffix.is_empty() {
+                    expected.push("tail\n");
+                }
+                assert_eq!(slices, expected);
+                assert_covers_text(&text, &ranges);
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_keep_styled_heading_and_nested_containers() {
+        for construct in [
+            "## **bold** and `code` [link](https://example.com)\n\n",
+            "> quote\n>\n> - **bold**\n>   - nested\n\n",
+            "- outer\n  - **nested**\n\n",
+        ] {
+            let text = format!("intro\n\n{construct}tail\n");
+            let ranges = blocks(&text);
+            let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+            assert_eq!(slices, vec!["intro\n\n", construct, "tail\n"]);
+            assert_covers_text(&text, &ranges);
+        }
     }
 
     /// 边界:空文档无块;纯空行整篇一块(编辑需要落点);单段无换行也成块。

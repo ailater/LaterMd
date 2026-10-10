@@ -2756,15 +2756,17 @@ mod tests {
         );
         assert_eq!(live.blocks.len(), 3, "标题/段落/标题:{:?}", live.blocks);
 
-        // 归约产出的跳转目标:底部标题行首(远在首屏之外)。目标块按**字节
-        // 归属**取(v1 块表现状:`# ` 标记可能归上一块尾,本例即如此),光标
-        // 仍落在与源码模式相同的文档位置 —— 同一入口同一落点。
+        // 归约产出的跳转目标:底部标题行首(远在首屏之外)。块表修复后
+        // (2026-10-10)`# ` 标记归属**标题块自身**,跳转进入标题块、光标
+        // 落在行首 —— 与源码模式同一文档位置,同一入口同一落点。
         let heading_byte = editor.text().find("# 底").expect("文档里有底部标题");
         let target = live
             .block_containing(heading_byte)
             .expect("跳转字节必落在某块");
         let target_local =
             editor.byte_to_char(heading_byte) - editor.byte_to_char(live.blocks[target].start);
+        assert_eq!(target, 2, "底部标题自身是跳转目标块");
+        assert_eq!(target_local, 0, "标题标记位于块内行首");
         cursor.jump_to = Some(editor.byte_to_char(heading_byte));
         let _ = live_scroll_frame(
             &ctx,
@@ -2818,9 +2820,12 @@ mod tests {
         )
         .expect("活动块响应可读")
         .top();
+        // 文末目标:视口被钳在文档底,滚动生效的判据从「离开文档顶」改为
+        // 「活动块顶已入视口」—— 若同帧没请求滚动,目标块还在视口外
+        // 1700px 处,top 会远超视口高。
         assert!(
-            top_next < 0.0,
-            "跳转帧同帧请求了滚动(第 3 帧 top 已 {top_next})"
+            (-1.0..600.0).contains(&top_next),
+            "跳转帧同帧请求了滚动(文末目标钳在文档底;第 3 帧 top 已 {top_next})"
         );
 
         // 布局稳定后再量光标行落点
