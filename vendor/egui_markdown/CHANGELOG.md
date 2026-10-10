@@ -133,8 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `TextWrapMode::Truncate` on the surrounding `Ui`, and now on the widget builders, truncates
-  the text. It previously behaved as wrap.
+- Block images no longer upscale the loading/error fallback to fill the available area.
+  `ImageSize::default()` is `ImageFit::Fraction(1×1)`, and while an image is loading — or once
+  it has failed — egui falls back to a 24×24 source size, which `Fraction` then scaled UP to
+  the full column (measured: a 10 000 × 10 000 rect under a bare context; a ~860×860 box in a
+  real pane). Block images now pin `fit_to_original_size(1.0)`, which never upscales: small
+  images render at their natural size, oversized ones still shrink to the column via
+  `max_width`, and the loading/error fallback stays at its native 24×24 box.
 - Section anchors are now computed in a single forward sweep over sections and rows. The
   previous per-section restart — re-counting the text prefix and re-walking the rows from
   the top for every section — made anchor recording O(sections × rows), which dominated

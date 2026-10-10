@@ -1260,7 +1260,19 @@ impl<'a> MarkdownLabel<'a> {
             continue;
           }
           let before_y = before_rect.min.y;
-          let image = egui::Image::new(url.as_ref()).max_width(ui.available_width()).show_loading_spinner(true);
+          // `ImageSize::default()` is `ImageFit::Fraction(1×1)` with aspect
+          // ratio kept: while the image is loading — or once it has failed —
+          // egui falls back to a 24×24 source size, which `Fraction` then
+          // scales UP to fill the whole available area (measured: the widget
+          // allocated 10 000 × 10 000 under a bare context, ~860×860 in a
+          // real pane). Markdown previews never upscale: small images render
+          // at their natural size, oversized ones still shrink to the column
+          // via `max_width`, and the loading/error fallback stays at its
+          // native 24×24 spinner/⚠ box.
+          let image = egui::Image::new(url.as_ref())
+            .max_width(ui.available_width())
+            .fit_to_original_size(1.0)
+            .show_loading_spinner(true);
           ui.add(image);
           record_widget_block(ui, self.id, md.spans[i].clone(), before_rect, ui.min_rect().bottom());
           cache_block_height(ui, block_sz_id, block_key(i), before_y);
