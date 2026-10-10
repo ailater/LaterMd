@@ -92,8 +92,12 @@ pub fn header(
 ) {
     let list_rect =
         egui::Rect::from_min_max(egui::pos2(rect.right() - CHIP_H, rect.top()), rect.max);
+    let add_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - CHIP_H * 2.0 - 2.0, rect.top()),
+        egui::pos2(rect.right() - CHIP_H - 2.0, rect.bottom()),
+    );
     let strip =
-        egui::Rect::from_min_max(rect.min, egui::pos2(list_rect.left() - 4.0, rect.bottom()));
+        egui::Rect::from_min_max(rect.min, egui::pos2(add_rect.left() - 4.0, rect.bottom()));
     let mut child = parent.new_child(
         egui::UiBuilder::new()
             .id_salt("header-document-tabs")
@@ -102,8 +106,32 @@ pub fn header(
     );
     child.set_clip_rect(strip.intersect(parent.clip_rect()));
     ui(&mut child, tabs, mode, outbox);
-    let response = parent.allocate_rect(list_rect, Sense::click());
+
+    let add_response = parent.allocate_rect(add_rect, Sense::click());
     let colors = crate::theme::shell(parent);
+    if add_response.hovered() || add_response.has_focus() {
+        parent.painter().rect_filled(add_rect, 5.0, colors.hover);
+    }
+    let center = add_rect.center();
+    let stroke = egui::Stroke::new(1.4, colors.secondary);
+    parent.painter().line_segment(
+        [center - egui::vec2(5.0, 0.0), center + egui::vec2(5.0, 0.0)],
+        stroke,
+    );
+    parent.painter().line_segment(
+        [center - egui::vec2(0.0, 5.0), center + egui::vec2(0.0, 5.0)],
+        stroke,
+    );
+    add_response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "新建文档"));
+    if add_response.clicked() {
+        outbox.push(Message::FileCommand(crate::file::FileCmd::New));
+    }
+    add_response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("新建文档");
+
+    let response = parent.allocate_rect(list_rect, Sense::click());
     if response.hovered() {
         parent.painter().rect_filled(list_rect, 5.0, colors.hover);
     }
@@ -471,6 +499,7 @@ pub(crate) fn rename_dialog(
         .default_pos(ui.ctx().viewport_rect().center())
         .collapsible(false)
         .resizable(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
             ui.label("标签显示名");
             ui.text_edit_singleline(&mut rename.draft)

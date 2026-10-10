@@ -1048,6 +1048,9 @@ pub fn ui(
                     .overflow_wrap(egui_markdown::OverflowWrap::BreakAll)
                     // 代码块复制头(#38)与右栏预览同一份:Live 模式的
                     // 富渲染块也是「code 预览的地方」。
+                    .scroll_code_blocks(true)
+                    .shrink_code_blocks(true)
+                    .code_block_min_width(Some(200.0))
                     .code_block_buttons(&crate::ui::preview::code_copy_buttons)
                     // mermaid 块出图(#51 M3)+ 任务 checkbox(#63),
                     // 与右栏预览同一渲染入口。

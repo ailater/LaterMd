@@ -236,6 +236,7 @@ pub fn panel(
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ui.ctx().viewport_rect().center())
         .collapsible(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         // COMMON 尺寸铁律:宽度定死、高度封顶自适应,列表限高滚动不撑窗
         .fixed_size(egui::vec2(WINDOW_W, WINDOW_H))
         .show(ui.ctx(), |ui| {

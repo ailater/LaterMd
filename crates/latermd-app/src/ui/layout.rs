@@ -352,7 +352,7 @@ impl LaterMdApp {
             .frame(
                 egui::Frame::NONE
                     .fill(crate::theme::shell(ui).chrome)
-                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
+                    .stroke(crate::ui::workbench::separator(ui)),
             )
             .show(ui, |ui| {
                 status_bar(ui, &self.state);
@@ -394,7 +394,7 @@ impl LaterMdApp {
                         right: if workbench { 12 } else { 8 },
                         ..egui::Margin::symmetric(8, 2)
                     })
-                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
+                    .stroke(crate::ui::workbench::separator(ui)),
             )
             .show_collapsible(ui, left, |ui| {
                 let sidebar = if workbench {
@@ -449,7 +449,7 @@ impl LaterMdApp {
                     // 保留字面量(设计系统 T2b 判例;inset::MD 另有 OVERLAY_MARGIN 消费)。
                     .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
                     .fill(crate::theme::shell(ui).content)
-                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
+                    .stroke(crate::ui::workbench::separator(ui)),
             )
             .show_collapsible(ui, right, |ui| {
                 crate::ui::workbench::pane_heading(ui, "对照预览", "只读");
@@ -501,7 +501,7 @@ impl LaterMdApp {
                 egui::Frame::default()
                     .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
                     .fill(crate::theme::shell(ui).content)
-                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
+                    .stroke(crate::ui::workbench::separator(ui)),
             )
             .show(ui, |ui| {
                 // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
@@ -1605,6 +1605,7 @@ fn commit_dialog(ui: &mut egui::Ui, subject: &str) -> (egui::Response, egui::Res
         .default_pos([80.0, 120.0])
         .collapsible(false)
         .resizable(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
             ui.label("建议的 commit subject:");
             ui.label(egui::RichText::new(subject).strong());
@@ -1640,6 +1641,7 @@ fn selection_ai_polish_dialog(
         .default_size([380.0, 240.0])
         .collapsible(false)
         .resizable(true)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
             ui.label(if streaming {
                 "润色中…(完成后可确认整段替换选区)"
@@ -1695,19 +1697,27 @@ fn destructive_confirm_dialog(
     let mut buttons = None;
     let danger = crate::ui::tokens::DANGER;
     egui::Window::new(title)
-        .default_pos([80.0, 120.0])
+        .title_bar(false)
+        .default_width(360.0)
         .collapsible(false)
         .resizable(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(crate::ui::tokens::text::TITLE)
+                    .strong(),
+            );
+            ui.add_space(crate::ui::tokens::SPACE_XS);
             ui.label(lead);
             egui::Frame::NONE
                 .fill(egui::Color32::from_rgba_unmultiplied(
                     danger.r(),
                     danger.g(),
                     danger.b(),
-                    16,
+                    10,
                 ))
-                .stroke(egui::Stroke::new(1.0, danger.gamma_multiply(0.45)))
+                .stroke(egui::Stroke::new(1.0, danger.gamma_multiply(0.28)))
                 .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_MD as u8))
                 .inner_margin(egui::Margin::same(8))
                 .outer_margin(egui::Margin::symmetric(0, 6))
@@ -1722,7 +1732,7 @@ fn destructive_confirm_dialog(
                         );
                         ui.painter()
                             .rect_filled(rect, egui::CornerRadius::same(2), danger);
-                        ui.label(egui::RichText::new(warning).strong().color(danger));
+                        ui.label(egui::RichText::new(warning).color(danger));
                     });
                 });
             if let Some((text, escalate)) = extra {

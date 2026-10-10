@@ -208,7 +208,20 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
 /// 单物理像素分隔线；与面板原生拖拽高亮共存。
 pub fn separator(ui: &egui::Ui) -> egui::Stroke {
     let colors = crate::theme::shell(ui);
-    egui::Stroke::new(1.0 / ui.ctx().pixels_per_point(), colors.border)
+    egui::Stroke::new(
+        1.0 / ui.ctx().pixels_per_point(),
+        colors.border.gamma_multiply(0.52),
+    )
+}
+
+/// 浮窗统一的 macOS 风格卡片：柔和边界、内容色底和充足内距。
+pub(crate) fn dialog_frame(ui: &egui::Ui) -> egui::Frame {
+    let colors = crate::theme::shell(ui);
+    egui::Frame::window(ui.style())
+        .fill(colors.content)
+        .stroke(separator(ui))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(16))
 }
 
 fn action(ui: &mut egui::Ui, rect: Rect, icon: Icon, tip: &str, selected: bool) -> bool {

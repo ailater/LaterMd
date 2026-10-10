@@ -513,6 +513,7 @@ pub fn panel(
         .default_pos(ui.ctx().viewport_rect().center())
         .collapsible(false)
         .resizable(false)
+        .frame(crate::ui::workbench::dialog_frame(ui))
         .show(ui.ctx(), |ui| {
             // 搜索框:E2 起参与过滤(三路大小写不敏感匹配,emoji_data::search);
             // desired_width 撑满让网格与输入框同宽
