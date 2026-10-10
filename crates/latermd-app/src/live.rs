@@ -30,6 +30,7 @@ use std::ops::Range;
 
 use eframe::egui;
 use egui_markdown::{LinkHandler, LinkStyle, MarkdownLabel};
+use egui_markdown_style::MarkdownStyle;
 use latermd_editor::EditorBuffer;
 
 use crate::state::{Message, OutlineCursor, PreviewState};
@@ -406,6 +407,74 @@ impl egui::TextBuffer for BlockBuffer<'_> {
     }
 }
 
+/// 块的粗分类(块间前距的判定用,不做解析)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// ATX 标题(前距额外叠加 `heading_space_above`)。
+    Heading,
+    /// 块级元件:围栏代码 / 表格 / 分割线 / 引用 / 图片行 —— vendored 单
+    /// 标签流对它们走 `before_block`/`after_block`(`block_spacing` 包围)。
+    Widget,
+    /// 普通文本流:段落与列表(列表在 vendored 里是文本行 + 标记,不是
+    /// 块元件)。
+    Text,
+}
+
+/// 按块源码首行做前缀粗分类。Setext 标题与「裸文本首行的 GFM 表格」不
+/// 识别 —— 误分类只差一档间距(8px),不值得为它上解析器。
+fn block_kind(block_text: &str) -> BlockKind {
+    let first = block_text.lines().next().unwrap_or("");
+    let t = first.trim_start();
+    let hashes = t.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ') {
+        return BlockKind::Heading;
+    }
+    if t.starts_with("```") || t.starts_with("~~~") || t.starts_with('>') || t.starts_with('|') {
+        return BlockKind::Widget; // 围栏代码 / 引用 / 表格(常用形态)
+    }
+    // 分割线:整行只由 -*-_ 与空白构成(非空)
+    if !t.is_empty() && t.bytes().all(|b| matches!(b, b'-' | b'*' | b'_' | b' ')) {
+        return BlockKind::Widget;
+    }
+    if t.starts_with("![") {
+        return BlockKind::Widget; // 图片行(vendored Image 是块元件)
+    }
+    BlockKind::Text
+}
+
+/// 正文行盒高:vendored `layout.rs::line_height_for` 同式(那边是私有
+/// fn,字段全为公开样式值;上游若改式,最坏是间距观感偏移,不伤正确性)。
+fn body_line_height(style: &MarkdownStyle, font_size: f32) -> f32 {
+    (font_size * style.line_height_ratio).max(font_size * style.min_line_height_em + 0.75)
+}
+
+/// 块间前距:镜像 vendored **单标签流**的块间节奏(右栏预览即此口径)。
+///
+/// 预览把整篇塞进一个 `MarkdownLabel`,块间空气由三种机制天然产生:文
+/// 本之间的空行是真实行盒、块级元件前后 `add_space(block_spacing)`
+/// (`before_block`/`after_block`)、标题前再叠一行
+/// `block_spacing + heading_space_above` 的透明 spacer。Live 是**逐块独
+/// 立标签**,标签会裁掉尾随空行、spacer 在段首被刻意抑制,块间只剩
+/// egui 出厂 3px —— 全部挤在一起(2026-10-10 用户反馈「Live 太紧凑」)。
+/// 本函数把三种机制按边界类型补回:
+///
+/// * 前一块是元件:`block_spacing`(对应 `after_block`,元件后无空行);
+/// * 前一块是文本:一个正文行盒高(对应真实空行);
+/// * 本块是标题:再叠 `block_spacing + heading_space_above`(spacer 行);
+/// * 本块是元件:再叠 `block_spacing`(`before_block`)。
+fn block_gap(style: &MarkdownStyle, font_size: f32, prev: BlockKind, this: BlockKind) -> f32 {
+    let base = match prev {
+        BlockKind::Widget => style.block_spacing,
+        BlockKind::Heading | BlockKind::Text => body_line_height(style, font_size),
+    };
+    let extra = match this {
+        BlockKind::Heading => style.block_spacing + style.heading_space_above,
+        BlockKind::Widget => style.block_spacing,
+        BlockKind::Text => 0.0,
+    };
+    base + extra
+}
+
 /// 绘制 Live Preview:非活动块富渲染(点击即进入编辑),活动块源码编辑。
 ///
 /// `selection` 是格式工具条的选区镜像出参(与源码模式 `ui::editor` 同一
@@ -497,14 +566,32 @@ pub fn ui(
         .id_salt("live-preview")
         .auto_shrink([false, false])
         .show(panel, |ui| {
+            // 块间节奏完全由 [`block_gap`] 前距决定(与右栏预览同口径,
+            // 2026-10-10):egui 出厂 item_spacing.y = 3px 会叠加在演算值
+            // 上,归零让前距成为唯一间距源。
+            ui.spacing_mut().item_spacing.y = 0.0;
             if block_count == 0 {
                 ui.weak("(空文档)");
             }
+            // 前一块的分类(首块无前距:vendored `had_content` 同语义,
+            // 文档顶贴顶不悬空)。
+            let mut prev_kind: Option<BlockKind> = None;
             for index in 0..block_count {
                 let range = live.blocks[index].clone();
                 // 块文本(渲染与行数估算都要用;编辑走的是同一份缓冲的切片,
                 // 这里只 clone 块自己,不是整篇)
                 let block_text = BlockBuffer::slice(editor.text(), &range).to_owned();
+                let kind = block_kind(&block_text);
+                if let Some(prev) = prev_kind {
+                    let style = egui_markdown_style::global_style(ui.ctx());
+                    ui.add_space(block_gap(
+                        &style,
+                        crate::theme::editor_font_size(ui.ctx()),
+                        prev,
+                        kind,
+                    ));
+                }
+                prev_kind = Some(kind);
                 if live.active == Some(index) {
                     let char_len = live.block_char_len(editor, index);
                     let lines = block_text.lines().count().max(1);
@@ -4372,5 +4459,200 @@ mod tests {
             "无浏览器弹出(hl:// 点击即使触发也吞掉)"
         );
         output.drop_without_applying_deltas();
+    }
+
+    /// 首行前缀粗分类:标题要空格(CommonMark)、列表是文本流、
+    /// `***加粗开头**` 不是分割线。
+    #[test]
+    fn block_kind_classifies_by_first_line() {
+        use super::BlockKind;
+        assert_eq!(super::block_kind("# 标题"), BlockKind::Heading);
+        assert_eq!(super::block_kind("###### 六级"), BlockKind::Heading);
+        assert_eq!(super::block_kind("##无空格不是标题"), BlockKind::Text);
+        assert_eq!(super::block_kind("####### 七个"), BlockKind::Text);
+        assert_eq!(
+            super::block_kind("```rust\nfn a(){}\n```\n"),
+            BlockKind::Widget
+        );
+        assert_eq!(super::block_kind("> 引用"), BlockKind::Widget);
+        assert_eq!(super::block_kind("| a | b |\n| - | - |"), BlockKind::Widget);
+        assert_eq!(super::block_kind("---"), BlockKind::Widget);
+        assert_eq!(super::block_kind("* * *"), BlockKind::Widget);
+        assert_eq!(super::block_kind("![图](x.png)"), BlockKind::Widget);
+        assert_eq!(super::block_kind("- 列表项"), BlockKind::Text);
+        assert_eq!(super::block_kind("- [ ] 任务"), BlockKind::Text);
+        assert_eq!(super::block_kind("1. 有序"), BlockKind::Text);
+        assert_eq!(super::block_kind("***加粗开头**"), BlockKind::Text);
+        assert_eq!(super::block_kind("段落"), BlockKind::Text);
+    }
+
+    /// 前距矩阵逐项对齐 vendored 单标签流(见 [`super::block_gap`] 的
+    /// 三机制对照表)。
+    #[test]
+    fn block_gap_mirrors_the_single_label_rhythm() {
+        use super::BlockKind;
+        let style = MarkdownStyle::default();
+        let line = super::body_line_height(&style, 15.0);
+        assert!((line - 19.5).abs() < 1e-4, "出厂 15pt×1.30 → 行盒 19.5");
+        let s = style.block_spacing;
+        let h = style.heading_space_above;
+        // 文本 → 文本:一个空行
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Text, BlockKind::Text),
+            line
+        );
+        // 文本 → 标题:空行 + spacer 行
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Text, BlockKind::Heading),
+            line + s + h
+        );
+        // 文本 → 元件:空行 + before_block
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Text, BlockKind::Widget),
+            line + s
+        );
+        // 元件 → 文本:仅 after_block(元件后无空行)
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Widget, BlockKind::Text),
+            s
+        );
+        // 元件 → 标题:after_block + spacer 行
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Widget, BlockKind::Heading),
+            s + s + h
+        );
+        // 标题 → 文本:空行(标题不是元件)
+        assert_eq!(
+            super::block_gap(&style, 15.0, BlockKind::Heading, BlockKind::Text),
+            line
+        );
+        // CJK 行高下限兜底:floor 抬行盒
+        let floored = MarkdownStyle {
+            min_line_height_em: 2.0,
+            ..MarkdownStyle::default()
+        };
+        assert!(super::body_line_height(&floored, 15.0) > line);
+    }
+
+    /// 块间前距逐像素守门(2026-10-10「Live 太紧凑」):标签裁尾随空行、
+    /// item_spacing 归零后,相邻文本块行盒之间的实测空隙必须等于
+    /// `block_gap` 的演算值(出厂样式 15pt×1.30 → 行盒 19.5)。改版前
+    /// 实测全部边界都是 3px(egui 出厂 item_spacing),本测试当场抓它。
+    /// 元件边界(代码块自绘框有内距、语言头与内容行纵向重叠)只断
+    /// 「已拉开」下界。
+    #[test]
+    fn inter_block_gaps_match_the_preview_rhythm() {
+        let ctx = egui::Context::default();
+        let doc = "# 标题\n\n段落甲正文。\n\n## 二级标题\n\n段落乙正文。\n\n```rust\nfn a(){}\n```\n\n段落丙。\n";
+        let (mut editor, mut live, mut cursor) = state_with(doc);
+        let mut preview = PreviewState::new(&editor);
+        let mut outbox = Vec::new();
+        let mut sink = None;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            super::ui(
+                ui,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut sink,
+                &mut live,
+                egui::Id::new("gap-test"),
+                false,
+                false,
+                &mut outbox,
+            );
+        });
+        let mut rows: Vec<(f32, f32, String)> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                let text = t.galley.text().to_owned();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let rect = egui::Rect::from_min_size(t.pos, t.galley.size());
+                rows.push((rect.top(), rect.bottom(), text));
+            }
+        }
+        output.drop_without_applying_deltas();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let gap_between = |from: &str, to: &str| -> f32 {
+            let a = rows.iter().rev().find(|r| r.2.trim() == from).expect(from);
+            let b = rows
+                .iter()
+                .find(|r| r.2.trim() == to && r.0 >= a.1)
+                .expect(to);
+            b.0 - a.1
+        };
+        let style = MarkdownStyle::default();
+        let line = super::body_line_height(&style, 15.0);
+        let s = style.block_spacing;
+        let h = style.heading_space_above;
+        // 文本边界:恰等于演算值
+        assert!(
+            (gap_between("段落甲正文。", "二级标题") - (line + s + h)).abs() < 0.6,
+            "段落 → 二级标题 = 空行 + spacer"
+        );
+        assert!(
+            (gap_between("二级标题", "段落乙正文。") - line).abs() < 0.6,
+            "标题 → 段落 = 一个空行"
+        );
+        assert!(
+            (gap_between("标题", "段落甲正文。") - line).abs() < 0.6,
+            "首块之后的第一个边界同为空行"
+        );
+        // 元件边界:自绘框有内距,断「已拉开」下界(改版前实测 3px)
+        assert!(
+            gap_between("段落乙正文。", "fn a(){}") >= s,
+            "段落 → 代码块前距:{:?}",
+            gap_between("段落乙正文。", "fn a(){}")
+        );
+        assert!(
+            gap_between("fn a(){}", "段落丙。") >= s,
+            "代码块 → 段落前距:{:?}",
+            gap_between("fn a(){}", "段落丙。")
+        );
+
+        // 行距同源(2026-10-10 用户问「Live 和预览能一样吗」):两栏的
+        // 标签用同一 `FontId`(字号档 + 预览族)与同一全局 MarkdownStyle,
+        // 行盒高必须逐像素相等 —— 谁改了其中一栏的字体取值,这里变红。
+        let out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui_markdown::MarkdownLabel::new(egui::Id::new("gap-test-preview"), doc)
+                .font(egui::FontId::new(
+                    crate::theme::editor_font_size(ui.ctx()),
+                    crate::fonts::preview_body_family(ui.ctx()),
+                ))
+                .wrap()
+                .show(ui);
+        });
+        // 预览整篇是单个 galley shape:按行遍历取目标段的行盒
+        let preview_row = out2
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let mut start = 0usize;
+                    t.galley.rows.iter().find_map(move |row| {
+                        let count = row.char_count_including_newline().0;
+                        let text: String =
+                            t.galley.job.text.chars().skip(start).take(count).collect();
+                        start += count;
+                        (text.trim() == "段落甲正文。").then_some(row.size.y)
+                    })
+                }
+                _ => None,
+            })
+            .next()
+            .expect("预览单标签里有该段行");
+        let live_row = rows
+            .iter()
+            .find(|r| r.2.trim() == "段落甲正文。")
+            .map(|r| r.1 - r.0)
+            .expect("Live 里有该段行");
+        assert!(
+            (preview_row - live_row).abs() < 0.6,
+            "行距须同源:预览行盒 {preview_row}px vs Live 行盒 {live_row}px"
+        );
+        out2.drop_without_applying_deltas();
     }
 }
