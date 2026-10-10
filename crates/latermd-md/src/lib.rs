@@ -155,9 +155,8 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
     //    坤哥报告的两个症状,默认示例文档即复现)。
     //    补救:原生 pulldown 再走一遍,取每个**块级构造**(标题/段落/
     //    列表项/代码块/表格/分隔线)的完整区间 —— 构造 span 天然包含
-    //    自己的行内标记;内容段起点落在哪个构造里,就吸附到该构造的
-    //    起/终(每构造首段吸附头、末段吸附尾,中段保持 token 边界,
-    //    软换行拆行的既有口径不动)。
+    //    自己的行内标记;同一构造的内容段统一吸附到该构造的起/终,
+    //    让每个 Live 编辑块都能独立解析。
     let constructs = construct_spans(text);
     let mut snapped: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
     let mut seg_index = 0_usize;
@@ -166,9 +165,10 @@ pub fn blocks(text: &str) -> Vec<Range<usize>> {
         // 归属按**首个 token 的 span 终点**判:span 起点可能吸收了前一块
         // 尾部的空行而落在上一个构造的区间里(span 终点恒在本构造内)。
         let first_span_end = segments[seg_index].2;
+        let construct_index = constructs.partition_point(|c| c.end < first_span_end);
         let containing = constructs
-            .iter()
-            .find(|c| first_span_end > c.start && first_span_end <= c.end);
+            .get(construct_index)
+            .filter(|c| first_span_end > c.start && first_span_end <= c.end);
         let Some(construct) = containing else {
             snapped.push((start, end));
             seg_index += 1;
@@ -227,8 +227,7 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
     options.insert(Options::ENABLE_TASKLISTS);
 
     let mut spans: Vec<Range<usize>> = Vec::new();
-    // 打开的「可分块构造」栈:Heading/段落化不了 —— 段落是隐式构造,
-    // 用 in_paragraph 标志;列表项与引用块显式入栈。
+    // 列表项、引用和脚注定义包含嵌套块,必须保留外层构造的源码标记。
     struct Open {
         start: usize,
         end: usize,
@@ -236,6 +235,7 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
     let mut stack: Vec<Open> = Vec::new();
     let mut in_paragraph = false;
     let mut para = (usize::MAX, 0_usize);
+    let mut code_start: Option<usize> = None;
 
     let push_block = |start: usize, end: usize, spans: &mut Vec<Range<usize>>| {
         if end > start {
@@ -244,8 +244,8 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
     };
 
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
-        // 构造内的累计区间:所有已开构造与当前段落都吃这个事件的范围
-        for open in stack.iter_mut() {
+        // 内层构造闭合时向父层传递范围,避免每个事件扫描所有祖先。
+        if let Some(open) = stack.last_mut() {
             open.start = open.start.min(range.start);
             open.end = open.end.max(range.end);
         }
@@ -259,10 +259,17 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
                     in_paragraph = true;
                     para = (usize::MAX, 0);
                 }
-                Tag::Item | Tag::BlockQuote(_) => {
+                Tag::Item | Tag::BlockQuote(_) | Tag::FootnoteDefinition(_) => {
                     stack.push(Open {
                         start: range.start,
                         end: range.end,
+                    });
+                }
+                Tag::CodeBlock(kind) => {
+                    code_start = Some(if kind.is_indented() {
+                        physical_line_start(text, range.start)
+                    } else {
+                        range.start
                     });
                 }
                 Tag::List(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
@@ -275,15 +282,23 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
                     }
                     in_paragraph = false;
                 }
-                TagEnd::Item | TagEnd::BlockQuote(_) => {
+                TagEnd::Item | TagEnd::BlockQuote(_) | TagEnd::FootnoteDefinition => {
                     if let Some(open) = stack.pop() {
+                        if let Some(parent) = stack.last_mut() {
+                            parent.start = parent.start.min(open.start);
+                            parent.end = parent.end.max(open.end);
+                        }
                         push_block(open.start, open.end.max(range.end), &mut spans);
                     }
                 }
                 TagEnd::Heading(_) => {
                     push_block(range.start, range.end, &mut spans);
                 }
-                TagEnd::CodeBlock | TagEnd::Table => {
+                TagEnd::CodeBlock => {
+                    let start = code_start.take().unwrap_or(range.start);
+                    push_block(start, range.end, &mut spans);
+                }
+                TagEnd::Table => {
                     push_block(range.start, range.end, &mut spans);
                 }
                 _ => {}
@@ -294,9 +309,6 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
             _ => {}
         }
     }
-    // 表格由 Start(Table) 后的 TableHead/Row/Cell 与 End(Table) 事件累计
-    // 进表格构造?表格不在段落也不入栈 —— 它的块级收口:列内事件不落
-    // 任何构造,靠 End(Table) 补推。
     spans.sort_by_key(|r| r.start);
     // 只合并**真重叠**(引用块与其内列表项:两套构造各记一遍);相邻留
     // 缝的(标题/段落/项)保持独立 —— 缝里是块间空行,归前一块(②)。
@@ -312,6 +324,13 @@ fn construct_spans(text: &str) -> Vec<Range<usize>> {
     merged
 }
 
+/// 从 `pos` 定位到所在物理行起点;缩进代码的 pulldown 起始 span
+/// 从首行内容开始,独立重解析必须保留行首四个空格。
+fn physical_line_start(text: &str, pos: usize) -> usize {
+    text[..pos.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1)
+}
 /// 从 `pos` 起跳过连续的换行与回车(CRLF 的 `\r` 也算分隔符的一部分)。
 fn skip_newlines(text: &str, mut pos: usize) -> usize {
     let bytes = text.as_bytes();
@@ -2361,6 +2380,63 @@ mod tests {
             "标记必须随自己的块"
         );
         assert_covers_text(text, &blocks);
+    }
+
+    #[test]
+    fn blocks_keep_indented_code_syntax() {
+        for code in ["    x\n    y\n\n", "\tx\n\ty\n\n"] {
+            let text = format!("intro\n\n{code}tail\n");
+            let ranges = blocks(&text);
+            let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+            assert_eq!(slices, vec!["intro\n\n", code, "tail\n"]);
+            assert_covers_text(&text, &ranges);
+            let parsed = egui_markdown::parser::parse(slices[1]);
+            assert!(parsed
+                .tokens
+                .iter()
+                .any(|t| matches!(t, Token::CodeBlock { .. })));
+        }
+    }
+
+    #[test]
+    fn blocks_keep_footnote_definitions_atomic() {
+        for definition in [
+            "[^1]: **bold**",
+            "[^1]: a\n\n    **last**",
+            "[^1]: first\n\n    - a\n      - nested\n    - b",
+        ] {
+            for suffix in ["", "\n\ntail\n"] {
+                let text = format!("intro\n\n{definition}{suffix}");
+                let ranges = blocks(&text);
+                let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+                let complete = if suffix.is_empty() {
+                    definition.to_owned()
+                } else {
+                    format!("{definition}\n\n")
+                };
+                let mut expected = vec!["intro\n\n", complete.as_str()];
+                if !suffix.is_empty() {
+                    expected.push("tail\n");
+                }
+                assert_eq!(slices, expected);
+                assert_covers_text(&text, &ranges);
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_keep_styled_heading_and_nested_containers() {
+        for construct in [
+            "## **bold** and `code` [link](https://example.com)\n\n",
+            "> quote\n>\n> - **bold**\n>   - nested\n\n",
+            "- outer\n  - **nested**\n\n",
+        ] {
+            let text = format!("intro\n\n{construct}tail\n");
+            let ranges = blocks(&text);
+            let slices: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+            assert_eq!(slices, vec!["intro\n\n", construct, "tail\n"]);
+            assert_covers_text(&text, &ranges);
+        }
     }
 
     /// 边界:空文档无块;纯空行整篇一块(编辑需要落点);单段无换行也成块。

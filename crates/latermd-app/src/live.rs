@@ -2765,6 +2765,8 @@ mod tests {
             .expect("跳转字节必落在某块");
         let target_local =
             editor.byte_to_char(heading_byte) - editor.byte_to_char(live.blocks[target].start);
+        assert_eq!(target, 2, "底部标题自身是跳转目标块");
+        assert_eq!(target_local, 0, "标题标记位于块内行首");
         cursor.jump_to = Some(editor.byte_to_char(heading_byte));
         let _ = live_scroll_frame(
             &ctx,
