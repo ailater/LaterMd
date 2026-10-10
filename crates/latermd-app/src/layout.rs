@@ -99,6 +99,7 @@ impl LayoutSettings {
     pub fn fresh_install() -> Self {
         Self {
             right: false,
+            left_view: SidebarTab::Outline,
             ..Self::default()
         }
     }

@@ -6041,9 +6041,11 @@ mod tests {
             let ctx = egui::Context::default();
             let probe = Rc::new(Cell::new((0u64, Rect::NOTHING)));
             let (mut app, dir) = zen_nav_app(theme);
-            if theme == "light" {
-                app.state.apply(Message::ToggleTheme);
-            }
+            app.state.theme.mode = if theme == "light" {
+                crate::theme::ThemeMode::Light
+            } else {
+                crate::theme::ThemeMode::Dark
+            };
             assert_eq!(
                 app.state.resolved_theme(),
                 if theme == "light" {
@@ -7228,9 +7230,11 @@ mod tests {
             // egui memory —— 共享 ctx 会把滚动状态泄进下一轮的首屏断言
             let ctx = egui::Context::default();
             let mut app = LaterMdApp::default();
-            if theme == "light" {
-                app.state.apply(Message::ToggleTheme);
-            }
+            app.state.theme.mode = if theme == "light" {
+                crate::theme::ThemeMode::Light
+            } else {
+                crate::theme::ThemeMode::Dark
+            };
             trigger_overlay(&mut app, &ctx, screen);
             let mode = app.state.resolved_theme();
             assert_eq!(

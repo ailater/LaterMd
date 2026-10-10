@@ -44,8 +44,7 @@ const SETTINGS_FILE: &str = "settings.json";
 pub const THEMES_DIR: &str = "themes";
 
 /// 明暗模式(用户的选择,含「跟随系统」这一非确定值)。serde 小写
-/// (`"light"`/`"dark"`/`"system"`);默认深色,与 egui 的默认 visuals 一致,
-/// 首跑无闪变。
+/// (`"light"`/`"dark"`/`"system"`);默认浅色,启动首帧前投影主题避免闪变。
 ///
 /// `System` **不是**一种可渲染的模式:绘制前必须经 [`ThemeMode::resolve`]
 /// 落到 Light/Dark(roadmap 风险 #8:Linux 无统一规范,检测可能失灵,届时
@@ -54,9 +53,9 @@ pub const THEMES_DIR: &str = "themes";
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
     /// 浅色。
+    #[default]
     Light,
     /// 深色。
-    #[default]
     Dark,
     /// 跟随系统(Windows 注册表 / macOS NSUserDefaults / Linux freedesktop
     /// portal)。检测不到时按 `fallback` 走。
