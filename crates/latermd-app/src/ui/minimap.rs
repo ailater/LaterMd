@@ -357,7 +357,7 @@ pub(crate) struct JumpInput {
     pub grab: Option<f32>,
 }
 
-/// 位置 → 目标滚动比例。两条路径,同一套几何(`full`/`travel`/`ve`
+/// 位置 → 目标滚动比例。两条路径,同一套几何(`full`/`travel`/`span`
 /// 与 None 口径共享):
 ///
 /// * **`grab: None`(现状,#55)**:点击处的内容对准编辑器**视口中心**。
@@ -365,36 +365,44 @@ pub(crate) struct JumpInput {
 ///   除以全文档高得到内容比例 `p`;②让视口中心落在 `p` →
 ///   `target = (p − viewport_frac/2) / (1 − viewport_frac)`。
 /// * **`grab: Some`(#68 拖阴影)**:目标阴影 top(`pointer_y − grab`)
-///   对准编辑器**视口顶**,抓取点相对高亮框不动。[`viewport_highlight`]
-///   的几何里阴影 top = `ratio × 滑轨`(滑轨 = 窄条高 − 阴影高
-///   `= map_h − ve·full`),反解即 `target = (pointer_y − grab) / 滑轨`。
+///   对准编辑器**视口顶**,抓取点相对高亮框不动。滑轨([`viewport_highlight`]
+///   里 `top` 的系数)统一写作 `span = (1−ve)·full − travel` —— 长文档时
+///   `travel = full − map_h`,该式退化为 `map_h − ve·full`(与 #68 原式逐
+///   位相等);短文档(`travel = 0`)退化成 `(1−ve)·full`,正是铺排 Outcomes
+///   下阴影实际可走的行程。反解即 `target = (pointer_y − grab) / span`。
 ///   绝对目标语义:**不含** `scroll_ratio`(平移量已被反解吸收,与
-///   居中路径同属「目标由指针唯一决定」)。滑轨退化(阴影高 ≥ 窄条高
-///   `ve·full ≥ map_h`,生产恒不发生 —— minimap 3px/行远矮于编辑器
-///   行高)返回 `None` 原样不动。
+///   居中路径同属「目标由指针唯一决定」)。滑轨退化(`span ≤ 0`:阴影高
+///   ≥ 可走行程,生产恒不发生 —— minimap 3px/行远矮于编辑器行高)返回
+///   `None` 原样不动。
 ///
-/// 短文档(minimap 不满一屏 → 编辑器同样滚不动)或内容不满一屏两条
-/// 路径都返回 `None`,调用方原样不动。输出钳进 0..=1(拖到顶到顶、
-/// 拖到底到底)。
+/// **唯一必要的 `None` 闸门是内容不满一屏(`ve ≥ 1`)** —— 那时编辑器确实
+/// 无行程,跳了也是空转。此前这版实现把「minimap 铺不满窄条」(`travel ≤ 0`)
+/// 也当成该 `None`,那是错的:minimap 3px/行、编辑器 ≥18px/行,同一篇文档
+/// 在两侧的行数阈值差一个量级(编辑区高 H 时编辑器 `H/18` 行就有行程,
+/// minimap 要 `H/3` 行才铺满)—— `H=900` 下即「编辑器 50 行能滚 vs minimap
+/// 300 行才有滑轨」。中间那段文档(全屏下约 50–300 行)**编辑器明明能滚、
+/// minimap 却全哑**,正是坤哥 2026-10-08 / 10-09 两次真机报告的「小窗可拖、
+/// 全屏不可拖」(同一篇文档,小视口下够长就绿)。2026-10-09 修:闸门只留
+/// `ve`;`travel` 退化为 0 时两条路径照各自公式算 —— 短文档下 minimap 顶部
+/// 铺排(`offset` 恒 0),加法分支天然退化为量纲自洽。
+///
+/// 输出钳进 0..=1(拖到顶到顶、拖到底到底)。
 pub(crate) fn jump_ratio(input: JumpInput) -> Option<f32> {
     let total = input.total_lines.max(1) as f32;
     let row_h = input.row_h.max(0.5);
     let full = total * row_h;
     let viewport = input.minimap_height.max(0.0);
     let travel = (full - viewport).max(0.0);
-    if travel <= 0.0 {
-        return None; // minimap 不满一屏:编辑器此时也滚不动
-    }
     let ve = input.viewport_frac.clamp(0.0, 1.0);
     if ve >= 1.0 {
         return None; // 内容不满一屏:编辑器无行程
     }
     match input.grab {
         Some(grab) => {
-            // 滑轨 = viewport_highlight 的 top 系数 = 窄条高 − 阴影高。
-            let span = viewport - ve * full;
+            // 滑轨 = viewport_highlight 的 top 系数(长短文档同一式)。
+            let span = (1.0 - ve) * full - travel;
             if span <= 0.0 {
-                return None; // 阴影高 ≥ 窄条高:无滑轨可拖,原样不动
+                return None; // 阴影高 ≥ 可走行程:无滑轨可拖,原样不动
             }
             Some(((input.pointer_y - grab) / span).clamp(0.0, 1.0))
         }
@@ -1456,10 +1464,12 @@ mod tests {
         }
     }
 
-    /// #68 M1 None 口径不变:短文档(minimap 不满一屏)/内容不满一屏在
-    /// grab=Some 下同样 None(grab 不放宽行程判定,先于 grab 判定);滑轨
-    /// 退化(阴影高 ≥ 窄条高,生产恒不发生 —— minimap 3px/行远矮于编辑
-    /// 器行高)→ None 原样不动。
+    /// #68 M1 None 口径(**2026-10-09 修订**):只剩下的真闸门是「内容不满一屏」
+    /// (`ve ≥ 1`,编辑器确实无行程)与「滑轨退化」(`span ≤ 0`,阴影高 ≥ 可走
+    /// 行程)。**「minimap 铺不满窄条」(`travel ≤ 0`)不再是 None** —— 那是
+    /// 2026-10-08/10-09 两次真机「小窗可拖、全屏不可拖」的根因:同一种 actionable
+    /// 文档在宽高都变大后 minimap 反而全哑(详见 [`jump_ratio`] 的量级失配注记)。
+    /// 修订后`None` 语义收敛成一句话:**编辑器滚不动才不跳**。
     #[test]
     fn grab_keeps_none_precedence_on_short_or_degenerate_inputs() {
         let make = |total_lines: usize, viewport_frac: f32| JumpInput {
@@ -1471,23 +1481,137 @@ mod tests {
             viewport_frac,
             grab: Some(90.0),
         };
-        // 短文档:minimap 不满一屏(10 行 × 3px = 30 < 600)
-        assert_eq!(
-            jump_ratio(make(10, 0.01)),
-            None,
-            "短文档编辑器滚不动,grab 也不跳"
-        );
-        // 内容不满一屏(ve=1)
+        // 内容不满一屏(ve=1):编辑器无行程 —— 修订前后同为 None。
         assert_eq!(
             jump_ratio(make(10000, 1.0)),
             None,
             "内容不满一屏,grab 也不跳"
         );
-        // 滑轨退化:ve=0.05 → 阴影高 1500 > 窄条 600,无滑轨可拖
+        // 滑轨退化:阴影高 ve·full ≥ 可走行程(10000 行 ×3px=30000、ve=0.05
+        // → 阴影 1500px,而窄条仅 600px 且意味着编辑器视口只看得见 50 行)。
         assert_eq!(
             jump_ratio(make(10000, 0.05)),
             None,
-            "阴影高 ≥ 窄条高:无滑轨,原样不动"
+            "阴影高 ≥ 可走行程:无滑轨,原样不动"
+        );
+
+        // —— 修订点:minimap 铺不满窄条但编辑器滚得动时必须能拖 ——
+        // 100 行 × 3px = 300px < 600px 窄条(travel = 0),而编辑器视口只占
+        // 内容 45% → 有行程。这是全屏下真实的几何(行条 3px vs 编辑器 ≥18px
+        // 行高,同一篇文档在两侧的行数阈值差一个量级)。
+        let full = 100.0 * ROW_H;
+        let expect_span = (1.0 - 0.45_f32) * full; // travel=0 时的滑轨
+        assert!(expect_span > 0.0);
+        assert_eq!(
+            jump_ratio(make(100, 0.45)),
+            Some(((300.0 - 90.0) / expect_span).clamp(0.0, 1.0)),
+            "短文档(minimap 未满屏)仍走滑轨公式,不再哑"
+        );
+        // 与 [`viewport_highlight`] 对偶:落地后阴影 top 恰 = 指针 − 抓取偏移。
+        // travel=0 时 top = ratio×span,「位移与反解同一把尺子」仍成立。
+        let target = jump_ratio(make(100, 0.45)).expect("短文档也有滑轨");
+        let (top, _) = viewport_highlight(
+            WindowInput {
+                minimap_height: 600.0,
+                total_lines: 100,
+                scroll_ratio: target,
+                row_h: ROW_H,
+            },
+            0.45,
+        );
+        let expected_top: f32 = 210.0_f32.min(expect_span);
+        assert!(
+            (top - expected_top).abs() < 1e-3,
+            "短文档拖影落地仍保抓取点不动(期望 ≈{expected_top},实测 {top})"
+        );
+    }
+
+    /// #68 量级失配的回归锁(坤哥 2026-10-08 / 10-09 两次真机「小窗可拖、
+    /// 全屏不可拖」):同一份**200 行**文档,小视口下 minimap 满屏可拖,大视口
+    /// (1920×1008)下 minimap 行条总高 600px 铺不满 ~1000px 窄条 → 修订前的
+    /// `jump_ratio` 在第一道闸门就返回 None,编辑器明明有 2000px 行程却拖不动。
+    ///
+    /// 为何必须端到端:这是 `editor` 层才拿得到的真实条件(ScrollArea 的
+    /// `viewport_height`/`content_height` 决定 `viewport_frac`),纯函数层的
+    /// 用例凭构造就能绕过。**撤销性强 hip — revert 掉 `jump_ratio` 的闸门修订
+    /// 本测试当场红**(拖 6 步 offset 恒 0)。
+    #[test]
+    fn dragging_short_document_works_at_fullscreen_viewport() {
+        let ctx = egui::Context::default();
+        // 200 行:editor 层 1920×1008 下 content ≈3000px vs viewport ≈1000px
+        // (编辑器滚得动),而 minimap 全高 600px < 窄条(铺不满)。
+        let text = (0..200)
+            .map(|_| "普通的一行")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorBuffer::new(&text);
+        let id = editor::tab_editor_id(1);
+        let big = egui::vec2(1920.0, 1008.0);
+
+        frame_sized(&ctx, &mut editor, 0.0, true, Vec::new(), big);
+        let (shapes, _) = frame_sized(&ctx, &mut editor, 0.1, true, Vec::new(), big);
+        let metrics0 = ctx
+            .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+            .unwrap_or_default();
+        assert!(
+            metrics0.content_height - metrics0.viewport_height > 100.0,
+            "前提:编辑器自身有行程(内容 {} / 视口 {}),否则本用例无意义",
+            metrics0.content_height,
+            metrics0.viewport_height
+        );
+        assert!(
+            200.0 * ROW_H < metrics0.viewport_height,
+            "前提:minimap 全高 {} 铺不满窄条 {}(正在复现的那个几何)",
+            200.0 * ROW_H,
+            metrics0.viewport_height
+        );
+
+        let map = viewport_rect(&shapes).expect("高亮框定位窄条");
+        let press = egui::pos2(map.center().x, map.top() + 20.0);
+        frame_sized(
+            &ctx,
+            &mut editor,
+            0.2,
+            true,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            big,
+        );
+
+        let mut previous = metrics0.offset;
+        let mut moved = 0;
+        for step in 0..6 {
+            let pos = egui::pos2(press.x, press.y + f32::from(step as u16) * 40.0);
+            frame_sized(
+                &ctx,
+                &mut editor,
+                0.3 + f64::from(step) * 0.1,
+                true,
+                vec![egui::Event::PointerMoved(pos)],
+                big,
+            );
+            let offset = ctx
+                .data(|d| d.get_temp::<ScrollMetrics>(metrics_id(id)))
+                .map_or(0.0, |m| m.offset);
+            assert!(
+                offset >= previous - 0.5,
+                "短文档大视口拖动单调不减(第 {step} 步 {previous} → {offset})"
+            );
+            if offset > previous + 1.0 {
+                moved += 1;
+            }
+            previous = offset;
+        }
+        assert!(
+            moved >= 3,
+            "minimap 铺不满窄条时仍然可拖(6 步中 {moved} 步在滚;窄条 {map:?})"
         );
     }
 
@@ -1722,6 +1846,11 @@ mod tests {
     /// #68 尺寸回归(坤哥 2026-10-08 真机报告:小窗可拖、全屏不可拖):大视口
     /// (1920×1008)下抓住阴影拖动,offset 逐帧跟随——与既有拖动测试同流程,
     /// 唯一变量=视口尺寸。editor 层不复现则 bug 在 layout 层面板分配。
+    ///
+    /// **本测试用的 500 行是「够长」的一档**:`jump_ratio` 曾有的「minimap 铺
+    /// 不满窄条即哑」闸门要 >~300 行才放行。缺的那一半(更短的文档)与 [#68]
+    /// 的量级失配修复一起补齐了 —— 见
+    /// `dragging_short_document_works_at_fullscreen_viewport`(200 行、同一视口)。
     #[test]
     fn dragging_minimap_works_at_fullscreen_viewport() {
         let ctx = egui::Context::default();
