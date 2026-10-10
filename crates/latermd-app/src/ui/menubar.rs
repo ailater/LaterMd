@@ -117,7 +117,7 @@ const AI_MENU: [&[Command]; 1] = [&[
 /// 第二项是该菜单标题的助记字母(Alt 命名空间,**全局唯一**,与 keymap
 /// 全部 Alt 类绑定的冲突审计见模块测试)。「设置」「帮助」不是命令
 /// (直达设置页 / 关于窗,照「设置」先例单独绘制),不进本表。
-const MENUS: [(&str, char, &[&[Command]]); 6] = [
+pub(crate) const MENUS: [(&str, char, &[&[Command]]); 6] = [
     ("文件", 'F', &FILE_MENU),
     ("编辑", 'E', &EDIT_MENU),
     ("格式", 'O', &FORMAT_MENU),
@@ -226,7 +226,7 @@ fn label_with_mnemonic(label: &str, letter: char) -> String {
 /// 打字机/专注/minimap/禅定;「切换主题」是明暗互换而非开/关(哪个算
 /// 「开」没有自然答案),不加勾选态。真值从 [`State`] 单一事实源取,
 /// 与设置页/标题栏按钮同源(取舍见 decisions-pending #129)。
-fn toggle_checked(cmd: Command, state: &State) -> Option<bool> {
+pub(crate) fn toggle_checked(cmd: Command, state: &State) -> Option<bool> {
     Some(match cmd {
         Command::ToggleSidebar => state.layout.left,
         Command::ToggleRightPreview => state.layout.right,

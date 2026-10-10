@@ -113,8 +113,6 @@ fn main() -> eframe::Result<()> {
         "LaterMD",
         opts,
         Box::new(|cc| {
-            #[cfg(target_os = "macos")]
-            mac_menu::install();
             if fonts::install(&cc.egui_ctx).is_none() {
                 // M0 验证 UI 已退役,字体失配只在终端告警,不静默吞掉
                 eprintln!("LaterMD: 未找到候选 CJK 字体,中文将显示为方块");
@@ -170,6 +168,10 @@ fn main() -> eframe::Result<()> {
                 }
             }
             let mut app = LaterMdApp::new(theme, file_tree, layout);
+            #[cfg(target_os = "macos")]
+            {
+                app.native_menu = mac_menu::NativeMenu::install(&cc.egui_ctx, &app.state);
+            }
             app.frameless = !native_chrome;
             app.state.system_theme = system;
             app.state.system_theme_ok = system.is_some();
@@ -227,6 +229,8 @@ fn viewport_builder(
 /// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
 #[derive(Default)]
 struct LaterMdApp {
+    #[cfg(target_os = "macos")]
+    native_menu: Option<mac_menu::NativeMenu>,
     state: state::State,
     outbox: Vec<state::Message>,
     /// 最近一次下发给原生窗口的标题缓存;仅用于跳过重复的 set_title。

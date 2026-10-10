@@ -1746,7 +1746,15 @@ fn checkout_extra_warning(open_in_editor: bool, dirty: bool) -> Option<&'static 
 
 impl eframe::App for LaterMdApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.native_menu {
+            menu.drain(ctx, &mut self.outbox);
+        }
         self.reduce(ctx);
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.native_menu {
+            menu.finish_frame(ctx, &mut self.outbox, &self.state);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
