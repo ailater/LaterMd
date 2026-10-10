@@ -411,6 +411,24 @@ fn block_rects_id(id: egui::Id) -> egui::Id {
   id.with("block-span-rects")
 }
 
+/// One painted text galley of a label, with its screen origin, kept for the
+/// frame it was painted in so callers can hit-test click positions.
+///
+/// A label on the segmented render path paints several text galleys (one per
+/// flush range); block widgets (code fences, tables) are separate widgets and
+/// deliberately absent — clicking them resolves to `None` here, and callers
+/// fall back to the block table ([`block_span_rects`]).
+#[derive(Clone)]
+struct HitGalley {
+  galley: Arc<Galley>,
+  /// Screen-space top-left of the galley in the frame it was painted.
+  origin: Pos2,
+}
+
+fn hit_galleys_id(id: egui::Id) -> egui::Id {
+  id.with("hit-galleys")
+}
+
 /// Read the block table recorded by the last render of the label with this `id`.
 ///
 /// The table is only valid in the frame it was written (screen rects go stale
@@ -463,6 +481,89 @@ fn record_block_rect(ui: &egui::Ui, id: egui::Id, span: std::ops::Range<usize>, 
     }
     blocks.push(BlockSpanRect { span, rect });
   });
+}
+
+/// Record one painted text galley under the label's per-frame hit table.
+fn record_hit_galley(ui: &egui::Ui, id: egui::Id, galley: &Arc<Galley>, origin: Pos2) {
+  let table_id = hit_galleys_id(id);
+  // Same lock discipline as `record_block_rect`: read the frame number
+  // outside `data_mut`.
+  let frame = ui.ctx().cumulative_pass_nr();
+  ui.ctx().data_mut(|d| {
+    let (seen, galleys) = d.get_temp_mut_or_insert_with::<(u64, Vec<HitGalley>)>(table_id, || (frame, Vec::new()));
+    if *seen != frame {
+      *seen = frame;
+      galleys.clear();
+    }
+    galleys.push(HitGalley { galley: Arc::clone(galley), origin });
+  });
+}
+
+/// Reset the label's per-frame hit-galley table (same discipline as the block
+/// table reset in [`MarkdownLabel::render`]).
+fn reset_hit_galleys(ui: &egui::Ui, id: egui::Id) {
+  let table_id = hit_galleys_id(id);
+  let frame = ui.ctx().cumulative_pass_nr();
+  ui.ctx().data_mut(|d| {
+    let (seen, galleys) = d.get_temp_mut_or_insert_with::<(u64, Vec<HitGalley>)>(table_id, || (frame, Vec::new()));
+    *seen = frame;
+    galleys.clear();
+  });
+}
+
+/// Map a screen position onto the character index in the text handed to the
+/// label with this `id` (after any `heal`/pre-processing), using the galleys
+/// painted by its last render.
+///
+/// Editor hit-testing semantics: the row containing `pos.y` is found first;
+/// within it, positions left of the first glyph collapse to the row start,
+/// past a glyph's midpoint collapse to that glyph, and past the last glyph
+/// collapse to just before the row's newline. Below the last row resolves to
+/// the end of the text.
+///
+/// Returns `None` when the label was not rendered in the current frame (stale
+/// or never painted, e.g. culled), or when `pos.y` falls outside every painted
+/// text galley — gaps between blocks and block widgets (code fences, tables)
+/// have no text geometry; callers that need a caret there can resolve through
+/// [`block_span_rects`] instead.
+pub fn char_index_at_pos(ui: &egui::Ui, id: egui::Id, pos: Pos2) -> Option<usize> {
+  let (frame, galleys) = ui.data(|d| d.get_temp::<(u64, Vec<HitGalley>)>(hit_galleys_id(id)))?;
+  (frame == ui.ctx().cumulative_pass_nr()).then_some(())?;
+  for hit in &galleys {
+    let bottom = hit.origin.y + hit.galley.size().y;
+    if pos.y >= hit.origin.y && pos.y <= bottom {
+      return Some(pos_to_char_index(&hit.galley, pos - hit.origin.to_vec2()));
+    }
+  }
+  None
+}
+
+/// Character index for a position inside one galley (origin-relative).
+///
+/// Rows are scanned top-down; the first row whose bottom reaches `pos.y` wins,
+/// so a position on the seam between two rows resolves to the lower one.
+fn pos_to_char_index(galley: &Galley, pos: Pos2) -> usize {
+  let mut char_index = 0usize;
+  for row in &galley.rows {
+    if pos.y <= row.max_y() {
+      let row_chars = row.char_count_excluding_newline().0;
+      let Some(first) = row.glyphs.first() else {
+        return char_index;
+      };
+      if pos.x <= first.pos.x {
+        return char_index;
+      }
+      for (i, glyph) in row.glyphs.iter().enumerate() {
+        if pos.x <= glyph.pos.x + glyph.advance_width * 0.5 {
+          return char_index + i;
+        }
+      }
+      // Past the last glyph: end of the row's content, before its newline.
+      return char_index + row_chars;
+    }
+    char_index += row.char_count_including_newline().0;
+  }
+  char_index
 }
 
 /// Does token `i` start a new block within a flushed text run?
@@ -900,6 +1001,7 @@ impl<'a> MarkdownLabel<'a> {
       *seen = frame;
       blocks.clear();
     });
+    reset_hit_galleys(ui, self.id);
 
     // Check if we have a cached layout for this text.
     let cached: Option<CachedMarkdownLayout> = ui.data(|d| d.get_temp(cache_id));
@@ -1598,6 +1700,7 @@ impl<'a> MarkdownLabel<'a> {
       let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
       self.record_section_anchors(ui, &relative_anchors, rect.min.y);
       self.record_text_blocks(ui, &galley, rect, tokens, token_base, source_spans);
+      record_hit_galley(ui, self.id, &galley, rect.min);
       paint_decorations(ui, hr_positions, &galley, &code_block_rects, rect.min, decoration_width, style);
       ui.painter().galley(rect.min, galley.clone(), color);
       if let Some(handler) = self.link_handler {
@@ -1609,6 +1712,7 @@ impl<'a> MarkdownLabel<'a> {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     self.record_section_anchors(ui, &relative_anchors, rect.min.y);
     self.record_text_blocks(ui, &galley, rect, tokens, token_base, source_spans);
+    record_hit_galley(ui, self.id, &galley, rect.min);
     paint_decorations(ui, hr_positions, &galley, &code_block_rects, response.rect.min, decoration_width, style);
 
     let disable_text_selection = !self.selectable || ui.input(|input| input.modifiers.shift);
