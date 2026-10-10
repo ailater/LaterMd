@@ -20,7 +20,7 @@
 use std::ops::Range;
 
 /// 格式动作。十七个,与工具条四组按钮一一对应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FormatAction {
     /// `**粗体**`
     Bold,
@@ -139,7 +139,8 @@ impl FormatGroup {
         FormatGroup::List,
     ];
 
-    /// **常驻直出**的组(2026-10-08 S2-2)。行内组 + 列表组 ——
+    /// **窄档直出**的组(2026-10-08 S2-2;2026-10-10 起是三档里的最窄
+    /// 一档,宽中两档见 `ui::format_bar::tier_plan`)。行内组 + 列表组 ——
     ///
     /// 依据 ui-polish §1.2「工具栏只留高频动作,其余收进设置,可发现性由
     /// 菜单栏负责」:行内五项(B / I / S / 行内代码 / 链接)是日常打字时的
@@ -161,7 +162,8 @@ impl FormatGroup {
     /// 这次它不是事后补的,是当场拦下的。
     pub const DIRECT: [FormatGroup; 2] = [FormatGroup::Inline, FormatGroup::List];
 
-    /// 进「更多」溢出菜单的组(2026-10-08 S2-2),顺序即菜单内分段顺序。
+    /// 进「更多」溢出菜单的组(2026-10-08 S2-2,窄档;中档只收块组,
+    /// 宽档不画菜单),顺序即菜单内分段顺序。
     pub const OVERFLOW: [FormatGroup; 2] = [FormatGroup::Heading, FormatGroup::Block];
 
     /// 该组的动作,顺序即按钮顺序。
