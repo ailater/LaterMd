@@ -218,10 +218,10 @@ pub mod text {
 /// 间隔:两侧都是内容,用于控件之间。与 `inset` 拆成两个命名空间,
 /// 根治「拿间隔的量去填贴边」的度量语境错配(`RAIL_W` 48→40 事故,
 /// docs/ui-shell-redesign-v2.md §5.5)。
-// T2a 起 `XS` 已有生产消费者(sidebar 的 Git 页节间留白),模块整体不再
-// expect;`SM`/`MD` 仍暂无生产消费者,逐常量挂 expect,接线后各自摘除
-// (clippy 的 unfulfilled 会提醒)。not(test):守门测试本身就是消费方,
-// cfg(test) 下裸 expect 会 unfulfilled。
+// T2a 起 `XS` 已有生产消费者(sidebar 的 Git 页节间留白);2026-10-10 设置卡片点样起 `MD`
+// 也有了(设置卡片间距)。`SM` 仍暂无生产消费者,挂 expect,接线后
+// 摘除(clippy 的 unfulfilled 会提醒)。not(test):守门测试本身就是
+// 消费方,cfg(test) 下裸 expect 会 unfulfilled。
 pub mod gap {
     /// 同一控件内的部件之间、紧挨着的两个小控件之间。
     pub const XS: f32 = 4.0;
@@ -230,8 +230,6 @@ pub mod gap {
     #[cfg_attr(not(test), expect(dead_code))]
     pub const SM: f32 = 8.0;
     /// 一个内容组的控件/列之间:一行表单的控件与说明。
-    // 暂无生产消费者;接线后摘除。
-    #[cfg_attr(not(test), expect(dead_code))]
     pub const MD: f32 = 12.0;
 }
 
@@ -239,8 +237,8 @@ pub mod gap {
 /// 同名 `gap` 紧一档——边界不需要对称留白(`inset::MD < gap::MD` 是
 /// §4.3 的刻意关系,有守门测试钉住)。
 // T2b 起 `MD` 已有生产消费者(layout 的预览面板贴边与查找/跳转浮卡
-// 留白),模块整体不再 expect;`SM`/`LG` 仍暂无生产消费者,逐常量挂
-// expect,接线后各自摘除(clippy 的 unfulfilled 会提醒)。not(test):
+// 留白);2026-10-10 设置卡片点样起 `LG` 有了(设置卡片内边距)。`SM` 仍暂无生产消费者,
+// 挂 expect,接线后摘除(clippy 的 unfulfilled 会提醒)。not(test):
 // 守门测试本身就是消费方,cfg(test) 下裸 expect 会 unfulfilled。
 pub mod inset {
     /// 控件内容到自身边框的贴边:盒子最里面的一圈。
@@ -250,8 +248,6 @@ pub mod inset {
     /// 内容区到分组/面板边界的贴边。
     pub const MD: f32 = 8.0;
     /// 大区域到窗口边界的贴边。
-    // 暂无生产消费者;接线后摘除。
-    #[cfg_attr(not(test), expect(dead_code))]
     pub const LG: f32 = 12.0;
 }
 
@@ -304,6 +300,21 @@ pub const SETTINGS_LABEL_W: f32 = 148.0;
 /// 快捷键页的控件列。
 pub const SETTINGS_KEY_W: f32 = 140.0;
 
+// —— 设置分区卡片(2026-10-10 坤哥点样)——
+//
+// 观感形态对齐 LaterScreen 设置面板的自绘卡片(2026-10-10 坤哥点样):
+// 每个分区一张「比窗底浅一档 + 细描边 + 圆角」的卡片,标题行 = 强调色
+// 小竖条 + 加粗小字。卡片只管观感,行为仍归 settings.rs 的消息归约。
+
+/// 分区卡片内边距(卡片内容到卡片边框):一侧内容、一侧卡片边界,
+/// 语义是贴边距,取 [`inset::LG`]。
+pub const SETTINGS_CARD_PAD: i8 = inset::LG as i8;
+/// 相邻两张卡片的纵向间隔:两侧都是内容块,语义是间隔,取 [`gap::MD`]。
+pub const SETTINGS_CARD_GAP: i8 = gap::MD as i8;
+/// 卡片标题左侧的强调竖条(宽 × 高)。竖条是标题的「图钉」,属
+/// 物理几何,不进语义档。
+pub const SETTINGS_CARD_BAR: egui::Vec2 = egui::Vec2::new(3.0, 14.0);
+
 // —— 圆角 ——
 
 /// 按钮圆角(shadcn rounded-sm 档)。
@@ -314,6 +325,11 @@ pub const RADIUS_SM: f32 = 4.0;
 /// 来源:Armas / shadcn 的 `rounded-md = 6px`(docs/ui-modernization.md
 /// §2.4「白拿它产出的办法」——抄数值不引库)。
 pub const RADIUS_MD: f32 = 6.0;
+/// 卡片/大面板圆角(shadcn rounded-lg 档)。2026-10-10 设置卡片点样起设置分区卡片消费;
+/// 比控件档大一档,大面积面板的圆角再贴着控件档读会显得拘谨。
+///
+/// 来源:shadcn 的 `rounded-lg = 8px`(出处同上)。
+pub const RADIUS_LG: f32 = 8.0;
 
 // —— 语义色 ——
 
@@ -371,6 +387,7 @@ mod tests {
     #[test]
     fn u0_tokens_match_sourced_values() {
         assert_eq!(RADIUS_MD, 6.0, "shadcn rounded-md");
+        assert_eq!(RADIUS_LG, 8.0, "shadcn rounded-lg");
         assert_eq!(INPUT_H, 36.0, "shadcn h-9");
         assert_eq!(INPUT_PAD_X, 12.0, "shadcn px-3");
         assert_eq!(INPUT_PAD_Y, 8.0, "shadcn py-2");

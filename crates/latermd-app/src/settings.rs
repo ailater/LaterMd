@@ -1,6 +1,8 @@
 //! 设置对话框(docs/ui-polish.md §5)。
 //!
-//! 形态:左侧竖排分页 + 右侧内容区,单个 `egui::Window`。
+//! 形态:左侧竖排分页 + 右侧内容区,单个 `egui::Window`。内容区按分区
+//! 渲成卡片(2026-10-10 卡片点样:比窗底浅一档的圆角面板 + 强调色竖条标题,形态对齐
+//! LaterScreen 设置面板的点样)。
 //!
 //! **为什么从工具栏的「设置」菜单升级成对话框**:菜单里只能塞几行
 //! (主题列表 + 一个入口),而快捷键页有 10 行、AI 页有一串字段 —— 塞进
@@ -308,6 +310,65 @@ pub(crate) fn settings_row<R>(
     control.expect("horizontal 闭包必被调用")
 }
 
+/// 分区卡片(2026-10-10 点样):比窗底浅一档的圆角面板 + 细描边,标题行 = 强调色
+/// 小竖条 + 加粗小字。卡片只管观感,不管行为 —— 闭包里照旧走
+/// [`settings_row`] 两列与消息归约,任何一行都不会因进卡而改语义。
+///
+/// 填充/描边取 [`crate::theme::ShellTokens`] 的 `faint`/`border`(与
+/// 窗底 `content` 同一套明暗投影):卡片与窗底的层次靠同一套 token 的
+/// 明度差表达,不另立色相 —— design-system-plan §5.3 的口径。
+fn card<R>(
+    ui: &mut egui::Ui,
+    shell: &crate::theme::ShellTokens,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::NONE
+        .fill(shell.faint)
+        .stroke(egui::Stroke::new(1.0, shell.border))
+        .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_LG as u8))
+        .inner_margin(egui::Margin::same(crate::ui::tokens::SETTINGS_CARD_PAD))
+        .outer_margin(egui::Margin {
+            bottom: crate::ui::tokens::SETTINGS_CARD_GAP,
+            ..Default::default()
+        })
+        .show(ui, |ui| {
+            // 撑满内容区宽:卡片是一整块分区面,不随内容缩窄
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    crate::ui::tokens::SETTINGS_CARD_BAR,
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(2),
+                    crate::ui::tokens::accent(ui),
+                );
+                ui.strong(egui::RichText::new(title).size(crate::ui::tokens::FONT_SM));
+            });
+            ui.add_space(crate::ui::tokens::SPACE_XS);
+            body(ui)
+        })
+        .inner
+}
+
+/// 主操作按钮(各页的「保存」):强调色实心底 + 反色文字,禁用态仍由
+/// `enabled` 表达(egui 出厂灰化)。反色文字按明暗各取一档:浅色强调
+/// #3370FF 配白字(对比约 4.6:1);暗色强调 #6C9FFF 偏亮,白字只有
+/// 约 2:1,配 shell 最沉的 `sidebar` 反而读得清。
+pub(crate) fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let ink = if ui.visuals().dark_mode {
+        crate::theme::shell_tokens(true).sidebar
+    } else {
+        egui::Color32::WHITE
+    };
+    let button = egui::Button::new(egui::RichText::new(text).color(ink).strong())
+        .fill(crate::ui::tokens::accent(ui))
+        .corner_radius(egui::CornerRadius::same(crate::ui::tokens::RADIUS_SM as u8));
+    ui.add_enabled(enabled, button)
+}
+
 /// 绘制设置对话框;返回窗口关闭按钮的响应,**窗口未绘制(已关闭)时为
 /// `None`**(测试据此断言「关闭后不再进入绘制路径」)。
 // 参数各自属于 State 的不同字段,打包成结构会造出人为聚合(vendored 层
@@ -432,6 +493,12 @@ pub fn dialog(
                         if mac && settings.tab == SettingsTab::Appearance {
                             ui.weak(egui::RichText::new("更改即时生效").size(11.0));
                         }
+                        ui.add_space(crate::ui::tokens::SPACE_SM);
+                        // 左端版本号:右到左布局里嵌一层左到右,吃掉余宽即
+                        // 落到最左(2026-10-10 卡片点样,对齐 LaterScreen 的页脚信息位)
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.weak(concat!("LaterMD v", env!("CARGO_PKG_VERSION")));
+                        });
                     });
                 });
             // 左:竖排分页(固定宽;WorkBuddy 观感 = 分页列吃侧栏灰、内容区吃窗底)
@@ -523,6 +590,7 @@ fn appearance(
     );
 }
 
+/// 非 macOS 的外观页(#169 拆出 legacy 名分):卡片化正文在此。
 fn appearance_legacy(
     ui: &mut egui::Ui,
     settings: &mut SettingsState,
@@ -532,180 +600,182 @@ fn appearance_legacy(
     resolved: ThemeMode,
     outbox: &mut Vec<Message>,
 ) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     ui.heading("外观");
     ui.add_space(crate::ui::tokens::SPACE_SM);
     // #70 M2:本页全部配置行走 settings_row 两列(标签列定宽、控件列同
     // 起点);原「整句标签 + 下一行控件」的区块说明拆出的文字保留在行下
-    // weak 行,信息零丢失
-    settings_row(ui, "主题", |ui| {
-        for mode in ThemeMode::ALL {
-            if ui
-                .selectable_label(theme.mode == mode, mode.label())
-                .clicked()
-            {
-                outbox.push(Message::ThemeChanged(mode));
-            }
-        }
-    });
-    ui.weak("外壳与正文、代码块同帧联动。");
-    if theme.mode == ThemeMode::System {
-        // #33:跟随系统时明暗来自系统检测,把解析值显出来——否则用户以为
-        // 「我选的深色被重置了」(实际是系统侧变了/检测值与期望不符)
-        ui.weak(format!(
-            "跟随系统中:当前解析为「{}」;想固定明暗请直接选深色/浅色",
-            resolved.label()
-        ));
-    }
-    if theme.mode == ThemeMode::System && !system_theme_ok {
-        // 检测不到就直说:Linux 无统一规范(roadmap 风险 #8),此时回落的
-        // 是上一次的手动选择,不该让用户以为「跟随系统」正在生效
-        ui.colored_label(
-            crate::ui::tokens::WARN,
-            "本机读不到系统主题设置,已回落到手动值",
-        );
-    }
-
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    let current = theme.skin.as_deref();
-    settings_row(ui, "皮肤", |ui| {
-        egui::ComboBox::from_id_salt("settings-skin-select")
-            .selected_text(current.unwrap_or("出厂默认"))
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(current.is_none(), "出厂默认").clicked() && current.is_some()
+    // weak 行,信息零丢失。2026-10-10 起按卡片点样分区再归入卡片。
+    card(ui, &shell, "主题与皮肤", |ui| {
+        settings_row(ui, "主题", |ui| {
+            for mode in ThemeMode::ALL {
+                if ui
+                    .selectable_label(theme.mode == mode, mode.label())
+                    .clicked()
                 {
-                    outbox.push(Message::ThemeSkinSelected(None));
+                    outbox.push(Message::ThemeChanged(mode));
                 }
-                for skin in &skins.skins {
-                    if ui
-                        .selectable_label(current == Some(skin.name.as_str()), &skin.name)
-                        .clicked()
+            }
+        });
+        ui.weak("外壳与正文、代码块同帧联动。");
+        if theme.mode == ThemeMode::System {
+            // #33:跟随系统时明暗来自系统检测,把解析值显出来——否则用户以为
+            // 「我选的深色被重置了」(实际是系统侧变了/检测值与期望不符)
+            ui.weak(format!(
+                "跟随系统中:当前解析为「{}」;想固定明暗请直接选深色/浅色",
+                resolved.label()
+            ));
+        }
+        if theme.mode == ThemeMode::System && !system_theme_ok {
+            // 检测不到就直说:Linux 无统一规范(roadmap 风险 #8),此时回落的
+            // 是上一次的手动选择,不该让用户以为「跟随系统」正在生效
+            ui.colored_label(
+                crate::ui::tokens::WARN,
+                "本机读不到系统主题设置,已回落到手动值",
+            );
+        }
+        let current = theme.skin.as_deref();
+        settings_row(ui, "皮肤", |ui| {
+            egui::ComboBox::from_id_salt("settings-skin-select")
+                .selected_text(current.unwrap_or("出厂默认"))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(current.is_none(), "出厂默认").clicked()
+                        && current.is_some()
                     {
-                        outbox.push(Message::ThemeSkinSelected(Some(skin.name.clone())));
+                        outbox.push(Message::ThemeSkinSelected(None));
                     }
+                    for skin in &skins.skins {
+                        if ui
+                            .selectable_label(current == Some(skin.name.as_str()), &skin.name)
+                            .clicked()
+                        {
+                            outbox.push(Message::ThemeSkinSelected(Some(skin.name.clone())));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("正文与代码高亮样式");
+        });
+        settings_row(ui, "导出皮肤", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.skin_export_name)
+                    .hint_text("皮肤名")
+                    .desired_width(140.0),
+            );
+            let name = settings.skin_export_name.trim();
+            if ui
+                .add_enabled(!name.is_empty(), egui::Button::new("导出当前样式"))
+                .clicked()
+            {
+                outbox.push(Message::ThemeSkinExported {
+                    name: name.to_owned(),
+                });
+            }
+        });
+        ui.weak("导出到配置目录 themes/ 下,改名或删文件即增删皮肤。");
+    });
+
+    card(ui, &shell, "排版", |ui| {
+        settings_row(ui, "界面密度", |ui| {
+            for density in Density::ALL {
+                if ui
+                    .selectable_label(theme.density == density, density.label())
+                    .clicked()
+                {
+                    outbox.push(Message::ThemeDensityChanged(density));
                 }
-            })
-            .response
-            .on_hover_text("正文与代码高亮样式");
-    });
-    settings_row(ui, "导出皮肤", |ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut settings.skin_export_name)
-                .hint_text("皮肤名")
-                .desired_width(140.0),
-        );
-        let name = settings.skin_export_name.trim();
-        if ui
-            .add_enabled(!name.is_empty(), egui::Button::new("导出当前样式"))
-            .clicked()
-        {
-            outbox.push(Message::ThemeSkinExported {
-                name: name.to_owned(),
-            });
-        }
-    });
-    ui.weak("导出到配置目录 themes/ 下,改名或删文件即增删皮肤。");
-
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    settings_row(ui, "界面密度", |ui| {
-        for density in Density::ALL {
-            if ui
-                .selectable_label(theme.density == density, density.label())
-                .clicked()
-            {
-                outbox.push(Message::ThemeDensityChanged(density));
             }
-        }
-    });
-    ui.weak("密度改间距与控件尺寸;字号在下方「排版」单独设置。");
+        });
+        ui.weak("密度改间距与控件尺寸;字号在下方单独设置。");
 
-    // 排版偏好(#23 F2+F3):滑杆从 theme 读**回显副本**,拖动中值变化的
-    // 每帧都发消息,归约落字段并写 settings.json,下一帧滑杆位置即归约后
-    // 的值 —— 与上方主题/密度选择的「即时生效」同款(不是 AI 页的草稿
-    // 模式:字号/行距是拖一下就该看到的偏好,没有「保存」步骤)。渲染投影
-    // 自 F3 起生效:`ThemeSettings::apply` 每帧把字号投到 Monospace 档
-    // (编辑器)并覆盖 markdown style 的行距倍率(预览)。
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    settings_row(ui, "字号", |ui| {
-        let mut font_size = theme.editor_font_size;
-        let response = ui.add(
-            egui::Slider::new(&mut font_size, EDITOR_FONT_SIZE_MIN..=EDITOR_FONT_SIZE_MAX)
-                .integer(),
-        );
-        if response.changed() {
-            outbox.push(Message::EditorFontSizeChanged(font_size));
-        }
-        response
-    })
-    .on_hover_text("正文基准字号,作用于编辑器与预览(标题按比例放大)。下限 12 是中文(CJK)可读性下限,不再往下放。");
-    settings_row(ui, "行距", |ui| {
-        let mut line_height = theme.line_height;
-        let response = ui.add(
-            egui::Slider::new(&mut line_height, LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX)
-                .fixed_decimals(1)
-                .step_by(0.1),
-        );
-        if response.changed() {
-            outbox.push(Message::EditorLineHeightChanged(line_height));
-        }
-        response
-    })
-    .on_hover_text("正文行距倍率(如 1.5 = 1.5 倍字号)。中文可读区间通常在 1.5–1.8。");
-
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    // #55 M2:minimap 开关与排版滑杆同款「回显副本 + changed() 即时发消息」
-    // 模式(不是 AI/MCP 页的草稿模式:开关拨一下就该看到)。全局偏好,
-    // 所有标签同开同关。
-    settings_row(ui, "Minimap", |ui| {
-        let mut show_minimap = theme.show_minimap;
-        let response = ui.checkbox(&mut show_minimap, "显示源码侧缩略导航(编辑区右缘)");
-        if response.changed() {
-            outbox.push(Message::ShowMinimapToggled(show_minimap));
-        }
-    });
-    // #64 M1:打字机模式开关(#55 同款「回显副本 + changed() 即时发消息」
-    // 模式)。全局偏好,源码与 Live 两模式共用;默认关(改变滚动行为的
-    // 功能出厂不替用户决定,取舍见 decisions-pending #121)。
-    settings_row(ui, "打字机模式", |ui| {
-        let mut show_typewriter = theme.show_typewriter;
-        let response = ui.checkbox(&mut show_typewriter, "光标行保持视口 1/3 线");
-        if response.changed() {
-            outbox.push(Message::TypewriterToggled(show_typewriter));
-        }
-    });
-    // #64 M2:专注模式开关(#55 同款「回显副本 + changed() 即时发消息」
-    // 模式)。全局偏好;Live 模式淡化非活动块,源码模式不接线(单
-    // TextEdit 无法分段淡化,decisions-pending #122);默认关。
-    settings_row(ui, "专注模式", |ui| {
-        let mut show_focus_mode = theme.show_focus_mode;
-        let response = ui.checkbox(&mut show_focus_mode, "Live 下淡化光标块之外的块");
-        if response.changed() {
-            outbox.push(Message::FocusModeToggled(show_focus_mode));
-        }
-    });
-
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    // #57 M2:左缘标签导航三态,与主题/密度选择同款 selectable_label
-    // (即时生效,非草稿模式 —— 显示偏好拨一下就该看到)。默认悬停,
-    // 常显/关闭是显式选择(取舍见 decisions-pending #107)。
-    settings_row(ui, "禅定模式", |ui| {
-        for mode in ZenNavMode::ALL {
-            if ui
-                .selectable_label(theme.zen_nav == mode, mode.label())
-                .clicked()
-            {
-                outbox.push(Message::ZenNavModeChanged(mode));
+        // 排版偏好(#23 F2+F3):滑杆从 theme 读**回显副本**,拖动中值变化的
+        // 每帧都发消息,归约落字段并写 settings.json,下一帧滑杆位置即归约后
+        // 的值 —— 与上方主题/密度选择的「即时生效」同款(不是 AI 页的草稿
+        // 模式:字号/行距是拖一下就该看到的偏好,没有「保存」步骤)。渲染投影
+        // 自 F3 起生效:`ThemeSettings::apply` 每帧把字号投到 Monospace 档
+        // (编辑器)并覆盖 markdown style 的行距倍率(预览)。
+        settings_row(ui, "字号", |ui| {
+            let mut font_size = theme.editor_font_size;
+            let response = ui.add(
+                egui::Slider::new(&mut font_size, EDITOR_FONT_SIZE_MIN..=EDITOR_FONT_SIZE_MAX)
+                    .integer(),
+            );
+            if response.changed() {
+                outbox.push(Message::EditorFontSizeChanged(font_size));
             }
-        }
+            response
+        })
+        .on_hover_text("正文基准字号,作用于编辑器与预览(标题按比例放大)。下限 12 是中文(CJK)可读性下限,不再往下放。");
+        settings_row(ui, "行距", |ui| {
+            let mut line_height = theme.line_height;
+            let response = ui.add(
+                egui::Slider::new(&mut line_height, LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX)
+                    .fixed_decimals(1)
+                    .step_by(0.1),
+            );
+            if response.changed() {
+                outbox.push(Message::EditorLineHeightChanged(line_height));
+            }
+            response
+        })
+        .on_hover_text("正文行距倍率(如 1.5 = 1.5 倍字号)。中文可读区间通常在 1.5–1.8。");
     });
-    ui.weak("左缘标签导航:悬停=移近左缘唤出;常显=进入禅定即显示;关闭=不渲染。");
 
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
-    // 决策,这里只显示不切换
-    settings_row(ui, "渲染后端", |ui| {
-        ui.weak(crate::renderer_label(
-            std::env::var("LATERMD_RENDERER").ok().as_deref(),
-        ));
+    card(ui, &shell, "编辑区", |ui| {
+        // #55 M2:minimap 开关与排版滑杆同款「回显副本 + changed() 即时发消息」
+        // 模式(不是 AI/MCP 页的草稿模式:开关拨一下就该看到)。全局偏好,
+        // 所有标签同开同关。
+        settings_row(ui, "Minimap", |ui| {
+            let mut show_minimap = theme.show_minimap;
+            let response = ui.checkbox(&mut show_minimap, "显示源码侧缩略导航(编辑区右缘)");
+            if response.changed() {
+                outbox.push(Message::ShowMinimapToggled(show_minimap));
+            }
+        });
+        // #64 M1:打字机模式开关(#55 同款「回显副本 + changed() 即时发消息」
+        // 模式)。全局偏好,源码与 Live 两模式共用;默认关(改变滚动行为的
+        // 功能出厂不替用户决定,取舍见 decisions-pending #121)。
+        settings_row(ui, "打字机模式", |ui| {
+            let mut show_typewriter = theme.show_typewriter;
+            let response = ui.checkbox(&mut show_typewriter, "光标行保持视口 1/3 线");
+            if response.changed() {
+                outbox.push(Message::TypewriterToggled(show_typewriter));
+            }
+        });
+        // #64 M2:专注模式开关(#55 同款「回显副本 + changed() 即时发消息」
+        // 模式)。全局偏好;Live 模式淡化非活动块,源码模式不接线(单
+        // TextEdit 无法分段淡化,decisions-pending #122);默认关。
+        settings_row(ui, "专注模式", |ui| {
+            let mut show_focus_mode = theme.show_focus_mode;
+            let response = ui.checkbox(&mut show_focus_mode, "Live 下淡化光标块之外的块");
+            if response.changed() {
+                outbox.push(Message::FocusModeToggled(show_focus_mode));
+            }
+        });
+        // #57 M2:左缘标签导航三态,与主题/密度选择同款 selectable_label
+        // (即时生效,非草稿模式 —— 显示偏好拨一下就该看到)。默认悬停,
+        // 常显/关闭是显式选择(取舍见 decisions-pending #107)。
+        settings_row(ui, "禅定模式", |ui| {
+            for mode in ZenNavMode::ALL {
+                if ui
+                    .selectable_label(theme.zen_nav == mode, mode.label())
+                    .clicked()
+                {
+                    outbox.push(Message::ZenNavModeChanged(mode));
+                }
+            }
+        });
+        ui.weak("左缘标签导航:悬停=移近左缘唤出;常显=进入禅定即显示;关闭=不渲染。");
+    });
+
+    card(ui, &shell, "渲染", |ui| {
+        // 只读信息(AGENTS.md §5):后端是编译期 feature + 启动环境变量的
+        // 决策,这里只显示不切换
+        settings_row(ui, "渲染后端", |ui| {
+            ui.weak(crate::renderer_label(
+                std::env::var("LATERMD_RENDERER").ok().as_deref(),
+            ));
+        });
     });
 }
 
@@ -716,6 +786,7 @@ fn keymap_page(
     keymap: &Keymap,
     outbox: &mut Vec<Message>,
 ) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     ui.heading("快捷键");
     ui.weak("点击键位按钮后按下新组合;Esc 取消,Backspace 清除绑定。");
     ui.add_space(crate::ui::tokens::SPACE_SM);
@@ -727,40 +798,43 @@ fn keymap_page(
     // #70 M2:原 Grid(命令/键位/清除/重置 四列)语义等价迁移到统一两列
     // helper —— 命令标签进标签列,其余三段控件依序进控件列;捕获态与
     // notice 的原地翻转逻辑分毫未动。Grid 退役后不再有表 id。
-    for cmd in Command::ALL {
-        settings_row(ui, cmd.label(), |ui| {
-            let capturing = settings.capture == Some(cmd);
-            let text = keymap
-                .get(cmd)
-                .map(|shortcut| shortcut.platform_text())
-                .unwrap_or_else(|| "未绑定".to_owned());
-            // 键位按钮统一最小宽:37 行的「键位 / 清除 / 重置」排成等宽
-            // 三段(原 Grid 的列对齐观感),否则按钮随组合键文字长短伸缩,
-            // 右侧两列呈锯齿。捕获态文案缩短 ——「Esc 取消」已在页首说明
-            let button = if capturing {
-                // 捕获中:按钮本体即提示,再点一次取消
-                egui::Button::new(
-                    egui::RichText::new("按下新键位…").color(crate::ui::tokens::accent(ui)),
-                )
-            } else {
-                egui::Button::new(text)
-            }
-            .min_size(egui::vec2(crate::ui::tokens::SETTINGS_KEY_W, 0.0));
-            if ui.add(button).clicked() {
-                // 原地翻转:捕获是纯 UI 关注点,键位落盘在归约
-                settings.capture = if capturing { None } else { Some(cmd) };
-                settings.notice = None;
-            }
-            if ui.small_button("清除").clicked() {
-                outbox.push(Message::KeymapCleared(cmd));
-            }
-            if ui.small_button("重置").clicked() {
-                outbox.push(Message::KeymapReset(cmd));
-            }
-        });
-    }
+    // 2026-10-10 卡片点样:37 行命令整体入卡,「全部恢复默认」留在卡外(全页动作,
+    // 不属于任何单条命令)。
+    card(ui, &shell, "命令", |ui| {
+        for cmd in Command::ALL {
+            settings_row(ui, cmd.label(), |ui| {
+                let capturing = settings.capture == Some(cmd);
+                let text = keymap
+                    .get(cmd)
+                    .map(|shortcut| shortcut.platform_text())
+                    .unwrap_or_else(|| "未绑定".to_owned());
+                // 键位按钮统一最小宽:37 行的「键位 / 清除 / 重置」排成等宽
+                // 三段(原 Grid 的列对齐观感),否则按钮随组合键文字长短伸缩,
+                // 右侧两列呈锯齿。捕获态文案缩短 ——「Esc 取消」已在页首说明
+                let button = if capturing {
+                    // 捕获中:按钮本体即提示,再点一次取消
+                    egui::Button::new(
+                        egui::RichText::new("按下新键位…").color(crate::ui::tokens::accent(ui)),
+                    )
+                } else {
+                    egui::Button::new(text)
+                }
+                .min_size(egui::vec2(crate::ui::tokens::SETTINGS_KEY_W, 0.0));
+                if ui.add(button).clicked() {
+                    // 原地翻转:捕获是纯 UI 关注点,键位落盘在归约
+                    settings.capture = if capturing { None } else { Some(cmd) };
+                    settings.notice = None;
+                }
+                if ui.small_button("清除").clicked() {
+                    outbox.push(Message::KeymapCleared(cmd));
+                }
+                if ui.small_button("重置").clicked() {
+                    outbox.push(Message::KeymapReset(cmd));
+                }
+            });
+        }
+    });
 
-    ui.add_space(crate::ui::tokens::SPACE_MD);
     let reset_all = ui.add_enabled(!keymap.is_default(), egui::Button::new("全部恢复默认"));
     if reset_all.clicked() {
         outbox.push(Message::KeymapResetAll);
@@ -781,7 +855,9 @@ fn ai_page(
     ai_key: &mut AiKeyState,
     outbox: &mut Vec<Message>,
 ) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     ui.heading("AI");
+    ui.add_space(crate::ui::tokens::SPACE_SM);
     // 字段级借用拆分:候选列表只读,草稿可变(下同 key_editor 的 creds)
     let models = &settings.models;
     let draft = &mut settings.ai_draft;
@@ -789,133 +865,133 @@ fn ai_page(
     // Ollama 连本机服务,参数照常参与
     let editable = draft.provider.uses_settings();
 
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    let mut provider = draft.provider;
-    settings_row(ui, "Provider", |ui| {
-        egui::ComboBox::from_id_salt("settings-ai-provider")
-            .selected_text(provider.label())
-            .show_ui(ui, |ui| {
-                for kind in ProviderKind::ALL {
-                    ui.selectable_value(&mut provider, kind, kind.label());
-                }
-            });
-    });
-    if provider != draft.provider {
-        // 切换时端点/模型的出厂值跟随;手改过的字段不动
-        draft.adopt_provider_defaults(provider);
-    }
-    ui.weak(draft.provider.description());
-
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    let factory = draft.provider.factory();
-    ui.add_enabled_ui(editable, |ui| {
-        settings_row(ui, "Base URL", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut draft.base_url)
-                    .hint_text(factory.base_url.as_str())
-                    .desired_width(f32::INFINITY),
-            );
+    card(ui, &shell, "服务", |ui| {
+        let mut provider = draft.provider;
+        settings_row(ui, "Provider", |ui| {
+            egui::ComboBox::from_id_salt("settings-ai-provider")
+                .selected_text(provider.label())
+                .show_ui(ui, |ui| {
+                    for kind in ProviderKind::ALL {
+                        ui.selectable_value(&mut provider, kind, kind.label());
+                    }
+                });
         });
-        settings_row(ui, "模型", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut draft.model)
-                    .hint_text(factory.model.as_str())
-                    .desired_width(f32::INFINITY),
-            );
-        });
-        // 拉取成功后的候选下拉:与手输框并存,点选才覆盖草稿;手输名不
-        // 在列表时回显带「(手输)」标记,不强制改写(decisions-pending #109)
-        if !models.options.is_empty() {
-            let known = models.options.iter().any(|name| name == &draft.model);
-            let selected = if known {
-                draft.model.clone()
-            } else if draft.model.trim().is_empty() {
-                format!("已获取 {} 个模型,点选填入", models.options.len())
-            } else {
-                format!("{}(手输)", draft.model)
-            };
-            settings_row(ui, "已获取", |ui| {
-                egui::ComboBox::from_id_salt("settings-ai-models-known")
-                    .selected_text(selected)
-                    .show_ui(ui, |ui| {
-                        for name in &models.options {
-                            ui.selectable_value(&mut draft.model, name.clone(), name);
-                        }
-                    });
-            });
+        if provider != draft.provider {
+            // 切换时端点/模型的出厂值跟随;手改过的字段不动
+            draft.adopt_provider_defaults(provider);
         }
+        ui.weak(draft.provider.description());
     });
 
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    // 上下文大小(#58 M3,decisions-pending #110):进入 prompt 的文档/
-    // diff 字节上限,0 = 跟随现状默认(摘要 32KB / commit diff 16KB)。
-    // prompt 组装在 provider 之前,Mock 同样生效,不随 provider 灰显。
-    settings_row(ui, "上下文大小(KB)", |ui| {
-        ui.add(egui::Slider::new(&mut draft.context_kb, 0..=CONTEXT_KB_MAX).text("KB"));
-    });
-    ui.weak(
-        "0 = 跟随默认(摘要文档 32KB / commit diff 16KB);\
-         超出上限的内容截断后进请求,约 1KB ≈ 250-350 token。",
-    );
+    card(ui, &shell, "端点与模型", |ui| {
+        let factory = draft.provider.factory();
+        ui.add_enabled_ui(editable, |ui| {
+            settings_row(ui, "Base URL", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.base_url)
+                        .hint_text(factory.base_url.as_str())
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            settings_row(ui, "模型", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.model)
+                        .hint_text(factory.model.as_str())
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            // 拉取成功后的候选下拉:与手输框并存,点选才覆盖草稿;手输名不
+            // 在列表时回显带「(手输)」标记,不强制改写(decisions-pending #109)
+            if !models.options.is_empty() {
+                let known = models.options.iter().any(|name| name == &draft.model);
+                let selected = if known {
+                    draft.model.clone()
+                } else if draft.model.trim().is_empty() {
+                    format!("已获取 {} 个模型,点选填入", models.options.len())
+                } else {
+                    format!("{}(手输)", draft.model)
+                };
+                settings_row(ui, "已获取", |ui| {
+                    egui::ComboBox::from_id_salt("settings-ai-models-known")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for name in &models.options {
+                                ui.selectable_value(&mut draft.model, name.clone(), name);
+                            }
+                        });
+                });
+            }
+        });
 
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    // 「获取模型列表」(#58 M2):Mock 不联网禁用并说明;拉取中禁用防重入,
-    // 按钮文字就是拉取中状态(与 bed 测试上传同款禁用 + 悬停说明)
-    let fetching = models.is_fetching();
-    let hover = if fetching {
-        Some("正在拉取模型列表…")
-    } else if !editable {
-        Some("Mock 不联网,无需获取模型列表")
-    } else {
-        None
-    };
-    let fetch = ui.add_enabled(
-        editable && !fetching,
-        egui::Button::new(if fetching {
-            "获取中…"
+        // 上下文大小(#58 M3,decisions-pending #110):进入 prompt 的文档/
+        // diff 字节上限,0 = 跟随现状默认(摘要 32KB / commit diff 16KB)。
+        // prompt 组装在 provider 之前,Mock 同样生效,不随 provider 灰显。
+        settings_row(ui, "上下文大小(KB)", |ui| {
+            ui.add(egui::Slider::new(&mut draft.context_kb, 0..=CONTEXT_KB_MAX).text("KB"));
+        });
+        ui.weak(
+            "0 = 跟随默认(摘要文档 32KB / commit diff 16KB);\
+             超出上限的内容截断后进请求,约 1KB ≈ 250-350 token。",
+        );
+
+        // 「获取模型列表」(#58 M2):Mock 不联网禁用并说明;拉取中禁用防重入,
+        // 按钮文字就是拉取中状态(与 bed 测试上传同款禁用 + 悬停说明)
+        ui.add_space(crate::ui::tokens::SPACE_SM);
+        let fetching = models.is_fetching();
+        let hover = if fetching {
+            Some("正在拉取模型列表…")
+        } else if !editable {
+            Some("Mock 不联网,无需获取模型列表")
         } else {
-            "获取模型列表"
-        }),
-    );
-    // on_disabled_hover_text 消费 Response:先算悬停文案再一次性挂上
-    let fetch = match hover {
-        Some(text) => fetch.on_disabled_hover_text(text),
-        None => fetch,
-    };
-    if editable && !fetching && fetch.clicked() {
-        outbox.push(Message::AiModelsFetchRequested);
-    }
-    if let Some(error) = &models.error {
-        ui.colored_label(crate::ui::tokens::WARN, error);
-    }
-
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.horizontal(|ui| {
-        let dirty = *draft != ai.config;
-        let save = ui.add_enabled(dirty, egui::Button::new("保存"));
-        if save.clicked() {
-            outbox.push(Message::AiConfigSaved(draft.clone()));
+            None
+        };
+        let fetch = ui.add_enabled(
+            editable && !fetching,
+            egui::Button::new(if fetching {
+                "获取中…"
+            } else {
+                "获取模型列表"
+            }),
+        );
+        // on_disabled_hover_text 消费 Response:先算悬停文案再一次性挂上
+        let fetch = match hover {
+            Some(text) => fetch.on_disabled_hover_text(text),
+            None => fetch,
+        };
+        if editable && !fetching && fetch.clicked() {
+            outbox.push(Message::AiModelsFetchRequested);
         }
-        let revert = ui.add_enabled(dirty, egui::Button::new("放弃修改"));
-        if revert.clicked() {
-            *draft = ai.config.clone();
+        if let Some(error) = &models.error {
+            ui.colored_label(crate::ui::tokens::WARN, error);
+        }
+
+        ui.add_space(crate::ui::tokens::SPACE_SM);
+        ui.horizontal(|ui| {
+            let dirty = *draft != ai.config;
+            let save = primary_button(ui, "保存", dirty);
+            if save.clicked() {
+                outbox.push(Message::AiConfigSaved(draft.clone()));
+            }
+            let revert = ui.add_enabled(dirty, egui::Button::new("放弃修改"));
+            if revert.clicked() {
+                *draft = ai.config.clone();
+            }
+        });
+        ui.weak(format!(
+            "当前生效:{} · {}",
+            ai.provider_label(),
+            ai.config.model
+        ));
+        // 端点只在联网型 provider 下有意义(Mock 不联网,不显示以免误导;
+        // Ollama 连本机服务,算联网型)
+        if ai.config.connects_network() {
+            ui.weak(ai.config.base_url_trimmed());
         }
     });
-    ui.weak(format!(
-        "当前生效:{} · {}",
-        ai.provider_label(),
-        ai.config.model
-    ));
-    // 端点只在联网型 provider 下有意义(Mock 不联网,不显示以免误导;
-    // Ollama 连本机服务,算联网型)
-    if ai.config.connects_network() {
-        ui.weak(ai.config.base_url_trimmed());
-    }
 
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    ui.separator();
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    ai_key::key_editor(ui, ai_key, outbox);
+    card(ui, &shell, "凭据", |ui| {
+        ai_key::key_editor(ui, ai_key, outbox)
+    });
 }
 
 /// MCP 页:开关 + 端口 + 工具权限 + 状态行 + 调用计数。
@@ -929,6 +1005,7 @@ fn mcp_page(
     mcp: &McpState,
     outbox: &mut Vec<Message>,
 ) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     ui.heading("MCP");
     ui.weak(
         "应用开着就能被本机其他 AI(Claude Code / Cursor 等)调用,检索这个文档库。\
@@ -937,80 +1014,81 @@ fn mcp_page(
     ui.add_space(crate::ui::tokens::SPACE_SM);
 
     let draft = &mut settings.mcp_draft;
-    settings_row(ui, "MCP 服务", |ui| {
-        ui.checkbox(&mut draft.enabled, "启用本地 MCP 服务(默认关闭)");
-    });
-    ui.add_enabled_ui(draft.enabled, |ui| {
-        settings_row(ui, "HTTP 端口", |ui| {
-            ui.add(egui::DragValue::new(&mut draft.http_port).range(McpConfig::PORT_RANGE));
-            ui.weak("只监听 127.0.0.1,外部机器连不上");
+    card(ui, &shell, "服务", |ui| {
+        settings_row(ui, "MCP 服务", |ui| {
+            ui.checkbox(&mut draft.enabled, "启用本地 MCP 服务(默认关闭)");
+        });
+        ui.add_enabled_ui(draft.enabled, |ui| {
+            settings_row(ui, "HTTP 端口", |ui| {
+                ui.add(egui::DragValue::new(&mut draft.http_port).range(McpConfig::PORT_RANGE));
+                ui.weak("只监听 127.0.0.1,外部机器连不上");
+            });
         });
     });
 
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.strong("工具权限(关掉的工具对客户端就不存在):");
-    for kind in ToolKind::ALL {
-        let mut on = draft.tool_enabled(kind);
-        let label = format!("{} — {}", kind.name(), kind.description());
-        if ui.checkbox(&mut on, label).changed() {
-            draft.tools.insert(kind.name().to_owned(), on);
-        }
-    }
-
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    ui.separator();
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    settings_row(ui, "状态", |ui| {
-        // 失败态用警示色:端口被占用是最常见的失败,不能混在普通文字里
-        let label = mcp.status.label();
-        if matches!(mcp.status, crate::mcp::McpStatus::Failed(_)) {
-            ui.colored_label(crate::ui::tokens::WARN, label);
-        } else {
-            ui.label(label);
-        }
-    });
-    settings_row(ui, "检索范围", |ui| match mcp.root() {
-        Some(root) => {
-            ui.weak(root.display().to_string());
-        }
-        None => {
-            ui.colored_label(
-                crate::ui::tokens::WARN,
-                "未设置文件树根目录:先选一个目录,否则所有工具都会拒绝执行。",
-            );
-        }
-    });
-
-    if !mcp.counts.is_empty() {
-        ui.add_space(crate::ui::tokens::SPACE_SM);
-        ui.strong("本次运行调用次数:");
+    card(ui, &shell, "工具权限", |ui| {
+        ui.weak("关掉的工具对客户端就不存在:");
         for kind in ToolKind::ALL {
-            if let Some(count) = mcp.counts.get(kind.name()) {
-                ui.horizontal(|ui| {
-                    ui.monospace(kind.name());
-                    ui.weak(count.to_string());
-                });
+            let mut on = draft.tool_enabled(kind);
+            let label = format!("{} — {}", kind.name(), kind.description());
+            if ui.checkbox(&mut on, label).changed() {
+                draft.tools.insert(kind.name().to_owned(), on);
             }
         }
-    }
+    });
 
-    // 客户端接线示例:用户照抄即可,省去查文档
-    if mcp.config.enabled {
-        ui.add_space(crate::ui::tokens::SPACE_SM);
-        settings_row(ui, "客户端配置", |ui| {
-            let url = format!("http://127.0.0.1:{}/mcp", mcp.config.http_port);
-            ui.monospace(&url);
-            if ui.small_button("复制").clicked() {
-                ui.ctx().copy_text(url.clone());
+    card(ui, &shell, "运行状态", |ui| {
+        settings_row(ui, "状态", |ui| {
+            // 失败态用警示色:端口被占用是最常见的失败,不能混在普通文字里
+            let label = mcp.status.label();
+            if matches!(mcp.status, crate::mcp::McpStatus::Failed(_)) {
+                ui.colored_label(crate::ui::tokens::WARN, label);
+            } else {
+                ui.label(label);
             }
         });
-        ui.weak("stdio 方式(客户端自己拉起进程): latermd --mcp-stdio");
-    }
+        settings_row(ui, "检索范围", |ui| match mcp.root() {
+            Some(root) => {
+                ui.weak(root.display().to_string());
+            }
+            None => {
+                ui.colored_label(
+                    crate::ui::tokens::WARN,
+                    "未设置文件树根目录:先选一个目录,否则所有工具都会拒绝执行。",
+                );
+            }
+        });
 
-    ui.add_space(crate::ui::tokens::SPACE_SM);
+        if !mcp.counts.is_empty() {
+            ui.add_space(crate::ui::tokens::SPACE_SM);
+            ui.strong("本次运行调用次数:");
+            for kind in ToolKind::ALL {
+                if let Some(count) = mcp.counts.get(kind.name()) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(kind.name());
+                        ui.weak(count.to_string());
+                    });
+                }
+            }
+        }
+
+        // 客户端接线示例:用户照抄即可,省去查文档
+        if mcp.config.enabled {
+            ui.add_space(crate::ui::tokens::SPACE_SM);
+            settings_row(ui, "客户端配置", |ui| {
+                let url = format!("http://127.0.0.1:{}/mcp", mcp.config.http_port);
+                ui.monospace(&url);
+                if ui.small_button("复制").clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+            });
+            ui.weak("stdio 方式(客户端自己拉起进程): latermd --mcp-stdio");
+        }
+    });
+
     ui.horizontal(|ui| {
         let dirty = *draft != mcp.config;
-        let save = ui.add_enabled(dirty, egui::Button::new("保存"));
+        let save = primary_button(ui, "保存", dirty);
         if save.clicked() {
             outbox.push(Message::McpConfigSaved(draft.clone()));
         }
@@ -1022,7 +1100,6 @@ fn mcp_page(
             ui.weak("保存后服务按新配置重启");
         }
     });
-    ui.add_space(crate::ui::tokens::SPACE_SM);
     ui.weak("完整设计:docs/mcp-plan.md(路径不得越出文件树根、无写工具)。");
 }
 
@@ -1039,6 +1116,7 @@ fn image_page(
     bed: &mut crate::bed::BedState,
     outbox: &mut Vec<Message>,
 ) {
+    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
     ui.heading("图片 · 图床");
     ui.weak(
         "图片框里的「上传」把图片发给图床,返回的 URL 插进文档。\
@@ -1050,92 +1128,104 @@ fn image_page(
         ui.colored_label(crate::ui::tokens::WARN, notice);
     }
 
-    if bed.profiles.is_empty() {
-        ui.weak("还没有图床,从下面的模板新增一个。");
-    }
-    // 克隆迭代:循环体只发消息不改列表,列表变更在归约
-    for profile in bed.profiles.clone() {
-        ui.horizontal(|ui| {
-            ui.strong(profile.display_name());
-            ui.weak(profile.body.label());
-            if ui.small_button("编辑").clicked() {
-                settings.bed_draft = Some(BedDraft::from_profile(&profile));
-                settings.notice = None;
-            }
-            let testing = bed.is_uploading();
-            let test = ui.add_enabled(!testing, egui::Button::new("测试上传"));
-            if testing {
-                test.on_disabled_hover_text("有上传进行中,稍候");
-            } else if test.clicked() {
-                outbox.push(Message::BedTestUploadRequested {
-                    profile_id: profile.id.clone(),
-                });
-            }
-            if ui.small_button("删除").clicked() {
-                outbox.push(Message::BedProfileDeleted {
-                    id: profile.id.clone(),
-                });
-            }
-        });
-    }
-
-    // 测试上传回显:成功给可复制的 URL,失败给警示色原因
-    if let Some((name, result)) = &bed.last_test {
-        match result {
-            Ok(url) => {
-                ui.label(format!("测试上传({name})成功:"));
-                ui.horizontal(|ui| {
-                    ui.monospace(url);
-                    if ui.small_button("复制").clicked() {
-                        ui.ctx().copy_text(url.clone());
-                    }
-                });
-            }
-            Err(error) => {
-                ui.colored_label(
-                    crate::ui::tokens::WARN,
-                    format!("测试上传({name})失败:{error}"),
-                );
-            }
+    // 2026-10-10 卡片点样:列表、回显与新增入口同卡(都属「现有图床」这一块);编辑器
+    // 单独成卡,标题随新增/编辑切换。
+    card(ui, &shell, "图床", |ui| {
+        if bed.profiles.is_empty() {
+            ui.weak("还没有图床,从下面的模板新增一个。");
         }
-    }
-    if bed.is_uploading() {
-        ui.colored_label(crate::ui::tokens::accent(ui), "上传中…");
-    }
-
-    ui.add_space(crate::ui::tokens::SPACE_MD);
-    ui.separator();
-    ui.add_space(crate::ui::tokens::SPACE_SM);
-    if settings.bed_draft.is_none() {
-        settings_row(ui, "新增图床", |ui| {
-            for (label, preset) in [
-                ("SM.MS", latermd_bed::BedProfile::preset_smms()),
-                ("GitHub", latermd_bed::BedProfile::preset_github()),
-                ("自定义", latermd_bed::BedProfile::preset_custom()),
-            ] {
-                if ui.button(label).clicked() {
-                    settings.bed_draft = Some(BedDraft {
-                        headers_text: headers_to_text(&preset.headers),
-                        profile: preset,
-                        token: String::new(),
-                    });
+        // 克隆迭代:循环体只发消息不改列表,列表变更在归约
+        for profile in bed.profiles.clone() {
+            ui.horizontal(|ui| {
+                ui.strong(profile.display_name());
+                ui.weak(profile.body.label());
+                if ui.small_button("编辑").clicked() {
+                    settings.bed_draft = Some(BedDraft::from_profile(&profile));
                     settings.notice = None;
                 }
+                let testing = bed.is_uploading();
+                let test = ui.add_enabled(!testing, egui::Button::new("测试上传"));
+                if testing {
+                    test.on_disabled_hover_text("有上传进行中,稍候");
+                } else if test.clicked() {
+                    outbox.push(Message::BedTestUploadRequested {
+                        profile_id: profile.id.clone(),
+                    });
+                }
+                if ui.small_button("删除").clicked() {
+                    outbox.push(Message::BedProfileDeleted {
+                        id: profile.id.clone(),
+                    });
+                }
+            });
+        }
+
+        // 测试上传回显:成功给可复制的 URL,失败给警示色原因
+        if let Some((name, result)) = &bed.last_test {
+            match result {
+                Ok(url) => {
+                    ui.label(format!("测试上传({name})成功:"));
+                    ui.horizontal(|ui| {
+                        ui.monospace(url);
+                        if ui.small_button("复制").clicked() {
+                            ui.ctx().copy_text(url.clone());
+                        }
+                    });
+                }
+                Err(error) => {
+                    ui.colored_label(
+                        crate::ui::tokens::WARN,
+                        format!("测试上传({name})失败:{error}"),
+                    );
+                }
             }
-        });
-    }
+        }
+        if bed.is_uploading() {
+            ui.colored_label(crate::ui::tokens::accent(ui), "上传中…");
+        }
+
+        // 新增入口:编辑器开着时收起(编辑态不该再点出第二个草稿)
+        if settings.bed_draft.is_none() {
+            ui.add_space(crate::ui::tokens::SPACE_SM);
+            settings_row(ui, "新增图床", |ui| {
+                for (label, preset) in [
+                    ("SM.MS", latermd_bed::BedProfile::preset_smms()),
+                    ("GitHub", latermd_bed::BedProfile::preset_github()),
+                    ("自定义", latermd_bed::BedProfile::preset_custom()),
+                ] {
+                    if ui.button(label).clicked() {
+                        settings.bed_draft = Some(BedDraft {
+                            headers_text: headers_to_text(&preset.headers),
+                            profile: preset,
+                            token: String::new(),
+                        });
+                        settings.notice = None;
+                    }
+                }
+            });
+        }
+    });
 
     if let Some(draft) = settings.bed_draft.as_mut() {
-        ui.add_space(crate::ui::tokens::SPACE_SM);
-        if bed_editor(ui, &mut settings.notice, draft, outbox) {
+        let title = if draft.profile.id.is_empty() {
+            "新增图床"
+        } else {
+            "编辑图床"
+        };
+        // 关闭编辑器(保存成功/取消)由闭包外的 result 带回 —— 闭包里借不出 settings
+        let mut close_editor = false;
+        card(ui, &shell, title, |ui| {
+            close_editor = bed_editor(ui, &mut settings.notice, draft, outbox);
+        });
+        if close_editor {
             settings.bed_draft = None;
         }
     }
 }
 
-/// 图床编辑器(新增与编辑共用;`draft.profile.id` 空 = 新增)。`notice` 是
-/// 页内提示槽(校验失败留在编辑器里改);返回 `true` = 保存成功或取消,
-/// 调用方据此收起编辑器。
+/// 图床编辑器本体(新增与编辑共用;卡片标题由调用方按 `draft.profile.id`
+/// 取「新增图床」/「编辑图床」)。`notice` 是页内提示槽(校验失败留在
+/// 编辑器里改);返回 `true` = 保存成功或取消,调用方据此收起编辑器。
 fn bed_editor(
     ui: &mut egui::Ui,
     notice: &mut Option<String>,
@@ -1143,13 +1233,6 @@ fn bed_editor(
     outbox: &mut Vec<Message>,
 ) -> bool {
     let profile = &mut draft.profile;
-    ui.strong(if profile.id.is_empty() {
-        "新增图床"
-    } else {
-        "编辑图床"
-    });
-    // 关闭编辑器(保存成功/取消)由闭包外的 result 带回 —— 闭包里借不出 settings
-    let mut result = Option::<bool>::None;
     // #70 M2:原两列 Grid 迁到统一 helper(标签列定宽与其他分页同起点);
     // 「请求头」行的多行输入由 `horizontal` 交叉居中自然落位
     settings_row(ui, "名称", |ui| {
@@ -1220,9 +1303,10 @@ fn bed_editor(
         );
     });
 
+    ui.add_space(crate::ui::tokens::SPACE_SM);
+    let mut close = false;
     ui.horizontal(|ui| {
-        let mut close = false;
-        if ui.button("保存").clicked() {
+        if primary_button(ui, "保存", true).clicked() {
             // 先把多行文本并进 profile 再校验;失败留在编辑器里改
             match headers_from_text(&draft.headers_text) {
                 Ok(headers) => {
@@ -1245,9 +1329,8 @@ fn bed_editor(
         if ui.button("取消").clicked() {
             close = true;
         }
-        result.replace(close);
     });
-    result.unwrap_or(false)
+    close
 }
 
 #[cfg(test)]
@@ -1713,8 +1796,10 @@ mod tests {
     /// (Temperature/Top-P/Max tokens/超时/流式接收/System prompt)不再
     /// 渲染。无头渲真实 AI 页数帧,收集全部 `TextShape` 的逻辑文本做
     /// 双向断言(保留项在场 + 被删项绝迹 —— 后者同时钉住「当前生效」行
-    /// 不再报流式形态)。#35 的 AI 页滑杆几何探针随四根滑杆移除而删除
-    /// (外观页两根排版滑杆的几何探针不受影响)。
+    /// 不再报流式形态)。2026-10-10 起按卡片点样直渲 `ai_page` 而非整窗:设置窗 440px 视口
+    /// 装不下三张卡,保存行落在 ScrollArea 折叠线以下会被裁掉 —— 页面内容
+    /// 的在场断言归页面直渲,整窗的「渲不 panic」由 `every_tab_renders`
+    /// 覆盖(与外观页滑杆/开关探针同口径)。
     #[test]
     fn ai_page_renders_kept_fields_without_removed_parameter_widgets() {
         let mut state = State::default();
@@ -1722,64 +1807,9 @@ mod tests {
         state.settings.tab = SettingsTab::Ai;
         // 切到可编辑 provider:Base URL/模型输入框真实渲出(参数区旧位置)
         state.settings.ai_draft.provider = ProviderKind::OpenAiCompatible;
-        let ctx = egui::Context::default();
-        state.theme.apply(&ctx, state.theme.mode);
-        let system_theme_ok = state.system_theme_ok;
-        let resolved = resolved_theme_for_test(&state);
         let mut all_text = String::new();
-        let mut now = 0.0_f64;
-        for _ in 0..5 {
-            now += 0.1; // fade-in 时钟:不给 time 首帧内容整体 noop(无头老坑)
-            let State {
-                settings,
-                ai_key,
-                ai,
-                mcp,
-                bed,
-                keymap,
-                theme,
-                skins,
-                ..
-            } = &mut state;
-            let mut outbox = Vec::new();
-            let mut output = ctx.run_ui(
-                RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::pos2(0.0, 0.0),
-                        egui::vec2(1200.0, 800.0),
-                    )),
-                    time: Some(now),
-                    ..Default::default()
-                },
-                |ui| {
-                    dialog(
-                        ui,
-                        settings,
-                        theme,
-                        skins,
-                        system_theme_ok,
-                        resolved,
-                        keymap,
-                        ai,
-                        ai_key,
-                        mcp,
-                        bed,
-                        &mut outbox,
-                    );
-                },
-            );
-            output.textures_delta.clear();
-            for clipped in &output.shapes {
-                if let egui::epaint::Shape::Text(text) = &clipped.shape {
-                    all_text.push_str(text.galley.text());
-                    all_text.push('\n');
-                }
-            }
-        }
-        assert!(
-            !all_text.is_empty(),
-            "五帧后仍无文本形状:fade-in 时钟或无头管线异常"
-        );
+        render_ai_page_collect(&mut state, 2, &mut all_text);
+        assert!(!all_text.is_empty(), "两帧后仍无文本形状:无头管线异常");
         for kept in ["Provider", "Base URL", "模型", "上下文大小", "保存"] {
             assert!(
                 all_text.contains(kept),
@@ -2257,6 +2287,12 @@ mod tests {
             let primitives = ctx.tessellate(last_shapes, 1.0);
             let shell = crate::theme::shell_tokens(matches!(mode, ThemeMode::Dark));
             let sample = |p: egui::Pos2| {
+                // 带 scissor 的采样器(与 PR#169 独立同修):epaint 的
+                // tessellate 只对矩形做粗剔除(tessellator.rs
+                // `tessellate_rect`),真裁剪在渲染器侧按
+                // `ClippedPrimitive::clip_rect` 下 scissor。直接摊平 mesh
+                // 采样会「看穿」滚动视口 —— 2026-10-10 起,卡片是大块
+                // 不透明矩形,第一块跨过折叠线就暴露了这个口径差。
                 // ScrollArea meshes extend outside its viewport. Sample only
                 // the primitives whose scissor includes the point, like wgpu.
                 let meshes: Vec<&Mesh> = primitives
@@ -2294,9 +2330,10 @@ mod tests {
                 shell.content
             );
 
-            // 中央内容区:6×8 网格采样,多数点露 content 色 —— 文字/控件
-            // 墨迹只占少数,若窗底没跟随主题(如写死暗色),浅色轮会大面积
-            // 偏黑,这里的多数派断言当场红
+            // 中央内容区:6×8 网格采样,多数点露窗底 content 色(卡片之间
+            // 的空隙)或卡片底 faint 色(2026-10-10 起,卡片化后内容区大部分被卡片
+            // 覆盖)。两色都出自同一套明暗 shell 投影 —— 若窗底写死暗色,
+            // 浅色轮这两档都会大面积偏黑,这里的多数派断言当场红
             let left = window.left() + crate::ui::tokens::SETTINGS_TABS_W + 24.0;
             let right = window.right() - 24.0; // 避开右缘滚动条
             let top = window.top() + 64.0; // 避开标题栏与页头
@@ -2312,10 +2349,12 @@ mod tests {
                     );
                     if p.y < bottom {
                         total += 1;
-                        if color_dist(sample(p), shell.content) <= 2
+                        let c = sample(p);
+                        if color_dist(c, shell.content) <= 2
+                            || color_dist(c, shell.faint) <= 2
                             || (cfg!(target_os = "macos")
                                 && color_dist(
-                                    sample(p),
+                                    c,
                                     crate::theme::window_fill(matches!(mode, ThemeMode::Dark)),
                                 ) <= 2)
                         {
@@ -2326,7 +2365,7 @@ mod tests {
             }
             assert!(
                 total > 0 && hits * 2 > total,
-                "{mode:?}:内容区 {hits}/{total} 点露 content 色,窗底疑似未随主题"
+                "{mode:?}:内容区 {hits}/{total} 点露 content/faint 色,窗底疑似未随主题"
             );
 
             tabs_colors.push(tabs);

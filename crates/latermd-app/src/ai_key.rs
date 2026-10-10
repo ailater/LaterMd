@@ -117,8 +117,9 @@ pub(crate) fn key_editor(
     });
     let buttons = ui.horizontal(|ui| {
         // 空白草稿/未配置时目标状态已达成,禁用防误触;归约侧仍有同款
-        // 防线(BlankSecret 拒绝、删除幂等)
-        let save = ui.add_enabled(!key.draft.trim().is_empty(), egui::Button::new("保存"));
+        // 防线(BlankSecret 拒绝、删除幂等)。2026-10-10 卡片点样:保存走主操作样式
+        // (与其他设置页的「保存」同一观感)
+        let save = crate::settings::primary_button(ui, "保存", !key.draft.trim().is_empty());
         if save.clicked() {
             outbox.push(Message::AiKeySaved);
         }
