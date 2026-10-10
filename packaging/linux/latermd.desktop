@@ -21,4 +21,8 @@ Categories=Utility;
 MimeType=text/markdown;text/x-markdown;
 Keywords=Markdown;MD;Editor;Note;Notes;笔记;文档;
 StartupNotify=true
-StartupWMClass=latermd
+# StartupWMClass 必须与运行时 WM_CLASS 的 class 段**精确一致(区分大小写)**:
+# eframe 在 X11 上用 run_native 的 app_name("LaterMD")作 class,egui 的
+# app_id 只对 Wayland 生效;写小写会让 dock/启动器认领失败,窗口图标
+# (_NET_WM_ICON)再对也白搭。2026-10-10 Deepin V23 实测复现并验证。
+StartupWMClass=LaterMD
