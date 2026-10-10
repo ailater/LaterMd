@@ -310,6 +310,13 @@ pub(crate) fn window(input: WindowInput) -> VisibleWindow {
 /// 10px 滚动条避让。egui ScrollArea 的滚动条贴视口右缘、画在后、居上,
 /// 行条最长到 98px 处,最后 10px 留给它;行条有效宽 96 在任务书建议的
 /// 80–100px 区间内。
+/// 自动模式只在较宽编辑区、文档超过两屏时启用。检查最多两屏行数，
+/// 不为每帧判断遍历整篇长文；宽度取添加缩略图之前的视口，避免反馈抖动。
+pub(crate) fn automatic_visible(width: f32, height: f32, row_height: f32, text: &str) -> bool {
+    let screen_lines = (height / row_height.max(1.0)).ceil() as usize;
+    width >= 600.0 && text.lines().take(screen_lines * 2 + 1).count() > screen_lines * 2
+}
+
 pub(crate) const MINIMAP_W: f32 = 108.0;
 
 /// 行条区左内边距:行条 x = 条左缘 + 此值 + 缩进。

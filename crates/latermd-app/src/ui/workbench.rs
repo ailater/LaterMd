@@ -10,6 +10,43 @@ pub const HEADER_H: f32 = 40.0;
 const TRAFFIC_LIGHTS_W: f32 = 76.0;
 const HEADER_RIGHT_W: f32 = 388.0;
 
+/// 三栏共同遵守的编辑区宽度预算（含内边距）。
+pub(crate) const EDITOR_MIN_W: f32 = 380.0;
+
+/// 临时收窄窗口只改变显示宽度，不覆盖用户拖出的偏好；放大时自动恢复。
+pub(crate) fn restore_panel_width(ui: &egui::Ui, name: &str, preferred: Option<f32>) {
+    let id = egui::Id::new(name);
+    let resizing = ui
+        .read_response(id.with("__resize"))
+        .is_some_and(|r| r.dragged() || r.drag_stopped());
+    if !resizing {
+        if let (Some(mut panel), Some(width)) = (
+            egui::PanelState::load(ui.ctx(), id),
+            preferred.filter(|v| v.is_finite() && *v > 0.0),
+        ) {
+            panel.outer_rect.max.x = panel.outer_rect.min.x + width;
+            ui.ctx().data_mut(|data| data.insert_persisted(id, panel));
+        }
+    }
+}
+
+pub(crate) fn remember_panel_width(
+    ui: &egui::Ui,
+    name: &str,
+    open: bool,
+    preferred: &mut Option<f32>,
+) {
+    let id = egui::Id::new(name);
+    let changed = ui
+        .read_response(id.with("__resize"))
+        .is_some_and(|r| r.drag_stopped());
+    if open && (preferred.is_none() || changed) {
+        if let Some(panel) = egui::PanelState::load(ui.ctx(), id) {
+            *preferred = Some(panel.size().x);
+        }
+    }
+}
+
 /// 系统按钮的中心换算到 egui 坐标；AppKit 使用 point，egui 还可能有
 /// 用户缩放，两者不能直接混用。无原生窗口的无头帧仍用标题栏中心。
 fn header_center_y(ui: &egui::Ui, bar: Rect) -> f32 {
@@ -130,14 +167,7 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
         right -= 18.0;
     }
     let left = rect.left() + 4.0;
-    let name = crate::ui::tabs::elide_text(
-        ui,
-        &tab.document.display_name(),
-        &egui::FontId::proportional(11.0),
-        (right - left).clamp(0.0, 160.0),
-    );
-    let name_rect = label_at(ui, left, y, &name, 11.0, colors.secondary);
-    let mut x = name_rect.right() + 16.0;
+    let mut x = left;
     let saved = if tab.document.path.is_none() {
         "未存储"
     } else if tab.editor.is_dirty() {
@@ -150,17 +180,19 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
         details.push(format!("行 {line} · 列 {col}"));
     }
     details.push(format!("{} 字", tab.editor.text().chars().count()));
-    for text in details {
+    for (index, text) in details.into_iter().enumerate() {
         let galley =
             ui.painter()
                 .layout_no_wrap(text, egui::FontId::proportional(11.0), colors.secondary);
         if x + galley.size().x > right {
             break;
         }
-        ui.painter().line_segment(
-            [egui::pos2(x - 8.0, y - 4.0), egui::pos2(x - 8.0, y + 4.0)],
-            separator(ui),
-        );
+        if index > 0 {
+            ui.painter().line_segment(
+                [egui::pos2(x - 8.0, y - 4.0), egui::pos2(x - 8.0, y + 4.0)],
+                separator(ui),
+            );
+        }
         let width = galley.size().x;
         ui.painter().galley(
             egui::pos2(x, y - galley.mesh_bounds.center().y),
@@ -248,7 +280,8 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     };
     let colors = crate::theme::shell(ui);
     let right = bar.right() - 12.0;
-    let right_start = right - HEADER_RIGHT_W;
+    let search_width = (bar.width() - 1044.0 + 196.0).clamp(112.0, 196.0);
+    let right_start = right - (HEADER_RIGHT_W - 196.0 + search_width);
     let sidebar_x = bar.left() + TRAFFIC_LIGHTS_W + 6.0;
     if action(
         ui,
@@ -267,7 +300,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
         ],
         separator(ui),
     );
-    Icon::File.draw(
+    Icon::FolderClosed.draw(
         ui.painter(),
         egui::pos2(divider_x + 19.0, center_y),
         14.0,
@@ -279,12 +312,13 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     );
     let mut font = egui::FontId::proportional(12.0);
     font.family = crate::fonts::semibold_family(ui.ctx());
-    let title = crate::ui::tabs::elide_text(
-        ui,
-        &state.tabs.current().display_name(),
-        &font,
-        title_rect.width().max(0.0),
-    );
+    let workspace = state
+        .file_tree
+        .root
+        .as_deref()
+        .map(crate::ui::sidebar::recent_label)
+        .unwrap_or_else(|| "LaterMD".to_owned());
+    let title = crate::ui::tabs::elide_text(ui, &workspace, &font, title_rect.width().max(0.0));
     let title_galley = ui.painter().layout_no_wrap(title, font, colors.text);
     ui.painter().with_clip_rect(title_rect).galley(
         egui::pos2(
@@ -297,7 +331,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     mode_switch(ui, slot(right_start, 100.0), state, outbox);
     search_field(
         ui,
-        slot(right_start + 112.0, 196.0),
+        slot(right_start + 112.0, search_width),
         &mut state.search,
         outbox,
     );
@@ -437,12 +471,6 @@ pub fn workspace_picker(
     outbox: &mut Vec<Message>,
 ) {
     let colors = crate::theme::shell(ui);
-    ui.label(
-        egui::RichText::new("文件夹")
-            .size(11.0)
-            .color(colors.secondary),
-    );
-    ui.add_space(4.0);
     let label = tree
         .root
         .as_deref()
@@ -522,22 +550,27 @@ pub fn workspace_picker(
 
 /// 返回导航占用的矩形,内容面板接在下方并独立滚动。
 pub fn navigation(ui: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Message>) -> Rect {
-    ui.add_space(12.0);
-    ui.label(
-        egui::RichText::new("工作台")
-            .size(11.0)
-            .color(crate::theme::shell(ui).secondary),
-    );
-    ui.add_space(4.0);
-    let top = ui.cursor().top();
-    for tab in SidebarTab::ALL {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::click());
-        let colors = crate::theme::shell(ui);
-        if tab == active || response.hovered() {
+    let colors = crate::theme::shell(ui);
+    let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
+    let more_width = 28.0;
+    let width = (bar.width() - more_width - 4.0) / 3.0;
+    for (index, tab) in [SidebarTab::Files, SidebarTab::Search, SidebarTab::Outline]
+        .into_iter()
+        .enumerate()
+    {
+        let rect = Rect::from_min_size(
+            bar.min + egui::vec2(index as f32 * width, 0.0),
+            egui::vec2(width - 2.0, 28.0),
+        );
+        let response = ui.interact(
+            rect,
+            ui.id().with(("workbench-view", index)),
+            Sense::click(),
+        );
+        if tab == active || response.hovered() || response.has_focus() {
             ui.painter().rect_filled(
                 rect,
-                6.0,
+                5.0,
                 if tab == active {
                     colors.selected_bg
                 } else {
@@ -545,51 +578,100 @@ pub fn navigation(ui: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Messag
                 },
             );
         }
-        tab.icon().draw(
-            ui.painter(),
-            egui::pos2(rect.left() + 15.0, rect.center().y),
-            15.0,
+        centered_label(
+            ui,
+            rect,
+            tab.label(),
             if tab == active {
-                colors.accent
+                colors.text
             } else {
                 colors.secondary
             },
         );
-        ui.painter().text(
-            egui::pos2(rect.left() + 32.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            if tab == SidebarTab::Backlinks {
-                "反向链接"
-            } else {
-                tab.label()
-            },
-            egui::FontId::proportional(13.0),
-            colors.text,
-        );
-        if response.clicked() {
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                true,
+                tab == active,
+                tab.label(),
+            )
+        });
+        if response.on_hover_text(tab.label()).clicked() {
             outbox.push(Message::SidebarTabChanged(tab));
         }
     }
-    let nav = Rect::from_min_max(
-        egui::pos2(ui.max_rect().left(), top),
-        ui.min_rect().right_bottom(),
+    let rect = Rect::from_min_size(
+        egui::pos2(bar.right() - more_width, bar.top()),
+        egui::vec2(more_width, 28.0),
     );
-    ui.add_space(18.0);
-    nav
+    let response = ui.interact(rect, ui.id().with("workbench-tools"), Sense::click());
+    let selected = matches!(active, SidebarTab::Git | SidebarTab::Backlinks);
+    if selected || response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(
+            rect,
+            5.0,
+            if selected {
+                colors.selected_bg
+            } else {
+                colors.hover
+            },
+        );
+    }
+    for offset in [-5.0, 0.0, 5.0] {
+        ui.painter().circle_filled(
+            rect.center() + egui::vec2(offset, 0.0),
+            1.3,
+            colors.secondary,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "更多视图"));
+    let response = response.on_hover_text("更多视图 · Git / 反向链接");
+    egui::Popup::menu(&response).show(|ui| {
+        for tab in [SidebarTab::Git, SidebarTab::Backlinks] {
+            if ui
+                .selectable_label(
+                    active == tab,
+                    if tab == SidebarTab::Backlinks {
+                        "反向链接"
+                    } else {
+                        tab.label()
+                    },
+                )
+                .clicked()
+            {
+                outbox.push(Message::SidebarTabChanged(tab));
+                ui.close();
+            }
+        }
+    });
+    ui.add_space(8.0);
+    bar
 }
 
 pub fn pane_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .size(12.0)
-                .color(crate::theme::shell(ui).secondary),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(detail).size(11.0).weak());
-        });
-    });
-    ui.add_space(8.0);
+    let colors = crate::theme::shell(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::hover());
+    label_at(
+        ui,
+        rect.left(),
+        rect.center().y,
+        title,
+        12.0,
+        colors.secondary,
+    );
+    let text = ui.painter().layout_no_wrap(
+        detail.to_owned(),
+        egui::FontId::proportional(11.0),
+        colors.secondary,
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.right() - text.size().x,
+            rect.center().y - text.mesh_bounds.center().y,
+        ),
+        text,
+        colors.secondary,
+    );
 }
 
 #[cfg(test)]
@@ -613,6 +695,97 @@ mod tests {
                 modifiers: Modifiers::NONE,
             },
         ]
+    }
+
+    #[test]
+    fn compact_navigation_fits_narrow_sidebar_and_switches_views() {
+        for width in [156.0, 216.0, 376.0] {
+            for (index, tab) in [SidebarTab::Files, SidebarTab::Search, SidebarTab::Outline]
+                .into_iter()
+                .enumerate()
+            {
+                let ctx = egui::Context::default();
+                let mut outbox = Vec::new();
+                let mut bar = Rect::NOTHING;
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        bar = navigation(ui, SidebarTab::Files, &mut outbox);
+                    },
+                )
+                .drop_without_applying_deltas();
+                assert!(bar.height() <= 32.0 && bar.width() <= width);
+                let pos = egui::pos2(
+                    bar.left() + (index as f32 + 0.5) * (bar.width() - 32.0) / 3.0,
+                    bar.center().y,
+                );
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        events: click(pos),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        navigation(ui, SidebarTab::Files, &mut outbox);
+                    },
+                )
+                .drop_without_applying_deltas();
+                assert!(outbox.contains(&Message::SidebarTabChanged(tab)));
+            }
+        }
+    }
+
+    #[test]
+    fn more_views_keeps_git_and_backlinks_reachable() {
+        for (label, tab) in [
+            ("Git", SidebarTab::Git),
+            ("反向链接", SidebarTab::Backlinks),
+        ] {
+            let ctx = egui::Context::default();
+            let mut outbox = Vec::new();
+            let mut bar = Rect::NOTHING;
+            let mut frame = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(216.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        bar = navigation(ui, SidebarTab::Files, &mut outbox);
+                    },
+                )
+            };
+            frame(Vec::new()).drop_without_applying_deltas();
+            frame(click(egui::pos2(202.0, 14.0))).drop_without_applying_deltas();
+            let output = frame(Vec::new());
+            let target = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == label).then(|| text.pos + text.galley.size() / 2.0)
+                    } else {
+                        None
+                    }
+                })
+                .expect("更多菜单保留两个工具入口");
+            output.drop_without_applying_deltas();
+            frame(click(target)).drop_without_applying_deltas();
+            assert!(outbox.contains(&Message::SidebarTabChanged(tab)));
+        }
     }
 
     #[test]

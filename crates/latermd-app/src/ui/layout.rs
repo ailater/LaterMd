@@ -358,13 +358,22 @@ impl LaterMdApp {
         //
         // 宽度下限走 `SIDEBAR_MIN_W`(180,M2 三段式起够用):160 是二分栏
         // 时代的数字(docs/ui-shell-redesign.md §11 R4)。
+        let reserve_preview = if self.state.layout.right {
+            tokens::PREVIEW_MIN_W
+        } else {
+            0.0
+        };
+        let sidebar_max =
+            (ui.available_width() - crate::ui::workbench::EDITOR_MIN_W - reserve_preview)
+                .clamp(tokens::SIDEBAR_MIN_W, 400.0);
+        crate::ui::workbench::restore_panel_width(ui, "nav", self.state.layout.left_width);
         let layout = &mut self.state.layout;
         let left = &mut layout.left;
         let active_tab = &mut layout.left_view;
         egui::Panel::left("nav")
             .resizable(true)
             .default_size(240.0)
-            .size_range(crate::ui::tokens::SIDEBAR_MIN_W..=400.0)
+            .size_range(crate::ui::tokens::SIDEBAR_MIN_W..=sidebar_max)
             // 2026-10-09:只把**左** margin 归零,其余照 egui 默认
             // (`Frame::side_top_panel` = symmetric(8,2))。rail 画在本面板
             // 内容区的左端,若保留这 8px,rail 带会与窗口左缘空出一道同底
@@ -402,13 +411,37 @@ impl LaterMdApp {
             });
         // PanelState 当前帧可读 outer_rect;只更新用户实际拖出的宽度,
         // show_collapsible=false 或动画中不写 None。
-        if let Some(panel) = egui::PanelState::load(ui.ctx(), egui::Id::new("nav")) {
-            self.state.layout.left_width = Some(panel.size().x);
+        crate::ui::workbench::remember_panel_width(
+            ui,
+            "nav",
+            self.state.layout.left,
+            &mut self.state.layout.left_width,
+        );
+
+        // 文档标签属于源码和预览共有的文档区域，统一占一条横向栏。
+        if crate::ui::tabs::visible(&self.state.tabs) {
+            egui::Panel::top("document-tabs")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(crate::theme::shell(ui).chrome)
+                        .inner_margin(egui::Margin::symmetric(12, 4)),
+                )
+                .show(ui, |ui| {
+                    crate::ui::tabs::ui(
+                        ui,
+                        &self.state.tabs,
+                        self.state.theme.tab_title_width,
+                        &mut self.outbox,
+                    );
+                });
         }
 
         // ④ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
         // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
         // 都只是让中间伸缩,不会挤掉谁。
+        let preview_max = (ui.available_width() - crate::ui::workbench::EDITOR_MIN_W)
+            .clamp(tokens::PREVIEW_MIN_W, 880.0);
+        crate::ui::workbench::restore_panel_width(ui, "preview", self.state.layout.right_width);
         let right = &mut self.state.layout.right;
         egui::Panel::right("preview")
             .resizable(true)
@@ -417,20 +450,18 @@ impl LaterMdApp {
             } else {
                 crate::ui::tokens::PREVIEW_DEFAULT_W
             })
-            .size_range(crate::ui::tokens::PREVIEW_MIN_W..=880.0)
+            .size_range(crate::ui::tokens::PREVIEW_MIN_W..=preview_max)
             .frame(
                 egui::Frame::default()
                     // 预览正文到面板边界的贴边:workbench 16 / 经典 8(main 的
                     // workbench 外观分支)。16 无 inset 档(SM4/MD8/LG12),一半换
                     // 一半留更乱 → 与 nav 的 Margin::symmetric(8,2) 同判,整处
                     // 保留字面量(设计系统 T2b 判例;inset::MD 另有 OVERLAY_MARGIN 消费)。
-                    .inner_margin(egui::Margin::same(if workbench { 16 } else { 8 }))
+                    .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
                     .fill(crate::theme::shell(ui).content),
             )
             .show_collapsible(ui, right, |ui| {
-                if workbench {
-                    crate::ui::workbench::pane_heading(ui, "预览", "实时更新");
-                }
+                crate::ui::workbench::pane_heading(ui, "预览", "实时更新");
                 let tab = self.state.tabs.current_mut();
                 // heal 只在 AI 流式写入本标签时开:补闭合是流式残缺帧的
                 // 必需品,完整文档上是恒等变换但逐行全文扫描,稳态帧不该付。
@@ -450,9 +481,12 @@ impl LaterMdApp {
                     &mut self.outbox,
                 );
             });
-        if let Some(panel) = egui::PanelState::load(ui.ctx(), egui::Id::new("preview")) {
-            self.state.layout.right_width = Some(panel.size().x);
-        }
+        crate::ui::workbench::remember_panel_width(
+            ui,
+            "preview",
+            self.state.layout.right,
+            &mut self.state.layout.right_width,
+        );
 
         // ⑤ 编辑器:源文本这份唯一真源住在中央,标签条/提示行/格式工具条在其上。
         // `CentralPanel` 最后加(顺序铁律 AGENTS §8 / adr-005 §3.2)。
@@ -474,18 +508,10 @@ impl LaterMdApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .inner_margin(if workbench {
-                        egui::Margin::symmetric(16, 8)
-                    } else {
-                        egui::Margin::symmetric(8, 2)
-                    })
+                    .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
                     .fill(crate::theme::shell(ui).content),
             )
             .show(ui, |ui| {
-                // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作。
-                // 标题宽度模式(#37)来自持久化偏好,缩短模式按可用空间收窄
-                // chip、完整模式按完整标题测宽(溢出走既有单行滚动)。
-                crate::ui::tabs::ui(ui, &state.tabs, state.theme.tab_title_width, outbox);
                 // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,
                 // decisions-pending #32)
                 notice_bar(ui, &state.tabs.current().document, outbox);
@@ -550,6 +576,19 @@ impl LaterMdApp {
                 if workbench {
                     ui.visuals_mut().extreme_bg_color = crate::theme::shell(ui).content;
                 }
+                let show_minimap = state.theme.show_minimap
+                    && (!state.theme.minimap_auto || {
+                        let font = egui::FontSelection::Style(egui::TextStyle::Monospace)
+                            .resolve(ui.style());
+                        let row = ui.fonts_mut(|fonts| fonts.row_height(&font))
+                            + ui.spacing().extra_text_line_spacing;
+                        crate::ui::minimap::automatic_visible(
+                            ui.available_width(),
+                            ui.available_height(),
+                            row,
+                            editor.text(),
+                        )
+                    });
                 crate::ui::editor::ui(
                     ui,
                     editor,
@@ -564,7 +603,7 @@ impl LaterMdApp {
                     crate::ui::editor::tab_editor_id(*id),
                     // #55 M2:源码 minimap 开关(全局偏好,所有标签同开同关;
                     // 行模型缓存仍是每标签一份,minimap::cache_id 分槽)。
-                    state.theme.show_minimap,
+                    show_minimap,
                     // #64 M1:打字机模式开关(全局偏好,源码/Live 两模式
                     // 共用;关闭 = 现状零变化)。
                     state.theme.show_typewriter,
@@ -1864,6 +1903,80 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    #[test]
+    fn shrinking_window_preserves_editor_budget_and_restores_user_widths() {
+        let ctx = egui::Context::default();
+        let mut app = LaterMdApp::default();
+        app.state.layout.left_width = Some(320.0);
+        app.state.layout.right_width = Some(650.0);
+        for width in [1600.0, 900.0, 1600.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 800.0));
+            for _ in 0..3 {
+                ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                )
+                .drop_without_applying_deltas();
+            }
+            let nav = egui::PanelState::load(&ctx, egui::Id::new("nav"))
+                .unwrap()
+                .size()
+                .x;
+            let preview = egui::PanelState::load(&ctx, egui::Id::new("preview"))
+                .unwrap()
+                .size()
+                .x;
+            assert!(
+                width - nav - preview >= 379.0,
+                "{width}: editor squeezed by {nav}/{preview}"
+            );
+            assert_eq!(app.state.layout.left_width, Some(320.0));
+            assert_eq!(app.state.layout.right_width, Some(650.0));
+            if width == 1600.0 {
+                assert!((nav - 320.0).abs() < 1.0 && (preview - 650.0).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_minimap_follows_document_and_window_size() {
+        for (width, lines, manual, expected) in [
+            (900.0, 400, false, false),
+            (1920.0, 10, false, false),
+            (1920.0, 400, false, true),
+            (900.0, 400, true, true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = LaterMdApp::default();
+            app.state.theme.minimap_auto = !manual;
+            app.state
+                .tabs
+                .current_mut()
+                .editor
+                .load(&"正文\n".repeat(lines));
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 800.0));
+            let mut shown = false;
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| app.draw(ui),
+                );
+                shown = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(r) if (r.rect.width() - 108.0).abs() < 0.5 && r.rect.height() > 10.0 && r.fill != egui::Color32::TRANSPARENT));
+                output.drop_without_applying_deltas();
+            }
+            assert_eq!(
+                shown, expected,
+                "width={width}, lines={lines}, manual={manual}"
+            );
+        }
+    }
+
     /// 全屏视口拖影回归(2026-10-08 坤哥真机报告:小窗可拖、全屏不可拖):
     /// 完整 UI(侧栏+编辑器+预览三列)两档尺寸同流程,按住 minimap 高亮框
     /// 拖动,编辑器 offset 必须逐帧前进。editor 层(minimap::frame_sized)同
@@ -1878,6 +1991,8 @@ mod tests {
             ));
             let mut app = LaterMdApp::default();
             app.state.settings_dir = Some(dir.clone());
+            // 本用例验证手动常显时拖拽；自动模式的窄窗折叠另有覆盖。
+            app.state.theme.minimap_auto = false;
             app.state.render_mode = crate::live::RenderMode::Source;
             app.state.tabs.current_mut().editor.replace_all(
                 &(0..500)
