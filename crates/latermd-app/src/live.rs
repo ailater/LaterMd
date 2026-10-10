@@ -85,11 +85,16 @@ pub struct LiveState {
     /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。
     caret_follow: bool,
     /// 富渲染块链接改写的块级缓存(#63;#65 M2 起高亮层并入同一条缓存):
-    /// 块序号 → (修订号, 改写后块文本)。富渲染块每帧渲染,改写要解析
-    /// 块文本,稳态帧不该重付(与 `marks` 缓存同一条纪律,只是富渲染块
-    /// 逐块都要,不是单槽)。修订号前进时整表清空(块序号随编辑漂移,
-    /// 旧条目不可信)。
-    rich_cache: std::collections::HashMap<usize, (u64, String)>,
+    /// 块序号 → (修订号, 改写后块文本, 高亮层映射, 任务层映射)。富渲染
+    /// 块每帧渲染,改写要解析块文本,稳态帧不该重付(与 `marks` 缓存同一
+    /// 纪律,只是富渲染块逐块都要,不是单槽)。修订号前进时整表清空(块
+    /// 序号随编辑漂移,旧条目不可信)。两张映射随渲染文本同源缓存:点击
+    /// 进编辑的落点换算要把渲染文本偏移**逆穿**回块源码坐标,点击时重算
+    /// 映射等于把改写解析重做一遍。
+    rich_cache: std::collections::HashMap<
+        usize,
+        (u64, String, latermd_md::OffsetMap, latermd_md::OffsetMap),
+    >,
 }
 
 impl LiveState {
@@ -115,20 +120,83 @@ impl LiveState {
             .or_else(|| self.active.filter(|index| *index < self.blocks.len()));
     }
 
-    /// 富渲染块的链接改写文本(#63 checkbox + #65 高亮):缓存命中直取,
-    /// 未命中重算并入表。层序与预览四层链一致(高亮在任务之前,生产顺序
-    /// wikilink → 高亮 → emoji → 任务的 Live 子集);两层各有「无目标字符
-    /// 不启动解析」的快路径,两层快路径直接恒等返回。
-    fn rich_block(&mut self, index: usize, rev: u64, block_text: &str) -> String {
-        if let Some((seen_rev, cached)) = self.rich_cache.get(&index) {
+    /// 富渲染块的链接改写(#63 checkbox + #65 高亮):缓存命中直取,未命中
+    /// 重算并入表。返回渲染文本与**逆穿方向**的两张映射(渲染坐标 → 上一
+    /// 层坐标):层序与预览四层链一致(高亮在任务之前,生产顺序 wikilink →
+    /// 高亮 → emoji → 任务的 Live 子集);两层各有「无目标字符不启动解析」
+    /// 的快路径,两层快路径直接恒等返回。
+    fn rich_block(
+        &mut self,
+        index: usize,
+        rev: u64,
+        block_text: &str,
+    ) -> (String, latermd_md::OffsetMap, latermd_md::OffsetMap) {
+        if let Some((seen_rev, rendered, highlight_map, task_map)) = self.rich_cache.get(&index) {
             if *seen_rev == rev {
-                return cached.clone();
+                return (rendered.clone(), highlight_map.clone(), task_map.clone());
             }
         }
-        let (after_highlight, _) = latermd_md::expand_highlight_links(block_text);
-        let (rendered, _) = latermd_md::expand_task_links(&after_highlight);
-        self.rich_cache.insert(index, (rev, rendered.clone()));
-        rendered
+        let (after_highlight, highlight_map) = latermd_md::expand_highlight_links(block_text);
+        let (rendered, task_map) = latermd_md::expand_task_links(&after_highlight);
+        self.rich_cache.insert(
+            index,
+            (
+                rev,
+                rendered.clone(),
+                highlight_map.clone(),
+                task_map.clone(),
+            ),
+        );
+        (rendered, highlight_map, task_map)
+    }
+
+    /// 把点击点的光标落点换算成块内字符偏移(#170):点击帧富渲染块已
+    /// 画出,vendored 的帧内命中表给出「点击点 → 渲染文本字符索引」;
+    /// 渲染坐标经任务层、高亮层两张映射**逆序**穿回块源码字节,钳进块
+    /// 文本后换算块内字符偏移。文本 galley 之外(代码块/表格 widget、块
+    /// 间空隙)回退到「y 最近渲染子块的起点」(点代码块落 ``` 行,点段
+    /// 间空隙落相邻段落首);连渲染子块表都没有(被剔除)时回退 None,
+    /// 调用方落块尾 —— 与旧行为一致,不劣化。
+    fn click_caret_local(
+        ui: &egui::Ui,
+        label_id: egui::Id,
+        pos: egui::Pos2,
+        rendered: &str,
+        highlight_map: &latermd_md::OffsetMap,
+        task_map: &latermd_md::OffsetMap,
+        block_source_len: usize,
+    ) -> Option<usize> {
+        let rendered_byte = match egui_markdown::char_index_at_pos(ui, label_id, pos) {
+            Some(char_index) => char_indices_to_byte(rendered, char_index),
+            None => {
+                let blocks = egui_markdown::block_span_rects(ui, label_id)?;
+                let last = blocks
+                    .iter()
+                    .max_by_key(|block| block.rect.min.y.to_bits())?;
+                if pos.y > last.rect.max.y {
+                    rendered.len()
+                } else {
+                    let nearest = blocks.iter().min_by_key(|block| {
+                        // 点击点 y 到子块 rect 的垂直距离(区间内为 0)
+                        let dy = if pos.y < block.rect.min.y {
+                            block.rect.min.y - pos.y
+                        } else if pos.y > block.rect.max.y {
+                            pos.y - block.rect.max.y
+                        } else {
+                            0.0
+                        };
+                        dy.to_bits()
+                    })?;
+                    nearest.span.start.min(rendered.len())
+                }
+            }
+        };
+        // 逆穿改写层(生产顺序 高亮 → 任务,逆序 任务 → 高亮);改写段
+        // 内部命中映回段首,是映射表的既定语义。
+        let after_task = task_map.rendered_to_source(rendered_byte);
+        let source_byte = highlight_map.rendered_to_source(after_task);
+        let clamped = source_byte.min(block_source_len);
+        Some(clamped)
     }
 
     /// 包含该字节的块序号;落在块之间的边界上取后一块(边界属于后一块的起点)。
@@ -389,7 +457,7 @@ pub fn ui(
     }
 
     let mut active_response: Option<egui::Response> = None;
-    let mut activate: Option<usize> = None;
+    let mut activate: Option<(usize, usize)> = None;
     let mut route: Option<(usize, usize)> = None;
     // 选区 AI 浮标(#61 M1)的锚点素材:活动块持久选区(**文档坐标**字符
     // 区对,块内捕获时换算)与尾端光标条屏幕矩形,活动块分支内捕获、
@@ -722,7 +790,8 @@ pub fn ui(
                     // 成底色段 —— 探针坐标域带块首,点击切换由 `ui` 帧末的
                     // 探针命中判定统一发出。无目标字符的块改写恒等,渲染
                     // 零变化。
-                    let block_rendered = live.rich_block(index, editor.revision(), &block_text);
+                    let (block_rendered, highlight_map, task_map) =
+                        live.rich_block(index, editor.revision(), &block_text);
                     // 字体与右栏预览同源(#23 F3):size = 用户字号偏好,
                     // 族 = 预览专用族(#43 M2 的行 metrics 对齐副本,无 CJK
                     // 回落 Proportional)。源码/Live 两种模式下排版偏好同观感。
@@ -757,16 +826,37 @@ pub fn ui(
                     if show_focus && crate::ui::focus::dimmed(live.active, index) {
                         paint_block_fade(ui, rect);
                     }
-                    if clicked_for_edit(ui, rect, editor_id) {
-                        activate = Some(index);
+                    // 点击进编辑(#170):光标落**点击处**而非块尾。点击帧
+                    // 富渲染块刚画出,帧内命中表把点击点映到渲染文本字符,
+                    // 经两张改写映射逆穿回块源码字节;文本 galley 之外回退
+                    // 最近子块起点,全落空(块被剔除等)保持旧行为落块尾。
+                    // 落点不滚动跟随:指针刚把视口定位到点击处。
+                    if let Some(pos) = clicked_for_edit(ui, rect, editor_id) {
+                        let label_id = editor_id.with(("live-render", index));
+                        let block_source = BlockBuffer::slice(editor.text(), &range);
+                        let local = LiveState::click_caret_local(
+                            ui,
+                            label_id,
+                            pos,
+                            &block_rendered,
+                            &highlight_map,
+                            &task_map,
+                            block_source.len(),
+                        )
+                        .map(|byte| {
+                            editor.byte_to_char(range.start + byte)
+                                - editor.byte_to_char(range.start)
+                        })
+                        .unwrap_or_else(|| live.block_char_len(editor, index));
+                        activate = Some((index, local));
                     }
                 }
             }
         });
 
-    if let Some(index) = activate {
+    if let Some((index, local)) = activate {
         live.active = Some(index);
-        live.pending_caret = Some((index, live.block_char_len(editor, index)));
+        live.pending_caret = Some((index, local));
         // 点击进编辑不跟随:指针刚把视口定位到点击处(decisions-pending #83)
         live.caret_follow = false;
         live.drag_anchor = None;
@@ -883,21 +973,21 @@ pub fn ui(
 /// 抬起点核对而按不下起点核对:`press_origin` 在抬起帧已被 egui 清空
 /// (input_state 释放即置 None);好在 `primary_clicked` 本身就含「未超出
 /// 点击距离」判定,残余歧义最多块边界 max_click_dist 一线。
-fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> bool {
+///
+/// 命中时返回抬起点(点击点):进编辑的光标落点换算(#170)以它为输入。
+fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> Option<egui::Pos2> {
     if !ui.input(|input| input.pointer.primary_clicked()) {
-        return false;
+        return None;
     }
-    let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
-        return false;
-    };
+    let pos = ui.input(|input| input.pointer.interact_pos())?;
     if !rect.contains(pos) {
-        return false;
+        return None;
     }
     if crate::ui::preview::copy_button_rects(ui.ctx())
         .iter()
         .any(|button| button.contains(pos))
     {
-        return false;
+        return None;
     }
     // 任务 checkbox(#63):点击归 checkbox 切换(帧内探针几何,由 paint
     // 先于本判定写入),不连带进编辑。
@@ -905,7 +995,7 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> boo
         .iter()
         .any(|checkbox| checkbox.contains(pos))
     {
-        return false;
+        return None;
     }
     // 选区 AI 浮标/菜单(#61)压在本块上时,点击归浮标(探针是上一帧的
     // 几何 —— 浮标本帧在场,下一帧才有点击可落,一帧滞后无影响)。
@@ -913,14 +1003,23 @@ fn clicked_for_edit(ui: &egui::Ui, rect: egui::Rect, editor_id: egui::Id) -> boo
         .iter()
         .any(|hit| hit.contains(pos))
     {
-        return false;
+        return None;
     }
-    !ui.ctx().output(|output| {
+    (!ui.ctx().output(|output| {
         output
             .commands
             .iter()
             .any(|cmd| matches!(cmd, egui::OutputCommand::OpenUrl(_)))
-    })
+    }))
+    .then_some(pos)
+}
+
+/// 渲染文本的第 `index` 个字符的字节偏移(越界 = 文本末尾):帧内命中
+/// 给的是字符索引,改写映射吃字节偏移。
+fn char_indices_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
 }
 
 /// 标记半隐藏的遮罩不透明度(遮罩色 = 编辑框背景色)。「弱化但可辨识」,
@@ -1263,12 +1362,15 @@ mod tests {
 
     /// 一帧 Live 列渲染的取证:复制按钮 rect 探针、CopyText 载荷、OpenUrl
     /// 目标、画出的文本 rect(正文/链接点击定位用)、浮标菜单点选的消息
-    /// (#61)。
+    /// (#61)、每条文本 galley 的字形屏幕坐标(#170 点击落点定位)。
     struct LiveFrame {
         button_rects: Vec<egui::Rect>,
         copied: Vec<String>,
         opened: Vec<String>,
         texts: Vec<(String, egui::Rect)>,
+        /// galley 文本 + 全部字形的屏幕坐标(行序拼接,与渲染文本字符序
+        /// 对齐):定位「点第二段第二行首字」这类目标,不必模拟字体度量。
+        glyphs: Vec<(String, Vec<egui::Pos2>)>,
         messages: Vec<Message>,
     }
 
@@ -1303,11 +1405,21 @@ mod tests {
         );
         let messages = outbox;
         let mut texts = Vec::new();
+        let mut glyphs = Vec::new();
         for clipped in &output.shapes {
             if let egui::epaint::Shape::Text(t) = &clipped.shape {
                 texts.push((
                     t.galley.text().to_owned(),
                     egui::Rect::from_min_size(t.pos, t.galley.size()),
+                ));
+                glyphs.push((
+                    t.galley.text().to_owned(),
+                    t.galley
+                        .rows
+                        .iter()
+                        .flat_map(|row| row.glyphs.iter())
+                        .map(|glyph| t.pos + glyph.pos.to_vec2())
+                        .collect(),
                 ));
             }
         }
@@ -1328,6 +1440,7 @@ mod tests {
             copied,
             opened,
             texts,
+            glyphs,
             messages,
         }
     }
@@ -1432,6 +1545,100 @@ mod tests {
         assert_eq!(live.active, Some(2), "点块内正文应切入编辑态:{live:?}");
     }
 
+    /// #170:点击富渲染块进入编辑,光标落**点击处**而非块尾(旧行为一律
+    /// 块尾 —— 点块内任何位置,光标都跳到块末尾的空行上)。第二段是软换
+    /// 行的两行源码,富渲染成一行(CommonMark 语义,换行渲染成空格):点
+    /// 渲染文本第 7 个字形(= 源码第二行行首「第」),块内字符偏移应落在
+    /// 7,而不是块尾 14。
+    #[test]
+    fn live_click_lands_caret_on_the_clicked_glyph() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("第一段\n\n第二段第一行\n第二段第二行\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (_, glyphs) = frame
+            .glyphs
+            .iter()
+            .find(|(text, _)| text.contains("第二段第二行"))
+            .expect("第二段已富渲染");
+        assert_eq!(glyphs.len(), 13, "软换行合行后 13 字形:{glyphs:?}");
+        // 渲染文本 "第二段第一行 第二段第二行" 第 7 字形,字形内左缘 +
+        // 1px(中点判定命中该字形)。
+        let target = glyphs[7] + egui::vec2(1.0, 0.0);
+
+        for events in click_events(target) {
+            live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(live.active, Some(1), "点击切入编辑态:{live:?}");
+        assert_eq!(
+            live.pending_caret,
+            Some((1, 7)),
+            "光标落点击字形而非块尾:{:?}",
+            live.pending_caret
+        );
+    }
+
+    /// #170 的落点精度:点第一段首字形,块内偏移落 0(字形级精确),
+    /// 不是块尾 5,也不是「最近子块」回退能给出的任何其它值。
+    #[test]
+    fn live_click_lands_caret_at_first_paragraph_start() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("第一段\n\n第二段第一行\n第二段第二行\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        let (_, glyphs) = frame
+            .glyphs
+            .iter()
+            .find(|(text, _)| text.trim() == "第一段")
+            .expect("第一段已富渲染");
+        let target = glyphs[0] + egui::vec2(1.0, 0.0);
+
+        for events in click_events(target) {
+            live_frame(
+                &ctx,
+                events,
+                &mut editor,
+                &mut preview,
+                &mut cursor,
+                &mut live,
+            );
+        }
+        assert_eq!(live.active, Some(0), "点击切入编辑态:{live:?}");
+        assert_eq!(
+            live.pending_caret,
+            Some((0, 0)),
+            "光标落第一段行首而非块尾 5:{:?}",
+            live.pending_caret
+        );
+    }
+
     /// Live 富渲染块的任务 checkbox(#63):任务块渲染出自绘 checkbox
     /// (探针在场、豁免面的代码块不产),点击走块内载荷 + 块首换算出
     /// [`Message::TaskCheckboxToggled`](载荷指向**源码**里标记的 `[`),
@@ -1491,7 +1698,7 @@ mod tests {
         let char_at = editor.byte_to_char(byte);
         editor.replace_range(char_at + 1..char_at + 2, "x");
         live.sync(&editor, None);
-        let block_rendered = live.rich_block(
+        let (block_rendered, _, _) = live.rich_block(
             0,
             editor.revision(),
             BlockBuffer::slice(editor.text(), &live.blocks[0]),
@@ -3895,17 +4102,17 @@ mod tests {
     fn live_rich_block_stacks_highlight_and_task_layers() {
         let mut live = LiveState::default();
         let doc = "- [ ] ==完== 成\n";
-        let rendered = live.rich_block(0, 1, doc);
+        let (rendered, _, _) = live.rich_block(0, 1, doc);
         assert!(rendered.contains("[完](<hl://>)"), "高亮层先跑:{rendered}");
         assert!(rendered.contains("task://"), "任务层后跑:{rendered}");
         assert!(!rendered.contains("=="), "标记被改写消费,不回流:{rendered}");
 
         // 缓存:同修订号直取同一份
-        assert_eq!(live.rich_block(0, 1, doc), rendered, "同修订号缓存命中");
+        assert_eq!(live.rich_block(0, 1, doc).0, rendered, "同修订号缓存命中");
 
         // 零变化护栏:无 == 无任务标记的块恒等
         assert_eq!(
-            live.rich_block(1, 1, "普通段落。\n"),
+            live.rich_block(1, 1, "普通段落。\n").0,
             "普通段落。\n",
             "无目标字符的块改写恒等"
         );

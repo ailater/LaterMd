@@ -763,6 +763,7 @@ pub struct Rewrite {
 /// (预合并要把第二层区间反解回源码坐标,复杂度换不来收益)。app 侧
 /// `PreviewState::rendered` 的生产链(wikilink 展开 → 相对图片 URI 改写)
 /// 即此口径的实例。
+#[derive(Debug, Clone)]
 pub struct OffsetMap {
     rewrites: Vec<Rewrite>,
 }
