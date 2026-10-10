@@ -1162,16 +1162,20 @@ mod tests {
 
         let query = query(&root, "^foo$", false);
         let outcome = search_sync(&query, MAX_HITS).unwrap();
-        assert_eq!(
-            outcome
-                .hits
-                .iter()
-                .map(|hit| (
+        let mut hits = outcome
+            .hits
+            .iter()
+            .map(|hit| {
+                (
                     hit.path.file_name().unwrap().to_owned(),
                     hit.line_no,
-                    hit.line_text.clone()
-                ))
-                .collect::<Vec<_>>(),
+                    hit.line_text.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        hits.sort();
+        assert_eq!(
+            hits,
             vec![
                 ("crlf.md".into(), 1, "foo".into()),
                 ("crlf.md".into(), 3, "foo".into()),
