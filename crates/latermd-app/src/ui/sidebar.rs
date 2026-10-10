@@ -86,7 +86,7 @@ fn draw_rail(
 ) {
     panel
         .painter()
-        .rect_filled(rail, 0.0, tokens::rail_fill(panel.visuals().dark_mode));
+        .rect_filled(rail, 0.0, crate::theme::shell(panel).rail);
 
     let keymap = Keymap::builtin();
     // 不用闭包:闭包要同时捕获 `&mut panel` 与 `index`,借用检查过不去
@@ -120,10 +120,7 @@ fn draw_rail(
     panel.painter().hline(
         egui::Rangef::new(rail.left() + inset, rail.right() - inset),
         y,
-        egui::Stroke::new(
-            tokens::RAIL_DIVIDER_H,
-            tokens::rail_divider(panel.visuals().dark_mode),
-        ),
+        egui::Stroke::new(tokens::RAIL_DIVIDER_H, crate::theme::shell(panel).border),
     );
 
     // ③ 下组:文件动作六枚(Command::FILE + 导出 HTML / PDF)
@@ -155,7 +152,7 @@ fn paint_rail_item(ui: &egui::Ui, rect: egui::Rect, item: RailItem, selected: bo
     let visuals = ui.visuals();
     let radius = egui::CornerRadius::same(tokens::RADIUS_SM as u8);
     if selected {
-        let shell = crate::theme::shell_tokens(visuals.dark_mode);
+        let shell = crate::theme::shell(ui);
         painter.rect_filled(rect, radius, shell.selected_bg);
         painter.rect_filled(
             egui::Rect::from_min_size(
@@ -486,7 +483,7 @@ fn paint_nav_tab(ui: &egui::Ui, rect: egui::Rect, tab: SidebarTab, selected: boo
     // 就是整数,取整无损;真要改成非整数 token 时这条要重新核。
     let radius = egui::CornerRadius::same(crate::ui::tokens::RADIUS_SM as u8);
     if selected {
-        let selected_bg = crate::theme::shell_tokens(visuals.dark_mode).selected_bg;
+        let selected_bg = crate::theme::shell(ui).selected_bg;
         painter.rect_filled(rect, radius, selected_bg);
         // 下缘 2px 强调色横条:贴着 tab 底缘,宽度取 tab 宽的 60%,
         // 视觉上是一枚「下划线」而非「边框」,与页签选中同款。
@@ -564,7 +561,7 @@ fn icon_label_row(
         // hover 用内建 hover 底
         if selected {
             let accent = crate::ui::tokens::accent(ui);
-            let selected_bg = crate::theme::shell_tokens(visuals.dark_mode).selected_bg;
+            let selected_bg = crate::theme::shell(ui).selected_bg;
             painter.rect_filled(rect, 0.0, selected_bg);
             painter.rect_filled(
                 egui::Rect::from_min_size(

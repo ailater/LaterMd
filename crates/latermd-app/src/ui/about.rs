@@ -303,7 +303,7 @@ pub fn dialog(ui: &mut egui::Ui, about: &AboutState, outbox: &mut Vec<Message>) 
     let mut open = true;
     // 窗底显式取当前主题 shell 色(#70 M1 同款:不依赖投影也在场,明暗
     // 各走各的 token);圆角/阴影/内边距仍走 egui 出厂 window 档。
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     egui::Window::new("关于 LaterMD")
         // 显式 id(设置窗同款):窗口拖动位置记忆与文案解耦
         .id(egui::Id::new("about-dialog"))

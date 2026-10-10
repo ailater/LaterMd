@@ -34,7 +34,7 @@ pub(super) fn style(ui: &mut egui::Ui) {
 }
 
 pub(super) fn navigation(ui: &mut egui::Ui, tab: SettingsTab, selected: bool) -> egui::Response {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     if selected || response.hovered() {
@@ -84,9 +84,9 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             .size(12.0)
             .family(crate::fonts::semibold_family(ui.ctx())),
     );
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     egui::Frame::NONE
-        .fill(crate::theme::window_fill(ui.visuals().dark_mode))
+        .fill(crate::theme::shell(ui).chrome)
         .stroke(egui::Stroke::new(
             1.0 / ui.ctx().pixels_per_point(),
             shell.border,
@@ -121,7 +121,7 @@ fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn segments(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usize> {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let width = (ui.available_width() / labels.len() as f32).clamp(48.0, 82.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(width * labels.len() as f32, 28.0),
@@ -171,7 +171,7 @@ fn segments(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usize
 }
 
 fn theme_choices(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Message>) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.horizontal(|ui| {
         for mode in ThemeMode::ALL {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(96.0, 80.0), Sense::click());
@@ -179,28 +179,17 @@ fn theme_choices(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mess
             let thumb =
                 Rect::from_min_size(rect.min + egui::vec2(2.0, 2.0), egui::vec2(92.0, 54.0));
             let dark = mode == ThemeMode::Dark;
-            let paper = if dark {
-                Color32::from_gray(35)
-            } else {
-                Color32::from_gray(252)
-            };
+            let preview = theme.shell_palette().colors(dark);
+            let paper = preview.content;
             ui.painter().rect_filled(thumb, 6.0, paper);
             let side =
                 Rect::from_min_max(thumb.min, egui::pos2(thumb.left() + 25.0, thumb.bottom()));
-            ui.painter().rect_filled(
-                side,
-                5.0,
-                if dark {
-                    Color32::from_gray(48)
-                } else {
-                    Color32::from_gray(227)
-                },
-            );
+            ui.painter().rect_filled(side, 5.0, preview.sidebar);
             if mode == ThemeMode::System {
                 ui.painter().rect_filled(
                     Rect::from_min_max(thumb.center_top(), thumb.max),
                     5.0,
-                    Color32::from_gray(40),
+                    theme.shell_palette().dark.content,
                 );
             }
             for (line, width) in [(0.0, 37.0), (1.0, 46.0), (2.0, 30.0)] {
@@ -208,11 +197,7 @@ fn theme_choices(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mess
                 ui.painter().rect_filled(
                     Rect::from_min_size(pos, egui::vec2(width, 2.0)),
                     1.0,
-                    if dark {
-                        Color32::from_gray(96)
-                    } else {
-                        Color32::from_gray(165)
-                    },
+                    preview.secondary,
                 );
             }
             ui.painter().rect_stroke(
@@ -256,7 +241,7 @@ fn theme_choices(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mess
 }
 
 fn toggle(ui: &mut egui::Ui, label: &str, help: &str, value: bool) -> bool {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 43.0), Sense::click());
     label_at(ui, rect.left(), rect.top() + 12.0, label, 13.0, colors.text);
@@ -319,6 +304,10 @@ pub(super) fn appearance(
             .size(12.0)
             .weak(),
     );
+    section(ui, "工作台皮肤", |ui| {
+        ui.small("窗口、侧栏、编辑区、控件与文档统一换肤。");
+        skins::choices(ui, theme, skins, outbox);
+    });
     section(ui, "主题", |ui| {
         theme_choices(ui, theme, outbox);
         if theme.mode == ThemeMode::System {
@@ -418,31 +407,7 @@ pub(super) fn appearance(
             }
         });
     });
-    section(ui, "文档样式", |ui| {
-        row(ui, "皮肤", |ui| {
-            egui::ComboBox::from_id_salt("settings-skin-select")
-                .selected_text(theme.skin.as_deref().unwrap_or("出厂默认"))
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(theme.skin.is_none(), "出厂默认")
-                        .clicked()
-                    {
-                        outbox.push(Message::ThemeSkinSelected(None));
-                    }
-                    for skin in &skins.skins {
-                        if ui
-                            .selectable_label(
-                                theme.skin.as_deref() == Some(skin.name.as_str()),
-                                &skin.name,
-                            )
-                            .clicked()
-                        {
-                            outbox.push(Message::ThemeSkinSelected(Some(skin.name.clone())));
-                        }
-                    }
-                });
-        });
-        rule(ui);
+    section(ui, "分享皮肤", |ui| {
         row(ui, "导出皮肤", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut settings.skin_export_name)

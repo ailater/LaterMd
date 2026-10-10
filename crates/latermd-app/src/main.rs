@@ -124,23 +124,7 @@ fn main() -> eframe::Result<()> {
             // 的网络地址也出图(ehttp 原生后端复用已在依赖树里的 ureq)。
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let theme = theme::ThemeSettings::load();
-            // 首帧前装好主题,避免开场按默认深色闪一帧;此后每次切换由
-            // `App::logic` 的投影维持。「跟随系统」在这里先探测一次,首帧
-            // 就不是靠 fallback 猜的。
             let system = theme::detect_system_mode();
-            theme.apply(
-                &cc.egui_ctx,
-                theme
-                    .mode
-                    .resolve(system, system.unwrap_or(theme::ThemeMode::Dark)),
-            );
-            // 出厂预设色板(U0):铺进皮肤目录一次(已存在的同名文件不动),
-            // 皮肤扫描由此拿到普通 .ron;用户改过的预设永远是用户那份。
-            // `LaterMdApp::new → load_preferences` 里同款调用兜测试注入目录,
-            // 这里只管真实平台目录
-            if let Some(dir) = theme::config_dir() {
-                theme_presets::install_to(&dir);
-            }
             // 文件树设置(上次根目录 + 最近列表)同样启动即恢复
             let file_tree = filetree::FileTreeSettings::load();
             // 外壳布局(左右两栏开着与否 + 左栏停在哪个视图)同上,M1 起持久化;
@@ -175,6 +159,10 @@ fn main() -> eframe::Result<()> {
             app.frameless = !native_chrome;
             app.state.system_theme = system;
             app.state.system_theme_ok = system.is_some();
+            // load_preferences 已恢复完整皮肤，首帧直接使用保存的应用色板。
+            app.state
+                .theme
+                .apply(&cc.egui_ctx, app.state.resolved_theme());
             Ok(Box::new(app))
         }),
     )

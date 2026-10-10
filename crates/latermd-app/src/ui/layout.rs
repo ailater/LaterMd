@@ -316,7 +316,7 @@ impl LaterMdApp {
             // 更细,低分屏下与原值一致。
             egui::Panel::top("workbench-header")
                 .exact_size(crate::ui::workbench::HEADER_H)
-                .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))
+                .frame(egui::Frame::NONE.fill(crate::theme::shell(ui).chrome))
                 .show(ui, |ui| {
                     crate::ui::workbench::header(ui, &mut self.state, &mut self.outbox)
                 });
@@ -425,7 +425,7 @@ impl LaterMdApp {
                     // 一半留更乱 → 与 nav 的 Margin::symmetric(8,2) 同判,整处
                     // 保留字面量(设计系统 T2b 判例;inset::MD 另有 OVERLAY_MARGIN 消费)。
                     .inner_margin(egui::Margin::same(if workbench { 16 } else { 8 }))
-                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+                    .fill(crate::theme::shell(ui).content),
             )
             .show_collapsible(ui, right, |ui| {
                 if workbench {
@@ -479,7 +479,7 @@ impl LaterMdApp {
                     } else {
                         egui::Margin::symmetric(8, 2)
                     })
-                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+                    .fill(crate::theme::shell(ui).content),
             )
             .show(ui, |ui| {
                 // 标签条(多标签 #11)在格式工具条之上:先选文档,再对文档操作。
@@ -548,8 +548,7 @@ impl LaterMdApp {
                     && focus_owner.is_some()
                     && !ui.input(|input| input.pointer.any_pressed());
                 if workbench {
-                    ui.visuals_mut().extreme_bg_color =
-                        crate::theme::content_fill(ui.visuals().dark_mode);
+                    ui.visuals_mut().extreme_bg_color = crate::theme::shell(ui).content;
                 }
                 crate::ui::editor::ui(
                     ui,
@@ -805,7 +804,7 @@ impl LaterMdApp {
         if cfg!(target_os = "macos") && !self.frameless {
             egui::Panel::top("workbench-header")
                 .exact_size(crate::ui::workbench::HEADER_H)
-                .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))
+                .frame(egui::Frame::NONE.fill(crate::theme::shell(ui).chrome))
                 .show(ui, |ui| {
                     crate::ui::workbench::header(ui, &mut self.state, &mut self.outbox)
                 });
@@ -847,7 +846,7 @@ impl LaterMdApp {
                     // i8 ;`f32` 走 `From<f32>` 时被 round 掉小数,故 `ZEN_GUTTER`
                     // 取整数常量(24),不留 24.5 这种会被静默吞掉的值。
                     .inner_margin(tokens::ZEN_GUTTER)
-                    .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
+                    .fill(crate::theme::shell(ui).content),
             )
             .show(ui, |ui| {
                 // 720 限宽居中,但**下限.md 的可用宽度**:窗口窄于

@@ -360,7 +360,7 @@ pub(super) fn search_capsule(
     search: &mut SearchState,
     outbox: &mut Vec<Message>,
 ) {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let id = ui.make_persistent_id("titlebar-search");
     let focused = ui.memory(|m| m.has_focus(id));
     let radius = RADIUS_MD * 2.0; // 完全圆角胶囊

@@ -1,15 +1,17 @@
 //! 出厂预设色板(ui-modernization.md §3 U0)。
 //!
+//! 应用色板覆盖整个工作台，正文样式与外壳一起导出。
+//!
 //! 抄 egui-thematic 0.1.1 的九套预设**色值**(该 crate MIT,2026-09-28 从
 //! crates.io 下载源码核对;它锁 egui 0.33 故被否决引库,数值白拿 ——
-//! ui-modernization.md §2.1)。每份色板是一份 `MarkdownStyle`,与 #8
-//! 皮肤文件(`themes/*.ron`)同格式,零依赖。
+//! ui-modernization.md §2.1)。正文沿用 MarkdownStyle，应用色板按各系列
+//! 的公开配色搭配明暗表面与强调色，存为完整 SkinFile，零新增依赖。
 //!
 //! 载入语义:预设**以字面量编进二进制**,启动时铺进皮肤目录一次
 //! (`themes/<name>.ron` 不存在才写)—— 皮肤系统由此拿到普通 `.ron`
 //! 文件:可被扫描、可被用户改、改了不会在下次启动被出厂值顶掉。
 //!
-//! 色板是纯数据:不参与渲染决策,唯一的「逻辑」是落盘。
+//! 色板是纯数据，投影与切换统一由 ThemeSettings 负责。
 
 use std::sync::OnceLock;
 
@@ -43,8 +45,13 @@ pub fn install_to(dir: &std::path::Path) -> Vec<String> {
         if path.exists() {
             continue;
         }
-        let Ok(text) = ron::ser::to_string_pretty(&skin.style, ron::ser::PrettyConfig::default())
-        else {
+        let Ok(text) = ron::ser::to_string_pretty(
+            &crate::theme::SkinFile {
+                markdown: skin.style.clone(),
+                shell: shell_palette(skin.name).unwrap_or_default(),
+            },
+            ron::ser::PrettyConfig::default(),
+        ) else {
             continue;
         };
         if std::fs::create_dir_all(&themes).is_ok() && std::fs::write(&path, text).is_ok() {
@@ -161,10 +168,10 @@ fn skins() -> Vec<BuiltinSkin> {
         skin(
             "Solarized Light",
             // 正文 657B83 / panel EEE8D5 / 窗底 FDF6E3
-            [0x65, 0x7B, 0x83],
+            [0xB4, 0xC5, 0xC5],
             [0x58, 0x6E, 0x75],
+            [0x07, 0x36, 0x42],
             [0xEE, 0xE8, 0xD5],
-            [0xFD, 0xF6, 0xE3],
         ),
         skin(
             "Tokyo Night",
@@ -189,7 +196,7 @@ fn skins() -> Vec<BuiltinSkin> {
             // 保持与暗色主题搭配时不至于浅字浅底
             [0xAB, 0xB2, 0xBF],
             [0x38, 0x3C, 0x44],
-            [0xF0, 0xF0, 0xF1],
+            [0x34, 0x34, 0x3B],
             [0xE8, 0xE9, 0xEB],
         ),
         skin(
@@ -203,9 +210,119 @@ fn skins() -> Vec<BuiltinSkin> {
     ]
 }
 
+/// 预设的应用色板。旧安装的纯正文 RON 按原名补齐，不覆盖用户修改。
+/// 每行依次是内容、导航、文字、次文字、强调色；状态色统一按表面混合。
+pub fn shell_palette(name: &str) -> Option<crate::theme::ShellPalette> {
+    let (light, dark) = match name {
+        "Dracula" => (
+            [0xf8f8fa, 0xeeeef4, 0x282a36, 0x656579, 0x7952b3],
+            [0x282a36, 0x21222c, 0xf8f8f2, 0xb3b1c6, 0xbd93f9],
+        ),
+        "Nord" => (
+            [0xeceff4, 0xe1e6ee, 0x2e3440, 0x596579, 0x456780],
+            [0x2e3440, 0x272d38, 0xe5e9f0, 0xa5b1c2, 0x88c0d0],
+        ),
+        "Gruvbox Dark" => (
+            [0xfbf1c7, 0xf2e5bc, 0x3c3836, 0x71624d, 0x95601a],
+            [0x282828, 0x202020, 0xebdbb2, 0xbdae93, 0xd8a657],
+        ),
+        "Solarized Dark" => (
+            [0xfdf6e3, 0xeee8d5, 0x475b62, 0x56686e, 0x1b668d],
+            [0x002b36, 0x00232c, 0xc1d1d1, 0x93a1a1, 0x62b9cd],
+        ),
+        "Solarized Light" => (
+            [0xfdf6e3, 0xeee8d5, 0x475b62, 0x56686e, 0x006e69],
+            [0x073642, 0x002b36, 0xc1d1d1, 0x93a1a1, 0x70c6bc],
+        ),
+        "Tokyo Night" => (
+            [0xf0f2f8, 0xe1e6f0, 0x343b58, 0x55617c, 0x34548a],
+            [0x1a1b26, 0x16161f, 0xc0caf5, 0x99a4ca, 0x7aa2f7],
+        ),
+        "One Dark" => (
+            [0xf5f6f8, 0xe9ebef, 0x383a42, 0x646976, 0x326f9b],
+            [0x282c34, 0x21252b, 0xd2d7e0, 0xabb2bf, 0x61afef],
+        ),
+        "One Light" => (
+            [0xfafafa, 0xeeeeef, 0x383a42, 0x646570, 0x8250a4],
+            [0x2b2b30, 0x232328, 0xe5e5eb, 0xb0afbc, 0xc5a1df],
+        ),
+        "Rosé Pine" => (
+            [0xfaf4ed, 0xf2e9e1, 0x575279, 0x65607d, 0x9d4862],
+            [0x191724, 0x14121f, 0xe0def4, 0xaaa5c4, 0xebbcba],
+        ),
+        _ => return None,
+    };
+    Some(crate::theme::ShellPalette {
+        light: palette(light),
+        dark: palette(dark),
+    })
+}
+
+fn palette(values: [u32; 5]) -> crate::theme::ShellTokens {
+    let [content, sidebar, text, secondary, accent] =
+        values.map(|hex| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8));
+    let mix = |a: Color32, b: Color32, t: f32| {
+        let c = |x: u8, y: u8| (f32::from(x) * (1.0 - t) + f32::from(y) * t).round() as u8;
+        Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
+    };
+    crate::theme::ShellTokens {
+        chrome: mix(sidebar, content, 0.45),
+        rail: mix(sidebar, text, 0.035),
+        content,
+        sidebar,
+        text,
+        secondary,
+        accent,
+        hover: mix(sidebar, text, 0.08),
+        selected_bg: mix(content, accent, 0.20),
+        border: mix(sidebar, text, 0.16),
+        code_bg: mix(content, sidebar, 0.6),
+        faint: mix(content, text, 0.045),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_palettes_keep_text_readable_on_surfaces_and_selection() {
+        fn luminance(c: Color32) -> f32 {
+            let linear = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            linear(c.r()) * 0.2126 + linear(c.g()) * 0.7152 + linear(c.b()) * 0.0722
+        }
+        for skin in builtins() {
+            let palette = shell_palette(skin.name).unwrap();
+            for colors in [palette.light, palette.dark] {
+                for (text, background) in [
+                    (colors.text, colors.content),
+                    (colors.text, colors.sidebar),
+                    (colors.text, colors.selected_bg),
+                    (colors.secondary, colors.content),
+                    (colors.secondary, colors.sidebar),
+                    (colors.accent, colors.content),
+                ] {
+                    let a = luminance(text);
+                    let b = luminance(background);
+                    let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                    assert!(
+                        contrast >= 4.5,
+                        "{}: {:?} on {:?}: {contrast}",
+                        skin.name,
+                        text,
+                        background
+                    );
+                }
+            }
+        }
+    }
 
     /// #23 F4/F5:标题排版新字段随九套预设出厂 —— `heading_space_above`
     /// 显式钉在 vendored 出厂值(4.0),`heading.scales` 走 vendored 新分级

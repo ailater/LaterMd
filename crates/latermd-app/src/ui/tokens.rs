@@ -330,17 +330,9 @@ pub const RADIUS_LG: f32 = 8.0;
 
 // —— 语义色 ——
 
-/// 强调色:页签选中、选中态下划线、主按钮。WorkBuddy 风(2026-09-26 定):
-/// 飞书系蓝,浅色 #3370FF、暗色 #6C9FFF。
-///
-/// AI 专属元素(ai:// 链接、指令卡)仍用紫罗兰 —— 见 `ui::preview` 的
-/// `ai_link_color`:强调色中立化之后,AI 是"唯一用紫罗兰的东西",反而更醒目。
+/// 当前应用皮肤的强调色，手绘图标、行号与控件共用。
 pub fn accent(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(0x6C, 0x9F, 0xFF)
-    } else {
-        Color32::from_rgb(0x33, 0x70, 0xFF)
-    }
+    crate::theme::shell(ui).accent
 }
 
 /// rail 带的底(详见 [`RAIL_W`])。比侧栏退后一档、远比内容区沉,让
@@ -355,16 +347,6 @@ pub fn rail_fill(dark: bool) -> egui::Color32 {
         egui::Color32::from_rgb(0x16, 0x17, 0x1A)
     } else {
         egui::Color32::from_rgb(0xE4, 0xE7, 0xEB)
-    }
-}
-
-/// rail 上下两组之间分隔线的颜色(详见 [`RAIL_DIVIDER_H`])。取 `border`
-/// 同档而不自调灰阶:它与侧栏里的分隔线是同一类装饰,两处不应对不上。
-pub fn rail_divider(dark: bool) -> egui::Color32 {
-    if dark {
-        egui::Color32::from_rgb(0x3C, 0x40, 0x43)
-    } else {
-        egui::Color32::from_rgb(0xE5, 0xE6, 0xE8)
     }
 }
 

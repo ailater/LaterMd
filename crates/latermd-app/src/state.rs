@@ -2764,7 +2764,7 @@ impl State {
             return;
         };
         let style = self.theme.markdown_style();
-        match crate::theme::export_skin(&dir, name, &style) {
+        match crate::theme::export_skin(&dir, name, &style, self.theme.shell_palette()) {
             Ok(path) => {
                 self.skins = SkinCatalog::load_from(&dir);
                 let stem = path
@@ -4782,7 +4782,8 @@ mod tests {
             block_spacing: 21.0,
             ..egui_markdown_style::MarkdownStyle::default()
         };
-        crate::theme::export_skin(&dir, "暗夜", &style).unwrap();
+        crate::theme::export_skin(&dir, "暗夜", &style, crate::theme::ShellPalette::default())
+            .unwrap();
         state.skins = SkinCatalog::load_from(&dir);
         assert_eq!(state.skins.skins.len(), 1);
 

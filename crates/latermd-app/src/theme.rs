@@ -5,7 +5,7 @@
 //! - **外壳**:`egui::Context::set_theme` 切换 egui 自带的 light/dark 双套
 //!   `Style`/`Visuals`(egui 0.36 按主题各持一份,面板/控件全部跟随);
 //! - **外壳 token**:密度(标准/紧凑)改写 spacing 与圆角 —— 批次 B 的视觉
-//!   打磨落点,不做每控件粒度自定义(roadmap 专题「明确不做」);
+//!   打磨落点；皮肤色板统一覆盖全应用，不做每控件粒度自定义;
 //! - **编辑器**:字号(#23 F3)投 `TextStyle::Monospace` 档;行距(#50 M2)
 //!   投 `spacing.extra_text_line_spacing`(TextEdit 行盒的绝对像素加值,
 //!   `max(0, 字号×行距 − 自然行高)`,自然行高经 `ctx.fonts` 现算);
@@ -40,7 +40,7 @@ use crate::ui::tokens;
 /// 配置文件名,落在平台配置目录下。
 const SETTINGS_FILE: &str = "settings.json";
 
-/// 皮肤目录名(配置目录下);每个 `.ron` 文件是一份 `MarkdownStyle`。
+/// 皮肤目录名；新 RON 包含正文和应用色板，兼容旧 MarkdownStyle 文件。
 pub const THEMES_DIR: &str = "themes";
 
 /// 明暗模式(用户的选择,含「跟随系统」这一非确定值)。serde 小写
@@ -309,6 +309,9 @@ pub struct ThemeSettings {
     /// 不跟着变)。
     #[serde(skip)]
     pub skin_style: Option<MarkdownStyle>,
+    /// 应用皮肤的明暗色板，与正文一起从 RON 加载。
+    #[serde(skip)]
+    pub skin_shell: Option<ShellPalette>,
 }
 
 /// 手动实现而非 derive:f32 字段的派生默认只能是 0.0,而 #23 的排版偏好
@@ -331,6 +334,7 @@ impl Default for ThemeSettings {
             overrides: None,
             emoji_recent: Vec::new(),
             skin_style: None,
+            skin_shell: None,
         }
     }
 }
@@ -397,7 +401,7 @@ impl ThemeSettings {
         if ctx.theme() != theme {
             ctx.set_theme(theme);
         }
-        apply_shell(ctx);
+        apply_shell(ctx, self.shell_palette());
         apply_density(ctx, self.density);
         apply_font_size(
             ctx,
@@ -415,6 +419,17 @@ impl ThemeSettings {
         if *egui_markdown_style::global_style(ctx) != wanted {
             egui_markdown_style::set_style(ctx, wanted);
         }
+    }
+
+    /// 应用与正文共用一次皮肤选择；旧预设按名称补齐外壳，用户文件不改写。
+    pub fn shell_palette(&self) -> ShellPalette {
+        self.skin_shell
+            .or_else(|| {
+                self.skin
+                    .as_deref()
+                    .and_then(crate::theme_presets::shell_palette)
+            })
+            .unwrap_or_default()
     }
 
     /// 生效的正文样式:皮肤 > `overrides` > 出厂默认([`default_markdown_style`])。
@@ -435,15 +450,18 @@ impl ThemeSettings {
             None => {
                 self.skin = None;
                 self.skin_style = None;
+                self.skin_shell = None;
             }
             Some(name) => match catalog.find(name) {
                 Some(skin) => {
                     self.skin = Some(name.to_owned());
                     self.skin_style = Some(skin.style.clone());
+                    self.skin_shell = skin.shell;
                 }
                 None => {
                     self.skin = None;
                     self.skin_style = None;
+                    self.skin_shell = None;
                 }
             },
         }
@@ -498,13 +516,13 @@ impl ThemeSettings {
     }
 }
 
-/// WorkBuddy 风外壳 token(2026-09-26 坤哥指定方向;浅色取自截图采样:
-/// 侧栏/顶栏 #F2F2F2、内容纯白、**无硬边框**,靠底色分区)。
-///
-/// 这是对 egui 内置 light/dark visuals 的**投影**(不再是"出厂默认"),
-/// 亮暗各一套;皮肤文件仍只管正文(批次 C 的"外壳随皮肤"依旧不做 ——
-/// 这里是内置观感,不是皮肤系统)。
+/// 全应用语义颜色。正文、导航、工具栏和弹窗共享同一色板。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellTokens {
+    /// 窗口顶栏与分组底色。
+    pub chrome: Color32,
+    /// 经典布局的图标轨道。
+    pub rail: Color32,
     /// 侧边栏 / 顶栏 / 菜单栏的底。
     pub sidebar: Color32,
     /// 编辑器与预览的内容区底。
@@ -534,6 +552,8 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
     }
     if dark {
         ShellTokens {
+            chrome: window_fill(dark),
+            rail: tokens::rail_fill(dark),
             // 2026-10-08 S2-3:`#1B1C1F`(原 `#202124`)。与 content
             // `#292A2D` 的对比度 1.122:1 → **1.196:1**,每通道差 9 → 14。
             // 取值理由:暗色下三栏(侧栏 / 编辑器 / 预览)的可辨边界靠
@@ -555,6 +575,8 @@ pub fn shell_tokens(dark: bool) -> ShellTokens {
         }
     } else {
         ShellTokens {
+            chrome: window_fill(dark),
+            rail: tokens::rail_fill(dark),
             // 2026-10-08 S2-3:`#EDEFF2`(原 `#F2F3F5`)。与 content `#FFFFFF`
             // 的对比度 1.110:1 → **1.135:1**,每通道差 13 → 18。
             // 理由与暗色同一条线索(侧栏退到背景层),但浅色下不能一味
@@ -588,6 +610,8 @@ fn macos_shell_tokens(dark: bool) -> ShellTokens {
     let rgb = |r, g, b| Color32::from_rgb(r, g, b);
     if dark {
         ShellTokens {
+            chrome: window_fill(dark),
+            rail: tokens::rail_fill(dark),
             sidebar: rgb(36, 36, 38),
             content: rgb(30, 30, 32),
             text: rgb(245, 245, 247),
@@ -601,6 +625,8 @@ fn macos_shell_tokens(dark: bool) -> ShellTokens {
         }
     } else {
         ShellTokens {
+            chrome: window_fill(dark),
+            rail: tokens::rail_fill(dark),
             sidebar: rgb(240, 240, 242),
             content: Color32::WHITE,
             text: rgb(29, 29, 31),
@@ -624,34 +650,70 @@ pub fn window_fill(dark: bool) -> Color32 {
 }
 
 /// 内容区的底(编辑器与预览面板显式 `.fill`;侧栏吃 `panel_fill`)。
+#[cfg(test)]
 pub fn content_fill(dark: bool) -> Color32 {
     shell_tokens(dark).content
 }
 
-/// 把 WorkBuddy 外壳 token 投影进 egui 的两套 style(亮暗各一)。
-///
-/// 只投影一次(`ui.data` 记标志):`style_mut_of` 即使值相同也会推进 style
-/// 版本、作废布局缓存,每帧调用不可接受。
-fn apply_shell(ctx: &egui::Context) {
-    let id = egui::Id::new("latermd-shell");
-    let changed = ctx.data_mut(|data| {
-        let done = data.get_temp::<bool>(id).unwrap_or(false);
-        data.insert_temp(id, true);
-        !done
-    });
-    if !changed {
-        return;
-    }
-    for theme in [egui::Theme::Light, egui::Theme::Dark] {
-        ctx.style_mut_of(theme, apply_shell_to);
+/// 可分享的应用皮肤同时提供明、暗两套；明暗模式独立切换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellPalette {
+    pub light: ShellTokens,
+    pub dark: ShellTokens,
+}
+
+impl Default for ShellPalette {
+    fn default() -> Self {
+        Self {
+            light: shell_tokens(false),
+            dark: shell_tokens(true),
+        }
     }
 }
 
-fn apply_shell_to(style: &mut egui::Style) {
-    let c = shell_tokens(style.visuals.dark_mode);
+impl ShellPalette {
+    pub fn colors(self, dark: bool) -> ShellTokens {
+        if dark {
+            self.dark
+        } else {
+            self.light
+        }
+    }
+}
+
+/// 只读当前窗口的皮肤；避免进程级全局变量影响多窗口/无头测试。
+pub fn shell(ui: &egui::Ui) -> ShellTokens {
+    ui.ctx()
+        .data(|data| data.get_temp::<ShellPalette>(egui::Id::new("latermd-shell")))
+        .unwrap_or_default()
+        .colors(ui.visuals().dark_mode)
+}
+
+/// 颜色变化才投影，空闲帧不推进 style 版本。重置密度缓存，以免换肤恢复默认尺寸。
+fn apply_shell(ctx: &egui::Context, palette: ShellPalette) {
+    let id = egui::Id::new("latermd-shell");
+    let changed = ctx.data_mut(|data| {
+        if data.get_temp::<ShellPalette>(id) == Some(palette) {
+            return false;
+        }
+        data.insert_temp(id, palette);
+        data.remove::<Density>(egui::Id::new("latermd-density"));
+        true
+    });
+    if changed {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            ctx.style_mut_of(theme, |style| {
+                apply_shell_to(style, palette.colors(theme == egui::Theme::Dark))
+            });
+        }
+    }
+}
+
+fn apply_shell_to(style: &mut egui::Style, c: ShellTokens) {
     let v = &mut style.visuals;
     v.panel_fill = c.sidebar;
     v.window_fill = c.content;
+    v.weak_text_color = Some(c.secondary);
 
     v.extreme_bg_color = c.code_bg;
     v.faint_bg_color = c.faint;
@@ -707,7 +769,6 @@ fn apply_shell_to(style: &mut egui::Style) {
     }
     // 输入框/按钮内的弱文字(占位符)用次要色
     style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    let _ = c.secondary; // 占位符色由 egui 的 weak_fg 承接,这里保持默认层级
 }
 
 /// 密度 → egui style token。
@@ -909,11 +970,35 @@ fn apply_font_size(ctx: &egui::Context, size: f32, ratio: f32) {
     }
 }
 
-/// 一份皮肤:显示名(文件名去扩展名)+ 正文样式。
+/// 一份皮肤：显示名、正文样式，以及可选的整应用明暗色板。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skin {
     pub name: String,
     pub style: MarkdownStyle,
+    pub shell: Option<ShellPalette>,
+}
+
+/// 新文件包含完整应用色板；旧的 MarkdownStyle RON 仍可直接读取。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SkinFile {
+    pub markdown: MarkdownStyle,
+    pub shell: ShellPalette,
+}
+
+fn parse_skin(
+    text: &str,
+) -> Result<(MarkdownStyle, Option<ShellPalette>), ron::error::SpannedError> {
+    // MarkdownStyle 使用 serde(default)，直接 fallback 会把损坏的新文件吞成默认样式。
+    // 先识别包裹字段，完整皮肤的缺字段/错误颜色必须报错。
+    let value: ron::Value = ron::from_str(text)?;
+    let wrapped = matches!(&value, ron::Value::Map(map) if map.iter().any(|(key, _)| {
+        matches!(key, ron::Value::String(key) if key == "markdown" || key == "shell")
+    }));
+    if wrapped {
+        ron::from_str::<SkinFile>(text).map(|file| (file.markdown, Some(file.shell)))
+    } else {
+        ron::from_str::<MarkdownStyle>(text).map(|style| (style, None))
+    }
 }
 
 /// 皮肤目录的内容(启动扫描一次,换皮肤/导出时重扫)。
@@ -940,14 +1025,16 @@ impl SkinCatalog {
             .filter_map(|entry| {
                 let path = entry.path();
                 let text = std::fs::read_to_string(&path).ok()?;
-                match ron::from_str::<MarkdownStyle>(&text) {
-                    Ok(style) => Some(Skin {
+                let parsed = parse_skin(&text);
+                match parsed {
+                    Ok((style, shell)) => Some(Skin {
                         name: entry
                             .path()
                             .file_stem()
                             .map(|stem| stem.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                         style,
+                        shell,
                     }),
                     Err(error) => {
                         eprintln!(
@@ -988,13 +1075,24 @@ pub fn skin_file_name(name: &str) -> String {
     }
 }
 
-/// 把一份样式导出成皮肤文件(RON);目录不存在则创建。返回落盘路径。
-pub fn export_skin(dir: &Path, name: &str, style: &MarkdownStyle) -> Result<PathBuf, String> {
+/// 导出完整应用皮肤(RON)，同时保存正文与外壳；目录不存在则创建。
+pub fn export_skin(
+    dir: &Path,
+    name: &str,
+    style: &MarkdownStyle,
+    shell: ShellPalette,
+) -> Result<PathBuf, String> {
     let path = dir
         .join(THEMES_DIR)
         .join(format!("{}.ron", skin_file_name(name)));
-    let text = ron::ser::to_string_pretty(style, ron::ser::PrettyConfig::default())
-        .map_err(|error| format!("皮肤序列化失败: {error}"))?;
+    let text = ron::ser::to_string_pretty(
+        &SkinFile {
+            markdown: style.clone(),
+            shell,
+        },
+        ron::ser::PrettyConfig::default(),
+    )
+    .map_err(|error| format!("皮肤序列化失败: {error}"))?;
     std::fs::create_dir_all(path.parent().unwrap_or(dir))
         .map_err(|error| format!("{}: {error}", dir.display()))?;
     std::fs::write(&path, text.as_bytes())
@@ -1413,6 +1511,79 @@ mod tests {
             "NaN 回落默认而非穿透"
         );
         assert_eq!(clamp_line_height(f32::NEG_INFINITY), 1.2, "负无穷钳到下界");
+    }
+
+    #[test]
+    fn skin_switch_updates_app_surfaces_and_preserves_density_and_typography() {
+        let ctx = egui::Context::default();
+        let mut settings = ThemeSettings {
+            editor_font_size: 19.0,
+            line_height: 1.8,
+            ..Default::default()
+        };
+        settings.apply(&ctx, ThemeMode::Light);
+        let geometry = ctx.global_style().spacing.clone();
+        for name in [Some("Nord"), Some("Rosé Pine"), None] {
+            settings.skin = name.map(str::to_owned);
+            settings.apply(&ctx, ThemeMode::Light);
+            let palette = settings.shell_palette();
+            for mode in [egui::Theme::Light, egui::Theme::Dark] {
+                let style = ctx.style_of(mode);
+                let colors = palette.colors(mode == egui::Theme::Dark);
+                assert_eq!(style.visuals.panel_fill, colors.sidebar);
+                assert_eq!(style.visuals.window_fill, colors.content);
+                assert_eq!(style.visuals.hyperlink_color, colors.accent);
+                assert_eq!(style.visuals.weak_text_color(), colors.secondary);
+                assert_eq!(style.visuals.selection.bg_fill, colors.selected_bg);
+                assert_eq!(style.spacing.interact_size, geometry.interact_size);
+                assert_eq!(style.spacing.item_spacing, geometry.item_spacing);
+                assert_eq!(style.text_styles[&egui::TextStyle::Monospace].size, 19.0);
+            }
+            let output = ctx.run_ui(Default::default(), |ui| {
+                assert_eq!(shell(ui), palette.light, "手绘控件与 egui 控件必须共享颜色");
+            });
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn full_skin_roundtrip_keeps_shell_when_renamed_and_legacy_keeps_document_edits() {
+        let dir = std::env::temp_dir().join(format!("latermd-full-skin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let style = MarkdownStyle {
+            block_spacing: 23.0,
+            ..default_markdown_style()
+        };
+        let palette = crate::theme_presets::shell_palette("Nord").unwrap();
+        let path = export_skin(&dir, "Nord copy", &style, palette).unwrap();
+        std::fs::rename(path, dir.join("themes/Custom.ron")).unwrap();
+        let legacy = ron::ser::to_string(&style).unwrap();
+        std::fs::write(dir.join("themes/Nord.ron"), &legacy).unwrap();
+        let catalog = SkinCatalog::load_from(&dir);
+        let mut settings = ThemeSettings::default();
+        settings.select_skin(Some("Custom"), &catalog);
+        assert_eq!(settings.shell_palette(), palette);
+        assert_eq!(settings.markdown_style(), style);
+        settings.save_to(Some(&dir)).unwrap();
+        let mut loaded = ThemeSettings::load_from(&dir).unwrap();
+        let name = loaded.skin.clone();
+        loaded.select_skin(name.as_deref(), &catalog);
+        assert_eq!(loaded.shell_palette(), palette);
+        settings.select_skin(Some("Nord"), &catalog);
+        assert_eq!(settings.shell_palette(), palette, "旧预设自动获得外壳");
+        assert_eq!(settings.markdown_style(), style, "保留用户正文修改");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("themes/Nord.ron")).unwrap(),
+            legacy
+        );
+        settings.select_skin(None, &catalog);
+        assert_eq!(settings.shell_palette(), ShellPalette::default());
+        assert_eq!(settings.markdown_style(), default_markdown_style());
+        assert!(
+            parse_skin("(markdown: (), shell: ())").is_err(),
+            "坏的完整皮肤不能吞成默认正文"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// #23 F3:字号投影到 `TextStyle::Monospace` 档(编辑器面板/行号槽/
@@ -1866,7 +2037,7 @@ mod tests {
             block_spacing: 17.0,
             ..MarkdownStyle::default()
         };
-        let path = export_skin(&dir, "我的皮肤", &style).unwrap();
+        let path = export_skin(&dir, "我的皮肤", &style, ShellPalette::default()).unwrap();
         assert!(path.ends_with("我的皮肤.ron"), "{path:?}");
 
         let catalog = SkinCatalog::load_from(&dir);

@@ -319,7 +319,7 @@ fn chip(
         // 中性选中观感(2026-10-10 mac 精修全平台化,#166/#169):淡底 +
         // 正文中性色,蓝色只留给选中/链接/操作 —— 标签条不再叠加下划线与
         // 蓝字重复强调。未选中悬停浅灰。
-        let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+        let shell = crate::theme::shell(ui);
         let hover_bg = shell.hover;
         let bg = if selected {
             shell.code_bg
