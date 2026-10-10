@@ -1443,70 +1443,16 @@ fn goto_bar_contents(
 /// 窗口窄到三段挤不下时,**先牺牲中段**(字数)—— 它是三者里唯一丢了
 /// 不影响操作的,判据是 `tokens::STATUSBAR_MIN_W`。
 fn status_bar(ui: &mut egui::Ui, state: &crate::state::State) {
-    if cfg!(target_os = "macos") {
-        let tab = state.tabs.current();
-        let position = tab
-            .cursor
-            .byte
-            .map(|byte| cursor_position(tab.editor.text(), byte));
-        crate::ui::workbench::status_bar(ui, state, position);
-        return;
-    }
-    let full = ui.available_width();
-    // **三段必须包在同一个 `horizontal` 里**。
-    //
-    // 2026-10-08 真机复核抓到的回归:改版前是 `ui.horizontal_wrapped(...)`
-    // 一个子 Ui,三段在它内部横排;改成三个平级调用后,父 Ui 的布局是
-    // `Layout::top_down`(egui `containers/panel.rs:821` 的 Panel 默认值),
-    // 于是**每个平级调用各占一行** —— 状态栏从 22px 涨到 **75px(约三倍)**,
-    // 三段竖着摞起来。1386 个测试全绿,没有任何断言看它的几何。
-    //
-    // 教训:状态栏这类「一条窄带」的每个分区都必须与相邻分区**同属一个
-    // horizontal**,平级即换行。已补 `status_bar_is_a_single_row` 断言钉住。
-    ui.horizontal(|ui| {
-        // —— 左段:文件 + 行列 ——
-        ui.weak(state.tabs.current().document.display_name());
-        let text = state.tabs.current().editor.text();
-        if let Some(byte) = state.tabs.current().cursor.byte {
-            let (line, col) = cursor_position(text, byte);
-            ui.weak(format!("行 {line}:{col}"));
-        }
-
-        // —— 中段:字数 ——
-        // 窗口不够宽时直接不画(见 fn 文档的取舍),而不是压缩左右两段。
-        if full >= crate::ui::tokens::STATUSBAR_MIN_W {
-            let count = text.chars().count();
-            ui.weak(format!("{count} 字"));
-        }
-
-        // —— 右段:主题 / AI / MCP,右对齐 ——
-        // `with_layout(right_to_left)` 让本段贴住窗口右缘;段内 push 顺序
-        // 即「从右到左」—— MCP 第一个 push 故画在最右,是最容易被扫到的位置。
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // MCP:关闭时只写「关」,开启才展开端点(窄条不堆信息)
-            match &state.mcp.status {
-                crate::mcp::McpStatus::Listening(port) => {
-                    ui.weak(format!("MCP: 127.0.0.1:{port}"));
-                }
-                crate::mcp::McpStatus::Failed(_) => {
-                    ui.colored_label(crate::ui::tokens::WARN, "MCP: 启动失败");
-                }
-                crate::mcp::McpStatus::Starting => {
-                    ui.weak("MCP: 启动中");
-                }
-                crate::mcp::McpStatus::Disabled => {
-                    ui.weak("MCP: 关");
-                }
-            }
-            let ai = if state.ai.is_streaming() {
-                format!("{} · 生成中", state.ai.provider_label())
-            } else {
-                state.ai.provider_label().to_owned()
-            };
-            ui.weak(ai);
-            ui.weak(state.theme.mode.label());
-        });
-    });
+    // 2026-10-10 统一:全平台走工作台单行状态栏(mac #169 精修平移)。
+    // 旧三段(horizontal_wrapped 家族)退役 —— 那套布局在 top_down 父 Ui
+    // 里摞过三行(见 tests::status_bar_is_a_single_row 的教训注记),新版
+    // allocate_exact_size 定形单行,窄窗按优先级省略右段/左段明细。
+    let tab = state.tabs.current();
+    let position = tab
+        .cursor
+        .byte
+        .map(|byte| cursor_position(tab.editor.text(), byte));
+    crate::ui::workbench::status_bar(ui, state, position);
 }
 
 /// 编辑器面板顶部的提示行(存在才显示):保存失败、撞键拒绝等需要用户
