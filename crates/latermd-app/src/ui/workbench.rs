@@ -114,7 +114,7 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
     .into_iter()
     .enumerate()
     {
-        if index > 0 && rect.width() < 640.0 {
+        if index > 0 && rect.width() < crate::ui::tokens::STATUSBAR_DROP_AUX_W {
             break;
         }
         let text = crate::ui::tabs::elide_text(ui, text, &egui::FontId::proportional(11.0), 150.0);
@@ -690,13 +690,16 @@ mod tests {
             2
         );
     }
-    #[cfg(target_os = "macos")]
+    // 2026-10-10 起状态栏全平台同实现,测试解除 mac 门控;无系统 CJK
+    // 字体的环境(精简 CI)优雅跳过 —— 打包兜底字体在的机器照常覆盖
     #[test]
     fn status_glyphs_stay_centered_and_do_not_overlap_when_resized() {
         for scale in [1.0, 1.5, 2.0] {
             for width in [360.0, 900.0] {
                 let ctx = egui::Context::default();
-                crate::fonts::install(&ctx).expect("macOS fonts");
+                if crate::fonts::install(&ctx).is_none() {
+                    return;
+                }
                 ctx.set_pixels_per_point(scale);
                 // Apply egui's pending zoom before measuring viewport geometry.
                 ctx.run_ui(
