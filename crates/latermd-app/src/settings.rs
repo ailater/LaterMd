@@ -808,27 +808,40 @@ fn theme_previews(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mes
                     },
                 );
             };
-            paper(thumb, false);
-            if mode == ThemeMode::System {
-                let right =
-                    egui::Rect::from_min_max(egui::pos2(thumb.center().x, thumb.top()), thumb.max);
-                painter.rect_filled(right, 5.0, dark_paper.content);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        right.min,
-                        egui::pos2(right.left() + 11.0, right.bottom()),
-                    ),
-                    5.0,
-                    dark_paper.sidebar,
-                );
+            match mode {
+                ThemeMode::Dark => paper(thumb, true),
+                ThemeMode::System => {
+                    // 跟随系统 = 左浅右暗对半
+                    paper(thumb, false);
+                    let right = egui::Rect::from_min_max(
+                        egui::pos2(thumb.center().x, thumb.top()),
+                        thumb.max,
+                    );
+                    painter.rect_filled(right, 5.0, dark_paper.content);
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            right.min,
+                            egui::pos2(right.left() + 11.0, right.bottom()),
+                        ),
+                        5.0,
+                        dark_paper.sidebar,
+                    );
+                }
+                ThemeMode::Light => paper(thumb, false),
             }
-            // 三行正文示意
+            // 三行正文示意:行墨取所在纸面的 border 档,跨纸面的「跟随
+            // 系统」用中间灰(两侧纸面上都读得出)
+            let ink = match mode {
+                ThemeMode::Dark => dark_paper.border,
+                ThemeMode::Light => light_paper.border,
+                ThemeMode::System => egui::Color32::from_gray(140),
+            };
             for (line, width) in [(0.0, 32.0), (1.0, 40.0), (2.0, 26.0)] {
                 let pos = thumb.min + egui::vec2(29.0, 13.0 + line * 8.0);
                 painter.rect_filled(
                     egui::Rect::from_min_size(pos, egui::vec2(width, 2.0)),
                     1.0,
-                    shell.border,
+                    ink,
                 );
             }
             painter.rect_stroke(
@@ -2556,6 +2569,83 @@ mod tests {
             );
             assert!(last_outbox.is_empty(), "show={show}: 无交互帧不产出消息");
         }
+    }
+
+    /// 主题预览图按模式画各自的纸面(2026-10-10 坤哥实机报告的回归:
+    /// 深色缩略图曾误画浅色纸 —— `paper(thumb, false)` 写死所致)。
+    /// 判据:暗色 content 纸面矩形 ≥2 块(「深色」整张 + 「跟随系统」
+    /// 右半),浅色纸面同理 ≥2 块;行墨不走当前主题 border(深色缩略图
+    /// 上浅灰墨才是对的,这里数 dark border 矩形 ≥2 同步钉住)。
+    #[test]
+    fn theme_previews_render_each_mode_with_its_own_paper() {
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.theme.apply(&ctx, state.theme.mode);
+        let skins = state.skins.clone();
+        let system_theme_ok = state.system_theme_ok;
+        let resolved = resolved_theme_for_test(&state);
+        let mut last_shapes = Vec::new();
+        for _ in 0..2 {
+            let State {
+                settings, theme, ..
+            } = &mut state;
+            let mut outbox = Vec::new();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        appearance(
+                            ui,
+                            settings,
+                            theme,
+                            &skins,
+                            system_theme_ok,
+                            resolved,
+                            &mut outbox,
+                        );
+                    });
+                },
+            );
+            let mut output = output;
+            output.textures_delta.clear();
+            last_shapes = output.shapes;
+        }
+        let dark = crate::theme::shell_tokens(true);
+        let light = crate::theme::shell_tokens(false);
+        let count = |want: egui::Color32| {
+            last_shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(&clipped.shape, egui::epaint::Shape::Rect(r) if r.fill == want)
+                })
+                .count()
+        };
+        assert!(
+            count(dark.content) >= 2,
+            "暗色纸面矩形应 ≥2(深色整张+跟随系统右半),实测 {}",
+            count(dark.content)
+        );
+        assert!(
+            count(dark.sidebar) >= 2,
+            "暗色侧栏条应 ≥2,实测 {}",
+            count(dark.sidebar)
+        );
+        assert!(
+            count(dark.border) >= 2,
+            "暗色行墨应 ≥2(深色缩略图上的三行示意),实测 {}",
+            count(dark.border)
+        );
+        assert!(
+            count(light.content) >= 2,
+            "浅色纸面矩形应 ≥2(浅色整张+跟随系统左半),实测 {}",
+            count(light.content)
+        );
     }
 
     /// #57 M2:外观页真实渲出禅定导航三态选择(与 minimap 测试同款:直接
