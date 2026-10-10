@@ -22,6 +22,7 @@
 | [emoji-plan.md](emoji-plan.md) | Emoji 插入规划：工具条自绘笑脸按钮 + Emoji 面板（搜索 / 分类 / 最近使用），拆 E1–E4 约 1.3d | **待坤哥放行**（2026-09-27，数据源选型待拍板） |
 | [preview-typography-and-keymap-plan.md](preview-typography-and-keymap-plan.md) | 预览行高重叠的根因与修复 + 标题分级 / 块间距规划 + 快捷键重排（主题让出 `Ctrl+Shift+T` 给 TabRestore） | **自动侧全部落地，仅余真机目视**（2026-09-28：行高已修，vendor 六项门禁 + 主仓 597 测试全绿；2026-10-01/02：键位改排 Alt+T 与 TabRestore 已落地，Win/mac 真机项见 §3.4；2026-10-02：标题分级/块间距随 #23 F4/F5 落地——vendored ①类 `02b33ad` + app `f138140`，无头像素验收见 [preview-typography-acceptance.md](preview-typography-acceptance.md)，真机目视 M1–M6 及键位三项留人工） |
 | [ui-shell-redesign-v2.md](ui-shell-redesign-v2.md) | 外壳第二次收口：七症状诊断（每条落到代码位置与常驻代价）+ S1/S2/S3 分批 + 明确不做清单 | **S1 + S2-2 + S2-3 已落地**（PR #131 侧栏视图导航 130px→26px、状态栏切三段；PR #135 格式条 17→8 直出 + 9 项溢出菜单（实测自然宽 568→**331px**，窄栏 3 行→2 行）；PR #133 侧栏与内容区明度差 1.135:1（浅）/ 1.196:1（暗）；PR #137 修状态栏被摞成三行的排版回归 + #138 三条窄条几何守门）；**S2-1 实测后无可行形态**（§6.1：标题栏路线会让标签间空白处**拖不动窗口**（ScrollArea 吃满该段宽度）；并排路线也否决 —— 最小窗编辑区仅 240px 而格式条单行就要 331px，标签条塞不进）；S3-1 待 #68 落地 |
+| [design-system-plan.md](design-system-plan.md) | 设计系统规划：尺度 token 语义档（space/text/gap/inset）+ 缩放轴 + 强调色纪律 + 语义正交（disktree 审读可迁移项，T1–T5 分批） | T1+T2 随本 PR 落地（2026-10-09）；T3 缩放轴 / T4 强调色纪律 / T5 minimap+editor 归流待排 |
 
 ## 决策总表（一句话版）
 
