@@ -218,15 +218,20 @@ pub mod text {
 /// 间隔:两侧都是内容,用于控件之间。与 `inset` 拆成两个命名空间,
 /// 根治「拿间隔的量去填贴边」的度量语境错配(`RAIL_W` 48→40 事故,
 /// docs/ui-shell-redesign-v2.md §5.5)。
-// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
-// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
-#[cfg_attr(not(test), expect(dead_code))]
+// T2a 起 `XS` 已有生产消费者(sidebar 的 Git 页节间留白),模块整体不再
+// expect;`SM`/`MD` 仍暂无生产消费者,逐常量挂 expect,接线后各自摘除
+// (clippy 的 unfulfilled 会提醒)。not(test):守门测试本身就是消费方,
+// cfg(test) 下裸 expect 会 unfulfilled。
 pub mod gap {
     /// 同一控件内的部件之间、紧挨着的两个小控件之间。
     pub const XS: f32 = 4.0;
     /// 紧密关联的控件之间:按钮组、对话框动作区。
+    // 暂无生产消费者;接线后摘除。
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const SM: f32 = 8.0;
     /// 一个内容组的控件/列之间:一行表单的控件与说明。
+    // 暂无生产消费者;接线后摘除。
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const MD: f32 = 12.0;
 }
 

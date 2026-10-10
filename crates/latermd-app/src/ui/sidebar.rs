@@ -1099,7 +1099,8 @@ fn git_panel(panel: &mut egui::Ui, git: &GitPanelState, outbox: &mut Vec<Message
         });
 
     if let Some(selected) = git.selected.as_deref() {
-        panel.add_space(4.0);
+        // 改动列表与选中文件 diff 区之间的节间留白:两侧都是内容 → gap 档。
+        panel.add_space(tokens::gap::XS);
         // 文件名 + 视图切换同一行:文件名等宽,右侧「双栏/统一」两态
         // 切换(#53 M2),点击发消息、归约写 `git.diff_view`(本层只读)
         panel.horizontal(|ui| {
@@ -1114,7 +1115,8 @@ fn git_panel(panel: &mut egui::Ui, git: &GitPanelState, outbox: &mut Vec<Message
         }
     }
 
-    panel.add_space(4.0);
+    // diff 区/回滚按钮与历史折叠区之间的节间留白:同上,gap 档。
+    panel.add_space(tokens::gap::XS);
     egui::CollapsingHeader::new(format!("历史({})", git.commits.len()))
         .id_salt("git-history")
         .default_open(true)
