@@ -311,6 +311,8 @@ impl LaterMdApp {
         // LATERMD_NATIVE_DECORATIONS=1 的原生装饰路径不画,行为与旧版
         // 完全一致)。
         if cfg!(target_os = "macos") && !self.frameless {
+            // 同一物理像素分隔线贯穿标题栏、侧栏、预览与状态栏。
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = crate::ui::workbench::separator(ui);
             egui::Panel::top("workbench-header")
                 .exact_size(crate::ui::workbench::HEADER_H)
                 .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))
@@ -540,6 +542,10 @@ impl LaterMdApp {
                     && cursor.jump_to.is_none()
                     && focus_owner.is_some()
                     && !ui.input(|input| input.pointer.any_pressed());
+                if workbench {
+                    ui.visuals_mut().extreme_bg_color =
+                        crate::theme::content_fill(ui.visuals().dark_mode);
+                }
                 crate::ui::editor::ui(
                     ui,
                     editor,

@@ -269,6 +269,7 @@ pub fn ui(
         search,
         git,
         backlinks,
+        false,
         outbox,
     );
 
@@ -317,6 +318,7 @@ pub fn workbench_ui(
         search,
         git,
         backlinks,
+        true,
         outbox,
     );
     panel.expand_to_include_rect(panel.max_rect());
@@ -333,6 +335,7 @@ fn draw_body(
     search: &mut SearchState,
     git: &GitPanelState,
     backlinks: &BacklinkState,
+    workbench: bool,
     outbox: &mut Vec<Message>,
 ) {
     egui::ScrollArea::vertical()
@@ -340,7 +343,7 @@ fn draw_body(
         .auto_shrink([false, false])
         .max_height(panel.available_height())
         .show(panel, |ui| match *active_tab {
-            SidebarTab::Files => files_panel(ui, file_tree, current_file, git, outbox),
+            SidebarTab::Files => files_panel(ui, file_tree, current_file, git, workbench, outbox),
             SidebarTab::Search => search_panel(ui, search, file_tree.root.as_deref(), outbox),
             SidebarTab::Outline => outline_panel(ui, outline, outbox),
             SidebarTab::Git => git_panel(ui, git, outbox),
@@ -823,35 +826,39 @@ fn files_panel(
     tree: &FileTreeState,
     current_file: Option<&Path>,
     git: &GitPanelState,
+    workbench: bool,
     outbox: &mut Vec<Message>,
 ) {
     // 根目录行:最近列表下拉(有历史才有)+ 选新目录按钮
     let root_hover = tree.root.as_deref().map(|path| path.display().to_string());
-    panel.horizontal(|ui| {
-        let selected = root_label(tree);
-        if tree.recents.is_empty() {
-            let response = ui.weak(&selected);
-            if let Some(hover) = &root_hover {
-                response.on_hover_text(hover);
+    if workbench {
+        crate::ui::workbench::workspace_picker(panel, tree, outbox);
+    } else {
+        panel.horizontal(|ui| {
+            let selected = root_label(tree);
+            if tree.recents.is_empty() {
+                let response = ui.weak(&selected);
+                if let Some(hover) = &root_hover {
+                    response.on_hover_text(hover);
+                }
+            } else {
+                let response = egui::ComboBox::from_id_salt("file-tree-roots")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for dir in &tree.recents {
+                            recent_row(ui, tree, dir, outbox);
+                        }
+                    })
+                    .response;
+                if let Some(hover) = &root_hover {
+                    response.on_hover_text(hover);
+                }
             }
-        } else {
-            let response = egui::ComboBox::from_id_salt("file-tree-roots")
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                    for dir in &tree.recents {
-                        recent_row(ui, tree, dir, outbox);
-                    }
-                })
-                .response;
-            if let Some(hover) = &root_hover {
-                response.on_hover_text(hover);
+            if ui.small_button("选择…").clicked() {
+                outbox.push(Message::FileTreeRootPick);
             }
-        }
-        if ui.small_button("选择…").clicked() {
-            outbox.push(Message::FileTreeRootPick);
-        }
-    });
-
+        });
+    }
     egui::ScrollArea::vertical()
         .id_salt("file-tree-scroll")
         // 不收缩宽度:长文件名在行内省略号截断(#40),不换行也不撑宽面板
@@ -866,7 +873,11 @@ fn files_panel(
                 }
             },
             None => {
-                ui.weak("选择一个目录作为文件树根(点上方「选择…」)");
+                ui.weak(if workbench {
+                    "从上方打开文件夹，浏览 Markdown 文档"
+                } else {
+                    "选择一个目录作为文件树根(点上方「选择…」)"
+                });
             }
         });
 }
@@ -909,7 +920,7 @@ fn last_segment(path: &Path) -> Option<String> {
 
 /// recents 项显示名:末级文件夹名;末段拿不到(如根路径 `/`)时回退
 /// 全路径——此时路径本身无中间段,不构成泄漏。
-fn recent_label(dir: &Path) -> String {
+pub(super) fn recent_label(dir: &Path) -> String {
     last_segment(dir).unwrap_or_else(|| dir.display().to_string())
 }
 
