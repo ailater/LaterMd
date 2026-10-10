@@ -140,9 +140,9 @@ pub enum SidebarTab {
 impl SidebarTab {
     /// 页签栏顺序。
     pub const ALL: [SidebarTab; 5] = [
+        Self::Outline,
         Self::Files,
         Self::Search,
-        Self::Outline,
         Self::Git,
         Self::Backlinks,
     ];
@@ -3662,10 +3662,10 @@ mod tests {
         let visible_before = state.layout.left;
 
         state.apply(Message::ToggleTheme);
-        assert_eq!(state.theme.mode, ThemeMode::Light, "默认深色 → 浅色");
+        assert_eq!(state.theme.mode, ThemeMode::Dark, "默认浅色 → 深色");
         assert!(dir.join("settings.json").exists(), "互换同样持久化");
         state.apply(Message::ToggleTheme);
-        assert_eq!(state.theme.mode, ThemeMode::Dark, "再切回深色");
+        assert_eq!(state.theme.mode, ThemeMode::Light, "再切回浅色");
 
         state.apply(Message::SidebarToggled);
         assert_eq!(state.layout.left, !visible_before);
@@ -5532,6 +5532,8 @@ mod tests {
     fn fresh_start_uses_writing_and_comparison_is_a_source_tool() {
         let mut state = State::default();
         state.restore_layout(LayoutSettings::fresh_install());
+        assert_eq!(state.theme.mode, ThemeMode::Light);
+        assert_eq!(state.layout.left_view, SidebarTab::Outline);
         let text = state.tabs.current().editor.text().to_owned();
         let revision = state.tabs.current().editor.revision();
         let tab_id = state.tabs.current().id;
@@ -5631,7 +5633,7 @@ mod tests {
         assert_eq!(
             state.poll_system_theme(std::time::Instant::now()),
             None,
-            "默认深色不轮询"
+            "默认浅色不轮询"
         );
         state.apply(Message::ThemeChanged(ThemeMode::System));
         let now = std::time::Instant::now();

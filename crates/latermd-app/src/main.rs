@@ -250,7 +250,7 @@ struct LaterMdApp {
 
 impl LaterMdApp {
     /// 以启动时装载的主题与文件树设置建应用(重启保持)。`Default` 恒为
-    /// 深色且不走磁盘,仅供测试。
+    /// 使用出厂设置且不走磁盘,仅供测试。
     fn new(
         theme: theme::ThemeSettings,
         file_tree: filetree::FileTreeSettings,

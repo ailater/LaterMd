@@ -3086,7 +3086,7 @@ mod tests {
         let size = crate::ui::tokens::NAV_TAB_H;
         let pitch = size + crate::ui::tokens::NAV_TAB_GAP;
         assert_eq!(
-            nav_tab_center(0.0, 0.0, SidebarTab::Files),
+            nav_tab_center(0.0, 0.0, SidebarTab::Outline),
             egui::pos2(size * 0.5, size * 0.5),
             "第一枚贴着左缘"
         );
@@ -3327,9 +3327,9 @@ mod tests {
         )
         .drop_without_applying_deltas();
 
-        // rail 第 2 枚 = 上组的「搜索」(SidebarTab::ALL 的第 2 项)。
+        // rail 第 3 枚 = 上组的「搜索」(SidebarTab::ALL 的第 3 项)。
         let rail = rail.get();
-        let target = rail_item_rect(rail, 1).center();
+        let target = rail_item_rect(rail, 2).center();
         assert!(
             rail.contains(target),
             "目标点须落在 rail 带内:{target:?} vs {rail:?}"
@@ -3363,7 +3363,7 @@ mod tests {
         assert_eq!(
             outbox,
             vec![Message::SidebarTabChanged(SidebarTab::Search)],
-            "rail 第 2 枚是「搜索」:应只发这一条切换消息"
+            "rail 第 3 枚是「搜索」:应只发这一条切换消息"
         );
     }
 

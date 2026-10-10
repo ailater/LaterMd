@@ -563,7 +563,7 @@ pub fn navigation(ui: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Messag
     let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
     let more_width = 28.0;
     let width = (bar.width() - more_width - 4.0) / 3.0;
-    for (index, tab) in [SidebarTab::Files, SidebarTab::Search, SidebarTab::Outline]
+    for (index, tab) in [SidebarTab::Outline, SidebarTab::Files, SidebarTab::Search]
         .into_iter()
         .enumerate()
     {
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn compact_navigation_fits_narrow_sidebar_and_switches_views() {
         for width in [156.0, 216.0, 376.0] {
-            for (index, tab) in [SidebarTab::Files, SidebarTab::Search, SidebarTab::Outline]
+            for (index, tab) in [SidebarTab::Outline, SidebarTab::Files, SidebarTab::Search]
                 .into_iter()
                 .enumerate()
             {
