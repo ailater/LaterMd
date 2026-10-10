@@ -26,6 +26,11 @@ use crate::style::MarkdownStyle;
 use crate::table;
 use crate::types::{Markdown, Token};
 
+/// Height reserved for the optional language/copy controls above a scrolling
+/// code block. The controls are painted as an overlay, so the frame must move
+/// the code galley below them to keep its first line readable.
+const CODE_BLOCK_HEADER_HEIGHT: f32 = 24.0;
+
 #[cfg(feature = "syntax_highlighting")]
 pub use crate::theme::default_code_theme;
 
@@ -96,10 +101,24 @@ struct CachedCodeBlock {
 }
 
 #[inline]
-fn hash_text(text: &str, style: &MarkdownStyle, handler: Option<&dyn LinkHandler>) -> u64 {
+fn hash_text(
+  text: &str,
+  style: &MarkdownStyle,
+  font: &FontId,
+  color: Color32,
+  dark_mode: bool,
+  handler: Option<&dyn LinkHandler>,
+) -> u64 {
   let mut hasher = std::collections::hash_map::DefaultHasher::new();
   text.hash(&mut hasher);
   style.hash(&mut hasher);
+  // The layout job stores resolved text colors and font metrics. Keeping these
+  // out of the whole-document key lets a light/dark switch reuse a galley from
+  // the previous theme, which paints stale colors and can reuse stale geometry
+  // after the host font chain changes.
+  font.hash(&mut hasher);
+  color.hash(&mut hasher);
+  dark_mode.hash(&mut hasher);
   if let Some(h) = handler {
     h.id().hash(&mut hasher);
   }
@@ -985,7 +1004,7 @@ impl<'a> MarkdownLabel<'a> {
       self.text
     };
 
-    let text_hash = hash_text(text, style, self.link_handler);
+    let text_hash = hash_text(text, style, &font, color, ui.visuals().dark_mode, self.link_handler);
     let cache_id = self.id.with("md_cache");
 
     // Reset the per-frame block table up front: every frame of this label starts
@@ -2001,11 +2020,17 @@ fn render_code_block(
   let stroke = Stroke::new(style.code_block.stroke_width, ui.visuals().widgets.noninteractive.bg_stroke.color);
 
   let p = &style.code_block.padding;
+  let header_height = code_block_buttons.map_or(0.0, |_| CODE_BLOCK_HEADER_HEIGHT);
   let frame = egui::Frame::NONE
     .fill(ui.visuals().code_bg_color)
     .stroke(stroke)
     .corner_radius(style.code_block.corner_radius)
-    .inner_margin(egui::Margin { left: p[0] as i8, top: p[1] as i8, right: p[2] as i8, bottom: p[3] as i8 });
+    .inner_margin(egui::Margin {
+      left: p[0] as i8,
+      top: (p[1] + header_height) as i8,
+      right: p[2] as i8,
+      bottom: p[3] as i8,
+    });
 
   let frame_response = frame.show(ui, |ui| {
     if !shrink_to_content {
