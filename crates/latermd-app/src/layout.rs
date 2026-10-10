@@ -57,6 +57,9 @@ pub struct LayoutSettings {
     /// 进入禅定前的面板快照(§7)。同上口径:`skip`,不落盘。
     #[serde(skip)]
     pub pre_zen: PreZen,
+    /// 进入 Live 前的预览栏状态；Live 默认收起预览，切回源码时恢复。
+    #[serde(skip)]
+    pub pre_live_right: Option<bool>,
     /// 上次退出时窗口是否最大化(2026-09-29 坤哥指令「记住上次是全屏还是
     /// 窗口」)。字段级 `default`:旧 layout.json 没有它,缺项回落 false
     /// 而不是整表 Corrupt 丢弃 left/right。
@@ -80,6 +83,7 @@ impl Default for LayoutSettings {
             zen: false,
             left_view: SidebarTab::Files,
             pre_zen: None,
+            pre_live_right: None,
             maximized: false,
             left_width: None,
             right_width: None,

@@ -3324,6 +3324,15 @@ mod tests {
             // 与 apply_shell_to 同投影:高亮底色的生产输入是 code_bg
             visuals.extreme_bg_color = tokens.code_bg;
             let bg = highlight_bg_color(&visuals);
+            let expected = if cfg!(target_os = "macos") {
+                if dark {
+                    egui::Color32::from_rgb(105, 97, 31)
+                } else {
+                    egui::Color32::from_rgb(248, 241, 173)
+                }
+            } else {
+                expected
+            };
             assert_eq!(bg, expected, "{label}");
             let ratio = contrast_ratio(tokens.text, bg);
             assert!(

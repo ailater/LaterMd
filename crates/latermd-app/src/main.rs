@@ -35,6 +35,8 @@ mod git_split_diff;
 mod keymap;
 mod layout;
 mod live;
+#[cfg(target_os = "macos")]
+mod mac_menu;
 mod mcp;
 #[cfg(test)]
 mod preview_pixel_acceptance;
@@ -166,6 +168,10 @@ fn main() -> eframe::Result<()> {
                 }
             }
             let mut app = LaterMdApp::new(theme, file_tree, layout);
+            #[cfg(target_os = "macos")]
+            {
+                app.native_menu = mac_menu::NativeMenu::install(&cc.egui_ctx, &app.state);
+            }
             app.frameless = !native_chrome;
             app.state.system_theme = system;
             app.state.system_theme_ok = system.is_some();
@@ -185,10 +191,9 @@ pub(crate) fn renderer_label(env: Option<&str>) -> &'static str {
     }
 }
 
-/// 原生装饰逃生口的判定(与 `main` 的启动选择同源):变量**精确**为 `1`
-/// 才回落系统标题栏,未设/其余值一律自绘。`env` 由调用方传入以便无头测试。
+/// macOS 默认使用系统窗口按钮;其它平台仍支持原生装饰逃生口。
 fn native_decorations(env: Option<&str>) -> bool {
-    env == Some("1")
+    cfg!(target_os = "macos") || env == Some("1")
 }
 
 /// 视口构建(与 `main` 的启动选择同源):窗口图标仅在解码成功(`Some`)时
@@ -204,6 +209,16 @@ fn viewport_builder(
         .with_min_inner_size([900.0, 600.0])
         .with_decorations(native_chrome)
         .with_maximized(maximized);
+    let builder = if cfg!(target_os = "macos") && native_chrome {
+        builder
+            .with_fullsize_content_view(true)
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_titlebar_buttons_shown(true)
+            .with_movable_by_background(false)
+    } else {
+        builder
+    };
     match icon {
         Some(icon) => builder.with_icon(icon),
         None => builder,
@@ -214,6 +229,8 @@ fn viewport_builder(
 /// [`eframe::App::ui`]。后台任务通道(P1,docs/adr-005 §5.2)将来汇入同一队列。
 #[derive(Default)]
 struct LaterMdApp {
+    #[cfg(target_os = "macos")]
+    native_menu: Option<mac_menu::NativeMenu>,
     state: state::State,
     outbox: Vec<state::Message>,
     /// 最近一次下发给原生窗口的标题缓存;仅用于跳过重复的 set_title。
@@ -286,9 +303,9 @@ mod tests {
     #[test]
     fn native_decorations_requires_exact_env_value() {
         assert!(native_decorations(Some("1")));
-        assert!(!native_decorations(Some("0")));
-        assert!(!native_decorations(Some("true")));
-        assert!(!native_decorations(None));
+        for value in [Some("0"), Some("true"), None] {
+            assert_eq!(native_decorations(value), cfg!(target_os = "macos"));
+        }
     }
 
     /// `--mcp-stdio` 只在精确匹配时生效(其它参数照常进 GUI);参数常量与

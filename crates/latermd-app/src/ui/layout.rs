@@ -310,7 +310,14 @@ impl LaterMdApp {
         // ⓪ 自绘窗口骨架之一:36px 自绘标题栏(仅无边框模式;
         // LATERMD_NATIVE_DECORATIONS=1 的原生装饰路径不画,行为与旧版
         // 完全一致)。
-        if self.frameless {
+        if cfg!(target_os = "macos") && !self.frameless {
+            egui::Panel::top("workbench-header")
+                .exact_size(crate::ui::workbench::HEADER_H)
+                .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))
+                .show(ui, |ui| {
+                    crate::ui::workbench::header(ui, &mut self.state, &mut self.outbox)
+                });
+        } else if self.frameless {
             egui::Panel::top("titlebar")
                 .exact_size(crate::ui::tokens::TITLEBAR_H)
                 .frame(
@@ -325,9 +332,12 @@ impl LaterMdApp {
 
         // ① 次外层:顶部菜单栏(全部命令的可发现性入口;开关类条目的
         // 勾选态从 state 取真值,#67 M2)
-        egui::Panel::top("menubar").show(ui, |ui| {
-            crate::ui::menubar::ui(ui, &self.state.keymap, &self.state, &mut self.outbox);
-        });
+        let workbench = cfg!(target_os = "macos") && !self.frameless;
+        if !workbench {
+            egui::Panel::top("menubar").show(ui, |ui| {
+                crate::ui::menubar::ui(ui, &self.state.keymap, &self.state, &mut self.outbox);
+            });
+        }
 
         // ② 底部状态栏:散落在工具栏/侧边栏边缘的只读信息收成一行
         // (docs/ui-polish.md §4),工具栏得以只留动作。
@@ -361,12 +371,18 @@ impl LaterMdApp {
             // 的间隔,沿用默认值以保证与标题栏等其他 panel 观感一致。
             .frame(
                 egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
-                    left: 0,
+                    left: if workbench { 12 } else { 0 },
+                    right: if workbench { 12 } else { 8 },
                     ..egui::Margin::symmetric(8, 2)
                 }),
             )
             .show_collapsible(ui, left, |ui| {
-                crate::ui::sidebar::ui(
+                let sidebar = if workbench {
+                    crate::ui::sidebar::workbench_ui
+                } else {
+                    crate::ui::sidebar::ui
+                };
+                sidebar(
                     ui,
                     active_tab,
                     &self.state.file_tree,
@@ -393,14 +409,21 @@ impl LaterMdApp {
         let right = &mut self.state.layout.right;
         egui::Panel::right("preview")
             .resizable(true)
-            .default_size(crate::ui::tokens::PREVIEW_DEFAULT_W)
+            .default_size(if workbench {
+                ((ui.available_width() - 32.0) * 0.5).max(crate::ui::tokens::PREVIEW_MIN_W)
+            } else {
+                crate::ui::tokens::PREVIEW_DEFAULT_W
+            })
             .size_range(crate::ui::tokens::PREVIEW_MIN_W..=880.0)
             .frame(
                 egui::Frame::default()
-                    .inner_margin(egui::Margin::same(8))
+                    .inner_margin(egui::Margin::same(if workbench { 16 } else { 8 }))
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
             .show_collapsible(ui, right, |ui| {
+                if workbench {
+                    crate::ui::workbench::pane_heading(ui, "预览", "实时更新");
+                }
                 let tab = self.state.tabs.current_mut();
                 // heal 只在 AI 流式写入本标签时开:补闭合是流式残缺帧的
                 // 必需品,完整文档上是恒等变换但逐行全文扫描,稳态帧不该付。
@@ -444,7 +467,11 @@ impl LaterMdApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .inner_margin(if workbench {
+                        egui::Margin::symmetric(16, 12)
+                    } else {
+                        egui::Margin::symmetric(8, 2)
+                    })
                     .fill(crate::theme::content_fill(ui.visuals().dark_mode)),
             )
             .show(ui, |ui| {
@@ -764,7 +791,14 @@ impl LaterMdApp {
         // Zen 是**另一套 panel 组合**而非「给三栏各加一个 if」:藏面板的最佳
         // 办法是从一开始就不添加它(侧栏宽度演算与 z 序全部让位),而不是
         // 添加了再把可见性摁掉。窗口 chrome 保留的理由见 [`Self::draw`]。
-        if self.frameless {
+        if cfg!(target_os = "macos") && !self.frameless {
+            egui::Panel::top("workbench-header")
+                .exact_size(crate::ui::workbench::HEADER_H)
+                .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))
+                .show(ui, |ui| {
+                    crate::ui::workbench::header(ui, &mut self.state, &mut self.outbox)
+                });
+        } else if self.frameless {
             egui::Panel::top("titlebar")
                 .exact_size(crate::ui::tokens::TITLEBAR_H)
                 .frame(
@@ -1712,7 +1746,15 @@ fn checkout_extra_warning(open_in_editor: bool, dirty: bool) -> Option<&'static 
 
 impl eframe::App for LaterMdApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.native_menu {
+            menu.drain(ctx, &mut self.outbox);
+        }
         self.reduce(ctx);
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.native_menu {
+            menu.finish_frame(ctx, &mut self.outbox, &self.state);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
