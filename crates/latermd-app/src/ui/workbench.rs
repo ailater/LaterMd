@@ -10,6 +10,54 @@ pub const HEADER_H: f32 = 40.0;
 const TRAFFIC_LIGHTS_W: f32 = 76.0;
 const HEADER_RIGHT_W: f32 = 388.0;
 
+/// 系统按钮的中心换算到 egui 坐标；AppKit 使用 point，egui 还可能有
+/// 用户缩放，两者不能直接混用。无原生窗口的无头帧仍用标题栏中心。
+fn header_center_y(ui: &egui::Ui, bar: Rect) -> f32 {
+    #[cfg(target_os = "macos")]
+    if let Some(center) = native_traffic_light_center(ui.ctx()) {
+        if (0.0..=bar.height()).contains(&center) {
+            return bar.top() + center;
+        }
+    }
+    let _ = ui;
+    bar.center().y
+}
+
+#[cfg(target_os = "macos")]
+fn native_traffic_light_center(ctx: &egui::Context) -> Option<f32> {
+    use objc2_app_kit::{NSApplication, NSWindowButton};
+    use objc2_foundation::MainThreadMarker;
+    let app = NSApplication::sharedApplication(MainThreadMarker::new()?);
+    // mainWindow 保持文档窗口身份，不随打开文件对话框的 keyWindow 改变。
+    let window = app.mainWindow().or_else(|| app.keyWindow())?;
+    let content = window.contentView()?;
+    let button = window.standardWindowButton(NSWindowButton::CloseButton)?;
+    let bounds = content.bounds();
+    let rect = button.convertRect_toView(button.bounds(), Some(&content));
+    // 先在 contentView 的坐标系中处理翻转；backing 坐标方向未必相同。
+    let backing_scale = content.convertRectToBacking(bounds).size.height / bounds.size.height;
+    let middle = rect.origin.y + rect.size.height / 2.0;
+    let top_down = if content.isFlipped() {
+        middle - bounds.origin.y
+    } else {
+        bounds.origin.y + bounds.size.height - middle
+    };
+    Some((top_down * backing_scale) as f32 / ctx.pixels_per_point())
+}
+
+/// 仅用于独立工具栏标签：按字形墨迹居中，避开中英文字体不同的行盒留白。
+/// 不修改正文的排版、基线或字体度量。
+fn centered_label(ui: &egui::Ui, rect: Rect, label: &str, color: egui::Color32) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(12.0), color);
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.mesh_bounds.center().y,
+    );
+    ui.painter().galley(pos, galley, color);
+}
+
 /// 单物理像素分隔线；与面板原生拖拽高亮共存。
 pub fn separator(ui: &egui::Ui) -> egui::Stroke {
     let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
@@ -68,6 +116,7 @@ fn action(ui: &mut egui::Ui, rect: Rect, icon: Icon, tip: &str, selected: bool) 
 /// 空白处可拖窗;所有命令仍走既有消息归约,不抢编辑器焦点。
 pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     let bar = ui.max_rect();
+    let center_y = header_center_y(ui, bar);
     let drag_rect = Rect::from_min_max(
         bar.left_top() + egui::vec2(TRAFFIC_LIGHTS_W, 0.0),
         bar.right_bottom(),
@@ -82,7 +131,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
             .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
     }
     let slot = |x: f32, w: f32| {
-        Rect::from_center_size(egui::pos2(x + w / 2.0, bar.center().y), egui::vec2(w, 28.0))
+        Rect::from_center_size(egui::pos2(x + w / 2.0, center_y), egui::vec2(w, 28.0))
     };
     let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
     let right = bar.right() - 12.0;
@@ -100,14 +149,14 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     let divider_x = sidebar_x + 40.0;
     ui.painter().line_segment(
         [
-            egui::pos2(divider_x, bar.center().y - 8.0),
-            egui::pos2(divider_x, bar.center().y + 8.0),
+            egui::pos2(divider_x, center_y - 8.0),
+            egui::pos2(divider_x, center_y + 8.0),
         ],
         separator(ui),
     );
     Icon::File.draw(
         ui.painter(),
-        egui::pos2(divider_x + 19.0, bar.center().y),
+        egui::pos2(divider_x + 19.0, center_y),
         14.0,
         colors.secondary,
     );
@@ -123,11 +172,13 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
         &font,
         title_rect.width().max(0.0),
     );
-    ui.painter().with_clip_rect(title_rect).text(
-        title_rect.left_center(),
-        Align2::LEFT_CENTER,
-        title,
-        font,
+    let title_galley = ui.painter().layout_no_wrap(title, font, colors.text);
+    ui.painter().with_clip_rect(title_rect).galley(
+        egui::pos2(
+            title_rect.left(),
+            center_y - title_galley.mesh_bounds.center().y,
+        ),
+        title_galley,
         colors.text,
     );
     mode_switch(ui, slot(right_start, 100.0), state, outbox);
@@ -139,8 +190,8 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     );
     ui.painter().line_segment(
         [
-            egui::pos2(right - 72.0, bar.center().y - 8.0),
-            egui::pos2(right - 72.0, bar.center().y + 8.0),
+            egui::pos2(right - 72.0, center_y - 8.0),
+            egui::pos2(right - 72.0, center_y + 8.0),
         ],
         separator(ui),
     );
@@ -178,11 +229,10 @@ fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Me
             ui.painter()
                 .rect_filled(part, 5.0, crate::theme::window_fill(ui.visuals().dark_mode));
         }
-        ui.painter().text(
-            part.center(),
-            Align2::CENTER_CENTER,
+        centered_label(
+            ui,
+            part,
             label,
-            egui::FontId::proportional(12.0),
             if selected {
                 colors.text
             } else {
@@ -526,5 +576,53 @@ mod tests {
                 .count(),
             2
         );
+    }
+    #[test]
+    fn source_and_live_glyphs_share_the_segment_center() {
+        for scale in [1.0, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx).expect("alignment test requires installed CJK fonts");
+            ctx.set_pixels_per_point(scale);
+            let rect = Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 28.0));
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                mode_switch(ui, rect, &State::default(), &mut Vec::new());
+            });
+            let mut centers = Vec::new();
+            fn inspect(shape: &egui::Shape, centers: &mut Vec<f32>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            inspect(shape, centers);
+                        }
+                    }
+                    egui::Shape::Text(text) if ["源码", "Live"].contains(&text.galley.text()) => {
+                        let mut bounds = Rect::NOTHING;
+                        for row in &text.galley.rows {
+                            for glyph in &row.glyphs {
+                                let min = text.pos
+                                    + row.pos.to_vec2()
+                                    + glyph.pos.to_vec2()
+                                    + glyph.uv_rect.offset;
+                                bounds |= Rect::from_min_size(min, glyph.uv_rect.size);
+                            }
+                        }
+                        centers.push(bounds.center().y);
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes {
+                inspect(&shape.shape, &mut centers);
+            }
+            output.textures_delta.clear();
+            assert_eq!(centers.len(), 2);
+            for y in centers {
+                assert!(
+                    (y - rect.center().y).abs() * scale <= 0.5,
+                    "glyph center {y} must match control center {} at scale {scale}",
+                    rect.center().y
+                );
+            }
+        }
     }
 }
