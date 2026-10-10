@@ -56,19 +56,90 @@ pub fn ui(
     // 换行会让标签条高度随标签数成倍增长,把编辑区顶得上下跳;单行 +
     // 滚动(垂直滚轮在仅水平可滚的 ScrollArea 里自动转为水平)高度恒定。
     // 完整模式溢出滚动;缩短模式收窄到最小宽后仍溢出也走这里兜底。
+    let reveal_id = panel.make_persistent_id("tabs-reveal");
+    let reveal_key = (tabs.current().id, tabs.tabs.len(), budget.to_bits());
+    let reveal = panel.data_mut(|data| {
+        let changed = data.get_temp::<(u64, usize, u32)>(reveal_id) != Some(reveal_key);
+        data.insert_temp(reveal_id, reveal_key);
+        changed
+    });
     egui::ScrollArea::horizontal()
         .id_salt("tabs-bar")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, true])
         .show(panel, |ui| {
             let widths = plan_widths(ui, tabs, mode, budget);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (index, width) in widths.iter().enumerate() {
-                    chip(ui, tabs, index, mode, *width, outbox);
+                    let response = chip(ui, tabs, index, mode, *width, outbox);
+                    if reveal && index == tabs.active {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
                 }
             });
         });
     true
+}
+
+/// 顶部文档区，列表按钮不参与横向滚动。拖窗区域由外层单独预留。
+pub fn header(
+    parent: &mut egui::Ui,
+    rect: egui::Rect,
+    tabs: &TabsState,
+    mode: TitleWidthMode,
+    outbox: &mut Vec<Message>,
+) {
+    let list_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.right() - CHIP_H, rect.top()), rect.max);
+    let strip =
+        egui::Rect::from_min_max(rect.min, egui::pos2(list_rect.left() - 4.0, rect.bottom()));
+    let mut child = parent.new_child(
+        egui::UiBuilder::new()
+            .id_salt("header-document-tabs")
+            .max_rect(strip)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(strip.intersect(parent.clip_rect()));
+    ui(&mut child, tabs, mode, outbox);
+    let response = parent.allocate_rect(list_rect, Sense::click());
+    let colors = crate::theme::shell(parent);
+    if response.hovered() {
+        parent.painter().rect_filled(list_rect, 5.0, colors.hover);
+    }
+    // 自绘向下箭头，不依赖字体 glyph。
+    let c = list_rect.center();
+    parent.painter().add(egui::Shape::line(
+        vec![
+            c + egui::vec2(-4.0, -2.0),
+            c + egui::vec2(0.0, 2.0),
+            c + egui::vec2(4.0, -2.0),
+        ],
+        egui::Stroke::new(1.3, colors.secondary),
+    ));
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "已打开的文档"));
+    egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(220.0);
+        ui.label("已打开的文档");
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for (index, tab) in tabs.tabs.iter().enumerate() {
+                    let label = elide_text(ui, &tab.display_name(), &tab_font(ui), 300.0);
+                    let response = ui.selectable_label(index == tabs.active, label);
+                    if response.clicked() {
+                        outbox.push(Message::TabActivate(index));
+                        ui.close();
+                    }
+                    if let Some(path) = &tab.document.path {
+                        response.on_hover_text(path.display().to_string());
+                    }
+                }
+            });
+    });
+    response.on_hover_text("已打开的文档");
 }
 
 /// 文本的实测显示宽(不换行;宽度只由字形决定,颜色不影响布局)。
@@ -280,7 +351,7 @@ fn chip(
     mode: TitleWidthMode,
     width: f32,
     outbox: &mut Vec<Message>,
-) {
+) -> egui::Response {
     let tab = &tabs.tabs[index];
     let selected = index == tabs.active;
     let name = tab.display_name();
@@ -378,6 +449,7 @@ fn chip(
     response.clone().context_menu(|ui| {
         context_menu_items(ui, tabs, index, mode, outbox);
     });
+    response
 }
 
 /// 重命名浮窗(#37「重命名」,**显示别名**语义):单行输入 + 确定/取消。

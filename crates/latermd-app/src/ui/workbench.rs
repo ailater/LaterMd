@@ -9,6 +9,8 @@ use eframe::egui::{self, Align2, Rect, Sense};
 pub const HEADER_H: f32 = 40.0;
 const TRAFFIC_LIGHTS_W: f32 = 76.0;
 const HEADER_RIGHT_W: f32 = 388.0;
+/// 固定保留在标签滚动区外的拖窗空白。
+pub(super) const HEADER_DRAG_W: f32 = 64.0;
 
 /// 三栏共同遵守的编辑区宽度预算（含内边距）。
 pub(crate) const EDITOR_MIN_W: f32 = 380.0;
@@ -280,7 +282,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     };
     let colors = crate::theme::shell(ui);
     let right = bar.right() - 12.0;
-    let search_width = (bar.width() - 1044.0 + 196.0).clamp(112.0, 196.0);
+    let search_width = if bar.width() < 1100.0 { 28.0 } else { 196.0 };
     let right_start = right - (HEADER_RIGHT_W - 196.0 + search_width);
     let sidebar_x = bar.left() + TRAFFIC_LIGHTS_W + 6.0;
     if action(
@@ -300,41 +302,42 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
         ],
         separator(ui),
     );
-    Icon::FolderClosed.draw(
-        ui.painter(),
-        egui::pos2(divider_x + 19.0, center_y),
-        14.0,
-        colors.secondary,
-    );
     let title_rect = Rect::from_min_max(
-        egui::pos2(divider_x + 33.0, bar.top()),
-        egui::pos2(right_start - 20.0, bar.bottom()),
+        egui::pos2(divider_x + 12.0, center_y - 14.0),
+        egui::pos2(right_start - HEADER_DRAG_W, center_y + 14.0),
     );
-    let mut font = egui::FontId::proportional(12.0);
-    font.family = crate::fonts::semibold_family(ui.ctx());
-    let workspace = state
-        .file_tree
-        .root
-        .as_deref()
-        .map(crate::ui::sidebar::recent_label)
-        .unwrap_or_else(|| "LaterMD".to_owned());
-    let title = crate::ui::tabs::elide_text(ui, &workspace, &font, title_rect.width().max(0.0));
-    let title_galley = ui.painter().layout_no_wrap(title, font, colors.text);
-    ui.painter().with_clip_rect(title_rect).galley(
-        egui::pos2(
-            title_rect.left(),
-            center_y - title_galley.mesh_bounds.center().y,
-        ),
-        title_galley,
-        colors.text,
-    );
+    if !state.layout.zen && crate::ui::tabs::visible(&state.tabs) {
+        crate::ui::tabs::header(
+            ui,
+            title_rect,
+            &state.tabs,
+            state.theme.tab_title_width,
+            outbox,
+        );
+    } else {
+        let workspace = state
+            .file_tree
+            .root
+            .as_deref()
+            .map(crate::ui::sidebar::recent_label)
+            .unwrap_or_else(|| "LaterMD".to_owned());
+        let font = egui::FontId::proportional(12.0);
+        let title = crate::ui::tabs::elide_text(ui, &workspace, &font, title_rect.width().max(0.0));
+        ui.painter().with_clip_rect(title_rect).text(
+            title_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            title,
+            font,
+            colors.text,
+        );
+    }
     mode_switch(ui, slot(right_start, 100.0), state, outbox);
-    search_field(
-        ui,
-        slot(right_start + 112.0, search_width),
-        &mut state.search,
-        outbox,
-    );
+    let search_rect = slot(right_start + 112.0, search_width);
+    if search_width < 100.0 {
+        compact_search(ui, search_rect, state, outbox);
+    } else {
+        search_field(ui, search_rect, &mut state.search, outbox);
+    }
     ui.painter().line_segment(
         [
             egui::pos2(right - 72.0, center_y - 8.0),
@@ -357,6 +360,27 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     }
     if action(ui, slot(right - 28.0, 28.0), Icon::Settings, "设置", false) {
         outbox.push(Message::SettingsOpened(SettingsTab::Appearance));
+    }
+}
+
+/// 窄窗口保留搜索入口，点击进入既有全文搜索页。
+pub(super) fn compact_search(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    state: &State,
+    outbox: &mut Vec<Message>,
+) {
+    if action(
+        ui,
+        rect,
+        Icon::Search,
+        "搜索文档",
+        state.layout.left_view == SidebarTab::Search && state.layout.left,
+    ) {
+        if !state.layout.left {
+            outbox.push(Message::SidebarToggled);
+        }
+        outbox.push(Message::SidebarTabChanged(SidebarTab::Search));
     }
 }
 

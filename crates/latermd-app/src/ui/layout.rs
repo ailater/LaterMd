@@ -418,24 +418,6 @@ impl LaterMdApp {
             &mut self.state.layout.left_width,
         );
 
-        // 文档标签属于源码和预览共有的文档区域，统一占一条横向栏。
-        if crate::ui::tabs::visible(&self.state.tabs) {
-            egui::Panel::top("document-tabs")
-                .frame(
-                    egui::Frame::NONE
-                        .fill(crate::theme::shell(ui).chrome)
-                        .inner_margin(egui::Margin::symmetric(12, 4)),
-                )
-                .show(ui, |ui| {
-                    crate::ui::tabs::ui(
-                        ui,
-                        &self.state.tabs,
-                        self.state.theme.tab_title_width,
-                        &mut self.outbox,
-                    );
-                });
-        }
-
         // ④ 右栏:只读预览。 `Panel::right` 必须在 `CentralPanel` 之前加
         // (先加的最外层),编辑器因此是吃剩余宽度的那个 —— 左右任意开合
         // 都只是让中间伸缩,不会挤掉谁。
