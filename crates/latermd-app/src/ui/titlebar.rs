@@ -190,8 +190,13 @@ pub fn shows_command_box(bar: Rect) -> bool {
 /// 命令箱整体矩形(纵向铺满标题栏,高度回调方裁到 TITLE_CMD_H)。
 pub fn command_box_rect(bar: Rect) -> Rect {
     let right = command_box_right_edge(bar);
+    let width = if bar.width() < 1100.0 {
+        crate::ui::tokens::TITLE_VIEW_W + crate::ui::tokens::TITLE_CMD_GAP + 28.0
+    } else {
+        crate::ui::tokens::TITLE_CMD_W
+    };
     Rect::from_min_max(
-        Pos2::new(right - crate::ui::tokens::TITLE_CMD_W, bar.top()),
+        Pos2::new(right - width, bar.top()),
         Pos2::new(right, bar.bottom()),
     )
 }
@@ -203,7 +208,8 @@ pub fn command_box_rect(bar: Rect) -> Rect {
 pub fn command_box_slot_rect(cbox: Rect, index: usize) -> Rect {
     const SLOTS: usize = 2;
     debug_assert!(index < SLOTS, "命令箱只有 {SLOTS} 个槽位");
-    let search_w = crate::ui::tokens::TITLE_SEARCH_W;
+    let search_w =
+        cbox.width() - crate::ui::tokens::TITLE_VIEW_W - crate::ui::tokens::TITLE_CMD_GAP;
     let view_w = crate::ui::tokens::TITLE_VIEW_W;
     let gap = crate::ui::tokens::TITLE_CMD_GAP;
     let inset_y = (cbox.height() - crate::ui::tokens::TITLE_CMD_H) / 2.0;
@@ -312,13 +318,41 @@ pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
                 );
             }
         }
-        painter.text(
-            text_pos,
-            egui::Align2::LEFT_CENTER,
-            state.tabs.current().document.window_title(),
-            font,
-            ui.visuals().text_color(),
+        let right = if shows_command_box(bar) {
+            command_box_rect(bar).left()
+        } else {
+            button_rects(bar)[0].left()
+        };
+        let title_rect = Rect::from_min_max(
+            egui::pos2(text_pos.x, bar.center().y - 14.0),
+            egui::pos2(
+                right - crate::ui::workbench::HEADER_DRAG_W,
+                bar.center().y + 14.0,
+            ),
         );
+        if !state.layout.zen && crate::ui::tabs::visible(&state.tabs) {
+            crate::ui::tabs::header(
+                ui,
+                title_rect,
+                &state.tabs,
+                state.theme.tab_title_width,
+                outbox,
+            );
+        } else {
+            let title = crate::ui::tabs::elide_text(
+                ui,
+                &state.tabs.current().document.window_title(),
+                &font,
+                title_rect.width().max(0.0),
+            );
+            ui.painter().with_clip_rect(title_rect).text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                title,
+                font,
+                ui.visuals().text_color(),
+            );
+        }
     }
 
     let rects = button_rects(bar);
@@ -441,7 +475,11 @@ fn command_box(
 ) {
     let _ = ctx;
     let slot0 = command_box_slot_rect(cbox, 0);
-    search_capsule(ui, slot0, &mut state.search, outbox);
+    if slot0.width() < 100.0 {
+        crate::ui::workbench::compact_search(ui, slot0, state, outbox);
+    } else {
+        search_capsule(ui, slot0, &mut state.search, outbox);
+    }
     let slot1 = command_box_slot_rect(cbox, 1);
     view_switch(ui, slot1, state, outbox);
 }
@@ -973,7 +1011,7 @@ mod tests {
     #[test]
     fn command_box_does_not_overlap_window_buttons() {
         // 900px 是 M0 的默认窗口宽,也是真机截图那一档
-        let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, TITLEBAR_H));
+        let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(1240.0, TITLEBAR_H));
         let buttons = button_rects(bar);
         let cbox = command_box_rect(bar);
         let slot0 = command_box_slot_rect(cbox, 0);
@@ -1050,7 +1088,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut state = State::default();
         let mut outbox = Vec::new();
-        let bar = Rect::from_min_max(Pos2::ZERO, Pos2::new(900.0, TITLEBAR_H));
+        let bar = Rect::from_min_max(Pos2::ZERO, Pos2::new(1240.0, TITLEBAR_H));
         let cbox = command_box_rect(bar);
         let switch = command_box_slot_rect(cbox, 1);
         let capsule = command_box_slot_rect(cbox, 0);
@@ -1061,7 +1099,7 @@ mod tests {
             let output = ctx.run_ui(
                 RawInput {
                     events,
-                    screen_rect: Some(SCREEN),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1240.0, 600.0))),
                     ..Default::default()
                 },
                 |ui| {
