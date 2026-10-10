@@ -350,42 +350,85 @@ pub fn ui(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
 /// `search.query` 由这里直接改写并通过 [`Message::SearchQueryChanged`]
 /// 触发 300ms 去抖搜索。
 ///
-/// 本轮只把**入口**挪到标题栏,结果列表仍在左栏「搜索」页 —— 结果浮层
-/// 是第二批(docs/ui-shell-redesign-v2.md §5.6 待办)。
+/// 视觉与交互对齐 mac 工作台 `workbench::search_field`(2026-10-10 精修
+/// 平移,#166):放大镜 + 聚焦强调描边 + 有词时清空入口;提示语从
+/// 「搜索 / 跳转…」改为实际用途「搜索文档…」(胶囊只做全文搜索,跳转
+/// 另有 Ctrl+G/查找浮层,旧提示语名不副实)。
 pub(super) fn search_capsule(
     ui: &mut egui::Ui,
     rect: Rect,
     search: &mut SearchState,
     outbox: &mut Vec<Message>,
 ) {
+    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let id = ui.make_persistent_id("titlebar-search");
+    let focused = ui.memory(|m| m.has_focus(id));
     let radius = RADIUS_MD * 2.0; // 完全圆角胶囊
-    let frame_margin = egui::Margin::symmetric(10, 0);
-    let inner = rect.shrink2(egui::vec2(10.0, 0.0));
-
-    let frame = egui::Frame::NONE
-        .inner_margin(frame_margin)
-        .corner_radius(radius)
-        .fill(ui.visuals().extreme_bg_color)
-        .stroke(egui::Stroke::new(
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-        ));
-
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, colors.content);
+    painter.rect_stroke(
+        rect,
+        radius,
+        if focused {
+            egui::Stroke::new(1.0, colors.accent.gamma_multiply(0.65))
+        } else {
+            egui::Stroke::new(1.0, colors.border)
+        },
+        egui::StrokeKind::Inside,
+    );
+    crate::ui::icons::Icon::Search.draw(
+        painter,
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        13.0,
+        colors.secondary,
+    );
+    let has_query = !search.query.is_empty();
+    let edit_rect = Rect::from_min_max(
+        egui::pos2(rect.left() + 24.0, rect.top() + 2.0),
+        egui::pos2(
+            rect.right() - if has_query { 22.0 } else { 6.0 },
+            rect.bottom() - 2.0,
+        ),
+    );
     let edit = egui::TextEdit::singleline(&mut search.query)
-        .id_salt("titlebar-search")
-        .font(egui::TextStyle::Small)
+        .id(id)
+        .font(egui::FontId::proportional(12.0))
         .hint_text(crate::ui::tokens::TITLE_SEARCH_HINT)
-        .frame(frame)
-        .desired_width(inner.width())
-        .min_size(inner.size());
-    // `Ui::put` 把 widget 摆到绝对矩形(垂直 within 恰当):命令箱是先顺序
-    // 算矩形再塞 widget,不可能跟 `horizontal` 的自然流走,put 是这里唯一
-    // 能把 TextEdit 放到指定 rect 的办法。
-    let response = ui.put(rect, edit);
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
+        .vertical_align(egui::Align::Center);
+    // `Ui::put` 把 widget 摆到绝对矩形:命令箱先顺序算矩形再塞 widget,
+    // put 是把 TextEdit 放进指定 rect 的唯一办法。
+    let response = ui.put(edit_rect, edit);
     if response.changed() {
         outbox.push(Message::SearchQueryChanged);
     }
     response.on_hover_text("全文搜索(结果在左栏「搜索」页)");
+    if has_query {
+        let clear_rect = Rect::from_center_size(
+            egui::pos2(rect.right() - 11.0, rect.center().y),
+            egui::vec2(18.0, 18.0),
+        );
+        let clear = ui.interact(clear_rect, id.with("clear"), egui::Sense::click());
+        let painter = ui.painter();
+        if ui.is_rect_visible(clear_rect) {
+            if clear.hovered() {
+                painter.rect_filled(clear_rect, crate::ui::tokens::RADIUS_SM, colors.hover);
+            }
+            crate::ui::icons::Icon::Close.draw(
+                painter,
+                clear_rect.center(),
+                11.0,
+                colors.secondary,
+            );
+        }
+        clear.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "清空搜索"));
+        if clear.clicked() {
+            search.query.clear();
+            outbox.push(Message::SearchQueryChanged);
+        }
+        clear.on_hover_text("清空搜索");
+    }
 }
 
 /// 标题栏右端命令箱(docs/ui-shell-redesign-v2.md §5.6):搜索胶囊 +
