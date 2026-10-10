@@ -59,13 +59,24 @@ pub const MAX_HITS: usize = 500;
 pub const MAX_LIST_ENTRIES: usize = 500;
 
 /// 一次搜索请求。
-#[derive(Debug, Clone)]
+///
+/// 三个开关(`case_insensitive` / `whole_word` / `literal`)在**编译层**
+/// 合成一个正则(字面转义、`\b` 包裹),扫描层只看编译产物 —— 侧边栏与
+/// 替换共用同一份语义,不存在「搜得到换不掉」的第二套匹配。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
     /// 遍历根(MCP 侧已校验过越界)。
     pub root: PathBuf,
-    /// 正则模式(用户输入按正则解释;大小写开关独立于模式本身)。
+    /// 搜索词。`literal = false` 时按正则解释(非法模式同步报错),
+    /// `true` 时按字面文本解释(特殊字符自动转义,永不编译失败)。
     pub pattern: String,
     pub case_insensitive: bool,
+    /// 完整匹配:模式被 `\b(?:…)\b` 包裹,使用 regex crate 的 Unicode
+    /// 词边界定义(不保证与其他编辑器的整词规则完全一致)。
+    pub whole_word: bool,
+    /// 字面文本模式:不按正则解释。GUI 侧边栏默认字面(直接粘贴 `C++`
+    /// 这类含元字符的词即可搜),MCP `search_docs` 维持正则语义(false)。
+    pub literal: bool,
 }
 
 /// 一条命中:文件 + 1 起行号 + 剥掉行终止符的行文本。
@@ -104,13 +115,29 @@ impl fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
-/// 编译搜索正则:同步执行,让非法模式在调用线程就报错(UI 输入到一半、
-/// MCP 传坏参数都是这一路径)。
-fn compile(query: &SearchQuery) -> Result<Regex, SearchError> {
+/// 拼装底层正则源:字面转义、`\b` 包裹(非捕获组,交替模式的作用域才
+/// 正确)与 bytes/str 两种正则都从它出发,开关语义单一实现。
+fn pattern_source(query: &SearchQuery) -> Result<String, SearchError> {
     if query.pattern.is_empty() {
         return Err(SearchError::InvalidPattern("搜索词为空".into()));
     }
-    RegexBuilder::new(&query.pattern)
+    let core = if query.literal {
+        regex::escape(&query.pattern)
+    } else {
+        query.pattern.clone()
+    };
+    Ok(if query.whole_word {
+        format!(r"\b(?:{core})\b")
+    } else {
+        core
+    })
+}
+
+/// 编译搜索正则:同步执行,让非法模式在调用线程就报错(UI 输入到一半、
+/// MCP 传坏参数都是这一路径)。bytes 变体的行匹配与 [`scan`] 的行切片
+/// 同口径;str 语义的替换走 [`replace_in_text`] 自行编译。
+fn compile(query: &SearchQuery) -> Result<Regex, SearchError> {
+    RegexBuilder::new(&pattern_source(query)?)
         .case_insensitive(query.case_insensitive)
         .build()
         .map_err(|error| SearchError::InvalidPattern(error.to_string()))
@@ -177,7 +204,8 @@ fn scan(
     let mut truncated = false;
     walk_markdown(root, &stop, |path, haystack| {
         for (index, line) in LineIter::new(b'\n', haystack).enumerate() {
-            if !regex.is_match(line) {
+            let (body, _) = split_line_terminator(line);
+            if !regex.is_match(body) {
                 continue;
             }
             if stop() {
@@ -208,13 +236,24 @@ pub fn is_markdown(path: &Path) -> bool {
         })
 }
 
-/// `LineIter` 产出的行自带终止符(`\n`,CRLF 文件还带 `\r`);入库前剥掉,
-/// 展示层拿到的就是纯行文本。非 UTF-8 内容替换为 U+FFFD,不因个别坏档
-/// 让整次搜索失败。
+/// 只拆掉一个 LF 或 CRLF 终止符;单独的 CR 与多余的 CR 都属于正文。
+/// 搜索与替换共用此字节级切口,非 UTF-8 行也无需转换即可匹配。
+fn split_line_terminator(line: &[u8]) -> (&[u8], &[u8]) {
+    let terminator_len = if line.ends_with(b"\r\n") {
+        2
+    } else if line.ends_with(b"\n") {
+        1
+    } else {
+        0
+    };
+    line.split_at(line.len() - terminator_len)
+}
+
+/// `LineIter` 产出的行自带 LF 或 CRLF;展示前只剥掉该终止符。
+/// 非 UTF-8 内容替换为 U+FFFD,不因个别坏档让整次搜索失败。
 pub fn trim_line_terminator(line: &[u8]) -> String {
-    String::from_utf8_lossy(line)
-        .trim_end_matches(['\r', '\n'])
-        .to_owned()
+    let (body, _) = split_line_terminator(line);
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// 取 lossy 全文第 `line_breaks` 个换行之后的那一行(0 起 = 第一行),
@@ -255,6 +294,52 @@ pub fn search_sync(query: &SearchQuery, max_hits: usize) -> Result<SearchOutcome
         },
     );
     Ok(outcome)
+}
+
+/// 侧边栏「全部替换」的文本级原语:在单份文本上执行与 `scan`**同口径**
+/// 的替换 —— 逐行匹配(`split_inclusive('\n')` 切片与 `LineIter` 同一切
+/// 口径),`^`/`$` 锚点、跨行不可见等语义与搜索结果严格一致,绝不出现
+/// 「列表里有命中、替换完还在」的错位。
+///
+/// `replacement` 在正则模式下支持 `$0`/`$1`/`${name}` 捕获引用
+/// (`regex` crate 展开,`$$` 为字面 `$`);字面模式下替换文本不展开。
+/// 返回(新文本, 替换处数);零命中时原样返回入参切片的所有权拷贝,
+/// 调用方据计数跳过写盘 —— 未命中的文件一个字节都不动。逐行处理
+/// 保留原始 LF/CRLF 终止符与未命中的行。
+pub fn replace_in_text(
+    query: &SearchQuery,
+    replacement: &str,
+    text: &str,
+) -> Result<(String, usize), SearchError> {
+    // 必须用 str 版正则:bytes 版的 `.` 匹配单个字节,替换会把多字节
+    // 字符从中间切烂;str 版保证匹配边界与产出都是合法 UTF-8。开关拼装
+    // 与扫描同源([`pattern_source`]),大小写语义一致。
+    let regex = regex::RegexBuilder::new(&pattern_source(query)?)
+        .case_insensitive(query.case_insensitive)
+        .build()
+        .map_err(|error| SearchError::InvalidPattern(error.to_string()))?;
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0usize;
+    for segment in text.split_inclusive('\n') {
+        // Use the same exact LF/CRLF body split as byte scanning. The input is
+        // valid UTF-8, so the ASCII-only slices can be viewed as str directly.
+        let (body_bytes, terminator_bytes) = split_line_terminator(segment.as_bytes());
+        let line = std::str::from_utf8(body_bytes).expect("text is valid UTF-8");
+        let terminator = std::str::from_utf8(terminator_bytes).expect("terminator is ASCII");
+        let hits = regex.find_iter(line).count();
+        if hits == 0 {
+            out.push_str(segment);
+        } else {
+            count += hits;
+            if query.literal {
+                out.push_str(&regex.replace_all(line, regex::NoExpand(replacement)));
+            } else {
+                out.push_str(&regex.replace_all(line, replacement));
+            }
+            out.push_str(terminator);
+        }
+    }
+    Ok((out, count))
 }
 
 /// 线程间共享的代际号:最新一代是唯一值得产出结果的搜索。
@@ -606,6 +691,29 @@ mod tests {
             root: root.to_path_buf(),
             pattern: pattern.into(),
             case_insensitive,
+            whole_word: false,
+            literal: false,
+        }
+    }
+
+    /// 完整匹配变体:其余字段与 [`query`] 同(正则模式)。
+    fn query_flags(
+        root: &Path,
+        pattern: &str,
+        case_insensitive: bool,
+        whole_word: bool,
+    ) -> SearchQuery {
+        SearchQuery {
+            whole_word,
+            ..query(root, pattern, case_insensitive)
+        }
+    }
+
+    /// 字面模式变体:大小写敏感、不整词。
+    fn literal_query(root: &Path, pattern: &str) -> SearchQuery {
+        SearchQuery {
+            literal: true,
+            ..query(root, pattern, false)
         }
     }
 
@@ -926,7 +1034,228 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ─── 反向链接扫描(backlinks)──────────────────────────────────
+    // ─── 字面 / 完整匹配开关(literal / whole_word)────────────────
+
+    /// 字面模式:含元字符的词按文本命中(未闭合括号当正则必然编译失败);
+    /// 同一词走正则路径则报 InvalidPattern —— 两个断言钉住开关的两面。
+    #[test]
+    fn literal_mode_escapes_metacharacters() {
+        let root = temp_vault("literal");
+        std::fs::write(root.join("cpp.md"), "函数 a(b 括号未闭合\n").unwrap();
+
+        let literal = literal_query(&root, "a(b");
+        let outcome = search_sync(&literal, MAX_HITS).unwrap();
+        assert_eq!(outcome.hits.len(), 1, "字面模式按文本命中 a(b");
+
+        let as_regex = query(&root, "a(b", false);
+        assert!(
+            search_sync(&as_regex, MAX_HITS).is_err(),
+            "正则模式编译失败"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 完整匹配:只命中独立词,复合词(running/runs)不误伤;大小写开关
+    /// 照常叠加。
+    #[test]
+    fn whole_word_skips_inflections() {
+        let root = temp_vault("whole-word");
+        std::fs::write(root.join("w.md"), "running runs run Run\n").unwrap();
+
+        let whole = query_flags(&root, "run", true, true);
+        let outcome = search_sync(&whole, MAX_HITS).unwrap();
+        assert_eq!(outcome.hits.len(), 1, "整行命中");
+        let line = &outcome.hits[0].line_text;
+        // 行内命中数靠 find_iter 数:run 与 Run 各一处,running/runs 不算
+        let regex = compile(&whole).unwrap();
+        assert_eq!(regex.find_iter(line.as_bytes()).count(), 2, "{line}");
+
+        let plain = query_flags(&root, "run", true, false);
+        let regex = compile(&plain).unwrap();
+        assert_eq!(
+            regex.find_iter(line.as_bytes()).count(),
+            4,
+            "无开关时词内也命中"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 完整匹配 + 交替模式:`\b` 作用于整个非捕获组,两个词都整词生效。
+    #[test]
+    fn whole_word_wraps_alternation_atomically() {
+        let root = temp_vault("whole-alt");
+        std::fs::write(root.join("alt.md"), "cat catalog dog dogs\n").unwrap();
+        let whole = query_flags(&root, "cat|dog", false, true);
+        let regex = compile(&whole).unwrap();
+        let line = "cat catalog dog dogs";
+        assert_eq!(regex.find_iter(line.as_bytes()).count(), 2, "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── 文本级替换(replace_in_text)──────────────────────────────
+
+    /// 基础替换:命中处全换、计数正确、换行风格(CRLF 与末行无换行)
+    /// 原样保留。
+    #[test]
+    fn replace_in_text_counts_and_preserves_lines() {
+        let root = temp_vault("replace-basic");
+        let text = "foo bar\r\nfoo again\nno match here\nfoo tail";
+        let outcome = replace_in_text(&query_flags(&root, "foo", true, false), "baz", text);
+        let (new_text, count) = outcome.unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(new_text, "baz bar\r\nbaz again\nno match here\nbaz tail");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 零命中恒等:返回与入参相同的文本、计数 0 —— 调用方据此跳过写盘。
+    #[test]
+    fn replace_in_text_is_identity_without_hits() {
+        let root = temp_vault("replace-identity");
+        let text = "什么都没有\n";
+        let (new_text, count) =
+            replace_in_text(&query_flags(&root, "不存在", true, false), "x", text).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(new_text, text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 捕获引用:`$1` 展开为第一捕获组(`$0` 全匹配),与 VS Code 替换
+    /// 语法对齐;正则模式与字面模式各验一面。
+    #[test]
+    fn replace_in_text_expands_capture_references() {
+        let root = temp_vault("replace-capture");
+        let text = "联系 bob@example.com 或 carol@example.com\n";
+        let outcome = replace_in_text(
+            &query_flags(&root, r"(\w+)@example\.com", true, false),
+            "$1 (at)",
+            text,
+        );
+        let (new_text, count) = outcome.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(new_text, "联系 bob (at) 或 carol (at)\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 行锚点与搜索同口径:逐行处理使 `^-` 这类行首锚点在**每一行**生效
+    /// (整篇一次性 replace_all 则只有首行能命中 —— 钉住逐行切片口径)。
+    #[test]
+    fn replace_in_text_line_anchors_match_search_semantics() {
+        let root = temp_vault("replace-anchor");
+        let text = "- a\nx\n- b\n";
+        let outcome = replace_in_text(&query_flags(&root, "^- ", true, false), "* ", text);
+        let (new_text, count) = outcome.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(new_text, "* a\nx\n* b\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// LF 与 CRLF 的行体切分必须让搜索和替换对行锚点给出同样结果。
+    #[test]
+    fn search_and_replace_agree_on_lf_and_crlf_anchors() {
+        let root = temp_vault("replace-anchor-terminators");
+        for (name, text) in [
+            ("lf.md", "foo\nnope\nfoo\n"),
+            ("crlf.md", "foo\r\nnope\r\nfoo\r\n"),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+
+        let query = query(&root, "^foo$", false);
+        let outcome = search_sync(&query, MAX_HITS).unwrap();
+        assert_eq!(
+            outcome
+                .hits
+                .iter()
+                .map(|hit| (
+                    hit.path.file_name().unwrap().to_owned(),
+                    hit.line_no,
+                    hit.line_text.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("crlf.md".into(), 1, "foo".into()),
+                ("crlf.md".into(), 3, "foo".into()),
+                ("lf.md".into(), 1, "foo".into()),
+                ("lf.md".into(), 3, "foo".into()),
+            ]
+        );
+        for (name, expected) in [
+            ("lf.md", "bar\nnope\nbar\n"),
+            ("crlf.md", "bar\r\nnope\r\nbar\r\n"),
+        ] {
+            let source = std::fs::read_to_string(root.join(name)).unwrap();
+            let (replaced, count) = replace_in_text(&query, "bar", &source).unwrap();
+            assert_eq!(count, 2, "{name}");
+            assert_eq!(replaced, expected, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 替换整行时只改行体,CRLF 终止符必须原样保留。
+    #[test]
+    fn replace_in_text_preserves_crlf_for_line_wildcard() {
+        let root = temp_vault("replace-crlf-wildcard");
+        let text = "one\r\ntwo\r\n";
+        let (new_text, count) = replace_in_text(&query(&root, "^.*$", false), "x", text).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(new_text, "x\r\nx\r\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有最终换行符的末行既可被搜索,也可被替换,且不凭空增加终止符。
+    #[test]
+    fn search_and_replace_handle_final_unterminated_line() {
+        let root = temp_vault("replace-final-line");
+        let path = root.join("final.md");
+        std::fs::write(&path, "prefix\nfoo").unwrap();
+        let query = query(&root, "^foo$", false);
+        let outcome = search_sync(&query, MAX_HITS).unwrap();
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].line_no, 2);
+        assert_eq!(outcome.hits[0].line_text, "foo");
+        let (new_text, count) = replace_in_text(&query, "bar", "prefix\nfoo").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(new_text, "prefix\nbar");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 字面查询的替换文本必须是 NoExpand: `$HOME`, `$1` 与 `$$` 都按原文输出。
+    #[test]
+    fn literal_replacement_does_not_expand_dollar_syntax() {
+        let root = temp_vault("replace-literal-dollars");
+        let query = literal_query(&root, "$HOME/$1/$$");
+        let text = "$HOME/$1/$$\n";
+        std::fs::write(root.join("dollars.md"), text).unwrap();
+        let outcome = search_sync(&query, MAX_HITS).unwrap();
+        assert_eq!(outcome.hits.len(), 1);
+        let (new_text, count) = replace_in_text(&query, "$HOME/$1/$$", text).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(new_text, text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replace_in_text_respects_whole_word() {
+        let root = temp_vault("replace-whole");
+        let text = "run runner running\n";
+        let outcome = replace_in_text(&query_flags(&root, "run", true, true), "runner", text);
+        let (new_text, count) = outcome.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(new_text, "runner runner running\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CJK 字面替换:中文词按文本命中并替换,多字节偏移不串位。
+    #[test]
+    fn replace_in_text_cjk_literal() {
+        let root = temp_vault("replace-cjk");
+        let text = "架构决策记录\n架构评审\n";
+        let outcome = replace_in_text(&query_flags(&root, "架构", true, false), "设计", text);
+        let (new_text, count) = outcome.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(new_text, "设计决策记录\n设计评审\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 反向链接样本库:目标文档 `note.md` 被多个文件以多种写法引用,外加
     /// 四类负样本(gitignore 排除、围栏代码块、draft 镜像、无链接文档)。
