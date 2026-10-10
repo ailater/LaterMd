@@ -827,18 +827,18 @@ mod tests {
     /// | 根 Ui 宽 | 直出 | 「更多」 |
     /// |---|---|---|
     /// | 1400 | 17(全四组) | 无 |
-    /// | 460 | 12(行内+标题+列表,块组进菜单) | 有 |
+    /// | 500 | 12(行内+标题+列表,块组进菜单) | 有 |
     /// | 300 | 8(行内+列表,S2-2 原状) | 有 |
     ///
     /// 探针只对**本帧画出的按钮**触发(菜单闭着时菜单条目不画),故一帧
     /// 的探针集合就是直出集合;「更多」在场与否用 shapes 文本取证(与
-    /// 图片测试第 1 段同一手法)。宽度取值避开三档阈值(~436/~535)各留
-    /// 出入档余量,平台字宽差异(mac 形态按钮 28 vs 24)吃不满这些余量。
+    /// 图片测试第 1 段同一手法)。中档使用 500px，给 macOS 形态按钮
+    /// (28 vs 24)、根 Ui 边距及「更多」文字宽度留足空间，仍小于全展开阈值。
     #[test]
     fn direct_set_grows_with_available_width() {
         use std::collections::HashSet;
         for (width, direct_expected, more_expected) in
-            [(1400.0, 17, false), (460.0, 12, true), (300.0, 8, true)]
+            [(1400.0, 17, false), (500.0, 12, true), (300.0, 8, true)]
         {
             let ctx = egui::Context::default();
             let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.0));
