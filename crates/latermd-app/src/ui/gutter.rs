@@ -453,7 +453,7 @@ mod tests {
     }
 
     /// 光标所在逻辑行的行号用 accent 色,其余行不用(暗色默认下的
-    /// `tokens::accent` = #6C9FFF)。光标经 §6.4 写回通道落到第 3 行首。
+    /// `tokens::accent` 取当前应用皮肤)。光标经 §6.4 写回通道落到第 3 行首。
     #[test]
     fn cursor_line_digit_gets_accent_color() {
         let ctx = egui::Context::default();
@@ -461,7 +461,7 @@ mod tests {
         let _ = frame_shapes(&ctx, &mut editor, 0.0, Some((4, 4)), Vec::new());
         let found = digits(&frame_shapes(&ctx, &mut editor, 0.1, None, Vec::new()));
 
-        let accent = egui::Color32::from_rgb(0x6C, 0x9F, 0xFF);
+        let accent = crate::theme::shell_tokens(true).accent;
         assert!(
             found.iter().any(|(l, _, c)| l == "3" && *c == accent),
             "光标行的行号是 accent 色"

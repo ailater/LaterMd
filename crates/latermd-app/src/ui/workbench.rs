@@ -78,7 +78,7 @@ pub(crate) fn label_at(
 
 pub(crate) fn small_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     if response.hovered() || response.has_focus() {
         ui.painter().rect_filled(rect, 5.0, colors.hover);
     }
@@ -90,7 +90,7 @@ pub(crate) fn small_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Resp
 }
 
 pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usize, usize)>) {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
     let y = rect.center().y;
     let tab = state.tabs.current();
@@ -173,13 +173,13 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, state: &State, position: Option<(usi
 
 /// 单物理像素分隔线；与面板原生拖拽高亮共存。
 pub fn separator(ui: &egui::Ui) -> egui::Stroke {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     egui::Stroke::new(1.0 / ui.ctx().pixels_per_point(), colors.border)
 }
 
 fn action(ui: &mut egui::Ui, rect: Rect, icon: Icon, tip: &str, selected: bool) -> bool {
     let response = ui.allocate_rect(rect, Sense::click());
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     if response.hovered() || response.has_focus() {
         ui.painter().rect_filled(rect, 6.0, colors.hover);
     }
@@ -246,7 +246,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
     let slot = |x: f32, w: f32| {
         Rect::from_center_size(egui::pos2(x + w / 2.0, center_y), egui::vec2(w, 28.0))
     };
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let right = bar.right() - 12.0;
     let right_start = right - HEADER_RIGHT_W;
     let sidebar_x = bar.left() + TRAFFIC_LIGHTS_W + 6.0;
@@ -323,7 +323,7 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, outbox: &mut Vec<Message>) {
 }
 
 fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let live = state.render_mode == crate::live::RenderMode::Live;
     ui.painter().rect_filled(rect, 7.0, colors.hover);
     for (index, label) in ["源码", "Live"].into_iter().enumerate() {
@@ -340,7 +340,7 @@ fn mode_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Me
                 .rect_stroke(part, 5.0, separator(ui), egui::StrokeKind::Inside);
         } else if response.hovered() {
             ui.painter()
-                .rect_filled(part, 5.0, crate::theme::window_fill(ui.visuals().dark_mode));
+                .rect_filled(part, 5.0, crate::theme::shell(ui).chrome);
         }
         centered_label(
             ui,
@@ -371,7 +371,7 @@ fn search_field(
     search: &mut crate::search::SearchState,
     outbox: &mut Vec<Message>,
 ) {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     let id = ui.make_persistent_id("workbench-search");
     let focused = ui.memory(|m| m.has_focus(id));
     ui.painter().rect_filled(rect, 6.0, colors.content);
@@ -436,7 +436,7 @@ pub fn workspace_picker(
     tree: &crate::filetree::FileTreeState,
     outbox: &mut Vec<Message>,
 ) {
-    let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let colors = crate::theme::shell(ui);
     ui.label(
         egui::RichText::new("文件夹")
             .size(11.0)
@@ -526,14 +526,14 @@ pub fn navigation(ui: &mut egui::Ui, active: SidebarTab, outbox: &mut Vec<Messag
     ui.label(
         egui::RichText::new("工作台")
             .size(11.0)
-            .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary),
+            .color(crate::theme::shell(ui).secondary),
     );
     ui.add_space(4.0);
     let top = ui.cursor().top();
     for tab in SidebarTab::ALL {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::click());
-        let colors = crate::theme::shell_tokens(ui.visuals().dark_mode);
+        let colors = crate::theme::shell(ui);
         if tab == active || response.hovered() {
             ui.painter().rect_filled(
                 rect,
@@ -583,7 +583,7 @@ pub fn pane_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
         ui.label(
             egui::RichText::new(title)
                 .size(12.0)
-                .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary),
+                .color(crate::theme::shell(ui).secondary),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(detail).size(11.0).weak());

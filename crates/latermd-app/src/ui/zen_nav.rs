@@ -272,11 +272,7 @@ fn row(ui: &mut egui::Ui, index: usize, label: &str, selected: bool, outbox: &mu
         let painter = ui.painter();
         let visuals = ui.visuals();
         if selected {
-            painter.rect_filled(
-                rect,
-                0.0,
-                crate::theme::shell_tokens(visuals.dark_mode).selected_bg,
-            );
+            painter.rect_filled(rect, 0.0, crate::theme::shell(ui).selected_bg);
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     rect.left_top(),

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 mod macos;
+mod skins;
 
 /// 设置页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -359,7 +360,7 @@ fn card<R>(
 /// 约 2:1,配 shell 最沉的 `sidebar` 反而读得清。
 pub(crate) fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     let ink = if ui.visuals().dark_mode {
-        crate::theme::shell_tokens(true).sidebar
+        crate::theme::shell(ui).sidebar
     } else {
         egui::Color32::WHITE
     };
@@ -393,7 +394,7 @@ pub fn dialog(
     // #70 M1:整窗显式随当前明暗主题取 shell 色(生产路径 `theme.apply`
     // 每帧已把 `window_fill` 投成同一值,这里再取一次是让「不依赖投影
     // 也在场」成为本窗自身性质,明暗各走各的 token,不写死任何一档)
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     let mac = cfg!(target_os = "macos");
     let frame = if mac {
         egui::Frame::window(ui.style())
@@ -600,7 +601,7 @@ fn appearance_legacy(
     resolved: ThemeMode,
     outbox: &mut Vec<Message>,
 ) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.heading("外观");
     ui.add_space(crate::ui::tokens::SPACE_SM);
     // #70 M2:本页全部配置行走 settings_row 两列(标签列定宽、控件列同
@@ -625,28 +626,9 @@ fn appearance_legacy(
                 "本机读不到系统主题设置,已回落到手动值",
             );
         }
-        let current = theme.skin.as_deref();
-        settings_row(ui, "皮肤", |ui| {
-            egui::ComboBox::from_id_salt("settings-skin-select")
-                .selected_text(current.unwrap_or("出厂默认"))
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(current.is_none(), "出厂默认").clicked()
-                        && current.is_some()
-                    {
-                        outbox.push(Message::ThemeSkinSelected(None));
-                    }
-                    for skin in &skins.skins {
-                        if ui
-                            .selectable_label(current == Some(skin.name.as_str()), &skin.name)
-                            .clicked()
-                        {
-                            outbox.push(Message::ThemeSkinSelected(Some(skin.name.clone())));
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("正文与代码高亮样式");
-        });
+        ui.label("工作台皮肤");
+        skins::choices(ui, theme, skins, outbox);
+        ui.weak("窗口、侧栏、编辑区、控件与文档统一换肤。");
         settings_row(ui, "导出皮肤", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut settings.skin_export_name)
@@ -773,10 +755,10 @@ fn appearance_legacy(
 /// 主题三态的**可点击小预览图**(形态对齐 macOS 设置页 `settings/macos.rs`
 /// 的 `theme_choices`,#169 精修移植):纸面 + 侧栏条 + 三行文本的迷你工作台,
 /// 选中态强调色描边。「跟随系统」用明暗对半表达。与 mac 版的差异:预览色
-/// 直接取 [`crate::theme::shell_tokens`] 真实 token(mac 版是固定灰阶近似),
+/// 直接取 [`ThemeSettings::shell_palette`] 的当前皮肤色板，
 /// 换皮肤/调色后缩略图跟着走。
 fn theme_previews(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Message>) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.horizontal(|ui| {
         for mode in ThemeMode::ALL {
             let (rect, response) =
@@ -786,8 +768,8 @@ fn theme_previews(ui: &mut egui::Ui, theme: &ThemeSettings, outbox: &mut Vec<Mes
                 egui::Rect::from_min_size(rect.min + egui::vec2(2.0, 2.0), egui::vec2(80.0, 48.0));
             let painter = ui.painter();
             // 纸面:跟随系统 = 左浅右暗对半;浅/深各取真实 shell 底
-            let dark_paper = crate::theme::shell_tokens(true);
-            let light_paper = crate::theme::shell_tokens(false);
+            let dark_paper = theme.shell_palette().dark;
+            let light_paper = theme.shell_palette().light;
             let paper = |r: egui::Rect, dark: bool| {
                 painter.rect_filled(
                     r,
@@ -901,7 +883,7 @@ fn keymap_page(
     keymap: &Keymap,
     outbox: &mut Vec<Message>,
 ) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.heading("快捷键");
     ui.weak("点击键位按钮后按下新组合;Esc 取消,Backspace 清除绑定。");
     ui.add_space(crate::ui::tokens::SPACE_SM);
@@ -970,7 +952,7 @@ fn ai_page(
     ai_key: &mut AiKeyState,
     outbox: &mut Vec<Message>,
 ) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.heading("AI");
     ui.add_space(crate::ui::tokens::SPACE_SM);
     // 字段级借用拆分:候选列表只读,草稿可变(下同 key_editor 的 creds)
@@ -1120,7 +1102,7 @@ fn mcp_page(
     mcp: &McpState,
     outbox: &mut Vec<Message>,
 ) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.heading("MCP");
     ui.weak(
         "应用开着就能被本机其他 AI(Claude Code / Cursor 等)调用,检索这个文档库。\
@@ -1231,7 +1213,7 @@ fn image_page(
     bed: &mut crate::bed::BedState,
     outbox: &mut Vec<Message>,
 ) {
-    let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
+    let shell = crate::theme::shell(ui);
     ui.heading("图片 · 图床");
     ui.weak(
         "图片框里的「上传」把图片发给图床,返回的 URL 插进文档。\
@@ -1642,7 +1624,7 @@ mod tests {
         };
         let appearance_labels = [
             "主题",
-            "皮肤",
+            "工作台皮肤",
             "导出皮肤",
             "界面密度",
             "字号",

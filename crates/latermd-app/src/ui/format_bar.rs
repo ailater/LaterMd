@@ -144,7 +144,7 @@ pub fn ui_with_probe(
                 // 的点击路径在溢出后就失去覆盖。
                 let menu = egui::RichText::new("更多")
                     .size(12.0)
-                    .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary);
+                    .color(crate::theme::shell(ui).secondary);
                 ui.menu_button(menu, |ui| {
                     for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
                         if index > 0 {
@@ -273,7 +273,7 @@ fn rich(ui: &mut egui::Ui, action: FormatAction, glyph: &str, shape: Glyph) -> e
             })
             .family(crate::fonts::semibold_family(ui.ctx()));
         if cfg!(target_os = "macos") {
-            text = text.color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary);
+            text = text.color(crate::theme::shell(ui).secondary);
         }
         match shape {
             Glyph::Weight => {}
