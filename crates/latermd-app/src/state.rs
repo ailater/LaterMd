@@ -1940,11 +1940,14 @@ impl State {
 
     /// 翻转右栏(只读预览)可见性;写盘同上由帧末统一负责。
     fn toggle_right_panel(&mut self) {
-        self.layout.right = !self.layout.right;
-        // Live 下用户明确点了预览按钮，以当前选择为准，不再在切回源码时
-        // 覆盖它。
+        if self.layout.zen {
+            self.toggle_zen();
+        }
         if self.render_mode == RenderMode::Live {
-            self.layout.pre_live_right = None;
+            self.toggle_live_preview();
+            self.layout.right = true;
+        } else {
+            self.layout.right = !self.layout.right;
         }
     }
 
@@ -1963,7 +1966,7 @@ impl State {
 
     /// 请求一次 Markdown 格式动作(§6.4 链路)。
     ///
-    /// Live 模式走 [`Self::apply_format_live`](块内定点写回);源码模式:
+    /// Live 模式走 [`Self::apply_format_live`]（块内定点写回）;源码模式:
     /// 语义全在 [`crate::compose::apply`],这里负责三件事:取当前选区 →
     /// 调用 → 把新文本写回缓冲并把新选区挂 `pending_selection`。选区为
     /// `None`(UI 还没回填过)时按纯光标(0,0)处理。
@@ -2782,10 +2785,26 @@ impl State {
         self.bed.poll()
     }
 
+    /// 装载布局后恢复编辑模式。内存 Default 保留源码测试夹具；真实启动
+    /// 无模式记录时进入写作。缓冲与撤销栈始终不重建。
+    pub fn restore_layout(&mut self, layout: LayoutSettings) {
+        let mode = layout.render_mode.unwrap_or(RenderMode::Live);
+        self.layout = layout;
+        self.render_mode = RenderMode::Source;
+        if mode == RenderMode::Live {
+            self.toggle_live_preview();
+        }
+    }
+
     /// 切模式:只翻标志。切到 Live 时顺带按当前光标定位活动块(首次进入
     /// 就有可编辑的块,而不是「点一下才出现」)。
     fn toggle_live_preview(&mut self) {
+        // 先恢复临时阅读布局，再切换，避免退出禅定时复活写作的右栏。
+        if self.layout.zen {
+            self.toggle_zen();
+        }
         self.render_mode = self.render_mode.opposite();
+        self.layout.render_mode = Some(self.render_mode);
         if self.render_mode == RenderMode::Live {
             self.layout.pre_live_right = Some(self.layout.right);
             self.layout.right = false;
@@ -5507,6 +5526,101 @@ mod tests {
 
         state.apply(Message::ToggleLivePreview);
         assert_eq!(state.render_mode, RenderMode::Source);
+    }
+
+    #[test]
+    fn fresh_start_uses_writing_and_comparison_is_a_source_tool() {
+        let mut state = State::default();
+        state.restore_layout(LayoutSettings::fresh_install());
+        let text = state.tabs.current().editor.text().to_owned();
+        let revision = state.tabs.current().editor.revision();
+        let tab_id = state.tabs.current().id;
+        assert_eq!(state.render_mode, RenderMode::Live);
+        assert!(!state.layout.right);
+        state.apply(Message::ToggleLivePreview);
+        assert_eq!(state.render_mode, RenderMode::Source);
+        assert!(!state.layout.right, "首次源码不强制开对照");
+        state.apply(Message::ToggleLivePreview);
+        state.apply(Message::RightPanelToggled);
+        assert_eq!(state.render_mode, RenderMode::Source);
+        assert!(state.layout.right, "写作中的对照入口进入源码并展开");
+        state.apply(Message::ToggleLivePreview);
+        assert!(!state.layout.right);
+        state.apply(Message::ToggleLivePreview);
+        assert!(state.layout.right, "回到源码恢复用户的对照选择");
+        state.apply(Message::RightPanelToggled);
+        state.apply(Message::ToggleLivePreview);
+        state.apply(Message::ToggleLivePreview);
+        assert!(!state.layout.right, "主动关闭也要记住");
+        assert_eq!(state.tabs.current().id, tab_id);
+        assert_eq!(state.tabs.current().editor.text(), text);
+        assert_eq!(state.tabs.current().editor.revision(), revision);
+        assert!(!state.tabs.current().editor.is_dirty());
+    }
+
+    #[test]
+    fn writing_and_source_preferences_survive_restart_and_legacy_migration() {
+        let dir = temp_path("writing-layout");
+        std::fs::create_dir_all(&dir).unwrap();
+        for right in [false, true] {
+            // 旧版本没有模式字段，升级默认写作，但保留原预览选择。
+            std::fs::write(dir.join("layout.json"), format!(r#"{{"right":{right}}}"#)).unwrap();
+            let mut state = State::default();
+            state.restore_layout(LayoutSettings::load_from(&dir).unwrap());
+            assert_eq!(state.render_mode, RenderMode::Live);
+            assert!(!state.layout.right);
+            for mode in [RenderMode::Live, RenderMode::Source] {
+                if state.render_mode != mode {
+                    state.apply(Message::ToggleLivePreview);
+                }
+                state.layout.save_to(Some(&dir)).unwrap();
+                let mut restarted = State::default();
+                restarted.restore_layout(LayoutSettings::load_from(&dir).unwrap());
+                assert_eq!(restarted.render_mode, mode);
+                assert_eq!(restarted.layout.right, mode == RenderMode::Source && right);
+                if mode == RenderMode::Live {
+                    restarted.apply(Message::ToggleLivePreview);
+                }
+                assert_eq!(restarted.layout.right, right);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mode_commands_exit_zen_without_reviving_duplicate_preview() {
+        for comparison in [false, true] {
+            let mut state = State::default();
+            state.layout.right = comparison;
+            state.apply(Message::ZenToggled);
+            state.apply(Message::ToggleLivePreview);
+            assert!(!state.layout.zen && !state.layout.right);
+            assert_eq!(state.render_mode, RenderMode::Live);
+            state.apply(Message::ZenToggled);
+            state.apply(Message::ZenToggled);
+            assert!(!state.layout.right);
+            state.apply(Message::ZenToggled);
+            state.apply(Message::RightPanelToggled);
+            assert!(!state.layout.zen && state.layout.right);
+            assert_eq!(state.render_mode, RenderMode::Source);
+        }
+    }
+
+    #[test]
+    fn saving_in_writing_zen_keeps_source_comparison_preference() {
+        let dir = temp_path("writing-zen-layout");
+        let mut state = State::default();
+        state.layout.left = false;
+        state.apply(Message::ToggleLivePreview);
+        state.apply(Message::ZenToggled);
+        state.layout.save_to(Some(&dir)).unwrap();
+        let mut restarted = State::default();
+        restarted.restore_layout(LayoutSettings::load_from(&dir).unwrap());
+        assert_eq!(restarted.render_mode, RenderMode::Live);
+        assert!(!restarted.layout.left && !restarted.layout.right && !restarted.layout.zen);
+        restarted.apply(Message::ToggleLivePreview);
+        assert!(restarted.layout.right);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 系统主题只在「跟随系统」模式轮询:其余模式返回 None(egui 得以收敛

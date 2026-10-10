@@ -10,7 +10,6 @@
 //! 同一批纯函数,测试与绘制零偏差。
 
 use crate::command::Command;
-use crate::live::RenderMode;
 use crate::search::SearchState;
 use crate::settings::SettingsTab;
 use crate::state::{Message, State};
@@ -451,54 +450,9 @@ fn command_box(
 ///
 /// 分段开关(VS Code / Zed 同款):**选中段有一层实心底**,非选中段
 /// 只有文字;点击任一段 → [`Message::ToggleLivePreview`]
-/// (与菜单栏「视图 → 切换 Live Preview」同一命令,不另开入口)。
+/// (与菜单栏「视图 → 写作模式」同一命令,不另开入口)。
 pub(super) fn view_switch(ui: &mut egui::Ui, rect: Rect, state: &State, outbox: &mut Vec<Message>) {
-    let live = state.render_mode == RenderMode::Live;
-    let half_w = rect.width() / 2.0;
-    let response = ui.allocate_rect(rect, Sense::click());
-    let painter = ui.painter();
-
-    painter.rect_filled(rect, RADIUS_MD, ui.visuals().extreme_bg_color);
-    // 选中段:实心底下压在胶囊底与 border 之上
-    let selected_x = if live {
-        rect.left() + half_w
-    } else {
-        rect.left()
-    };
-    let selected = Rect::from_min_size(
-        Pos2::new(selected_x, rect.top()),
-        egui::vec2(half_w, rect.height()),
-    );
-    painter.rect_filled(selected, RADIUS_MD, ui.visuals().selection.bg_fill);
-
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    painter.text(
-        Pos2::new(rect.left() + half_w / 2.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        "源码",
-        font.clone(),
-        if live {
-            ui.visuals().text_color()
-        } else {
-            ui.visuals().strong_text_color()
-        },
-    );
-    painter.text(
-        Pos2::new(rect.left() + half_w + half_w / 2.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        "Live",
-        font,
-        if live {
-            ui.visuals().strong_text_color()
-        } else {
-            ui.visuals().text_color()
-        },
-    );
-
-    if response.clicked() {
-        outbox.push(Message::ToggleLivePreview);
-    }
-    response.on_hover_text("切换源码 / Live Preview");
+    crate::ui::workbench::mode_switch(ui, rect, state, outbox);
 }
 
 /// 某条命令当前绑的键位(用户可改,与 settings 快捷键页同源)。
@@ -565,7 +519,7 @@ fn window_button(
                 None => action.to_owned(),
             })
         }
-        TitleButton::PanelRight => response.on_hover_text("关闭右侧预览"),
+        TitleButton::PanelRight => response.on_hover_text("对照预览（源码模式）"),
         // 与 `PanelLeft` 同款:键位文案取自 keymap(用户可改),不硬编码 F11。
         TitleButton::Zen => {
             let action = if zen_open {
@@ -1119,8 +1073,8 @@ mod tests {
         };
 
         frame_fn(&mut state, &mut outbox, Vec::new());
-        // 点 Live 段(右半)→ ToggleLivePreview
-        let live_center = egui::pos2(switch.left() + switch.width() * 0.75, switch.center().y);
+        // 点写作段(左半)→ ToggleLivePreview
+        let live_center = egui::pos2(switch.left() + switch.width() * 0.25, switch.center().y);
         frame_fn(
             &mut state,
             &mut outbox,

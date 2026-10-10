@@ -461,7 +461,7 @@ impl LaterMdApp {
                     .fill(crate::theme::shell(ui).content),
             )
             .show_collapsible(ui, right, |ui| {
-                crate::ui::workbench::pane_heading(ui, "预览", "实时更新");
+                crate::ui::workbench::pane_heading(ui, "对照预览", "只读");
                 let tab = self.state.tabs.current_mut();
                 // heal 只在 AI 流式写入本标签时开:补闭合是流式残缺帧的
                 // 必需品,完整文档上是恒等变换但逐行全文扫描,稳态帧不该付。
