@@ -6041,6 +6041,116 @@ mod tests {
         );
     }
 
+    /// Live 模式真实帧里的工具条点击(2026-10-10):活动块内框选 → 点
+    /// 加粗 → 块内包裹、内容仍选中。链路三段各有独立测试(镜像
+    /// `live::active_block_selection_is_mirrored_for_the_format_bar`、归约
+    /// `state::live_format_applies_inside_the_active_block`、落地
+    /// `live::format_landing_restores_the_content_selection`),本测试钉
+    /// 三段在真实布局帧里的**接缝** —— 镜像/落地都走真实 `app.draw`,
+    /// 消息经真实 `reduce` 消费。
+    #[test]
+    fn clicking_bold_in_live_mode_formats_the_active_block() {
+        use crate::compose::FormatAction;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0));
+        let mut app = LaterMdApp {
+            frameless: true,
+            ..Default::default()
+        };
+        app.state.render_mode = crate::live::RenderMode::Live;
+        app.state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("甲乙丙\n\n后文");
+        // 光标在第 0 字节:live.sync 把块 0 定位成活动块
+        app.state.tabs.current_mut().cursor.byte = Some(0);
+        let block_id =
+            crate::ui::editor::tab_editor_id(app.state.tabs.current().id).with(("live-block", 0));
+
+        // reduce + draw 一帧(与 task 测试同节奏):draw 发消息,下一帧
+        // reduce 消费 —— 尾帧是链路闭合的必要一环。
+        let frame = |app: &mut LaterMdApp, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.reduce(ui.ctx());
+                    app.draw(ui);
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // 预热两帧(块表定位活动块 + 布局收敛),再把「框选 甲乙丙」注进
+        // 活动块的持久 TextEditState —— 与真实拖选同源(state 是唯一真源)。
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        {
+            let mut st = egui::widgets::text_edit::TextEditState::default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(3),
+            )));
+            st.store(&ctx, block_id);
+            ctx.memory_mut(|mem| mem.request_focus(block_id));
+        }
+
+        let center = Rc::new(RefCell::new(egui::Pos2::ZERO));
+        {
+            let sink = center.clone();
+            app.format_probe = Some(Box::new(move |action, rect| {
+                if action == FormatAction::Bold {
+                    *sink.borrow_mut() = rect.center();
+                }
+            }));
+        }
+        frame(&mut app, Vec::new());
+        app.format_probe = None;
+        let center = *center.borrow();
+        assert!(center.x > 0.0, "探针拿到了加粗按钮的位置:{center:?}");
+
+        let click = |pressed| Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut app, vec![Event::PointerMoved(center)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        // 尾帧:reduce 消费 FormatRequested,落地帧写回块选区
+        frame(&mut app, Vec::new());
+
+        let tab = app.state.tabs.current();
+        assert_eq!(
+            tab.editor.text(),
+            "**甲乙丙**\n\n后文",
+            "live 下点加粗落在活动块内,块外一字不动"
+        );
+        let landed = egui::widgets::text_edit::TextEditState::load(&ctx, block_id)
+            .and_then(|st| st.cursor.char_range())
+            .expect("落地选区在场");
+        assert_eq!(
+            (
+                landed.primary.index.0.min(landed.secondary.index.0),
+                landed.primary.index.0.max(landed.secondary.index.0)
+            ),
+            (2, 5),
+            "内容仍选中(连点第二次可 toggle)"
+        );
+        assert!(
+            tab.live.pending_caret.is_none() && tab.live.pending_range.is_none(),
+            "落地即焚"
+        );
+    }
+
     /// 任务列表崩溃回归(2026-09-27 用户实测「点几次就崩溃」)。
     ///
     /// 全链路:真实 `reduce`+`draw`、真实格式条 Task 按钮、CJK 文本行中

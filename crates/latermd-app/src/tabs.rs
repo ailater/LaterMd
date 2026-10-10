@@ -96,7 +96,8 @@ pub struct TabState {
     pub cursor: OutlineCursor,
     /// 自动保存记忆(#18)。
     pub autosave: TabAutosave,
-    /// 编辑器选区的**字符**区间`(起, 止)`,由 `ui::editor` 每帧回填。
+    /// 编辑器选区的**字符**区间`(起, 止)`,由 `ui::editor` 每帧回填
+    /// (Live 模式由 `live::ui` 从活动块镜像,无活动块即 `None`)。
     ///
     /// 存在的理由:工具条按钮被点中的时候编辑器已经失焦,而 `TextEdit` 的
     /// 选区活在其持久 widget state 里,归约侧拿不到 —— 于是 UI 每帧把它
@@ -106,7 +107,8 @@ pub struct TabState {
     /// 待写回的新选区(格式动作产出),由 `ui::editor` 下一帧消费。
     ///
     /// 链路见 docs/ui-shell-redesign.md §6.4:`FormatRequested` → 归约 →
-    /// 这里 → UI 写入 `TextEdit` 持久 cursor + 还焦。
+    /// 这里 → UI 写入 `TextEdit` 持久 cursor + 还焦。**仅源码模式消费**:
+    /// Live 模式的落点走 `LiveState::pending_caret/pending_range`。
     pub pending_selection: Option<(usize, usize)>,
     /// Live Preview 的块表与活动块(仅在 Live 模式下使用)。
     pub live: LiveState,

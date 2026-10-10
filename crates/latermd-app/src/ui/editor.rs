@@ -178,6 +178,7 @@ pub fn ui(
             editor,
             preview,
             cursor,
+            selection,
             live,
             editor_id,
             show_typewriter,
