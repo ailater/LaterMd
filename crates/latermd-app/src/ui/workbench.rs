@@ -577,6 +577,8 @@ mod tests {
             2
         );
     }
+    // 验证 macOS 的实际中英文字体；其他平台 CI 不要求预装 CJK 系统字体。
+    #[cfg(target_os = "macos")]
     #[test]
     fn source_and_live_glyphs_share_the_segment_center() {
         for scale in [1.0, 1.5, 2.0] {
