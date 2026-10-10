@@ -45,6 +45,48 @@ fn collect(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
   }
 }
 
+fn collect_text_colors(shape: &egui::epaint::Shape, out: &mut Vec<(String, Color32)>) {
+  match shape {
+    egui::epaint::Shape::Text(text) => {
+      let color = text.galley.job.sections.first().map(|section| section.format.color).unwrap_or(Color32::TRANSPARENT);
+      out.push((text.galley.text().to_owned(), color));
+    }
+    egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect_text_colors(shape, out)),
+    _ => {}
+  }
+}
+
+/// A theme switch must rebuild whole-document galleys because their layout
+/// sections contain the resolved body color. Reusing the previous galley makes
+/// the document keep the old theme's text color until its contents change.
+#[test]
+fn theme_switch_rebuilds_whole_document_text_colors() {
+  let ctx = Context::default();
+  let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(500.0, 500.0));
+  let render = |dark: bool| {
+    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+    let mut output = ctx.run_ui(RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+      let mut child = ui.new_child(UiBuilder::new().max_rect(screen));
+      MarkdownLabel::new(Id::new("theme-switch"), "正文在主题切换后仍保持当前颜色。").show(&mut child);
+    });
+    let mut colors = Vec::new();
+    for clipped in &output.shapes {
+      collect_text_colors(&clipped.shape, &mut colors);
+    }
+    output.textures_delta.clear();
+    colors
+  };
+
+  let light = render(false);
+  let dark = render(true);
+  let light_again = render(false);
+  let expected_light = egui::Visuals::light().text_color();
+  let expected_dark = egui::Visuals::dark().text_color();
+  assert!(light.iter().any(|(text, color)| text.contains("正文") && *color == expected_light));
+  assert!(dark.iter().any(|(text, color)| text.contains("正文") && *color == expected_dark));
+  assert!(light_again.iter().any(|(text, color)| text.contains("正文") && *color == expected_light));
+}
+
 /// Editing a word must be reflected even when the edit does not change the token count.
 #[test]
 fn edit_within_segmented_doc_is_reflected() {

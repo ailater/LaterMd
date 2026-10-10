@@ -1747,6 +1747,13 @@ mod tests {
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut images, &mut galleys);
         }
+        // The preview can also emit mesh shapes for scroll fades when the
+        // document grows past the viewport.  They are UI chrome, not emoji
+        // textures, so keep the probe's image count focused on inline widgets.
+        let probe = ctx
+            .data(|d| d.get_temp::<Vec<egui::Rect>>(emoji_probe_id(tab_id)))
+            .unwrap_or_default();
+        images.retain(|(_, rect)| probe.iter().any(|widget| widget.contains(rect.center())));
         let delta72 = output
             .textures_delta
             .set
@@ -1761,9 +1768,7 @@ mod tests {
         let frame = EmojiFrame {
             texts: painted_text(&output),
             images,
-            probe: ctx
-                .data(|d| d.get_temp::<Vec<egui::Rect>>(emoji_probe_id(tab_id)))
-                .unwrap_or_default(),
+            probe,
             cursor: output.platform_output.cursor_icon,
             delta72,
             galleys,
