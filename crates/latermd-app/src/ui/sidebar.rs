@@ -655,7 +655,7 @@ fn outline_row(
     response
 }
 
-/// Search 页:搜索行(折叠箭头 + 输入)+ 三开关行 + 可选替换行 + 状态行
+/// Search 页:搜索行(折叠箭头 + 输入 + 三开关)+ 可选替换行 + 状态行
 /// + 按文件分组的结果列表。
 ///
 /// 开关对齐 VS Code:「Aa」区分大小写、「ab」全字匹配、正则 `.*`;三者
@@ -678,68 +678,7 @@ fn search_panel(
         return;
     };
 
-    // 搜索行:左端折叠箭头(展开替换行,VS Code 同位),右端输入占满
-    panel.horizontal(|ui| {
-        let (rect, chevron) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-        if chevron.hovered() || chevron.has_focus() {
-            ui.painter()
-                .rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
-        }
-        ui.painter().add(egui::Shape::convex_polygon(
-            arrow_vertices(rect.center(), 3.5, search.replace_open).to_vec(),
-            ui.visuals().text_color(),
-            egui::Stroke::NONE,
-        ));
-        chevron
-            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "展开替换"));
-        let chevron = chevron.on_hover_text(if search.replace_open {
-            "收起替换"
-        } else {
-            "展开替换"
-        });
-        if chevron.clicked() {
-            search.replace_open = !search.replace_open;
-        }
-        let edited = egui::TextEdit::singleline(&mut search.query)
-            .id_salt("search-input")
-            .hint_text(if search.regex {
-                "正则表达式…"
-            } else {
-                "搜索…"
-            })
-            .desired_width(f32::INFINITY)
-            .show(ui)
-            .response
-            .changed();
-        if edited {
-            outbox.push(Message::SearchQueryChanged);
-        }
-    });
-    // 开关行:三片与 VS Code 检索视图同款;「Aa」语义取反(片亮 = 区分
-    // 大小写 = case_insensitive 关)
-    panel.horizontal(|ui| {
-        let case = ui
-            .selectable_label(!search.case_insensitive, "Aa")
-            .on_hover_text("区分大小写");
-        if case.clicked() {
-            search.case_insensitive = !search.case_insensitive;
-            outbox.push(Message::SearchQueryChanged);
-        }
-        let word = ui
-            .selectable_label(search.whole_word, "ab")
-            .on_hover_text("全字匹配");
-        if word.clicked() {
-            search.whole_word = !search.whole_word;
-            outbox.push(Message::SearchQueryChanged);
-        }
-        let regex = ui
-            .selectable_label(search.regex, ".*")
-            .on_hover_text("使用正则表达式");
-        if regex.clicked() {
-            search.regex = !search.regex;
-            outbox.push(Message::SearchQueryChanged);
-        }
-    });
+    search_controls(panel, search, outbox);
     // 替换行:替换词草稿不触发任何事,消费只在「全部替换」;零命中禁用
     if search.replace_open {
         panel.horizontal(|ui| {
@@ -770,6 +709,93 @@ fn search_panel(
             ));
         });
     }
+    search_results(panel, search, root, outbox);
+}
+
+fn search_controls(
+    panel: &mut egui::Ui,
+    search: &mut SearchState,
+    outbox: &mut Vec<Message>,
+) -> [egui::Response; 5] {
+    panel
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding.x = 2.0;
+            let mode_size = egui::vec2(24.0, ui.spacing().interact_size.y.max(22.0));
+            let (rect, chevron) =
+                ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+            if chevron.hovered() || chevron.has_focus() {
+                ui.painter()
+                    .rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
+            }
+            ui.painter().add(egui::Shape::convex_polygon(
+                arrow_vertices(rect.center(), 3.5, search.replace_open).to_vec(),
+                ui.visuals().text_color(),
+                egui::Stroke::NONE,
+            ));
+            chevron.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "展开替换")
+            });
+            let chevron = chevron.on_hover_text(if search.replace_open {
+                "收起替换"
+            } else {
+                "展开替换"
+            });
+            if chevron.clicked() {
+                search.replace_open = !search.replace_open;
+            }
+            // 为右侧三枚按钮预留宽度，避免 TextEdit 吃满横向空间。
+            let input_width = (ui.available_width() - 3.0 * (mode_size.x + 2.0)).max(1.0);
+            let input = egui::TextEdit::singleline(&mut search.query)
+                .id_salt("search-input")
+                .hint_text(if search.regex {
+                    "正则表达式…"
+                } else {
+                    "搜索…"
+                })
+                .desired_width(input_width)
+                .min_size(egui::vec2(0.0, mode_size.y))
+                .show(ui)
+                .response
+                .response;
+            if input.changed() {
+                outbox.push(Message::SearchQueryChanged);
+            }
+            let case = ui
+                .add_sized(
+                    mode_size,
+                    egui::Button::selectable(!search.case_insensitive, "Aa"),
+                )
+                .on_hover_text("区分大小写");
+            if case.clicked() {
+                search.case_insensitive = !search.case_insensitive;
+                outbox.push(Message::SearchQueryChanged);
+            }
+            let word = ui
+                .add_sized(mode_size, egui::Button::selectable(search.whole_word, "ab"))
+                .on_hover_text("全字匹配");
+            if word.clicked() {
+                search.whole_word = !search.whole_word;
+                outbox.push(Message::SearchQueryChanged);
+            }
+            let regex = ui
+                .add_sized(mode_size, egui::Button::selectable(search.regex, ".*"))
+                .on_hover_text("使用正则表达式");
+            if regex.clicked() {
+                search.regex = !search.regex;
+                outbox.push(Message::SearchQueryChanged);
+            }
+            [chevron, input, case, word, regex]
+        })
+        .inner
+}
+
+fn search_results(
+    panel: &mut egui::Ui,
+    search: &mut SearchState,
+    root: &Path,
+    outbox: &mut Vec<Message>,
+) {
     match &search.status {
         SearchStatus::Running => {
             panel.weak(format!("搜索中…(已 {} 条)", search.hits.len()));
@@ -2250,6 +2276,143 @@ mod tests {
                 texts.iter().any(|text| text.contains(expected)),
                 "搜索页应渲染 {expected:?}, 实际文本:{texts:?}"
             );
+        }
+    }
+
+    #[test]
+    fn search_controls_stay_on_one_line_without_overlap() {
+        for dark in [false, true] {
+            for sidebar_width in [tokens::SIDEBAR_MIN_W, 240.0, 400.0] {
+                for query in ["", "needle", "很长的搜索文本 Aa ab .* ".repeat(20).as_str()] {
+                    let ctx = egui::Context::default();
+                    ctx.set_visuals(if dark {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    });
+                    let mut search = SearchState {
+                        query: query.into(),
+                        ..SearchState::default()
+                    };
+                    let mut outbox = Vec::new();
+                    let mut rects = [Rect::NOTHING; 5];
+                    // 包含 rail、面板右边距和滚动条的最窄内容预算。
+                    let width = sidebar_width
+                        - tokens::RAIL_W
+                        - 8.0
+                        - ctx
+                            .style_of(if dark {
+                                egui::Theme::Dark
+                            } else {
+                                egui::Theme::Light
+                            })
+                            .spacing
+                            .scroll
+                            .allocated_width();
+                    let bounds =
+                        Rect::from_min_size(egui::pos2(50.0, 20.0), egui::vec2(width, 200.0));
+                    let output = ctx.run_ui(
+                        RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(600.0, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let mut content = ui.new_child(egui::UiBuilder::new().max_rect(bounds));
+                            rects = search_controls(&mut content, &mut search, &mut outbox)
+                                .map(|response| response.rect);
+                        },
+                    );
+                    for rect in rects {
+                        assert!(rect.width() > 0.0, "控件有可用宽度: {rect:?}");
+                        assert!(
+                            rect.left() >= bounds.left() - 0.5
+                                && rect.right() <= bounds.right() + 0.5,
+                            "控件不得越出侧栏: {rect:?}, bounds={bounds:?}"
+                        );
+                        assert!(
+                            (rect.center().y - rects[1].center().y).abs() < 1.0,
+                            "所有控件应在同一行: {rects:?}"
+                        );
+                    }
+                    for pair in rects.windows(2) {
+                        assert!(
+                            pair[0].right() <= pair[1].left(),
+                            "控件有序且不重叠: {rects:?}"
+                        );
+                    }
+                    assert!(rects[1].width() >= 20.0, "最窄侧栏仍可输入: {rects:?}");
+                    for (label, rect) in ["Aa", "ab", ".*"].into_iter().zip(&rects[2..]) {
+                        let text_rect = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::epaint::Shape::Text(text)
+                                    if text.galley.job.text == label =>
+                                {
+                                    let text_rect = text.visual_bounding_rect();
+                                    assert!(
+                                        shape.clip_rect.contains_rect(text_rect),
+                                        "按钮文本未被裁剪: {label}"
+                                    );
+                                    Some(text_rect)
+                                }
+                                _ => None,
+                            })
+                            .expect("模式按钮文本可见");
+                        assert!(
+                            rect.contains_rect(text_rect),
+                            "按钮文字不越出点击区域: {label}"
+                        );
+                    }
+                    output.drop_without_applying_deltas();
+                    assert!(outbox.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_controls_chevron_click_toggles_replace() {
+        let ctx = egui::Context::default();
+        let mut search = SearchState::default();
+        let mut outbox = Vec::new();
+        let mut center = egui::Pos2::ZERO;
+        for expected in [true, false] {
+            ctx.run_ui(RawInput::default(), |ui| {
+                center = search_controls(ui, &mut search, &mut outbox)[0]
+                    .rect
+                    .center();
+            })
+            .drop_without_applying_deltas();
+            ctx.run_ui(
+                RawInput {
+                    events: vec![
+                        Event::PointerMoved(center),
+                        Event::PointerButton {
+                            pos: center,
+                            button: PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                        Event::PointerButton {
+                            pos: center,
+                            button: PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    search_controls(ui, &mut search, &mut outbox);
+                },
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(search.replace_open, expected);
+            assert!(outbox.is_empty(), "展开替换不触发搜索");
         }
     }
 
