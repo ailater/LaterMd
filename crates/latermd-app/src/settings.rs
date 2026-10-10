@@ -2578,6 +2578,9 @@ mod tests {
     /// 上浅灰墨才是对的,这里数 dark border 矩形 ≥2 同步钉住)。
     #[test]
     fn theme_previews_render_each_mode_with_its_own_paper() {
+        // 直渲 appearance_legacy:预览图住在非 mac 的 legacy 页,macOS 上
+        // `appearance` 分发到 macos::appearance(原生页无预览),走分发器
+        // 会在 mac CI 数到 0 块暗纸(#177 实测)
         let mut state = State::default();
         let ctx = egui::Context::default();
         state.theme.apply(&ctx, state.theme.mode);
@@ -2600,7 +2603,7 @@ mod tests {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        appearance(
+                        appearance_legacy(
                             ui,
                             settings,
                             theme,
