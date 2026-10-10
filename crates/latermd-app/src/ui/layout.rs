@@ -310,9 +310,10 @@ impl LaterMdApp {
         // ⓪ 自绘窗口骨架之一:36px 自绘标题栏(仅无边框模式;
         // LATERMD_NATIVE_DECORATIONS=1 的原生装饰路径不画,行为与旧版
         // 完全一致)。
-        if cfg!(target_os = "macos") && !self.frameless {
-            // 同一物理像素分隔线贯穿标题栏、侧栏、预览与状态栏。
-            ui.visuals_mut().widgets.noninteractive.bg_stroke = crate::ui::workbench::separator(ui);
+        if !self.frameless {
+            // 同一物理像素分隔线贯穿标题栏、侧栏、预览与状态栏(mac 精修
+            // 全平台化,#166):1 物理像素,高分屏下比投影档(1 逻辑像素)
+            // 更细,低分屏下与原值一致。
             egui::Panel::top("workbench-header")
                 .exact_size(crate::ui::workbench::HEADER_H)
                 .frame(egui::Frame::NONE.fill(crate::theme::window_fill(ui.visuals().dark_mode)))

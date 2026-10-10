@@ -430,11 +430,10 @@ pub fn ui(
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                         .desired_rows(lines.clamp(1, 40));
-                    let edit = if cfg!(target_os = "macos") {
-                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
-                    } else {
-                        edit
-                    };
+                    // 活动块无输入框式外框(2026-10-10 mac 精修全平台化,
+                    // #169):只留文字内距,光标/选区/IME 通路不变
+                    let edit =
+                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)));
                     let output = edit.show(ui);
 
                     // 光标(块内字符偏移):跨块路由判定、键盘跟随与回填共用
