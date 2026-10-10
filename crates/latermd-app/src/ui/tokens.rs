@@ -167,6 +167,84 @@ pub const INPUT_PAD_Y: f32 = 8.0;
 /// docs/roadmap 专题 #23,与本棒解耦)。
 pub const FONT_SM: f32 = 14.0;
 
+// —— 语义档(docs/design-system-plan.md §4,T1 批次只新增、零调用点迁移)——
+//
+// 第二代尺度真源:命名表达「两个东西的关系」,不表达「它今天解析成
+// 多少像素」——取档先问两侧东西彼此是什么,再对号入座。旧 `SPACE_*`
+// 等常量与其全部引用一律不动,T2 起按 §4.1 分流规则迁移后才退役。
+
+/// 间距档:量「两个隔开的东西离多远」,不区分间隔与贴边——那两个
+/// 语义拆给了下面的 `gap` / `inset` 命名空间,这里只是中性的距离标尺。
+// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
+// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
+#[cfg_attr(not(test), expect(dead_code))]
+pub mod space {
+    /// 图标基线与文字基线、紧凑分隔线的两侧:两个几乎贴住的东西。
+    pub const XXS: f32 = 2.0;
+    /// 同一控件内的部件之间:图标与文字、标题与描述。
+    pub const XS: f32 = 4.0;
+    /// 紧密关联的控件之间:按钮组、对话框动作区。
+    pub const SM: f32 = 8.0;
+    /// 一个内容组的各部分之间:一行的各列、紧凑表单项。
+    pub const MD: f32 = 12.0;
+    /// 一节之内分隔的组之间,也量区域整体的内边距。
+    pub const LG: f32 = 16.0;
+    /// 节与节之间:分节的呼吸。
+    pub const XL: f32 = 24.0;
+    /// 大区域的边界:空状态的呼吸。
+    pub const XXL: f32 = 32.0;
+}
+
+/// 字号档:量「这段字以什么身份出场」。取档看文本扮演的角色,不看
+/// 它今天解析成多少像素。
+// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
+// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
+#[cfg_attr(not(test), expect(dead_code))]
+pub mod text {
+    /// 元信息、tooltip:读不读都行的字。
+    pub const CAPTION: f32 = 11.0;
+    /// 正文与控件标签:界面的默认语气。
+    pub const BODY: f32 = 13.0;
+    /// 次要标签与提示行:`FONT_SM` 的语义档归宿。
+    pub const SMALL: f32 = 14.0;
+    /// 窗口/分节/对话框的标题:一块区域的名字。
+    pub const TITLE: f32 = 16.0;
+    /// 应用名、当前文件名:整个界面只出现一两次的身份字。
+    pub const HEADING: f32 = 20.0;
+    /// 值得从房间对面读出的数字:统计大头、空状态主文案。
+    pub const DISPLAY: f32 = 32.0;
+}
+
+/// 间隔:两侧都是内容,用于控件之间。与 `inset` 拆成两个命名空间,
+/// 根治「拿间隔的量去填贴边」的度量语境错配(`RAIL_W` 48→40 事故,
+/// docs/ui-shell-redesign-v2.md §5.5)。
+// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
+// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
+#[cfg_attr(not(test), expect(dead_code))]
+pub mod gap {
+    /// 同一控件内的部件之间、紧挨着的两个小控件之间。
+    pub const XS: f32 = 4.0;
+    /// 紧密关联的控件之间:按钮组、对话框动作区。
+    pub const SM: f32 = 8.0;
+    /// 一个内容组的控件/列之间:一行表单的控件与说明。
+    pub const MD: f32 = 12.0;
+}
+
+/// 贴边距:一侧是内容、另一侧是窗口/容器边界,用于区域内边距。比
+/// 同名 `gap` 紧一档——边界不需要对称留白(`inset::MD < gap::MD` 是
+/// §4.3 的刻意关系,有守门测试钉住)。
+// T1 只新增不迁移、暂无生产消费者;T2 接线消费后摘除,clippy 的 unfulfilled 会提醒。
+// not(test):守门测试本身就是本档集的首个消费者,cfg(test) 下裸 expect 会 unfulfilled。
+#[cfg_attr(not(test), expect(dead_code))]
+pub mod inset {
+    /// 控件内容到自身边框的贴边:盒子最里面的一圈。
+    pub const SM: f32 = 4.0;
+    /// 内容区到分组/面板边界的贴边。
+    pub const MD: f32 = 8.0;
+    /// 大区域到窗口边界的贴边。
+    pub const LG: f32 = 12.0;
+}
+
 // —— 设置弹窗观感基线(#70 M1)——
 //
 // 设置窗三段骨架(左分页列 / 中央滚动区 / 底部按钮条)的尺寸与留白
@@ -294,5 +372,104 @@ mod tests {
         })
         .drop_without_applying_deltas();
         assert_ne!(light, dark, "明暗两档强调色不同");
+    }
+
+    /// 语义档守门(docs/design-system-plan.md §4.5):相邻两档分不出
+    /// 大小 = 档位退化成「同一档的两个名字」,严格递增即无重复。
+    fn assert_strictly_increasing(scale: &str, steps: &[f32]) {
+        for pair in steps.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{scale} 档位须严格递增且无重复:{} !< {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn space_scale_strictly_increasing() {
+        assert_strictly_increasing(
+            "space",
+            &[
+                space::XXS,
+                space::XS,
+                space::SM,
+                space::MD,
+                space::LG,
+                space::XL,
+                space::XXL,
+            ],
+        );
+    }
+
+    #[test]
+    fn text_scale_strictly_increasing() {
+        assert_strictly_increasing(
+            "text",
+            &[
+                text::CAPTION,
+                text::BODY,
+                text::SMALL,
+                text::TITLE,
+                text::HEADING,
+                text::DISPLAY,
+            ],
+        );
+    }
+
+    #[test]
+    fn gap_scale_strictly_increasing() {
+        assert_strictly_increasing("gap", &[gap::XS, gap::SM, gap::MD]);
+    }
+
+    #[test]
+    fn inset_scale_strictly_increasing() {
+        assert_strictly_increasing("inset", &[inset::SM, inset::MD, inset::LG]);
+    }
+
+    /// §4.3 刻意关系:贴边距比同名间隔紧一档。这条不等式一旦反过来,
+    /// 就回到了 `RAIL_W` 48→40 的度量语境错配,必须钉死。
+    /// (经局部变量取值:直接断言两个常量的大小关系会踩
+    /// `clippy::assertions_on_constants`。)
+    #[test]
+    fn inset_md_is_tighter_than_gap_md() {
+        let inset_md = inset::MD;
+        let gap_md = gap::MD;
+        assert!(
+            inset_md < gap_md,
+            "inset::MD({}) 必须小于 gap::MD({}):贴边距比同名间隔紧一档",
+            inset_md,
+            gap_md
+        );
+    }
+
+    /// 钉值防漂移:各档数值与规划 §4.2/§4.3 的表一字不差,改任一侧
+    /// 必须同步改另一侧(本测试就是另一侧)。
+    #[test]
+    fn semantic_tier_values_match_plan() {
+        // §4.2 间距 7 档
+        assert_eq!(space::XXS, 2.0);
+        assert_eq!(space::XS, 4.0);
+        assert_eq!(space::SM, 8.0);
+        assert_eq!(space::MD, 12.0);
+        assert_eq!(space::LG, 16.0);
+        assert_eq!(space::XL, 24.0);
+        assert_eq!(space::XXL, 32.0);
+        // §4.2 字号 6 档
+        assert_eq!(text::CAPTION, 11.0);
+        assert_eq!(text::BODY, 13.0);
+        assert_eq!(text::SMALL, 14.0);
+        assert_eq!(text::TITLE, 16.0);
+        assert_eq!(text::HEADING, 20.0);
+        assert_eq!(text::DISPLAY, 32.0);
+        // §4.3 间隔 3 档
+        assert_eq!(gap::XS, 4.0);
+        assert_eq!(gap::SM, 8.0);
+        assert_eq!(gap::MD, 12.0);
+        // §4.3 贴边距 3 档
+        assert_eq!(inset::SM, 4.0);
+        assert_eq!(inset::MD, 8.0);
+        assert_eq!(inset::LG, 12.0);
     }
 }
