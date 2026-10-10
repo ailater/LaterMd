@@ -717,76 +717,83 @@ fn search_controls(
     search: &mut SearchState,
     outbox: &mut Vec<Message>,
 ) -> [egui::Response; 5] {
+    // 不用 horizontal_centered：它占满父级全部高度,会把替换行和结果挤出
+    // 布局。这里只分配单行高度、交叉轴居中,控件中心线与输入框对齐。
+    let row_h = panel.spacing().interact_size.y.max(22.0);
     panel
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().button_padding.x = 2.0;
-            let mode_size = egui::vec2(24.0, ui.spacing().interact_size.y.max(22.0));
-            let (rect, chevron) =
-                ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-            if chevron.hovered() || chevron.has_focus() {
-                ui.painter()
-                    .rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
-            }
-            ui.painter().add(egui::Shape::convex_polygon(
-                arrow_vertices(rect.center(), 3.5, search.replace_open).to_vec(),
-                ui.visuals().text_color(),
-                egui::Stroke::NONE,
-            ));
-            chevron.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "展开替换")
-            });
-            let chevron = chevron.on_hover_text(if search.replace_open {
-                "收起替换"
-            } else {
-                "展开替换"
-            });
-            if chevron.clicked() {
-                search.replace_open = !search.replace_open;
-            }
-            // 为右侧三枚按钮预留宽度，避免 TextEdit 吃满横向空间。
-            let input_width = (ui.available_width() - 3.0 * (mode_size.x + 2.0)).max(1.0);
-            let input = egui::TextEdit::singleline(&mut search.query)
-                .id_salt("search-input")
-                .hint_text(if search.regex {
-                    "正则表达式…"
+        .allocate_ui_with_layout(
+            egui::vec2(panel.available_width(), row_h),
+            egui::Layout::left_to_right(egui::Align::Center).with_cross_align(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding.x = 2.0;
+                let mode_size = egui::vec2(24.0, ui.spacing().interact_size.y.max(22.0));
+                let (rect, chevron) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                if chevron.hovered() || chevron.has_focus() {
+                    ui.painter()
+                        .rect_filled(rect, RADIUS_SM, ui.visuals().widgets.hovered.bg_fill);
+                }
+                ui.painter().add(egui::Shape::convex_polygon(
+                    arrow_vertices(rect.center(), 3.5, search.replace_open).to_vec(),
+                    ui.visuals().text_color(),
+                    egui::Stroke::NONE,
+                ));
+                chevron.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "展开替换")
+                });
+                let chevron = chevron.on_hover_text(if search.replace_open {
+                    "收起替换"
                 } else {
-                    "搜索…"
-                })
-                .desired_width(input_width)
-                .min_size(egui::vec2(0.0, mode_size.y))
-                .show(ui)
-                .response
-                .response;
-            if input.changed() {
-                outbox.push(Message::SearchQueryChanged);
-            }
-            let case = ui
-                .add_sized(
-                    mode_size,
-                    egui::Button::selectable(!search.case_insensitive, "Aa"),
-                )
-                .on_hover_text("区分大小写");
-            if case.clicked() {
-                search.case_insensitive = !search.case_insensitive;
-                outbox.push(Message::SearchQueryChanged);
-            }
-            let word = ui
-                .add_sized(mode_size, egui::Button::selectable(search.whole_word, "ab"))
-                .on_hover_text("全字匹配");
-            if word.clicked() {
-                search.whole_word = !search.whole_word;
-                outbox.push(Message::SearchQueryChanged);
-            }
-            let regex = ui
-                .add_sized(mode_size, egui::Button::selectable(search.regex, ".*"))
-                .on_hover_text("使用正则表达式");
-            if regex.clicked() {
-                search.regex = !search.regex;
-                outbox.push(Message::SearchQueryChanged);
-            }
-            [chevron, input, case, word, regex]
-        })
+                    "展开替换"
+                });
+                if chevron.clicked() {
+                    search.replace_open = !search.replace_open;
+                }
+                // 为右侧三枚按钮预留宽度，避免 TextEdit 吃满横向空间。
+                let input_width = (ui.available_width() - 3.0 * (mode_size.x + 2.0)).max(1.0);
+                let input = egui::TextEdit::singleline(&mut search.query)
+                    .id_salt("search-input")
+                    .hint_text(if search.regex {
+                        "正则表达式…"
+                    } else {
+                        "搜索…"
+                    })
+                    .desired_width(input_width)
+                    .min_size(egui::vec2(0.0, mode_size.y))
+                    .show(ui)
+                    .response
+                    .response;
+                if input.changed() {
+                    outbox.push(Message::SearchQueryChanged);
+                }
+                let case = ui
+                    .add_sized(
+                        mode_size,
+                        egui::Button::selectable(!search.case_insensitive, "Aa"),
+                    )
+                    .on_hover_text("区分大小写");
+                if case.clicked() {
+                    search.case_insensitive = !search.case_insensitive;
+                    outbox.push(Message::SearchQueryChanged);
+                }
+                let word = ui
+                    .add_sized(mode_size, egui::Button::selectable(search.whole_word, "ab"))
+                    .on_hover_text("全字匹配");
+                if word.clicked() {
+                    search.whole_word = !search.whole_word;
+                    outbox.push(Message::SearchQueryChanged);
+                }
+                let regex = ui
+                    .add_sized(mode_size, egui::Button::selectable(search.regex, ".*"))
+                    .on_hover_text("使用正则表达式");
+                if regex.clicked() {
+                    search.regex = !search.regex;
+                    outbox.push(Message::SearchQueryChanged);
+                }
+                [chevron, input, case, word, regex]
+            },
+        )
         .inner
 }
 
@@ -2335,6 +2342,10 @@ mod tests {
                         assert!(
                             (rect.center().y - rects[1].center().y).abs() < 1.0,
                             "所有控件应在同一行: {rects:?}"
+                        );
+                        assert!(
+                            (rect.center().y - rects[1].center().y).abs() <= 0.5,
+                            "垂直中心线必须重合(截图回归:按钮整体下移): {rects:?}"
                         );
                     }
                     for pair in rects.windows(2) {
