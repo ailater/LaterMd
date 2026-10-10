@@ -470,6 +470,9 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip_text: &str) -> egui::R
         };
         icon.draw(painter, rect.center(), ICON, color);
     }
+    // 自绘控件补辅助技术语义(mac 精修带回的口径,#166)
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip_text));
     response.on_hover_text(tooltip_text)
 }
 
@@ -536,6 +539,10 @@ pub fn icon_tab(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> e
     if response.clicked() {
         response.mark_changed();
     }
+    // 自绘控件补辅助技术语义(mac 精修带回的口径,#166)
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+    });
     response
 }
 

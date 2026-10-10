@@ -16,21 +16,18 @@
 use crate::state::Message;
 use crate::tabs::{TabRename, TabsState};
 use crate::theme::TitleWidthMode;
-use crate::ui::tokens::{RADIUS_SM, SPACE_SM, SPACE_XS};
-use eframe::egui::{self, Align2, Sense};
+use crate::ui::tokens::{SPACE_SM, SPACE_XS};
+use eframe::egui::{self, Sense};
 
-/// chip 高度(比工具栏矮一档:标签条更密集)。
-const CHIP_H: f32 = if cfg!(target_os = "macos") {
-    28.0
-} else {
-    24.0
-};
+/// chip 高度(与格式条/工作台头部同一 28pt 点击档;2026-10-10 mac 精修
+/// (#166/#169)全平台化,原非 mac 24pt 退役)。
+const CHIP_H: f32 = 28.0;
 /// 关闭 × 的方框边长。
 const CLOSE: f32 = 12.0;
-/// chip 里文字之外的固定开销:左右内边距 + 文字与关闭钮的间隙 + 关闭钮。
-/// chip 总宽减它就是文本可用宽(省略号截断的预算)。
-const CHIP_CHROME: f32 =
-    SPACE_SM + SPACE_XS + CLOSE + SPACE_SM + if cfg!(target_os = "macos") { 22.0 } else { 0.0 };
+/// chip 里文字之外的固定开销:左内边距、文档图标位(图标 13 加两侧余量)、
+/// 文字与关闭钮的间隙、关闭钮、右内边距之和。chip 总宽减它就是文本可用宽,
+/// 即省略号截断的预算。
+const CHIP_CHROME: f32 = SPACE_SM + 22.0 + SPACE_XS + CLOSE + SPACE_SM;
 /// 缩短模式下单个 chip 的最小宽(#37):装得下「…」+ 关闭按钮,还给
 /// 一两个汉字的辨识余量。预算再紧也不收窄到它之下 —— 保不住最小宽,
 /// 关闭按钮就会被挤到点不中;溢出交给既有单行水平滚动。
@@ -64,9 +61,7 @@ pub fn ui(
         .show(panel, |ui| {
             let widths = plan_widths(ui, tabs, mode, budget);
             ui.horizontal(|ui| {
-                if cfg!(target_os = "macos") {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                }
+                ui.spacing_mut().item_spacing.x = 4.0;
                 for (index, width) in widths.iter().enumerate() {
                     chip(ui, tabs, index, mode, *width, outbox);
                 }
@@ -131,12 +126,10 @@ fn share_widths(full: &[f32], budget: f32) -> Vec<f32> {
     widths
 }
 
-fn tab_font(ui: &egui::Ui) -> egui::FontId {
-    if cfg!(target_os = "macos") {
-        egui::FontId::proportional(12.0)
-    } else {
-        egui::TextStyle::Button.resolve(ui.style())
-    }
+fn tab_font(_ui: &egui::Ui) -> egui::FontId {
+    // 12pt 文件名(#169 精修档):比正文小一号,标签条是「索引」不是正文
+    let _ = _ui;
+    egui::FontId::proportional(12.0)
 }
 
 /// 按实测宽截断文本并补省略号(#37 缩短模式):在 **Unicode 字符(char)
@@ -318,102 +311,51 @@ fn chip(
         Some(path) => format!("{name}\n{}", path.display()),
         None => format!("{name}\n尚未保存到磁盘"),
     };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
     let response = response.on_hover_text(tip);
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        // WorkBuddy 风活动页签:浅蓝底 + 蓝字 + 底部 2px 蓝条;未选中悬停浅灰
-        let accent = crate::ui::tokens::accent(ui);
+        // 中性选中观感(2026-10-10 mac 精修全平台化,#166/#169):淡底 +
+        // 正文中性色,蓝色只留给选中/链接/操作 —— 标签条不再叠加下划线与
+        // 蓝字重复强调。未选中悬停浅灰。
         let shell = crate::theme::shell_tokens(ui.visuals().dark_mode);
-        let selected_bg = if cfg!(target_os = "macos") {
-            shell.code_bg
-        } else {
-            shell.selected_bg
-        };
-        let hover_bg = crate::theme::shell_tokens(ui.visuals().dark_mode).hover;
+        let hover_bg = shell.hover;
         let bg = if selected {
-            selected_bg
+            shell.code_bg
         } else if response.hovered() {
             hover_bg
         } else {
             egui::Color32::TRANSPARENT
         };
-        painter.rect_filled(
-            rect,
-            if cfg!(target_os = "macos") {
-                6.0
-            } else {
-                RADIUS_SM
-            },
-            bg,
+        painter.rect_filled(rect, 6.0, bg);
+        crate::ui::icons::Icon::File.draw(
+            painter,
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            13.0,
+            shell.secondary,
         );
-        let text_color = if selected && !cfg!(target_os = "macos") {
-            accent
-        } else {
-            text_color
-        };
-        if cfg!(target_os = "macos") {
-            crate::ui::icons::Icon::File.draw(
-                painter,
-                egui::pos2(rect.left() + 14.0, rect.center().y),
-                13.0,
-                shell.secondary,
-            );
-            let galley =
-                painter.layout_no_wrap(shown.clone(), egui::FontId::proportional(12.0), text_color);
-            painter.galley(
-                egui::pos2(
-                    rect.left() + 26.0,
-                    rect.center().y - galley.mesh_bounds.center().y,
-                ),
-                galley,
-                text_color,
-            );
-        } else {
-            painter.text(
-                egui::pos2(rect.left() + SPACE_SM, rect.center().y),
-                Align2::LEFT_CENTER,
-                &shown,
-                font,
-                text_color,
-            );
-        }
-        if selected && !cfg!(target_os = "macos") {
-            // 底部 2px 强调条:WorkBuddy 标签的视觉锚点
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + SPACE_SM, rect.bottom() - 2.0),
-                egui::pos2(rect.right() - SPACE_SM, rect.bottom()),
-            );
-            painter.rect_filled(bar, 1.0, accent);
-        }
+        let galley =
+            painter.layout_no_wrap(shown.clone(), egui::FontId::proportional(12.0), text_color);
+        painter.galley(
+            egui::pos2(
+                rect.left() + 26.0,
+                rect.center().y - galley.mesh_bounds.center().y,
+            ),
+            galley,
+            text_color,
+        );
         // 关闭 ×:悬停该 chip 时才上色(常驻会显得噪)
         let cross = if response.hovered() {
             ui.visuals().text_color()
         } else {
             ui.visuals().weak_text_color()
         };
-        if cfg!(target_os = "macos") {
-            if response.hovered() || selected {
-                crate::ui::icons::Icon::Close.draw(painter, close_rect.center(), 14.0, cross);
-            } else if tab.editor.is_dirty() {
-                painter.circle_filled(close_rect.center(), 2.5, cross);
-            }
-        } else {
-            let stroke = egui::Stroke::new(1.2, cross);
-            painter.line_segment(
-                [
-                    egui::pos2(close_rect.left(), close_rect.top()),
-                    egui::pos2(close_rect.right(), close_rect.bottom()),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(close_rect.right(), close_rect.top()),
-                    egui::pos2(close_rect.left(), close_rect.bottom()),
-                ],
-                stroke,
-            );
+        if response.hovered() || selected {
+            crate::ui::icons::Icon::Close.draw(painter, close_rect.center(), 14.0, cross);
+        } else if tab.editor.is_dirty() {
+            // 未悬停时脏标记用小圆点:关闭钮位置让位给「有未保存」状态
+            painter.circle_filled(close_rect.center(), 2.5, cross);
         }
     }
 

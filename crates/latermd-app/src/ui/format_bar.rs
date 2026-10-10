@@ -27,7 +27,7 @@ use crate::command::Command;
 use crate::compose::{FormatAction, FormatGroup};
 use crate::keymap::Keymap;
 use crate::state::Message;
-use crate::ui::icons::{self, Icon};
+use crate::ui::icons::Icon;
 use crate::ui::tokens;
 use eframe::egui;
 
@@ -110,17 +110,13 @@ pub fn ui_with_probe(
         .id_salt("format-bar")
         .auto_shrink([false, true])
         .show(panel, |ui| {
-            if cfg!(target_os = "macos") {
-                ui.spacing_mut().interact_size.y = 28.0;
-                ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-                ui.spacing_mut().extra_text_line_spacing = 0.0;
-            }
+            // 28pt 点击区 + 8px 按钮内距(2026-10-10 mac 精修全平台化,
+            // #166/#169):与工作台头部/标签条同一点击档
+            ui.spacing_mut().interact_size.y = 28.0;
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            ui.spacing_mut().extra_text_line_spacing = 0.0;
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = if cfg!(target_os = "macos") {
-                    2.0
-                } else {
-                    tokens::SPACE_XS
-                };
+                ui.spacing_mut().item_spacing.x = 2.0;
 
                 // ① 直出组(2026-10-08 S2-2:只有行内五项,理由见
                 // `FormatGroup::DIRECT`)。
@@ -146,13 +142,9 @@ pub fn ui_with_probe(
                 // 「探针在菜单内也生效」是刻意的:无头测试据此在菜单打开后拿到条目
                 // 矩形,否则菜单里的动作**没有任何测试能定位** —— 等于格式动作
                 // 的点击路径在溢出后就失去覆盖。
-                let menu = if cfg!(target_os = "macos") {
-                    egui::RichText::new("更多")
-                        .size(12.0)
-                        .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary)
-                } else {
-                    egui::RichText::new("更多")
-                };
+                let menu = egui::RichText::new("更多")
+                    .size(12.0)
+                    .color(crate::theme::shell_tokens(ui.visuals().dark_mode).secondary);
                 ui.menu_button(menu, |ui| {
                     for (index, group) in FormatGroup::OVERFLOW.iter().enumerate() {
                         if index > 0 {
@@ -187,26 +179,20 @@ pub fn ui_with_probe(
 }
 
 fn separator(ui: &mut egui::Ui) {
-    if cfg!(target_os = "macos") {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 28.0), egui::Sense::hover());
-        ui.painter().line_segment(
-            [
-                rect.center() - egui::vec2(0.0, 6.0),
-                rect.center() + egui::vec2(0.0, 6.0),
-            ],
-            crate::ui::workbench::separator(ui),
-        );
-    } else {
-        ui.separator();
-    }
+    // 细线分隔(28pt 档内居中 12px 短线),替代通高 egui separator
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 28.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [
+            rect.center() - egui::vec2(0.0, 6.0),
+            rect.center() + egui::vec2(0.0, 6.0),
+        ],
+        crate::ui::workbench::separator(ui),
+    );
 }
 
 fn compact_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
-    if cfg!(target_os = "macos") {
-        crate::ui::workbench::small_icon(ui, icon, tip)
-    } else {
-        icons::icon_button(ui, icon, tip)
-    }
+    // 28pt 方形小图标钮(带悬停底与辅助语义),与工具条/工作台同款
+    crate::ui::workbench::small_icon(ui, icon, tip)
 }
 
 /// Emoji 按钮 tooltip(带当前键位,与动作按钮的 tooltip 同款口径)。

@@ -272,11 +272,10 @@ pub fn ui(
                         .desired_width(desired_width)
                         .desired_rows(rows)
                         .lock_focus(true);
-                    let edit = if cfg!(target_os = "macos") {
-                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
-                    } else {
-                        edit
-                    };
+                    // 活动块无输入框式外框(2026-10-10 mac 精修全平台化,
+                    // #169):只留文字内距,光标/选区/IME 通路不变
+                    let edit =
+                        edit.frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)));
                     let output = edit.show(row);
                     (slot, output)
                 })
