@@ -67,6 +67,13 @@ pub struct LiveState {
     pub active: Option<usize>,
     /// 下一帧要落到(块, 块内字符偏移)的光标:跨块 caret 路由的交接点。
     pub pending_caret: Option<(usize, usize)>,
+    /// pending_caret 落地时的块内选区(主, 副)。`None` = 塌缩成
+    /// pending_caret 的单点(跳转/路由/点击进编辑的既有口径);`Some` =
+    /// 格式动作(live 分支)产出的「内容仍选中」落点 —— 与源码模式
+    /// 「新选区落在内容处」同语义(连点第二次才 toggle 得掉,见
+    /// `compose::View::wrap` 的严判定)。与 pending_caret 同生共死:每个
+    /// 非格式入口置 pending_caret 时都一并清掉它,落地帧 take。
+    pub pending_range: Option<(usize, usize)>,
     /// 块表对应的修订号;只在修订号前进时重算块。
     synced_rev: Option<u64>,
     /// 活动块的内联标记缓存(LP2-1 半隐藏 + LP2-2 选区扩展):(修订号,
@@ -82,8 +89,9 @@ pub struct LiveState {
     /// 与大纲跳转置真 —— 光标去了别的块,视图必须同帧跟上;点击进编辑
     /// 置假 —— 指针刚把视口定位到点击处,再跟随等于把视图拽离用户点的
     /// 地方(#29「滚轮/空闲帧不抢滚动」的同族红线)。与 pending_caret
-    /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。
-    caret_follow: bool,
+    /// 同生共死:每个置 pending 的入口都一并写,落地帧消费。格式动作
+    /// (live 归约)也置假 —— 选区是用户刚框出来的,无需拽视口。
+    pub caret_follow: bool,
     /// 富渲染块链接改写的块级缓存(#63;#65 M2 起高亮层并入同一条缓存):
     /// 块序号 → (修订号, 改写后块文本, 高亮层映射, 任务层映射)。富渲染
     /// 块每帧渲染,改写要解析块文本,稳态帧不该重付(与 `marks` 缓存同一
@@ -220,6 +228,7 @@ impl LiveState {
         self.blocks.clear();
         self.active = None;
         self.pending_caret = None;
+        self.pending_range = None;
         self.synced_rev = None;
         self.marks = None;
         self.drag_anchor = None;
@@ -399,6 +408,10 @@ impl egui::TextBuffer for BlockBuffer<'_> {
 
 /// 绘制 Live Preview:非活动块富渲染(点击即进入编辑),活动块源码编辑。
 ///
+/// `selection` 是格式工具条的选区镜像出参(与源码模式 `ui::editor` 同一
+/// 契约,见 `TabState::selection`):Live 的选区只存在于活动块 TextEdit 的
+/// 持久 state,每帧抄出(文档坐标字符区间);无活动块 = 无选区,置 `None`。
+///
 /// 返回活动块 TextEdit 的响应(没有活动块时返回一块占位区域,便于测试定位)。
 #[allow(clippy::too_many_arguments)]
 pub fn ui(
@@ -406,6 +419,7 @@ pub fn ui(
     editor: &mut EditorBuffer,
     preview: &mut PreviewState,
     cursor: &mut OutlineCursor,
+    selection: &mut Option<(usize, usize)>,
     live: &mut LiveState,
     editor_id: egui::Id,
     show_typewriter: bool,
@@ -413,6 +427,12 @@ pub fn ui(
     outbox: &mut Vec<Message>,
 ) -> egui::Response {
     live.sync(editor, cursor.byte);
+
+    // 格式工具条的选区镜像(2026-10-10,live 格式动作的前半段):先按
+    // 「无选区」起底,活动块分支内回填。起底防的是陈旧值 —— `tab.selection`
+    // 是两种模式的共用槽,live 下不回填就会留着源码模式的旧值,归约侧
+    // 拿它盲写会把 `**` 插到任意位置(曾是在 live 下点加粗的现行 bug)。
+    *selection = None;
 
     // 按下帧焦点快照(#63,与右栏预览共用同一暂存):checkbox 命中帧要把
     // 它还给活动块 —— 点击 checkbox 的意图是切换勾选,不是转移焦点。预览
@@ -451,6 +471,7 @@ pub fn ui(
             let local = editor.byte_to_char(byte) - editor.byte_to_char(live.blocks[block].start);
             live.active = Some(block);
             live.pending_caret = Some((block, local));
+            live.pending_range = None;
             live.caret_follow = true;
             live.drag_anchor = None;
         }
@@ -547,6 +568,10 @@ pub fn ui(
                             block_base + range.primary.index.0,
                             block_base + range.secondary.index.0,
                         ));
+                        // 同值镜像给格式工具条(帧首已起底 None):活动块是
+                        // 唯一可编辑块,块基不受本帧编辑影响,换算恒成立
+                        // (与上一行选区 AI 的换算同一条)。
+                        *selection = sel_ai_selection;
                         let tail = range.primary.index.0.max(range.secondary.index.0);
                         let rect = output
                             .galley
@@ -715,11 +740,25 @@ pub fn ui(
                         if block == index {
                             let id = response.id;
                             let mut state = output.state;
-                            state
-                                .cursor
-                                .set_char_range(Some(egui::text::CCursorRange::one(
-                                    egui::text::CCursor::new(char_idx),
-                                )));
+                            // 落地光标:格式入口(live 归约)附带 pending_range
+                            // → 落成「内容仍选中」;其余入口塌缩单点(既有口径)。
+                            match live.pending_range.take() {
+                                Some((primary, secondary)) => {
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::two(
+                                            egui::text::CCursor::new(primary),
+                                            egui::text::CCursor::new(secondary),
+                                        ),
+                                    ));
+                                }
+                                None => {
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::one(egui::text::CCursor::new(
+                                            char_idx,
+                                        )),
+                                    ));
+                                }
+                            }
                             state.store(ui.ctx(), id);
                             ui.ctx().memory_mut(|mem| mem.request_focus(id));
                             live.pending_caret = None;
@@ -857,6 +896,7 @@ pub fn ui(
     if let Some((index, local)) = activate {
         live.active = Some(index);
         live.pending_caret = Some((index, local));
+        live.pending_range = None;
         // 点击进编辑不跟随:指针刚把视口定位到点击处(decisions-pending #83)
         live.caret_follow = false;
         live.drag_anchor = None;
@@ -890,6 +930,7 @@ pub fn ui(
     if let Some(route) = route {
         live.active = Some(route.0);
         live.pending_caret = Some(route);
+        live.pending_range = None;
         // 跨块路由:光标去了别的块,落地帧视口必须同帧跟上
         live.caret_follow = true;
         live.drag_anchor = None;
@@ -1232,12 +1273,14 @@ mod tests {
         };
         let before = editor.text().to_owned();
         let mut outbox = Vec::new();
+        let mut selection_mirror = None;
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             super::ui(
                 ui,
                 &mut editor,
                 &mut preview,
                 &mut cursor,
+                &mut selection_mirror,
                 &mut live,
                 egui::Id::new("live-test"),
                 false,
@@ -1372,6 +1415,8 @@ mod tests {
         /// 对齐):定位「点第二段第二行首字」这类目标,不必模拟字体度量。
         glyphs: Vec<(String, Vec<egui::Pos2>)>,
         messages: Vec<Message>,
+        /// 本帧镜像出的格式工具条选区(活动块持久选区的文档坐标)。
+        selection_mirror: Option<(usize, usize)>,
     }
 
     /// 跑一帧 Live 面板(生产入口 `super::ui`)并收集取证。
@@ -1384,6 +1429,7 @@ mod tests {
         live: &mut LiveState,
     ) -> LiveFrame {
         let mut outbox = Vec::new();
+        let mut selection_mirror = None;
         let output = ctx.run_ui(
             egui::RawInput {
                 events,
@@ -1395,6 +1441,7 @@ mod tests {
                     editor,
                     preview,
                     cursor,
+                    &mut selection_mirror,
                     live,
                     egui::Id::new("live-copy-test"),
                     false,
@@ -1442,6 +1489,7 @@ mod tests {
             texts,
             glyphs,
             messages,
+            selection_mirror,
         }
     }
 
@@ -1636,6 +1684,96 @@ mod tests {
             Some((0, 0)),
             "光标落第一段行首而非块尾 5:{:?}",
             live.pending_caret
+        );
+    }
+
+    /// 活动块选区每帧镜像进 selection 出参(live 格式动作的前半段,
+    /// 2026-10-10):活动块的持久 TextEditState 选区换算成文档坐标抄给
+    /// `TabState::selection`;**无活动块帧必须镜像出 None** —— 不然归约
+    /// 侧会拿源码模式的陈旧值盲写(曾是在 live 下点加粗的现行 bug)。
+    #[test]
+    fn active_block_selection_is_mirrored_for_the_format_bar() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("第一段\n\n第二段\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+
+        // 无活动块:镜像 None
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(frame.selection_mirror, None, "无活动块 = 无选区");
+
+        // 活动块 0 内框选 0..3:经持久 TextEditState 注入,再跑一帧
+        live.active = Some(0);
+        let block_id = egui::Id::new("live-copy-test").with(("live-block", 0));
+        let mut st = egui::widgets::text_edit::TextEditState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(3),
+        )));
+        st.store(&ctx, block_id);
+        ctx.memory_mut(|mem| mem.request_focus(block_id));
+        let frame = live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+        assert_eq!(
+            frame.selection_mirror.map(|(a, b)| (a.min(b), a.max(b))),
+            Some((0, 3)),
+            "活动块选区镜像成文档坐标(块基 0,同值;TextEdit 会归一化主副序)"
+        );
+    }
+
+    /// 格式动作的落地帧(链路末端,2026-10-10):归约挂上的
+    /// `pending_caret` + `pending_range` 落成块的持久双侧选区
+    /// (「内容仍选中」),并即焚;焦点还给活动块。
+    #[test]
+    fn format_landing_restores_the_content_selection() {
+        let ctx = egui::Context::default();
+        let mut editor = EditorBuffer::new("**甲乙丙**\n\n后文\n");
+        let mut preview = PreviewState::new(&editor);
+        let mut cursor = OutlineCursor::default();
+        let mut live = LiveState::default();
+        live.sync(&editor, Some(editor.char_to_byte(2)));
+        assert_eq!(live.active, Some(0));
+        live.pending_caret = Some((0, 2));
+        live.pending_range = Some((2, 5));
+
+        live_frame(
+            &ctx,
+            Vec::new(),
+            &mut editor,
+            &mut preview,
+            &mut cursor,
+            &mut live,
+        );
+
+        let id = egui::Id::new("live-copy-test").with(("live-block", 0));
+        let st =
+            egui::widgets::text_edit::TextEditState::load(&ctx, id).expect("活动块 state 已建立");
+        let range = st.cursor.char_range().expect("落地选区");
+        assert_eq!(
+            (
+                range.primary.index.0.min(range.secondary.index.0),
+                range.primary.index.0.max(range.secondary.index.0)
+            ),
+            (2, 5),
+            "双侧选区落地(块内坐标;TextEdit 会归一化主副序)"
+        );
+        assert!(
+            live.pending_caret.is_none() && live.pending_range.is_none(),
+            "落地即焚,不悬置到下一帧"
         );
     }
 
@@ -1850,6 +1988,7 @@ mod tests {
     ) -> Vec<egui::Rect> {
         let mut fade = egui::Color32::TRANSPARENT;
         let mut outbox = Vec::new();
+        let mut selection_mirror = None;
         let output = ctx.run_ui(
             egui::RawInput {
                 time: Some(time),
@@ -1862,6 +2001,7 @@ mod tests {
                     editor,
                     preview,
                     cursor,
+                    &mut selection_mirror,
                     live,
                     egui::Id::new(FADE_EDITOR_ID),
                     false,
@@ -2519,6 +2659,7 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut id = egui::Id::NULL;
         let mut outbox = Vec::new();
+        let mut selection_mirror = None;
         let output = ctx.run_ui(
             egui::RawInput {
                 time: Some(time),
@@ -2532,6 +2673,7 @@ mod tests {
                     editor,
                     preview,
                     cursor,
+                    &mut selection_mirror,
                     live,
                     egui::Id::new(SCROLL_EDITOR_ID),
                     show_typewriter,
@@ -3773,6 +3915,7 @@ mod tests {
     ) {
         let mut outbox = Vec::new();
         let mut fade = egui::Color32::TRANSPARENT;
+        let mut selection_mirror = None;
         let output = ctx.run_ui(
             egui::RawInput {
                 events,
@@ -3784,6 +3927,7 @@ mod tests {
                     editor,
                     preview,
                     cursor,
+                    &mut selection_mirror,
                     live,
                     egui::Id::new(FOCUS_EDITOR_ID),
                     false,
@@ -4011,12 +4155,14 @@ mod tests {
             let (mut editor, mut preview, mut cursor, mut live) = focus_state();
             let mut outbox = Vec::new();
             let mut fade = egui::Color32::TRANSPARENT;
+            let mut selection_mirror = None;
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 super::ui(
                     ui,
                     &mut editor,
                     &mut preview,
                     &mut cursor,
+                    &mut selection_mirror,
                     &mut live,
                     egui::Id::new(FOCUS_EDITOR_ID),
                     typewriter,
@@ -4186,12 +4332,14 @@ mod tests {
         let mut cursor = OutlineCursor::default();
         let mut live = LiveState::default();
         let mut outbox = Vec::new();
+        let mut selection_mirror = None;
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             super::ui(
                 ui,
                 &mut editor,
                 &mut preview,
                 &mut cursor,
+                &mut selection_mirror,
                 &mut live,
                 egui::Id::new("live-highlight-test"),
                 false,

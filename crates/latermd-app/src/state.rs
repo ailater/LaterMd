@@ -1958,7 +1958,8 @@ impl State {
 
     /// 请求一次 Markdown 格式动作(§6.4 链路)。
     ///
-    /// 语义全在 [`crate::compose::apply`];这里负责三件事:取当前选区 →
+    /// Live 模式走 [`Self::apply_format_live`](块内定点写回);源码模式:
+    /// 语义全在 [`crate::compose::apply`],这里负责三件事:取当前选区 →
     /// 调用 → 把新文本写回缓冲并把新选区挂 `pending_selection`。选区为
     /// `None`(UI 还没回填过)时按纯光标(0,0)处理。
     ///
@@ -1967,6 +1968,10 @@ impl State {
     /// 收益不成比例)。代价是 `TextEdit` 内建 undoer 的快照被整篇重建打碎,
     /// Ctrl+Z 可能一次回退一整次格式操作 —— 已知并接受(§9 R3)。
     fn apply_format(&mut self, action: crate::compose::FormatAction) {
+        if self.render_mode == crate::live::RenderMode::Live {
+            self.apply_format_live(action);
+            return;
+        }
         let tab = self.tabs.current_mut();
         let selection = tab.selection.unwrap_or((0, 0));
         let start = selection.0.min(selection.1);
@@ -1981,6 +1986,52 @@ impl State {
         if let Some(byte) = tab.cursor.byte {
             tab.cursor.byte = Some(tab.editor.char_to_byte(tab.editor.byte_to_char(byte)));
         }
+    }
+
+    /// Live 模式的格式动作:对**活动块**切片做块内 `compose::apply`,
+    /// `replace_range` 定点写回(与 AI 润色/任务勾选同一条通道,TextEdit
+    /// 内建 undo 单步可退),新选区经 `pending_caret` + `pending_range` 落
+    /// 回活动块 —— 内容仍选中,连点第二次才 toggle 得掉(与源码模式
+    /// `wrap` 的严判定同语义)。
+    ///
+    /// 防御(live 下点格式动作曾是现行 bug:拿源码模式的陈旧选区、甚至
+    /// 从 (0,0) 盲插 `**`):活动块或选区缺失、选区与活动块不相交,一律
+    /// 放弃 —— live 的选区只可能来自活动块(每帧由 `live::ui` 镜像进
+    /// `tab.selection`),拿不到就不猜。
+    fn apply_format_live(&mut self, action: crate::compose::FormatAction) {
+        let tab = self.tabs.current_mut();
+        // 块表以「最后一次绘制帧」的文本为基准;消息队列里若排着更早的
+        // 改文消息(如连点两次加粗),此刻的块表已过期 —— 先按当前缓冲
+        // 重同步(幂等,修订号没动就是空操作),活动块也随 cursor.byte
+        // 重新定位,后续连点才能落在正确的块上。
+        tab.live.sync(&tab.editor, tab.cursor.byte);
+        let Some(index) = tab.live.active else {
+            return;
+        };
+        let Some((sel_start, sel_stop)) = tab.selection else {
+            return;
+        };
+        let (sel_start, sel_stop) = (sel_start.min(sel_stop), sel_start.max(sel_stop));
+        let range = tab.live.blocks[index].clone();
+        let base = tab.editor.byte_to_char(range.start);
+        let len = tab.live.block_char_len(&tab.editor, index);
+        if sel_stop <= base || sel_start >= base + len {
+            return;
+        }
+        let local_start = sel_start.saturating_sub(base).min(len);
+        let local_stop = sel_stop.saturating_sub(base).min(len);
+        let block_text = tab.editor.text()[range].to_owned();
+        let (new_block, new_selection) =
+            crate::compose::apply(action, &block_text, local_start..local_stop);
+        tab.editor.replace_range(base..base + len, &new_block);
+        // 新选区(块内坐标)落回活动块。不写 `pending_selection` —— Live
+        // 不消费它,挂到切回源码才触发是惊扰;caret_follow = false,与
+        // 「点击进编辑不拽视口」同口径:选区本就是用户刚框出来的。
+        tab.live.pending_caret = Some((index, new_selection.start));
+        tab.live.pending_range = Some((new_selection.start, new_selection.end));
+        tab.live.caret_follow = false;
+        // 大纲/状态栏的同帧口径:光标落到内容起点(下一帧镜像再校准)。
+        tab.cursor.byte = Some(tab.editor.char_to_byte(base + new_selection.start));
     }
 
     /// 查找条开/关:开时按当前选区预填查找词(选中即所要找的,编辑器
@@ -8779,6 +8830,128 @@ mod tests {
             state.tabs.current().editor.text(),
             "甲乙丙",
             "选区正好框住内层 → toggle off"
+        );
+    }
+
+    /// Live 模式:格式动作落在**活动块内**(2026-10-10)。链路:`live::ui`
+    /// 把活动块选区镜像进 `tab.selection`(文档坐标)→ 归约对块切片
+    /// apply → `replace_range` 定点写回 → `pending_caret/pending_range`
+    /// 落回「内容仍选中」。此前 live 下点加粗会拿源码模式的陈旧选区
+    /// (甚至从 (0,0))盲插 `**`,是本分支堵掉的现行 bug。
+    #[test]
+    fn live_format_applies_inside_the_active_block() {
+        let mut state = State {
+            render_mode: crate::live::RenderMode::Live,
+            ..Default::default()
+        };
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("hello world\n\n后文");
+        let tab = state.tabs.current_mut();
+        tab.live.sync(&tab.editor, None);
+        tab.live.active = Some(0);
+        tab.selection = Some((0, 5)); // "hello"
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        let tab = state.tabs.current();
+        assert_eq!(
+            tab.editor.text(),
+            "**hello** world\n\n后文",
+            "块内包裹,块外一字不动"
+        );
+        assert_eq!(
+            tab.live.pending_caret,
+            Some((0, 2)),
+            "光标落内容起点(** 之后)"
+        );
+        assert_eq!(tab.live.pending_range, Some((2, 7)), "内容仍选中");
+        assert!(!tab.live.caret_follow, "工具条触发不拽视口");
+        assert_eq!(tab.pending_selection, None, "Live 不走 pending_selection");
+        assert_eq!(tab.cursor.byte, Some(2), "大纲/状态栏光标同帧跟上内容起点");
+    }
+
+    /// Live 守门:无活动块时格式动作 no-op —— 不许拿源码模式的陈旧选区
+    /// (或 (0,0))在任意位置盲写标记。
+    #[test]
+    fn live_format_without_active_block_is_a_noop() {
+        let mut state = State {
+            render_mode: crate::live::RenderMode::Live,
+            ..Default::default()
+        };
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("hello world\n\n后文");
+        let tab = state.tabs.current_mut();
+        tab.live.sync(&tab.editor, None);
+        // live.active 刻意保持 None:没有块获得焦点;selection 是残留值
+        tab.selection = Some((0, 5));
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        let tab = state.tabs.current();
+        assert_eq!(tab.editor.text(), "hello world\n\n后文", "无活动块不写");
+        assert!(tab.live.pending_caret.is_none());
+        assert!(tab.live.pending_range.is_none());
+    }
+
+    /// Live 守门:选区与活动块不相交(过期镜像/跨块残留)同样 no-op。
+    #[test]
+    fn live_format_with_selection_outside_active_block_is_a_noop() {
+        let mut state = State {
+            render_mode: crate::live::RenderMode::Live,
+            ..Default::default()
+        };
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("hello world\n\n后文");
+        let tab = state.tabs.current_mut();
+        tab.live.sync(&tab.editor, None);
+        tab.live.active = Some(1); // 活动块是「后文」
+        tab.selection = Some((0, 5)); // 选的却是块 0 的 "hello"
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        assert_eq!(state.tabs.current().editor.text(), "hello world\n\n后文");
+    }
+
+    /// 连点两次加粗 = toggle off:第一次落地的「内容仍选中」经镜像回填
+    /// 成第二次的输入;第二次归约前块表已因上次写回过期 —— 入口的
+    /// `live.sync` 重同步让动作落在**新块表**上(连点链路)。
+    #[test]
+    fn live_format_toggles_off_on_second_click() {
+        let mut state = State {
+            render_mode: crate::live::RenderMode::Live,
+            ..Default::default()
+        };
+        state
+            .tabs
+            .current_mut()
+            .editor
+            .replace_all("甲乙丙\n\n后文");
+        let tab = state.tabs.current_mut();
+        tab.live.sync(&tab.editor, None);
+        tab.live.active = Some(0);
+        tab.selection = Some((0, 3));
+
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+        assert_eq!(state.tabs.current().editor.text(), "**甲乙丙**\n\n后文");
+
+        // 下一帧 UI 落地 + 镜像:块内选区 (2,5) 原样回填(块基 0,文档
+        // 坐标同值)—— 与 live::ui 每帧镜像同一只手。
+        state.tabs.current_mut().selection = Some((2, 5));
+        state.apply(Message::FormatRequested(FormatAction::Bold));
+
+        assert_eq!(
+            state.tabs.current().editor.text(),
+            "甲乙丙\n\n后文",
+            "选区正被 ** 包着 → toggle off"
         );
     }
 
