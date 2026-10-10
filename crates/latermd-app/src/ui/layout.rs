@@ -348,9 +348,15 @@ impl LaterMdApp {
         // **必须在左右栏之前加**:先加的最外层、先画者占满全窗横向 ——
         // 若放在 nav/preview 之后,它就只在中央残余区里横跨,左右栏脚下
         // 各缺一截(2026-09-27 用户实测反馈的第二条)。
-        egui::Panel::bottom("statusbar").show(ui, |ui| {
-            status_bar(ui, &self.state);
-        });
+        egui::Panel::bottom("statusbar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(crate::theme::shell(ui).chrome)
+                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
+            )
+            .show(ui, |ui| {
+                status_bar(ui, &self.state);
+            });
 
         // ③ 左栏:导航(文件树 / 搜索 / 大纲 / Git 四视图)。`show_collapsible`
         // 原地持有 `&mut bool`,因此先解构再把闭包要用的其余状态分头借用
@@ -382,11 +388,13 @@ impl LaterMdApp {
             // 才是 Activity Bar 的读法。右/上/下不动:那里仍是与相邻内容
             // 的间隔,沿用默认值以保证与标题栏等其他 panel 观感一致。
             .frame(
-                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
-                    left: if workbench { 12 } else { 0 },
-                    right: if workbench { 12 } else { 8 },
-                    ..egui::Margin::symmetric(8, 2)
-                }),
+                egui::Frame::side_top_panel(ui.style())
+                    .inner_margin(egui::Margin {
+                        left: if workbench { 12 } else { 0 },
+                        right: if workbench { 12 } else { 8 },
+                        ..egui::Margin::symmetric(8, 2)
+                    })
+                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
             )
             .show_collapsible(ui, left, |ui| {
                 let sidebar = if workbench {
@@ -440,7 +448,8 @@ impl LaterMdApp {
                     // 一半留更乱 → 与 nav 的 Margin::symmetric(8,2) 同判,整处
                     // 保留字面量(设计系统 T2b 判例;inset::MD 另有 OVERLAY_MARGIN 消费)。
                     .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
-                    .fill(crate::theme::shell(ui).content),
+                    .fill(crate::theme::shell(ui).content)
+                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
             )
             .show_collapsible(ui, right, |ui| {
                 crate::ui::workbench::pane_heading(ui, "对照预览", "只读");
@@ -491,7 +500,8 @@ impl LaterMdApp {
             .frame(
                 egui::Frame::default()
                     .inner_margin(egui::Margin::symmetric(if workbench { 16 } else { 8 }, 8))
-                    .fill(crate::theme::shell(ui).content),
+                    .fill(crate::theme::shell(ui).content)
+                    .stroke(egui::Stroke::new(1.0, crate::theme::shell(ui).border)),
             )
             .show(ui, |ui| {
                 // 提示行(存在才显示;原文件工具栏的能力,工具栏退役后迁此,

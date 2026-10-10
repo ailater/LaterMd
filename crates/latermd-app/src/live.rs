@@ -26,7 +26,7 @@
 //! **同帧**发生,不出现「光标写了但视图没跟」的帧。滚动偏移与跟随标志
 //! 都在 UI 侧,不进 State 归约。
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use eframe::egui;
 use egui_markdown::{LinkHandler, LinkStyle, MarkdownLabel};
@@ -34,6 +34,22 @@ use egui_markdown_style::MarkdownStyle;
 use latermd_editor::EditorBuffer;
 
 use crate::state::{Message, OutlineCursor, PreviewState};
+
+type RichCacheEntry = (
+    u64,
+    Arc<str>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+);
+type RichBlock = (
+    Arc<str>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+    Arc<latermd_md::OffsetMap>,
+);
 
 /// 编辑器的渲染模式(P3 的那**一个标志**)。
 ///
@@ -101,10 +117,7 @@ pub struct LiveState {
     /// 序号随编辑漂移,旧条目不可信)。两张映射随渲染文本同源缓存:点击
     /// 进编辑的落点换算要把渲染文本偏移**逆穿**回块源码坐标,点击时重算
     /// 映射等于把改写解析重做一遍。
-    rich_cache: std::collections::HashMap<
-        usize,
-        (u64, String, latermd_md::OffsetMap, latermd_md::OffsetMap),
-    >,
+    rich_cache: std::collections::HashMap<usize, RichCacheEntry>,
 }
 
 impl LiveState {
@@ -135,29 +148,44 @@ impl LiveState {
     /// 层坐标):层序与预览四层链一致(高亮在任务之前,生产顺序 wikilink →
     /// 高亮 → emoji → 任务的 Live 子集);两层各有「无目标字符不启动解析」
     /// 的快路径,两层快路径直接恒等返回。
-    fn rich_block(
-        &mut self,
-        index: usize,
-        rev: u64,
-        block_text: &str,
-    ) -> (String, latermd_md::OffsetMap, latermd_md::OffsetMap) {
-        if let Some((seen_rev, rendered, highlight_map, task_map)) = self.rich_cache.get(&index) {
+    fn rich_block(&mut self, index: usize, rev: u64, block_text: &str) -> RichBlock {
+        if let Some((seen_rev, rendered, offset_map, highlight_map, emoji_map, task_map)) =
+            self.rich_cache.get(&index)
+        {
             if *seen_rev == rev {
-                return (rendered.clone(), highlight_map.clone(), task_map.clone());
+                return (
+                    Arc::clone(rendered),
+                    Arc::clone(offset_map),
+                    Arc::clone(highlight_map),
+                    Arc::clone(emoji_map),
+                    Arc::clone(task_map),
+                );
             }
         }
-        let (after_highlight, highlight_map) = latermd_md::expand_highlight_links(block_text);
-        let (rendered, task_map) = latermd_md::expand_task_links(&after_highlight);
+        let (after_wikilinks, offset_map) = latermd_md::expand_wikilinks_with_map(block_text);
+        let (after_highlight, highlight_map) = latermd_md::expand_highlight_links(&after_wikilinks);
+        let (after_emoji, emoji_map) = latermd_md::expand_emoji_links(
+            &after_highlight,
+            crate::ui::emoji_data::covered_glyphs(),
+        );
+        let (rendered, task_map) = latermd_md::expand_task_links(&after_emoji);
+        let rendered = Arc::<str>::from(rendered);
+        let offset_map = Arc::new(offset_map);
+        let highlight_map = Arc::new(highlight_map);
+        let emoji_map = Arc::new(emoji_map);
+        let task_map = Arc::new(task_map);
         self.rich_cache.insert(
             index,
             (
                 rev,
-                rendered.clone(),
-                highlight_map.clone(),
-                task_map.clone(),
+                Arc::clone(&rendered),
+                Arc::clone(&offset_map),
+                Arc::clone(&highlight_map),
+                Arc::clone(&emoji_map),
+                Arc::clone(&task_map),
             ),
         );
-        (rendered, highlight_map, task_map)
+        (rendered, offset_map, highlight_map, emoji_map, task_map)
     }
 
     /// 把点击点的光标落点换算成块内字符偏移(#170):点击帧富渲染块已
@@ -167,12 +195,15 @@ impl LiveState {
     /// 间空隙)回退到「y 最近渲染子块的起点」(点代码块落 ``` 行,点段
     /// 间空隙落相邻段落首);连渲染子块表都没有(被剔除)时回退 None,
     /// 调用方落块尾 —— 与旧行为一致,不劣化。
+    #[allow(clippy::too_many_arguments)]
     fn click_caret_local(
         ui: &egui::Ui,
         label_id: egui::Id,
         pos: egui::Pos2,
         rendered: &str,
+        offset_map: &latermd_md::OffsetMap,
         highlight_map: &latermd_md::OffsetMap,
+        emoji_map: &latermd_md::OffsetMap,
         task_map: &latermd_md::OffsetMap,
         block_source_len: usize,
     ) -> Option<usize> {
@@ -204,7 +235,9 @@ impl LiveState {
         // 逆穿改写层(生产顺序 高亮 → 任务,逆序 任务 → 高亮);改写段
         // 内部命中映回段首,是映射表的既定语义。
         let after_task = task_map.rendered_to_source(rendered_byte);
-        let source_byte = highlight_map.rendered_to_source(after_task);
+        let after_emoji = emoji_map.rendered_to_source(after_task);
+        let after_highlight = highlight_map.rendered_to_source(after_emoji);
+        let source_byte = offset_map.rendered_to_source(after_highlight);
         let clamped = source_byte.min(block_source_len);
         Some(clamped)
     }
@@ -255,6 +288,8 @@ struct LiveRichHandler<'a> {
     /// 正文文本色(#65 M2 高亮取色用;构造时取真实 visuals,与预览
     /// handler 同一纪律 —— 不用 `Visuals::dark()/light()` 推)。
     text_color: egui::Color32,
+    dark_mode: bool,
+    clicked: std::cell::RefCell<Vec<Message>>,
 }
 
 impl<'a> LiveRichHandler<'a> {
@@ -262,12 +297,19 @@ impl<'a> LiveRichHandler<'a> {
         mermaid: &'a crate::ui::mermaid::LiveMermaidHandler,
         task_base: usize,
         text_color: egui::Color32,
+        dark_mode: bool,
     ) -> Self {
         Self {
             mermaid,
             task_base,
             text_color,
+            dark_mode,
+            clicked: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    fn drain_into(&self, outbox: &mut Vec<Message>) {
+        outbox.append(&mut self.clicked.borrow_mut());
     }
 }
 
@@ -295,6 +337,18 @@ impl LinkHandler for LiveRichHandler<'_> {
                 underline: false,
             });
         }
+        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(self.text_color),
+                underline: false,
+            });
+        }
+        if href.starts_with(latermd_md::WIKI_SCHEME) {
+            return Some(LinkStyle {
+                color: Some(crate::ui::preview::wiki_link_color(self.dark_mode)),
+                underline: true,
+            });
+        }
         href.starts_with(latermd_md::TASK_SCHEME)
             .then_some(LinkStyle {
                 color: None,
@@ -307,6 +361,18 @@ impl LinkHandler for LiveRichHandler<'_> {
         // handler 同一口径。
         if href.starts_with(latermd_md::HIGHLIGHT_SCHEME) {
             return true;
+        }
+        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            return true;
+        }
+        if let Some(target) = href.strip_prefix(latermd_md::WIKI_SCHEME) {
+            let target = target.trim();
+            if !target.is_empty() {
+                self.clicked.borrow_mut().push(Message::WikilinkClicked {
+                    target: target.to_owned(),
+                });
+                return true;
+            }
         }
         // 只吞不发:切换消息由帧末探针判定单点发出,这里若转发,将来
         // vendored 错位修好时会双发(两次切换 = 一步空转 + 两份 undo)。
@@ -329,6 +395,15 @@ impl LinkHandler for LiveRichHandler<'_> {
             crate::ui::preview::append_highlight_section(ui, text, job, font);
             return true;
         }
+        if href.starts_with(latermd_md::EMOJI_SCHEME) {
+            let format = egui::TextFormat {
+                font_id: font.clone(),
+                color: egui::Color32::TRANSPARENT,
+                ..egui::TextFormat::default()
+            };
+            job.append(text, 0.0, format);
+            return true;
+        }
         if !href.starts_with(latermd_md::TASK_SCHEME) {
             return false;
         }
@@ -342,7 +417,7 @@ impl LinkHandler for LiveRichHandler<'_> {
     }
 
     fn inline_widget_size(&self, href: &str, font: &egui::FontId) -> Option<egui::Vec2> {
-        href.starts_with(latermd_md::TASK_SCHEME)
+        (href.starts_with(latermd_md::TASK_SCHEME) || href.starts_with(latermd_md::EMOJI_SCHEME))
             .then(|| egui::vec2(font.size, font.size))
     }
 
@@ -354,6 +429,20 @@ impl LinkHandler for LiveRichHandler<'_> {
                 href,
                 crate::ui::preview::TaskProbeDomain::Live(self.task_base),
             );
+        } else if let Some(glyph) = href.strip_prefix(latermd_md::EMOJI_SCHEME) {
+            let side = rect.width().min(rect.height());
+            if side > 0.0 && ui.is_rect_visible(rect) {
+                if let Some(texture) = crate::ui::emoji_panel::inline_texture(ui, glyph) {
+                    let paint_rect =
+                        egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+                    ui.painter().image(
+                        texture.id(),
+                        paint_rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
         }
     }
 }
@@ -572,17 +661,36 @@ pub fn ui(
             // 上,归零让前距成为唯一间距源。
             ui.spacing_mut().item_spacing.y = 0.0;
             if block_count == 0 {
-                ui.weak("(空文档)");
+                // 空文档也必须有真实 TextEdit，才能在写作模式直接获得
+                // 光标并接收首个字符；使用同一 EditorBuffer，不另建镜像。
+                let mut buffer = BlockBuffer {
+                    buffer: editor,
+                    range: 0..0,
+                };
+                let response_id = editor_id.with("live-empty");
+                let output = egui::TextEdit::multiline(&mut buffer)
+                    .id(response_id)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(1)
+                    .hint_text("从这里开始写作")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
+                    .show(ui);
+                cursor.byte = output
+                    .state
+                    .cursor
+                    .char_range()
+                    .map(|range| editor.char_to_byte(range.primary.index.0));
+                active_response = Some(output.response.response);
             }
             // 前一块的分类(首块无前距:vendored `had_content` 同语义,
             // 文档顶贴顶不悬空)。
             let mut prev_kind: Option<BlockKind> = None;
             for index in 0..block_count {
                 let range = live.blocks[index].clone();
-                // 块文本(渲染与行数估算都要用;编辑走的是同一份缓冲的切片,
-                // 这里只 clone 块自己,不是整篇)
-                let block_text = BlockBuffer::slice(editor.text(), &range).to_owned();
-                let kind = block_kind(&block_text);
+                // 块文本直接借用共享缓冲；渲染缓存持有改写结果，稳态帧不再复制整块。
+                let block_text = BlockBuffer::slice(editor.text(), &range);
+                let kind = block_kind(block_text);
                 if let Some(prev) = prev_kind {
                     let style = egui_markdown_style::global_style(ui.ctx());
                     ui.add_space(block_gap(
@@ -917,8 +1025,8 @@ pub fn ui(
                     // 成底色段 —— 探针坐标域带块首,点击切换由 `ui` 帧末的
                     // 探针命中判定统一发出。无目标字符的块改写恒等,渲染
                     // 零变化。
-                    let (block_rendered, highlight_map, task_map) =
-                        live.rich_block(index, editor.revision(), &block_text);
+                    let (block_rendered, offset_map, highlight_map, emoji_map, task_map) =
+                        live.rich_block(index, editor.revision(), block_text);
                     // 字体与右栏预览同源(#23 F3):size = 用户字号偏好,
                     // 族 = 预览专用族(#43 M2 的行 metrics 对齐副本,无 CJK
                     // 回落 Proportional)。源码/Live 两种模式下排版偏好同观感。
@@ -926,20 +1034,26 @@ pub fn ui(
                         &mermaid_handler,
                         range.start,
                         ui.visuals().text_color(),
+                        matches!(ui.ctx().theme(), egui::Theme::Dark),
                     );
-                    MarkdownLabel::new(editor_id.with(("live-render", index)), &block_rendered)
-                        .font(egui::FontId::new(
-                            crate::theme::editor_font_size(ui.ctx()),
-                            crate::fonts::preview_body_family(ui.ctx()),
-                        ))
-                        .wrap()
-                        // 代码块复制头(#38)与右栏预览同一份:Live 模式的
-                        // 富渲染块也是「code 预览的地方」。
-                        .code_block_buttons(&crate::ui::preview::code_copy_buttons)
-                        // mermaid 块出图(#51 M3)+ 任务 checkbox(#63),
-                        // 与右栏预览同一渲染入口。
-                        .link_handler(&rich_handler)
-                        .show(ui);
+                    MarkdownLabel::new(
+                        editor_id.with(("live-render", index)),
+                        block_rendered.as_ref(),
+                    )
+                    .font(egui::FontId::new(
+                        crate::theme::editor_font_size(ui.ctx()),
+                        crate::fonts::preview_body_family(ui.ctx()),
+                    ))
+                    .wrap()
+                    .overflow_wrap(egui_markdown::OverflowWrap::BreakAll)
+                    // 代码块复制头(#38)与右栏预览同一份:Live 模式的
+                    // 富渲染块也是「code 预览的地方」。
+                    .code_block_buttons(&crate::ui::preview::code_copy_buttons)
+                    // mermaid 块出图(#51 M3)+ 任务 checkbox(#63),
+                    // 与右栏预览同一渲染入口。
+                    .link_handler(&rich_handler)
+                    .show(ui);
+                    rich_handler.drain_into(outbox);
                     let bottom = ui.cursor().top();
                     let rect = egui::Rect::from_min_max(
                         egui::pos2(ui.min_rect().left(), top),
@@ -965,9 +1079,11 @@ pub fn ui(
                             ui,
                             label_id,
                             pos,
-                            &block_rendered,
-                            &highlight_map,
-                            &task_map,
+                            block_rendered.as_ref(),
+                            offset_map.as_ref(),
+                            highlight_map.as_ref(),
+                            emoji_map.as_ref(),
+                            task_map.as_ref(),
                             block_source.len(),
                         )
                         .map(|byte| {
@@ -1924,7 +2040,7 @@ mod tests {
         let char_at = editor.byte_to_char(byte);
         editor.replace_range(char_at + 1..char_at + 2, "x");
         live.sync(&editor, None);
-        let (block_rendered, _, _) = live.rich_block(
+        let (block_rendered, _, _, _, _) = live.rich_block(
             0,
             editor.revision(),
             BlockBuffer::slice(editor.text(), &live.blocks[0]),
@@ -4336,7 +4452,7 @@ mod tests {
     fn live_rich_block_stacks_highlight_and_task_layers() {
         let mut live = LiveState::default();
         let doc = "- [ ] ==完== 成\n";
-        let (rendered, _, _) = live.rich_block(0, 1, doc);
+        let (rendered, _, _, _, _) = live.rich_block(0, 1, doc);
         assert!(rendered.contains("[完](<hl://>)"), "高亮层先跑:{rendered}");
         assert!(rendered.contains("task://"), "任务层后跑:{rendered}");
         assert!(!rendered.contains("=="), "标记被改写消费,不回流:{rendered}");
@@ -4346,7 +4462,7 @@ mod tests {
 
         // 零变化护栏:无 == 无任务标记的块恒等
         assert_eq!(
-            live.rich_block(1, 1, "普通段落。\n").0,
+            live.rich_block(1, 1, "普通段落。\n").0.as_ref(),
             "普通段落。\n",
             "无目标字符的块改写恒等"
         );
@@ -4360,7 +4476,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mermaid = crate::ui::mermaid::LiveMermaidHandler::new();
         let body = egui::Color32::from_rgb(0x11, 0x22, 0x33);
-        let handler = LiveRichHandler::new(&mermaid, 0, body);
+        let handler = LiveRichHandler::new(&mermaid, 0, body, false);
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let font = egui::FontId::proportional(15.0);
             let mut job = egui::text::LayoutJob::default();

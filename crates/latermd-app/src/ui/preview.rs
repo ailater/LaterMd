@@ -28,7 +28,7 @@ pub(crate) fn ai_link_color(dark_mode: bool) -> egui::Color32 {
 }
 
 /// `[[wikilink]]` 的链接色(青绿,与 ai:// 的紫罗兰区分),按明暗主题取两档。
-fn wiki_link_color(dark_mode: bool) -> egui::Color32 {
+pub(crate) fn wiki_link_color(dark_mode: bool) -> egui::Color32 {
     if dark_mode {
         egui::Color32::from_rgb(0x6C, 0xD4, 0xC0)
     } else {
@@ -1046,6 +1046,7 @@ pub fn ui(
             MarkdownLabel::new(label_id, rendered.as_ref())
                 .font(font)
                 .wrap()
+                .overflow_wrap(egui_markdown::OverflowWrap::BreakAll)
                 .heal(heal)
                 // 视口外代码块高亮延迟(#59/#60 首切卡顿,vendor ①类配套):
                 // 缓存 miss 帧里起始于视口下缘之外的 flush 段不做 syntect

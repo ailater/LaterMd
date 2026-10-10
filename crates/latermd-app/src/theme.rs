@@ -351,6 +351,10 @@ impl Default for ThemeSettings {
 /// `visuals.faint_bg_color`,明暗两套 visuals 自动适配,app 不另配颜色。
 pub fn default_markdown_style() -> MarkdownStyle {
     let mut style = MarkdownStyle::default();
+    // 代码块采用 macOS 风格的宽松内距与圆角，避免代码贴边、边框过硬。
+    style.code_block.padding = [12.0, 10.0, 12.0, 10.0];
+    style.code_block.corner_radius = tokens::RADIUS_MD;
+    style.code_block.stroke_width = 1.0;
     style.table.stroke_width = 1.0;
     style.table.corner_radius = tokens::RADIUS_MD;
     style.table.header_fill = true;
